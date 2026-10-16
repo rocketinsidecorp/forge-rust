@@ -362,7 +362,7 @@ Cargo commands. Phase 2 adds PostgreSQL by default to newly generated applicatio
 development profile pins PostgreSQL, uses health-based service ordering, a named
 data volume and a one-shot migration service. SQLx remains in the generated
 outer infrastructure/bootstrap boundary; framework-owned application-facing
-contracts live in `forge-db`. `--skip-database` creates a database-free
+contracts live in `forge-db`. `forge new -d none` creates a database-free
 application. Compose remains a local/development convenience, not the production
 orchestration contract.
 

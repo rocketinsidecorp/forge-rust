@@ -1,5 +1,7 @@
 use clap::{Parser, Subcommand};
 
+use crate::generate::Database;
+
 #[derive(Debug, Parser)]
 #[command(
     name = "forge",
@@ -32,9 +34,16 @@ pub(crate) enum Command {
         /// Do not generate the GitHub Actions workflow and Dependabot configuration.
         #[arg(long)]
         skip_ci: bool,
-        /// Generate an application without PostgreSQL, migrations or database Compose services.
-        #[arg(long)]
-        skip_database: bool,
+        /// Database backend: postgresql (alias postgres), mysql, mariadb,
+        /// sqlite3 (alias sqlite) or none (no SQLx, migrations or database services).
+        #[arg(
+            short = 'd',
+            long,
+            value_enum,
+            value_name = "DATABASE",
+            default_value_t = Database::Postgresql
+        )]
+        database: Database,
         /// Do not run `cargo generate-lockfile` after generation.
         #[arg(long)]
         skip_lockfile: bool,

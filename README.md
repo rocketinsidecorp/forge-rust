@@ -49,7 +49,8 @@ cargo run
 curl localhost:3000/health/live
 ```
 
-Use `forge new shop --skip-database` for a service that does not need
+Pick the database like `rails new -d`: `forge new shop -d postgresql|mysql|mariadb|sqlite3`
+(PostgreSQL is the default). Use `forge new shop -d none` for a service that does not need
 PostgreSQL.
 
 Build and run the container image. It is a distroless runtime running as a

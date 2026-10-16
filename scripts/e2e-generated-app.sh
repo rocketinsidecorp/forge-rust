@@ -47,7 +47,7 @@ forge="$repo_root/target/debug/forge"
 log "Generating $app_name"
 new_args=(new "$app_name" --skip-lockfile --forge-path .forge/crates/forge)
 if [[ "$skip_docker" == 1 ]]; then
-  new_args+=(--skip-database)
+  new_args+=(--database none)
 fi
 (cd "$work_dir" && "$forge" "${new_args[@]}")
 mkdir -p "$app_dir/.forge"

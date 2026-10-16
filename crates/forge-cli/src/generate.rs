@@ -21,13 +21,94 @@ pub(crate) enum ForgeSource {
     Path(String),
 }
 
+/// Database backend selected with `forge new -d` (ADR 0021).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum Database {
+    /// PostgreSQL 18 with row-level security and least-privilege roles (default).
+    #[value(name = "postgresql", alias = "postgres")]
+    Postgresql,
+    /// MySQL 8.4.
+    Mysql,
+    /// MariaDB 11.8 LTS.
+    Mariadb,
+    /// SQLite stored in a file.
+    #[value(name = "sqlite3", alias = "sqlite")]
+    Sqlite3,
+    /// No database: no SQLx, migrations or database Compose services.
+    #[value(name = "none")]
+    Disabled,
+}
+
+impl Database {
+    fn is_enabled(self) -> bool {
+        self != Self::Disabled
+    }
+
+    /// MySQL and MariaDB share the MySQL-protocol driver and migrations.
+    fn is_mysql_family(self) -> bool {
+        matches!(self, Self::Mysql | Self::Mariadb)
+    }
+
+    /// SQLx driver feature of the application's `sqlx` dependency.
+    fn driver(self) -> &'static str {
+        match self {
+            Self::Postgresql | Self::Disabled => "postgres",
+            Self::Mysql | Self::Mariadb => "mysql",
+            Self::Sqlite3 => "sqlite",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Postgresql => "PostgreSQL",
+            Self::Mysql => "MySQL",
+            Self::Mariadb => "MariaDB",
+            Self::Sqlite3 => "SQLite",
+            Self::Disabled => "no database",
+        }
+    }
+
+    /// Cargo options of the `forge` dependency that select this backend.
+    fn forge_features(self) -> &'static str {
+        match self {
+            Self::Postgresql => "",
+            Self::Mysql | Self::Mariadb => ", default-features = false, features = [\"mysql\"]",
+            Self::Sqlite3 => ", features = [\"sqlite\"]",
+            Self::Disabled => ", default-features = false",
+        }
+    }
+
+    /// Lists what `forge new` does not generate for this backend, if anything.
+    ///
+    /// ADR 0021 section 7: until a backend has full parity the generator
+    /// reports the missing modules instead of emitting PostgreSQL SQL.
+    pub(crate) fn unavailable_notice(self) -> Option<String> {
+        if matches!(self, Self::Postgresql | Self::Disabled) {
+            return None;
+        }
+        let backend = self.label();
+        Some(format!(
+            "note: the following PostgreSQL-only modules are not available for {backend} yet \
+             (ADR 0021) and were not generated:\n\
+             \x20 - row-level security policies and runtime/migrator role setup\n\
+             \x20 - audit event persistence (PgAuditSink)\n\
+             \x20 - identity, session and password-credential persistence (PostgresSessionStore, \
+             PostgresPasswordCredentialStore)\n\
+             \x20 - tenant membership persistence and tenant transaction settings (PgMembershipStore, \
+             begin_tenant_transaction)\n\
+             Tenant isolation on {backend} rests on the application layer: always bind the tenant \
+             predicate from `TenantContext`. Use PostgreSQL when the database must enforce isolation."
+        ))
+    }
+}
+
 /// Options accepted by `forge new`.
 #[derive(Debug, Clone)]
 pub(crate) struct NewApplication {
     pub(crate) name: String,
     pub(crate) docker: bool,
     pub(crate) ci: bool,
-    pub(crate) database: bool,
+    pub(crate) database: Database,
     pub(crate) forge: ForgeSource,
 }
 
@@ -37,7 +118,9 @@ enum Group {
     Docker,
     Ci,
     Database,
-    DatabaseDocker,
+    Postgres,
+    PostgresDocker,
+    Sqlite,
 }
 
 struct Template {
@@ -74,31 +157,31 @@ const TEMPLATES: &[Template] = &[
     template!(Group::Database, ".gitattributes" => "gitattributes.tmpl"),
     template!(Group::Database, "migrations/.gitkeep" => "migrations/gitkeep.tmpl"),
     template!(
-        Group::Database,
+        Group::Postgres,
         "migrations/00000000000000000001_forge_audit.up.sql" => "migrations/00000000000000000001_forge_audit.up.sql.tmpl"
     ),
     template!(
-        Group::Database,
+        Group::Postgres,
         "migrations/00000000000000000001_forge_audit.down.sql" => "migrations/00000000000000000001_forge_audit.down.sql.tmpl"
     ),
     template!(
-        Group::Database,
+        Group::Postgres,
         "migrations/00000000000000000002_forge_identity.up.sql" => "migrations/00000000000000000002_forge_identity.up.sql.tmpl"
     ),
     template!(
-        Group::Database,
+        Group::Postgres,
         "migrations/00000000000000000002_forge_identity.down.sql" => "migrations/00000000000000000002_forge_identity.down.sql.tmpl"
     ),
     template!(
-        Group::Database,
+        Group::Postgres,
         "src/infrastructure/audit/mod.rs" => "src/infrastructure/audit/mod.rs.tmpl"
     ),
     template!(
-        Group::Database,
+        Group::Postgres,
         "src/infrastructure/auth/mod.rs" => "src/infrastructure/auth/mod.rs.tmpl"
     ),
     template!(
-        Group::Database,
+        Group::Postgres,
         "src/infrastructure/tenancy/mod.rs" => "src/infrastructure/tenancy/mod.rs.tmpl"
     ),
     template!(
@@ -106,13 +189,14 @@ const TEMPLATES: &[Template] = &[
         "src/infrastructure/security/mod.rs" => "src/infrastructure/security/mod.rs.tmpl"
     ),
     template!(
-        Group::Database,
+        Group::Postgres,
         "src/infrastructure/database/mod.rs" => "src/infrastructure/database/mod.rs.tmpl"
     ),
     template!(
-        Group::DatabaseDocker,
+        Group::PostgresDocker,
         "docker/postgres/init.sql" => "docker/postgres/init.sql.tmpl"
     ),
+    template!(Group::Sqlite, "storage/.gitkeep" => "storage/gitkeep.tmpl"),
     template!(Group::Docker, "Dockerfile" => "Dockerfile.tmpl"),
     template!(Group::Docker, ".dockerignore" => "dockerignore.tmpl"),
     template!(Group::Docker, "compose.yaml" => "compose.yaml.tmpl"),
@@ -269,7 +353,7 @@ pub(crate) fn create_application(
     options: &NewApplication,
 ) -> Result<PathBuf, CliError> {
     validate_application_name(&options.name)?;
-    let forge_dependency = forge_dependency(&options.forge)?;
+    let forge_dependency = forge_dependency(&options.forge, options.database)?;
 
     let destination = parent.join(&options.name);
     match fs::create_dir(&destination) {
@@ -350,11 +434,13 @@ fn is_reserved_name(name: &str) -> bool {
     RESERVED.contains(&name)
 }
 
-/// Renders the `forge` dependency as a TOML inline table.
-fn forge_dependency(source: &ForgeSource) -> Result<String, CliError> {
+/// Renders the `forge` dependency, including the backend features, as a TOML
+/// inline table.
+fn forge_dependency(source: &ForgeSource, database: Database) -> Result<String, CliError> {
+    let features = database.forge_features();
     match source {
         ForgeSource::GitTag => Ok(format!(
-            "{{ git = \"{FORGE_REPOSITORY}\", tag = \"v{FORGE_VERSION}\" }}"
+            "{{ git = \"{FORGE_REPOSITORY}\", tag = \"v{FORGE_VERSION}\"{features} }}"
         )),
         ForgeSource::Path(path) => {
             let rejected = path.is_empty()
@@ -367,7 +453,7 @@ fn forge_dependency(source: &ForgeSource) -> Result<String, CliError> {
                     reason: "use a non-empty path with forward slashes and no quotes or control characters",
                 });
             }
-            Ok(format!("{{ path = \"{path}\" }}"))
+            Ok(format!("{{ path = \"{path}\"{features} }}"))
         }
     }
 }
@@ -378,32 +464,29 @@ fn write_application(
     forge_dependency: &str,
 ) -> Result<(), CliError> {
     let database_name = options.name.replace('-', "_");
-    let runtime_url_local =
-        format!("postgres://app_runtime:app_runtime@127.0.0.1:5432/{database_name}");
-    let migration_url_local =
-        format!("postgres://app_migrator:app_migrator@127.0.0.1:5432/{database_name}");
-    let runtime_url_container =
-        format!("postgres://app_runtime:app_runtime@db:5432/{database_name}");
-    let migration_url_container =
-        format!("postgres://app_migrator:app_migrator@db:5432/{database_name}");
+    let urls = DatabaseUrls::new(options.database, &database_name);
     let variables = [
         ("%%APP_NAME%%", options.name.as_str()),
         ("%%RUST_VERSION%%", RUST_VERSION),
         ("%%FORGE_DEPENDENCY%%", forge_dependency),
         ("%%DATABASE_NAME%%", database_name.as_str()),
-        ("%%DATABASE_DRIVER%%", "postgres"),
-        ("%%DATABASE_RUNTIME_URL_LOCAL%%", runtime_url_local.as_str()),
+        ("%%DATABASE_DRIVER%%", options.database.driver()),
+        ("%%DATABASE_LABEL%%", options.database.label()),
+        (
+            "%%DATABASE_RUNTIME_URL_LOCAL%%",
+            urls.runtime_local.as_str(),
+        ),
         (
             "%%DATABASE_MIGRATION_URL_LOCAL%%",
-            migration_url_local.as_str(),
+            urls.migration_local.as_str(),
         ),
         (
             "%%DATABASE_RUNTIME_URL_CONTAINER%%",
-            runtime_url_container.as_str(),
+            urls.runtime_container.as_str(),
         ),
         (
             "%%DATABASE_MIGRATION_URL_CONTAINER%%",
-            migration_url_container.as_str(),
+            urls.migration_container.as_str(),
         ),
     ];
 
@@ -412,8 +495,10 @@ fn write_application(
             Group::Always => true,
             Group::Docker => options.docker,
             Group::Ci => options.ci,
-            Group::Database => options.database,
-            Group::DatabaseDocker => options.database && options.docker,
+            Group::Database => options.database.is_enabled(),
+            Group::Postgres => options.database == Database::Postgresql,
+            Group::PostgresDocker => options.database == Database::Postgresql && options.docker,
+            Group::Sqlite => options.database == Database::Sqlite3,
         };
         if enabled {
             let content = render(
@@ -427,12 +512,12 @@ fn write_application(
     }
 
     for (directory, description) in RESERVED_MODULES {
-        if options.database
-            && matches!(
-                *directory,
-                "src/infrastructure/database" | "src/infrastructure/security"
-            )
-        {
+        let replaced_by_template = match *directory {
+            "src/infrastructure/database" => options.database == Database::Postgresql,
+            "src/infrastructure/security" => options.database.is_enabled(),
+            _ => false,
+        };
+        if replaced_by_template {
             continue;
         }
         write_file(
@@ -444,16 +529,72 @@ fn write_application(
     Ok(())
 }
 
+/// Local and container connection URLs of the selected backend.
+///
+/// Credentials are development-only and appear in the generated Compose file
+/// and README. PostgreSQL uses separate migration and runtime roles; MySQL,
+/// MariaDB and SQLite use one development account or file.
+struct DatabaseUrls {
+    runtime_local: String,
+    migration_local: String,
+    runtime_container: String,
+    migration_container: String,
+}
+
+impl DatabaseUrls {
+    fn new(database: Database, name: &str) -> Self {
+        match database {
+            Database::Postgresql | Database::Disabled => Self {
+                runtime_local: format!("postgres://app_runtime:app_runtime@127.0.0.1:5432/{name}"),
+                migration_local: format!(
+                    "postgres://app_migrator:app_migrator@127.0.0.1:5432/{name}"
+                ),
+                runtime_container: format!("postgres://app_runtime:app_runtime@db:5432/{name}"),
+                migration_container: format!("postgres://app_migrator:app_migrator@db:5432/{name}"),
+            },
+            Database::Mysql | Database::Mariadb => {
+                let scheme = if database == Database::Mysql {
+                    "mysql"
+                } else {
+                    "mariadb"
+                };
+                let local = format!("{scheme}://app:app@127.0.0.1:3306/{name}");
+                let container = format!("{scheme}://app:app@db:3306/{name}");
+                Self {
+                    migration_local: local.clone(),
+                    runtime_local: local,
+                    migration_container: container.clone(),
+                    runtime_container: container,
+                }
+            }
+            Database::Sqlite3 => {
+                let local = "sqlite://storage/development.sqlite3?mode=rwc".to_owned();
+                let container = "sqlite:///data/production.sqlite3?mode=rwc".to_owned();
+                Self {
+                    migration_local: local.clone(),
+                    runtime_local: local,
+                    migration_container: container.clone(),
+                    runtime_container: container,
+                }
+            }
+        }
+    }
+}
+
 /// Substitutes template variables and evaluates nested capability conditionals.
 ///
-/// PostgreSQL is the only database capability currently enabled. MySQL and
-/// SQLite markers are understood only so stale/unsupported template branches
-/// cannot leak into generated applications.
-fn render(template: &str, variables: &[(&str, &str)], docker: bool, database: bool) -> String {
+/// `%%if name%%` / `%%if !name%%` ... `%%end%%` blocks nest. Known names are
+/// `docker`, `database` (any backend), `postgresql`, `mysql`, `mariadb`,
+/// `mysql_family` (MySQL or MariaDB) and `sqlite`. Unknown names are false.
+fn render(template: &str, variables: &[(&str, &str)], docker: bool, database: Database) -> String {
     let condition = |name: &str| match name {
         "docker" => docker,
-        "database" | "postgresql" => database,
-        "mysql" | "sqlite" => false,
+        "database" => database.is_enabled(),
+        "postgresql" => database == Database::Postgresql,
+        "mysql" => database == Database::Mysql,
+        "mariadb" => database == Database::Mariadb,
+        "mysql_family" => database.is_mysql_family(),
+        "sqlite" => database == Database::Sqlite3,
         _ => false,
     };
 
@@ -551,7 +692,7 @@ mod tests {
             name: name.to_owned(),
             docker: true,
             ci: true,
-            database: true,
+            database: Database::Postgresql,
             forge: ForgeSource::GitTag,
         }
     }
@@ -770,7 +911,7 @@ mod tests {
         let options = NewApplication {
             docker: false,
             ci: false,
-            database: false,
+            database: Database::Disabled,
             ..options("plain")
         };
 
@@ -801,7 +942,7 @@ mod tests {
         let parent = tempfile::tempdir().expect("temporary directory should be available");
         let options = NewApplication {
             docker: false,
-            database: true,
+            database: Database::Postgresql,
             ..options("plain-db")
         };
 
@@ -819,7 +960,7 @@ mod tests {
         let parent = tempfile::tempdir().expect("temporary directory should be available");
         let options = NewApplication {
             docker: false,
-            database: false,
+            database: Database::Disabled,
             ..options("plain")
         };
 
@@ -829,6 +970,188 @@ mod tests {
         assert!(workflow.contains("cargo test"));
         assert!(!workflow.contains("docker"));
         assert!(!read(&root, ".github/dependabot.yml").contains("docker"));
+    }
+
+    fn generate(database: Database, docker: bool) -> (tempfile::TempDir, PathBuf) {
+        let parent = tempfile::tempdir().expect("temporary directory should be available");
+        let options = NewApplication {
+            database,
+            docker,
+            forge: ForgeSource::Path("../forge/crates/forge".to_owned()),
+            ..options("sample-app")
+        };
+        let root = create_application(parent.path(), &options).expect("generation should succeed");
+        (parent, root)
+    }
+
+    const POSTGRES_ONLY_FILES: &[&str] = &[
+        "migrations/00000000000000000001_forge_audit.up.sql",
+        "migrations/00000000000000000002_forge_identity.up.sql",
+        "docker/postgres/init.sql",
+        "src/infrastructure/audit/mod.rs",
+        "src/infrastructure/auth/mod.rs",
+        "src/infrastructure/tenancy/mod.rs",
+    ];
+
+    fn assert_no_postgres_artifacts(root: &Path) {
+        for file in POSTGRES_ONLY_FILES {
+            assert!(!root.join(file).exists(), "{file} must not be generated");
+        }
+        for (path, content) in snapshot(root) {
+            for needle in [
+                "gen_random_uuid",
+                "ROW LEVEL SECURITY",
+                "set_config(",
+                "PgPool",
+                "postgres:",
+                "pg_isready",
+                "app_runtime",
+            ] {
+                assert!(!content.contains(needle), "{path} contains `{needle}`");
+            }
+        }
+        assert!(read(root, "migrations/.gitkeep").is_empty());
+    }
+
+    #[test]
+    fn postgresql_is_the_default_backend_with_default_features() {
+        let (_parent, root) = generate(Database::Postgresql, true);
+
+        assert!(read(&root, "Cargo.toml").contains("forge = { path = \"../forge/crates/forge\" }"));
+        assert!(read(&root, "Cargo.toml").contains("\"postgres\", \"runtime-tokio\""));
+        assert!(read(&root, "src/bootstrap/mod.rs").contains(".postgres(sqlx::migrate!())"));
+        assert!(read(&root, "compose.yaml").contains("postgres:18.6-trixie@sha256:"));
+        assert!(
+            read(&root, "README.md").contains("postgres://app_runtime:app_runtime@127.0.0.1:5432/")
+        );
+        assert!(root.join("docker/postgres/init.sql").is_file());
+        assert!(Database::Postgresql.unavailable_notice().is_none());
+    }
+
+    #[test]
+    fn mysql_selects_the_mysql_driver_container_and_urls() {
+        let (_parent, root) = generate(Database::Mysql, true);
+
+        let manifest = read(&root, "Cargo.toml");
+        assert!(manifest.contains(
+            "forge = { path = \"../forge/crates/forge\", default-features = false, features = [\"mysql\"] }"
+        ));
+        assert!(manifest.contains("\"mysql\", \"runtime-tokio\""));
+        assert!(!manifest.contains("\"postgres\""));
+        let bootstrap = read(&root, "src/bootstrap/mod.rs");
+        assert!(bootstrap.contains(".mysql(sqlx::migrate!())"));
+        assert!(!bootstrap.contains(".postgres("));
+        let compose = read(&root, "compose.yaml");
+        assert!(compose.contains("image: mysql:8.4"));
+        assert!(compose.contains("MYSQL_DATABASE: sample_app"));
+        assert!(compose.contains("mysqladmin\", \"ping\", \"--host=127.0.0.1"));
+        assert!(compose.contains("db-data:/var/lib/mysql"));
+        assert!(compose.contains("FORGE_DATABASE_URL: mysql://app:app@db:3306/sample_app"));
+        assert!(compose.contains("  migrate:"));
+        assert!(compose.contains("service_completed_successfully"));
+        assert!(read(&root, "README.md").contains("mysql://app:app@127.0.0.1:3306/sample_app"));
+        assert_no_postgres_artifacts(&root);
+    }
+
+    #[test]
+    fn mariadb_uses_the_mysql_driver_with_a_mariadb_container_and_url() {
+        let (_parent, root) = generate(Database::Mariadb, true);
+
+        let manifest = read(&root, "Cargo.toml");
+        assert!(manifest.contains("default-features = false, features = [\"mysql\"]"));
+        assert!(manifest.contains("\"mysql\", \"runtime-tokio\""));
+        assert!(read(&root, "src/bootstrap/mod.rs").contains(".mysql(sqlx::migrate!())"));
+        let compose = read(&root, "compose.yaml");
+        assert!(compose.contains("image: mariadb:11.8"));
+        assert!(compose.contains("MARIADB_DATABASE: sample_app"));
+        assert!(compose.contains("healthcheck.sh\", \"--connect\", \"--innodb_initialized"));
+        assert!(compose.contains("db-data:/var/lib/mysql"));
+        assert!(compose.contains("mariadb://app:app@db:3306/sample_app"));
+        assert!(!compose.contains("mysql:8.4"));
+        assert!(read(&root, "README.md").contains("mariadb://app:app@127.0.0.1:3306/sample_app"));
+        assert_no_postgres_artifacts(&root);
+    }
+
+    #[test]
+    fn sqlite3_uses_a_file_volume_owned_by_the_runtime_user() {
+        let (_parent, root) = generate(Database::Sqlite3, true);
+
+        let manifest = read(&root, "Cargo.toml");
+        assert!(
+            manifest
+                .contains("forge = { path = \"../forge/crates/forge\", features = [\"sqlite\"] }")
+        );
+        assert!(manifest.contains("\"sqlite\", \"runtime-tokio\""));
+        assert!(read(&root, "src/bootstrap/mod.rs").contains(".sqlite(sqlx::migrate!())"));
+        let compose = read(&root, "compose.yaml");
+        assert!(!compose.contains("  db:"));
+        assert!(compose.contains("sqlite-data:/data"));
+        assert!(compose.contains("sqlite:///data/production.sqlite3?mode=rwc"));
+        assert!(compose.contains("  migrate:"));
+        assert!(!compose.contains("service_healthy"));
+        let dockerfile = read(&root, "Dockerfile");
+        assert!(dockerfile.contains("COPY --from=build --chown=65532:65532 /out/data /data"));
+        assert!(root.join("storage/.gitkeep").is_file());
+        assert!(read(&root, ".gitignore").contains("/storage/*"));
+        assert!(read(&root, ".dockerignore").contains("/storage"));
+        assert!(read(&root, "README.md").contains("sqlite://storage/development.sqlite3?mode=rwc"));
+        assert_no_postgres_artifacts(&root);
+    }
+
+    #[test]
+    fn non_database_backends_have_no_storage_directory_or_sqlite_ignore_rules() {
+        for database in [Database::Postgresql, Database::Mysql, Database::Disabled] {
+            let (_parent, root) = generate(database, true);
+            assert!(!root.join("storage").exists());
+            assert!(!read(&root, ".gitignore").contains("storage"));
+            assert!(!read(&root, "Dockerfile").contains("/data"));
+        }
+    }
+
+    #[test]
+    fn none_has_no_database_assets_and_minimal_forge_features() {
+        let (_parent, root) = generate(Database::Disabled, true);
+
+        assert!(read(&root, "Cargo.toml").contains("default-features = false }"));
+        assert!(!read(&root, "Cargo.toml").contains("sqlx"));
+        assert!(!read(&root, "src/bootstrap/mod.rs").contains("migrate"));
+        assert!(!root.join("migrations").exists());
+        assert!(!read(&root, "compose.yaml").contains("db:"));
+    }
+
+    #[test]
+    fn every_backend_and_option_combination_renders_every_placeholder() {
+        for database in [
+            Database::Postgresql,
+            Database::Mysql,
+            Database::Mariadb,
+            Database::Sqlite3,
+            Database::Disabled,
+        ] {
+            for docker in [true, false] {
+                let (_parent, root) = generate(database, docker);
+                for (path, content) in snapshot(&root) {
+                    assert!(!content.contains("%%"), "{database:?} {path}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unavailable_notice_lists_the_missing_modules_for_non_postgres_backends() {
+        for database in [Database::Mysql, Database::Mariadb, Database::Sqlite3] {
+            let notice = database.unavailable_notice().expect("notice");
+            assert!(notice.contains(database.label()));
+            for module in [
+                "row-level security",
+                "PgAuditSink",
+                "PostgresSessionStore",
+                "PgMembershipStore",
+            ] {
+                assert!(notice.contains(module), "{module}");
+            }
+        }
+        assert!(Database::Disabled.unavailable_notice().is_none());
     }
 
     #[test]
@@ -890,7 +1213,7 @@ mod tests {
     }
 
     /// `examples/hello-forge` is the committed database-free output of
-    /// `forge new hello-forge --skip-ci --skip-database --forge-path ../../crates/forge`.
+    /// `forge new hello-forge --skip-ci -d none --forge-path ../../crates/forge`.
     /// Regenerate it with `FORGE_BLESS=1 cargo test -p forge-cli`.
     #[test]
     fn hello_forge_example_matches_generator_output() {
@@ -898,7 +1221,7 @@ mod tests {
         let parent = tempfile::tempdir().expect("temporary directory should be available");
         let options = NewApplication {
             ci: false,
-            database: false,
+            database: Database::Disabled,
             forge: ForgeSource::Path("../../crates/forge".to_owned()),
             ..options("hello-forge")
         };

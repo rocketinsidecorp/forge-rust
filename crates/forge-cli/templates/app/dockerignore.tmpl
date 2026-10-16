@@ -13,3 +13,7 @@
 # The builder image pins the same toolchain through RUST_VERSION;
 # tests/container.rs fails when the two versions drift apart.
 /rust-toolchain.toml
+%%if sqlite%%
+# Local SQLite databases must never enter the image.
+/storage
+%%end%%

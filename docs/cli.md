@@ -17,7 +17,7 @@ from a checkout.
 
 ```text
 forge id
-forge new <name> [--skip-docker] [--skip-ci] [--skip-database] [--skip-lockfile] [--forge-path <PATH>]
+forge new <name> [-d <DATABASE>] [--skip-docker] [--skip-ci] [--skip-lockfile] [--forge-path <PATH>]
 forge generate migration <name>
 forge check
 forge test
@@ -48,7 +48,7 @@ lowercase ASCII letter and use only lowercase letters, digits, `-` and `_`.
 | --- | --- |
 | `--skip-docker` | Do not generate `Dockerfile`, `.dockerignore` or `compose.yaml`. |
 | `--skip-ci` | Do not generate `.github/workflows/ci.yml` or `.github/dependabot.yml`. |
-| `--skip-database` | Do not add SQLx, migrations, PostgreSQL Compose services or database bootstrap hooks. |
+| `-d`, `--database <DATABASE>` | `postgresql` (default, alias `postgres`), `mysql`, `mariadb`, `sqlite3` (alias `sqlite`) or `none`. `none` omits SQLx, migrations, database Compose services and bootstrap hooks. See [Database backends](#database-backends). |
 | `--skip-lockfile` | Do not run `cargo generate-lockfile` after generation. |
 | `--forge-path <PATH>` | Depend on a local `forge` crate by path instead of the Git tag. For framework contributors, similar to `rails new --dev`. |
 
@@ -138,9 +138,9 @@ shop/
 │   ├── dependabot.yml       #   cargo, docker, github-actions updates
 │   └── workflows/
 │       └── ci.yml           #   fmt check, clippy -D warnings, tests, image build
-├── .gitattributes           # omitted with --skip-database; SQL migrations use LF
+├── .gitattributes           # omitted with -d none; SQL migrations use LF
 ├── .gitignore
-├── build.rs                  # omitted with --skip-database; rebuild on migration changes
+├── build.rs                  # omitted with -d none; rebuild on migration changes
 ├── Cargo.lock               # omitted with --skip-lockfile (or if generation fails)
 ├── Cargo.toml               # package `shop`, lib `app`, deps: forge, serde, SQLx + auth mechanism crates
 ├── Dockerfile               # omitted with --skip-docker
@@ -148,8 +148,8 @@ shop/
 ├── compose.yaml             # omitted with --skip-docker; 127.0.0.1:3000, stop_grace_period 20s
 ├── docker/                   # omitted with --skip-docker
 │   └── postgres/
-│       └── init.sql          # omitted with --skip-database; local least-privilege roles
-├── migrations/              # omitted with --skip-database; Forge + app SQL
+│       └── init.sql          # PostgreSQL only; local least-privilege roles
+├── migrations/              # omitted with -d none; Forge + app SQL
 │   ├── 00000000000000000001_forge_audit.up.sql
 │   ├── 00000000000000000001_forge_audit.down.sql
 │   ├── 00000000000000000002_forge_identity.up.sql
@@ -170,7 +170,7 @@ shop/
 
 [`examples/hello-forge`](../examples/hello-forge) is the committed
 database-free output of
-`forge new hello-forge --skip-ci --skip-database --skip-lockfile --forge-path ../../crates/forge`
+`forge new hello-forge --skip-ci -d none --skip-lockfile --forge-path ../../crates/forge`
 and is the authoritative reference for exact file contents. A golden test in
 `forge-cli` fails if generator output drifts from it. Like a real user
 application, it is a standalone package outside the framework workspace. Its
@@ -209,7 +209,28 @@ Notes on the generated package:
 - With the default database capability, Compose includes PostgreSQL, waits until
   the database and least-privilege roles are initialized, runs a one-shot
   migration container with the migration credential, then starts the app with
-  only the runtime credential. `--skip-database` removes those database pieces.
+  only the runtime credential. `-d none` removes those database pieces.
+
+### Database backends
+
+Like `rails new -d`, `forge new -d <DATABASE>` selects the backend
+([ADR 0021](adr/0021-selectable-database-backends.md)). IDs are always UUIDv7
+generated in Rust; generated SQL never uses database UUID generators.
+
+| `-d` | Framework call | Compose service | Local `FORGE_DATABASE_URL` |
+| --- | --- | --- | --- |
+| `postgresql` (default) | `.postgres(sqlx::migrate!())` | `postgres:18` with migrator/runtime roles | `postgres://app_runtime:…@127.0.0.1:5432/<app>` (migrations use `app_migrator`) |
+| `mysql` | `.mysql(sqlx::migrate!())` | `mysql:8.4` | `mysql://…@127.0.0.1:3306/<app>` |
+| `mariadb` | `.mysql(sqlx::migrate!())` | `mariadb:11.8` | `mariadb://…@127.0.0.1:3306/<app>` |
+| `sqlite3` | `.sqlite(sqlx::migrate!())` | none; `/data` volume owned by uid 65532 | `sqlite://storage/development.sqlite3?mode=rwc` |
+| `none` | — | — | — |
+
+PostgreSQL-only modules are not generated for `mysql`, `mariadb` or `sqlite3`
+yet, and `forge new` prints which ones: row-level security and the
+runtime/migrator roles, audit event persistence, identity/session/credential
+persistence, and tenant membership persistence. Tenant isolation on those
+backends rests on the application layer (bind the tenant predicate from
+`TenantContext`); use PostgreSQL when the database must enforce isolation.
 
 ## `forge check`, `forge test`, `forge format`, `forge lint`
 

@@ -1,6 +1,6 @@
 //! Concrete mechanisms that implement application ports.
 
-%%if database%%
+%%if postgresql%%
 pub mod audit;
 pub mod auth;
 %%end%%
@@ -9,6 +9,6 @@ pub mod database;
 pub mod queue;
 pub mod security;
 pub mod telemetry;
-%%if database%%
+%%if postgresql%%
 pub mod tenancy;
 %%end%%
