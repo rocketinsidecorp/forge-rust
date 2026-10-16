@@ -1,6 +1,6 @@
 # %%APP_NAME%%
 
-A [Forge](https://github.com/fabriciobonjorno/forge-rust) application organized
+A [Forge](https://github.com/rocketinsidecorp/forge-rust) application organized
 around hexagonal architecture boundaries:
 
 ```text
@@ -28,7 +28,7 @@ only as 256-bit digests.
 %%if mysql_family%%
 `migrations/` starts empty. The PostgreSQL-only audit, identity, session and
 tenant-membership modules were not generated for %%DATABASE_LABEL%% yet
-([ADR 0021](https://github.com/fabriciobonjorno/forge-rust/blob/main/docs/adr/0021-selectable-database-backends.md)).
+([ADR 0021](https://github.com/rocketinsidecorp/forge-rust/blob/main/docs/adr/0021-selectable-database-backends.md)).
 Tenant isolation on %%DATABASE_LABEL%% rests on the application layer: always bind the
 tenant predicate from `TenantContext`. Write ids with `Id::<T>::new()` (UUIDv7) and
 store them as `BINARY(16)`; the database must never generate ids.
@@ -36,7 +36,7 @@ store them as `BINARY(16)`; the database must never generate ids.
 %%if sqlite%%
 `migrations/` starts empty. The PostgreSQL-only audit, identity, session and
 tenant-membership modules were not generated for SQLite yet
-([ADR 0021](https://github.com/fabriciobonjorno/forge-rust/blob/main/docs/adr/0021-selectable-database-backends.md)).
+([ADR 0021](https://github.com/rocketinsidecorp/forge-rust/blob/main/docs/adr/0021-selectable-database-backends.md)).
 Tenant isolation on SQLite rests on the application layer: always bind the tenant
 predicate from `TenantContext`. Write ids with `Id::<T>::new()` (UUIDv7) and store
 them as `BLOB`; the database must never generate ids. The local database file is

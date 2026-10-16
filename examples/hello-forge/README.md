@@ -1,6 +1,6 @@
 # hello-forge
 
-A [Forge](https://github.com/fabriciobonjorno/forge-rust) application organized
+A [Forge](https://github.com/rocketinsidecorp/forge-rust) application organized
 around hexagonal architecture boundaries:
 
 ```text

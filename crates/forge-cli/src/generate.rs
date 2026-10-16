@@ -876,7 +876,7 @@ mod tests {
         assert!(postgres_init.contains("CREATE ROLE app_runtime"));
         assert!(postgres_init.contains("NOBYPASSRLS"));
         assert!(manifest.contains(&format!(
-            "forge = {{ git = \"https://github.com/fabriciobonjorno/forge-rust\", tag = \"v{FORGE_VERSION}\" }}"
+            "forge = {{ git = \"https://github.com/rocketinsidecorp/forge-rust\", tag = \"v{FORGE_VERSION}\" }}"
         )));
 
         let dockerfile = read(&root, "Dockerfile");
