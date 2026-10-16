@@ -2,3 +2,8 @@
 .env
 .env.*
 !.env.example
+%%if sqlite%%
+# Local SQLite databases (and their WAL/SHM files) live in storage/.
+/storage/*
+!/storage/.gitkeep
+%%end%%

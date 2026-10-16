@@ -16,22 +16,49 @@ src/bootstrap       composition root and process lifecycle
 ## Development
 
 %%if database%%
-This application uses PostgreSQL. SQLx stays in the outer
+This application uses %%DATABASE_LABEL%%. SQLx stays in the outer
 infrastructure/bootstrap boundary; domain and application code do not depend on it.
+`src/bootstrap` declares the backend once; Forge owns the connection pool, runs the
+embedded migrations and reports database readiness on `/health/ready`.
+%%if postgresql%%
 The built-in Forge migrations create append-only audit storage first, then
 principal/session/membership tables. Session bearer and CSRF values are persisted
 only as 256-bit digests.
+%%end%%
+%%if mysql_family%%
+`migrations/` starts empty. The PostgreSQL-only audit, identity, session and
+tenant-membership modules were not generated for %%DATABASE_LABEL%% yet
+([ADR 0021](https://github.com/fabriciobonjorno/forge-rust/blob/main/docs/adr/0021-selectable-database-backends.md)).
+Tenant isolation on %%DATABASE_LABEL%% rests on the application layer: always bind the
+tenant predicate from `TenantContext`. Write ids with `Id::<T>::new()` (UUIDv7) and
+store them as `BINARY(16)`; the database must never generate ids.
+%%end%%
+%%if sqlite%%
+`migrations/` starts empty. The PostgreSQL-only audit, identity, session and
+tenant-membership modules were not generated for SQLite yet
+([ADR 0021](https://github.com/fabriciobonjorno/forge-rust/blob/main/docs/adr/0021-selectable-database-backends.md)).
+Tenant isolation on SQLite rests on the application layer: always bind the tenant
+predicate from `TenantContext`. Write ids with `Id::<T>::new()` (UUIDv7) and store
+them as `BLOB`; the database must never generate ids. The local database file is
+`storage/development.sqlite3` (git-ignored; the directory is kept by `storage/.gitkeep`).
+%%end%%
 
 %%if docker%%
-Start PostgreSQL with:
+%%if !sqlite%%
+Start the database with:
 
 ```bash
 docker compose up -d db
 ```
 %%end%%
-
+%%end%%
+%%if postgresql%%
 Use the migration role only for schema changes, then the least-privilege runtime
 role for the application:
+%%end%%
+%%if !postgresql%%
+Apply the migrations, then run the application:
+%%end%%
 
 ```bash
 export FORGE_MIGRATION_DATABASE_URL='%%DATABASE_MIGRATION_URL_LOCAL%%'
@@ -41,12 +68,17 @@ export FORGE_DATABASE_URL='%%DATABASE_RUNTIME_URL_LOCAL%%'
 cargo run
 ```
 
+`serve` requires `FORGE_DATABASE_URL`; a URL for another database engine exits
+with code 78.
+
+%%if postgresql%%
 Database-enabled applications include `infrastructure::audit::PgAuditSink`,
 `infrastructure::auth::PostgresSessionStore`, and
 `infrastructure::tenancy::PgMembershipStore`. The runtime role can append
 structured security-audit events but cannot read, update, or delete audit
 history.
 
+%%end%%
 Create a reversible application migration with:
 
 ```bash
@@ -80,7 +112,12 @@ rejected at startup. Run `cargo run -- help` for the full list.
 ```bash
 docker build -t %%APP_NAME%% .
 %%if database%%
-docker compose up --build     # PostgreSQL, one-shot migrations, then app
+%%if !sqlite%%
+docker compose up --build     # %%DATABASE_LABEL%%, one-shot migrations, then app
+%%end%%
+%%if sqlite%%
+docker compose up --build     # one-shot migrations on the sqlite-data volume, then app
+%%end%%
 %%end%%
 %%if !database%%
 docker run --rm -p 3000:3000 %%APP_NAME%%
@@ -93,6 +130,7 @@ The image is built with `cargo build --release --locked`, so commit
 health check runs `%%APP_NAME%% healthcheck`.
 %%if database%%
 
+%%if postgresql%%
 The Compose PostgreSQL credentials are development-only. It creates a dedicated
 `app_migrator` role that owns schema changes and a separate `app_runtime` role
 without schema ownership or `BYPASSRLS`. The database is stored in the named
@@ -115,5 +153,19 @@ use optimistic credential versions so a concurrent password change or disable
 cannot be overwritten. The bearer cookie and CSRF token are separate secrets;
 never place the CSRF token
 inside the HttpOnly session cookie.
+%%end%%
+%%if mysql_family%%
+
+The Compose %%DATABASE_LABEL%% credentials are development-only (random root
+password, application account `app`). The data lives in the named `db-data` volume,
+and the app starts only after the database is healthy and migrations complete
+successfully.
+%%end%%
+%%if sqlite%%
+
+The SQLite file lives in the named `sqlite-data` volume mounted at `/data`, owned by
+uid 65532 (the image's runtime user). The one-shot `migrate` service and the app share
+it; run a single app replica per volume.
+%%end%%
 %%end%%
 %%end%%

@@ -1,6 +1,6 @@
 # Development convenience only; not a production orchestration contract.
 services:
-%%if database%%
+%%if postgresql%%
   db:
     image: postgres:18.6-trixie@sha256:5a5a84b19854a9ffaa54082c166ff4ec27473a361e496e5ea167f298f2da9722
     environment:
@@ -23,6 +23,54 @@ services:
       timeout: 3s
       retries: 30
 
+%%end%%
+%%if mysql%%
+  db:
+    # Pin the image by digest (image@sha256:...) for anything beyond local development.
+    image: mysql:8.4
+    environment:
+      # Development-only credentials. Never reuse them in a deployment.
+      MYSQL_RANDOM_ROOT_PASSWORD: "yes"
+      MYSQL_DATABASE: %%DATABASE_NAME%%
+      MYSQL_USER: app
+      MYSQL_PASSWORD: app
+    ports:
+      - "127.0.0.1:${MYSQL_PUBLISHED_PORT:-3306}:3306"
+    volumes:
+      - db-data:/var/lib/mysql
+    healthcheck:
+      # --host forces TCP: the temporary server used for first-time
+      # initialization listens on the socket only.
+      test: ["CMD", "mysqladmin", "ping", "--host=127.0.0.1", "--silent"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+      start_period: 10s
+
+%%end%%
+%%if mariadb%%
+  db:
+    # Pin the image by digest (image@sha256:...) for anything beyond local development.
+    image: mariadb:11.8
+    environment:
+      # Development-only credentials. Never reuse them in a deployment.
+      MARIADB_RANDOM_ROOT_PASSWORD: "1"
+      MARIADB_DATABASE: %%DATABASE_NAME%%
+      MARIADB_USER: app
+      MARIADB_PASSWORD: app
+    ports:
+      - "127.0.0.1:${MARIADB_PUBLISHED_PORT:-3306}:3306"
+    volumes:
+      - db-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+      start_period: 10s
+
+%%end%%
+%%if database%%
   migrate:
     build: .
     image: %%APP_NAME%%:dev
@@ -30,13 +78,21 @@ services:
     environment:
       FORGE_MIGRATION_DATABASE_URL: %%DATABASE_MIGRATION_URL_CONTAINER%%
     read_only: true
+%%if sqlite%%
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    volumes:
+      - sqlite-data:/data
+%%end%%
     cap_drop:
       - ALL
     security_opt:
       - no-new-privileges:true
+%%if !sqlite%%
     depends_on:
       db:
         condition: service_healthy
+%%end%%
 
 %%end%%
   app:
@@ -48,6 +104,10 @@ services:
       FORGE_LOG: info
 %%if database%%
       FORGE_DATABASE_URL: %%DATABASE_RUNTIME_URL_CONTAINER%%
+%%end%%
+%%if sqlite%%
+    volumes:
+      - sqlite-data:/data
 %%end%%
     init: true
     read_only: true
@@ -65,5 +125,11 @@ services:
         condition: service_completed_successfully
 
 volumes:
+%%if sqlite%%
+  # Owned by uid 65532 (the image's runtime user); see the Dockerfile.
+  sqlite-data:
+%%end%%
+%%if !sqlite%%
   db-data:
+%%end%%
 %%end%%

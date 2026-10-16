@@ -34,7 +34,7 @@ fn execute(
             name,
             skip_docker,
             skip_ci,
-            skip_database,
+            database,
             skip_lockfile,
             forge_path,
         } => {
@@ -42,7 +42,7 @@ fn execute(
                 name,
                 docker: !skip_docker,
                 ci: !skip_ci,
-                database: !skip_database,
+                database,
                 forge: forge_path.map_or(ForgeSource::GitTag, ForgeSource::Path),
             };
             let destination = generate::create_application(current_dir, &options)?;
@@ -53,6 +53,9 @@ fn execute(
                 destination.display()
             )
             .map_err(CliError::Output)?;
+            if let Some(notice) = options.database.unavailable_notice() {
+                writeln!(output, "{notice}").map_err(CliError::Output)?;
+            }
 
             if !skip_lockfile && let Err(error) = CargoCommand::GenerateLockfile.run(&destination) {
                 writeln!(

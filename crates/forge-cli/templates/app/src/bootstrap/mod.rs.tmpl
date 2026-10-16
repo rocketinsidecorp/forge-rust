@@ -3,44 +3,25 @@
 //! health routes and graceful shutdown.
 %%if database%%
 //!
-//! SQLx is confined to this outer composition/infrastructure boundary.
-//! Migrations are embedded in the binary and executed by the Forge process CLI.
+//! The database backend is declared once below. Forge owns the connection pool,
+//! runs the embedded migrations (`migrate`, `rollback`) and reports database
+//! readiness. SQLx is confined to this outer composition/infrastructure boundary.
 %%end%%
 
 use std::process::ExitCode;
 
-%%if database%%
-use forge::config::SecretString;
-use sqlx::{PgPool, migrate::Migrator};
-
-static MIGRATOR: Migrator = sqlx::migrate!();
-
-async fn migrate_database(url: SecretString) -> Result<(), sqlx::Error> {
-    let pool = PgPool::connect(url.expose()).await?;
-    MIGRATOR.run(&pool).await?;
-    pool.close().await;
-    Ok(())
-}
-
-async fn rollback_database(url: SecretString) -> Result<(), sqlx::Error> {
-    let pool = PgPool::connect(url.expose()).await?;
-    let target = sqlx::query_scalar::<_, i64>(
-        "SELECT version FROM _sqlx_migrations ORDER BY version DESC OFFSET 1 LIMIT 1",
-    )
-    .fetch_optional(&pool)
-    .await?
-    .unwrap_or(0);
-    MIGRATOR.undo(&pool, target).await?;
-    pool.close().await;
-    Ok(())
-}
-%%end%%
 /// Runs the command selected on the command line (serve by default).
 pub fn run() -> ExitCode {
     forge::App::new(env!("CARGO_PKG_NAME"))
         .version(env!("CARGO_PKG_VERSION"))
-%%if database%%
-        .migrations(migrate_database, rollback_database)
+%%if postgresql%%
+        .postgres(sqlx::migrate!())
+%%end%%
+%%if mysql_family%%
+        .mysql(sqlx::migrate!())
+%%end%%
+%%if sqlite%%
+        .sqlite(sqlx::migrate!())
 %%end%%
         .routes(crate::adapters::http::routes)
         .run()

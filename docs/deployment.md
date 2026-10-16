@@ -84,7 +84,7 @@ cargo run
 docker compose up --build
 ```
 
-Applications generated with `--skip-database` omit PostgreSQL and the migration
+Applications generated with `-d none` omit the database and the migration
 service while retaining the ordinary app container workflow.
 
 ### Pinning base images for release builds

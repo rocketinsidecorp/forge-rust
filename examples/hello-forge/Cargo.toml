@@ -13,7 +13,7 @@ name = "hello-forge"
 path = "src/main.rs"
 
 [dependencies]
-forge = { path = "../../crates/forge" }
+forge = { path = "../../crates/forge", default-features = false }
 serde = { version = "1", features = ["derive"] }
 
 [lints.rust]

@@ -72,12 +72,12 @@ fn skip_docker_omits_container_assets() {
 }
 
 #[test]
-fn skip_database_omits_postgres_and_migration_assets() {
+fn database_none_omits_postgres_and_migration_assets() {
     let directory = tempfile::tempdir().expect("temporary directory should be available");
 
     let output = forge(
         directory.path(),
-        &["new", "api", "--skip-database", "--skip-lockfile"],
+        &["new", "api", "-d", "none", "--skip-lockfile"],
     );
 
     assert!(output.status.success(), "{output:?}");
@@ -135,4 +135,70 @@ fn id_prints_a_uuid_version_seven() {
     let id = id.trim();
     assert_eq!(id.len(), 36);
     assert_eq!(id.as_bytes()[14], b'7', "version nibble of {id}");
+}
+
+#[test]
+fn database_flag_accepts_aliases_and_prints_the_notice_for_non_postgres_backends() {
+    for (value, expected_feature, notice) in [
+        ("postgres", None, false),
+        ("postgresql", None, false),
+        ("mysql", Some("mysql"), true),
+        ("mariadb", Some("mysql"), true),
+        ("sqlite", Some("sqlite"), true),
+        ("sqlite3", Some("sqlite"), true),
+    ] {
+        let directory = tempfile::tempdir().expect("temporary directory should be available");
+
+        let output = forge(
+            directory.path(),
+            &["new", "api", "--database", value, "--skip-lockfile"],
+        );
+
+        assert!(output.status.success(), "{value}: {output:?}");
+        let manifest =
+            std::fs::read_to_string(directory.path().join("api/Cargo.toml")).expect("manifest");
+        match expected_feature {
+            Some(feature) => assert!(manifest.contains(&format!("features = [\"{feature}\"]"))),
+            None => assert!(manifest.contains("\"postgres\"")),
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(
+            stdout.contains("PostgreSQL-only modules are not available"),
+            notice,
+            "{value}"
+        );
+    }
+}
+
+#[test]
+fn database_flag_short_form_and_invalid_values() {
+    let directory = tempfile::tempdir().expect("temporary directory should be available");
+
+    let short = forge(
+        directory.path(),
+        &["new", "api", "-d", "sqlite3", "--skip-lockfile"],
+    );
+    let invalid = forge(
+        directory.path(),
+        &["new", "other", "-d", "oracle", "--skip-lockfile"],
+    );
+
+    assert!(short.status.success(), "{short:?}");
+    assert!(directory.path().join("api/storage/.gitkeep").is_file());
+    assert!(!invalid.status.success());
+    assert!(String::from_utf8_lossy(&invalid.stderr).contains("invalid value 'oracle'"));
+    assert!(!directory.path().join("other").exists());
+}
+
+#[test]
+fn skip_database_flag_is_replaced_by_database_none() {
+    let directory = tempfile::tempdir().expect("temporary directory should be available");
+
+    let output = forge(
+        directory.path(),
+        &["new", "api", "--skip-database", "--skip-lockfile"],
+    );
+
+    assert!(!output.status.success());
+    assert!(!directory.path().join("api").exists());
 }

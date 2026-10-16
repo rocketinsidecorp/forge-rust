@@ -70,7 +70,7 @@ generated configuration while avoiding a native OpenSSL dependency.
 
 The dependency is not added to the framework workspace merely for convenience:
 only generated applications that enable the database capability consume it.
-`--skip-database` removes SQLx entirely from a generated application's graph.
+`forge new -d none` removes SQLx entirely from a generated application's graph.
 
 ## Phase 3 persistence dependency decision
 
