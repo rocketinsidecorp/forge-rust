@@ -191,4 +191,5 @@ Contribution rules:
 
 ## License
 
-The workspace manifest declares `MIT OR Apache-2.0`.
+Forge is open source under the [MIT License](LICENSE). Contributions are
+welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md).
