@@ -21,12 +21,16 @@
 //! ```
 
 mod app;
+#[cfg(feature = "jobs")]
+mod background;
 mod cli;
 mod command;
 mod compose;
 mod console;
 mod database;
 mod logging;
+#[cfg(feature = "jobs")]
+mod operator;
 mod probe;
 mod signal;
 pub mod web;
@@ -37,7 +41,14 @@ pub use forge_auth as auth;
 pub use forge_config as config;
 pub use forge_core as core;
 pub use forge_db as db;
+/// Integration events, the transactional outbox and idempotent consumers
+/// (feature `events`, ADR 0025).
+#[cfg(feature = "events")]
+pub use forge_events as events;
 pub use forge_http as http;
+/// Durable jobs, workers and cron schedules (feature `jobs`, ADR 0025).
+#[cfg(feature = "jobs")]
+pub use forge_jobs as jobs;
 pub use forge_security as security;
 pub use forge_tenancy as tenancy;
 /// Server-rendered views: HTML responses, CSRF protection, flash messages,
@@ -48,6 +59,10 @@ pub use forge_tenancy as tenancy;
 pub use forge_views as views;
 
 pub use app::App;
+#[cfg(feature = "events")]
+pub use background::EventsSetup;
+#[cfg(feature = "jobs")]
+pub use background::WorkerMode;
 pub use command::{CommandContext, CommandError, CommandOptions};
 pub use compose::{ComposeError, Composition};
 pub use worker::{RunningWorkers, Shutdown, SubmitError, WorkQueue};

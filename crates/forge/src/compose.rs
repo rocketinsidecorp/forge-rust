@@ -30,6 +30,10 @@ pub struct Composition<'a> {
     config: &'a AppConfig,
     database: Option<DatabaseHandle>,
     workers: Vec<Worker>,
+    #[cfg(feature = "jobs")]
+    jobs: Option<&'a mut forge_jobs::Jobs>,
+    #[cfg(feature = "events")]
+    events: Option<&'a mut crate::background::EventsSetup>,
 }
 
 impl<'a> Composition<'a> {
@@ -43,6 +47,10 @@ impl<'a> Composition<'a> {
             config,
             database,
             workers: Vec::new(),
+            #[cfg(feature = "jobs")]
+            jobs: None,
+            #[cfg(feature = "events")]
+            events: None,
         }
     }
 
@@ -89,6 +97,40 @@ impl<'a> Composition<'a> {
         let (queue, worker) = worker::queue(name, capacity, handle);
         self.workers.push(worker);
         queue
+    }
+
+    /// Hands the declared job registrations to the hooks.
+    #[cfg(feature = "jobs")]
+    pub(crate) fn attach_jobs(&mut self, parts: &'a mut crate::background::JobsParts) {
+        self.jobs = Some(&mut parts.jobs);
+        #[cfg(feature = "events")]
+        {
+            self.events = parts.events.as_mut();
+        }
+    }
+
+    /// Returns the job registry: register handlers, per-queue concurrency,
+    /// cron schedules, worker timing and retention (feature `jobs`).
+    ///
+    /// Fails with [`ComposeError::JobsNotDeclared`] unless the application
+    /// called [`App::jobs`](crate::App::jobs).
+    #[cfg(feature = "jobs")]
+    pub fn jobs(&mut self) -> Result<&mut forge_jobs::Jobs, ComposeError> {
+        self.jobs
+            .as_deref_mut()
+            .ok_or(ComposeError::JobsNotDeclared)
+    }
+
+    /// Returns the outbox wiring: the publisher committed events go to and
+    /// the dispatcher settings (feature `events`).
+    ///
+    /// Fails with [`ComposeError::EventsNotDeclared`] unless the application
+    /// called [`App::events`](crate::App::events).
+    #[cfg(feature = "events")]
+    pub fn events(&mut self) -> Result<&mut crate::background::EventsSetup, ComposeError> {
+        self.events
+            .as_deref_mut()
+            .ok_or(ComposeError::EventsNotDeclared)
     }
 
     /// Returns the route table for registering application routes.
@@ -213,6 +255,22 @@ impl<'a> Composition<'a> {
         self.database = Some(DatabaseHandle::Sqlite(database));
         self
     }
+
+    /// Makes `jobs` available through [`Composition::jobs`].
+    #[cfg(feature = "jobs")]
+    #[must_use]
+    pub fn with_jobs(mut self, jobs: &'a mut forge_jobs::Jobs) -> Self {
+        self.jobs = Some(jobs);
+        self
+    }
+
+    /// Makes `events` available through [`Composition::events`].
+    #[cfg(feature = "events")]
+    #[must_use]
+    pub fn with_events(mut self, events: &'a mut crate::background::EventsSetup) -> Self {
+        self.events = Some(events);
+        self
+    }
 }
 
 impl fmt::Debug for Composition<'_> {
@@ -240,6 +298,14 @@ pub enum ComposeError {
         /// The requested backend: `"postgres"`, `"mysql"` or `"sqlite"`.
         requested: &'static str,
     },
+    /// A composition hook asked for the job registry without `App::jobs`.
+    #[cfg(feature = "jobs")]
+    #[error("the application requested jobs but did not declare them with App::jobs")]
+    JobsNotDeclared,
+    /// A composition hook asked for the outbox without `App::events`.
+    #[cfg(feature = "events")]
+    #[error("the application requested the outbox but did not declare it with App::events")]
+    EventsNotDeclared,
     /// A route could not be registered, for example because it is a duplicate.
     #[error("failed to register routes")]
     Route(#[from] RouteError),

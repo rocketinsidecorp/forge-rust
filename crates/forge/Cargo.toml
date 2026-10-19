@@ -14,7 +14,9 @@ forge-auth = { path = "../forge-auth" }
 forge-config = { path = "../forge-config" }
 forge-core = { path = "../forge-core" }
 forge-db = { path = "../forge-db" }
+forge-events = { path = "../forge-events", optional = true }
 forge-http = { path = "../forge-http" }
+forge-jobs = { path = "../forge-jobs", optional = true }
 forge-security = { path = "../forge-security" }
 forge-tenancy = { path = "../forge-tenancy" }
 forge-views = { path = "../forge-views", optional = true, default-features = false, features = ["runtime"] }
@@ -36,12 +38,20 @@ postgres = ["forge-db/postgres"]
 mysql = ["forge-db/mysql"]
 sqlite = ["forge-db/sqlite"]
 # `Composition::for_testing` and `forge::db::testing::TestDatabase`.
-testing = ["forge-db/testing"]
+testing = ["forge-db/testing", "forge-jobs?/testing"]
 # Server-rendered views (ADR 0022): `forge::views` and `forge::web::html`.
 views = ["dep:forge-views"]
+# Durable PostgreSQL jobs, workers and cron schedules (ADR 0025):
+# `forge::jobs`, `App::jobs` and the `jobs` subcommands.
+jobs = ["postgres", "dep:forge-jobs"]
+# Transactional outbox and idempotent consumers (ADR 0025): `forge::events`
+# and `App::events`.
+events = ["jobs", "dep:forge-events"]
 
 [dev-dependencies]
+async-trait.workspace = true
 bytes.workspace = true
+forge-db = { path = "../forge-db", features = ["testing"] }
 sqlx = { workspace = true, features = ["macros"] }
 tempfile.workspace = true
 serde_json.workspace = true

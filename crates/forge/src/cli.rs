@@ -22,6 +22,9 @@ pub(crate) enum Command {
     /// An application command registered with `App::command`: its index in
     /// the registration list and its arguments.
     App(usize, Vec<String>),
+    /// Run job workers or an operator command (feature `jobs`).
+    #[cfg(feature = "jobs")]
+    Jobs(JobsCommand),
 }
 
 /// Names of the built-in commands, which applications cannot replace.
@@ -32,7 +35,40 @@ pub(crate) const BUILT_IN: &[&str] = &[
     "rollback",
     "version",
     "help",
+    "jobs",
 ];
+
+/// `jobs` subcommand.
+#[cfg(feature = "jobs")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum JobsCommand {
+    /// Run workers, schedules and the outbox dispatcher until a signal.
+    Work,
+    /// Print job counts per queue and state.
+    Status,
+    /// List dead jobs, newest first.
+    Dead {
+        /// Maximum number listed.
+        limit: u16,
+    },
+    /// Requeue a dead job.
+    Retry(forge_jobs::JobId),
+    /// Delete a dead job.
+    Discard(forge_jobs::JobId),
+    /// List dead outbox events (feature `events`).
+    #[cfg(feature = "events")]
+    DeadEvents {
+        /// Maximum number listed.
+        limit: u16,
+    },
+    /// Requeue a dead outbox event (feature `events`).
+    #[cfg(feature = "events")]
+    RetryEvent(forge_events::EventId),
+}
+
+/// Default number of dead jobs or events listed.
+#[cfg(feature = "jobs")]
+const DEFAULT_LIST_LIMIT: u16 = 50;
 
 /// Invalid command line.
 #[derive(Debug, Error, Eq, PartialEq)]
@@ -46,6 +82,19 @@ pub(crate) enum UsageError {
     /// An application command argument is not valid UTF-8.
     #[error("arguments must be valid UTF-8")]
     NotUnicode,
+    /// A required argument is missing.
+    #[cfg(feature = "jobs")]
+    #[error("missing {0}")]
+    MissingArgument(&'static str),
+    /// An argument is not a valid value.
+    #[cfg(feature = "jobs")]
+    #[error("invalid {what}: {value:?}")]
+    InvalidArgument {
+        /// What was expected.
+        what: &'static str,
+        /// The rejected argument.
+        value: String,
+    },
 }
 
 /// Parses process arguments, excluding the program name. `app_commands` are
@@ -64,6 +113,8 @@ pub(crate) fn parse(
             Some("rollback") => Command::Rollback,
             Some("version" | "--version" | "-V") => Command::Version,
             Some("help" | "--help" | "-h") => Command::Help,
+            #[cfg(feature = "jobs")]
+            Some("jobs") => Command::Jobs(parse_jobs(&mut args)?),
             Some(name) if app_commands.contains(&name) => {
                 let index = app_commands
                     .iter()
@@ -89,6 +140,92 @@ pub(crate) fn parse(
     Ok(command)
 }
 
+#[cfg(feature = "jobs")]
+fn parse_jobs(args: &mut impl Iterator<Item = OsString>) -> Result<JobsCommand, UsageError> {
+    let Some(subcommand) = args.next() else {
+        return Ok(JobsCommand::Work);
+    };
+    let text = |arg: OsString| arg.to_string_lossy().into_owned();
+    let mut id = |what: &'static str| -> Result<String, UsageError> {
+        args.next()
+            .map(text)
+            .ok_or(UsageError::MissingArgument(what))
+    };
+    match subcommand.to_str() {
+        Some("work") => Ok(JobsCommand::Work),
+        Some("status") => Ok(JobsCommand::Status),
+        Some("dead") => Ok(JobsCommand::Dead {
+            limit: parse_limit(args.next())?,
+        }),
+        Some("retry") => Ok(JobsCommand::Retry(parse_id("job id", id("job id")?)?)),
+        Some("discard") => Ok(JobsCommand::Discard(parse_id("job id", id("job id")?)?)),
+        #[cfg(feature = "events")]
+        Some("dead-events") => Ok(JobsCommand::DeadEvents {
+            limit: parse_limit(args.next())?,
+        }),
+        #[cfg(feature = "events")]
+        Some("retry-event") => Ok(JobsCommand::RetryEvent(parse_id(
+            "event id",
+            id("event id")?,
+        )?)),
+        _ => Err(UsageError::UnknownCommand(format!(
+            "jobs {}",
+            text(subcommand)
+        ))),
+    }
+}
+
+#[cfg(feature = "jobs")]
+fn parse_limit(arg: Option<OsString>) -> Result<u16, UsageError> {
+    let Some(arg) = arg else {
+        return Ok(DEFAULT_LIST_LIMIT);
+    };
+    let value = arg.to_string_lossy().into_owned();
+    match value.parse::<u16>() {
+        Ok(limit @ 1..=500) => Ok(limit),
+        _ => Err(UsageError::InvalidArgument {
+            what: "limit (1-500)",
+            value,
+        }),
+    }
+}
+
+/// Parses a UUIDv7 identifier.
+#[cfg(feature = "jobs")]
+fn parse_id<T>(what: &'static str, value: String) -> Result<forge_core::Id<T>, UsageError> {
+    value
+        .parse()
+        .map_err(|_| UsageError::InvalidArgument { what, value })
+}
+
+/// Usage lines of the `jobs` subcommands.
+fn jobs_usage() -> &'static str {
+    #[cfg(feature = "events")]
+    {
+        "  jobs [work]  Run job workers, cron schedules and the outbox dispatcher until SIGTERM/SIGINT
+  jobs status  Print job counts per queue and state
+  jobs dead [LIMIT]          List dead jobs, newest first (default 50, at most 500)
+  jobs retry JOB_ID          Requeue a dead job with a fresh attempt budget
+  jobs discard JOB_ID        Delete a dead job
+  jobs dead-events [LIMIT]   List dead outbox events
+  jobs retry-event EVENT_ID  Requeue a dead outbox event
+"
+    }
+    #[cfg(all(feature = "jobs", not(feature = "events")))]
+    {
+        "  jobs [work]  Run job workers and cron schedules until SIGTERM/SIGINT
+  jobs status  Print job counts per queue and state
+  jobs dead [LIMIT]          List dead jobs, newest first (default 50, at most 500)
+  jobs retry JOB_ID          Requeue a dead job with a fresh attempt budget
+  jobs discard JOB_ID        Delete a dead job
+"
+    }
+    #[cfg(not(feature = "jobs"))]
+    {
+        ""
+    }
+}
+
 /// Human-readable usage, including the application's commands (name and
 /// summary) and every supported configuration variable.
 pub(crate) fn usage(name: &str, app_commands: &[(&str, &str)]) -> String {
@@ -96,6 +233,7 @@ pub(crate) fn usage(name: &str, app_commands: &[(&str, &str)]) -> String {
     for (command, summary) in app_commands {
         commands.push_str(&format!("  {command:<12} {summary}\n"));
     }
+    let jobs = jobs_usage();
     format!(
         "\
 Usage: {name} [COMMAND] [ARGS]
@@ -107,7 +245,7 @@ Commands:
   rollback     Revert the latest reversible database migration
 {commands}  version      Print the application name and version (also --version, -V)
   help         Print this help (also --help, -h)
-
+{jobs}
 Environment:
   FORGE_ENV                   development | test | production (default: development)
   FORGE_BIND                  listen socket address (default: 127.0.0.1:3000)
@@ -212,6 +350,88 @@ mod tests {
         let result = parse_builtin(vec![OsString::from_vec(vec![0xff])]);
 
         assert!(matches!(result, Err(UsageError::UnknownCommand(_))));
+    }
+
+    #[cfg(feature = "jobs")]
+    #[test]
+    fn jobs_subcommands_parse_and_validate_their_arguments() {
+        let id = forge_jobs::JobId::new();
+        let text = id.to_string();
+        assert_eq!(
+            parse_builtin(args(&["jobs"])),
+            Ok(Command::Jobs(JobsCommand::Work))
+        );
+        assert_eq!(
+            parse_builtin(args(&["jobs", "work"])),
+            Ok(Command::Jobs(JobsCommand::Work))
+        );
+        assert_eq!(
+            parse_builtin(args(&["jobs", "status"])),
+            Ok(Command::Jobs(JobsCommand::Status))
+        );
+        assert_eq!(
+            parse_builtin(args(&["jobs", "dead"])),
+            Ok(Command::Jobs(JobsCommand::Dead { limit: 50 }))
+        );
+        assert_eq!(
+            parse_builtin(args(&["jobs", "dead", "7"])),
+            Ok(Command::Jobs(JobsCommand::Dead { limit: 7 }))
+        );
+        assert_eq!(
+            parse_builtin(args(&["jobs", "retry", &text])),
+            Ok(Command::Jobs(JobsCommand::Retry(id)))
+        );
+        assert_eq!(
+            parse_builtin(args(&["jobs", "discard", &text])),
+            Ok(Command::Jobs(JobsCommand::Discard(id)))
+        );
+        assert_eq!(
+            parse_builtin(args(&["jobs", "retry"])),
+            Err(UsageError::MissingArgument("job id"))
+        );
+        // UUIDv4 and garbage are rejected.
+        for bad in ["not-a-uuid", "0b9b6c2e-6d1e-4c3a-9f5e-2a7c1d3e4f50"] {
+            assert!(matches!(
+                parse_builtin(args(&["jobs", "retry", bad])),
+                Err(UsageError::InvalidArgument { what: "job id", .. })
+            ));
+        }
+        for bad in ["0", "501", "x"] {
+            assert!(
+                parse_builtin(args(&["jobs", "dead", bad])).is_err(),
+                "{bad}"
+            );
+        }
+        assert!(matches!(
+            parse_builtin(args(&["jobs", "status", "extra"])),
+            Err(UsageError::UnexpectedArgument(_))
+        ));
+        assert!(matches!(
+            parse_builtin(args(&["jobs", "frobnicate"])),
+            Err(UsageError::UnknownCommand(_))
+        ));
+        #[cfg(feature = "events")]
+        {
+            let event = forge_events::EventId::new();
+            assert_eq!(
+                parse_builtin(args(&["jobs", "retry-event", &event.to_string()])),
+                Ok(Command::Jobs(JobsCommand::RetryEvent(event)))
+            );
+            assert_eq!(
+                parse_builtin(args(&["jobs", "dead-events", "3"])),
+                Ok(Command::Jobs(JobsCommand::DeadEvents { limit: 3 }))
+            );
+        }
+        let usage = usage("demo", &[]);
+        for line in [
+            "jobs [work]",
+            "jobs status",
+            "jobs dead",
+            "jobs retry",
+            "jobs discard",
+        ] {
+            assert!(usage.contains(line), "{line}");
+        }
     }
 
     #[test]
