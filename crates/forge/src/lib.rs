@@ -22,7 +22,9 @@
 
 mod app;
 mod cli;
+mod command;
 mod compose;
+mod console;
 mod database;
 mod logging;
 mod probe;
@@ -45,4 +47,5 @@ pub use forge_tenancy as tenancy;
 pub use forge_views as views;
 
 pub use app::App;
+pub use command::{CommandContext, CommandError, CommandOptions};
 pub use compose::{ComposeError, Composition};

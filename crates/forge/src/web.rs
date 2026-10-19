@@ -55,6 +55,20 @@ pub fn error(failure: &ForgeError) -> Response {
     json(status, &failure.report())
 }
 
+/// Logs a failure that does not change the response, with its cause chain,
+/// for example an audit write or a delivery that must not alter what the
+/// visitor sees. Infrastructure failures are warnings, others errors.
+/// Never pass a failure whose message or sources contain a secret.
+pub fn report(failure: &ForgeError) {
+    let chain = cause_chain(failure);
+    match failure.category() {
+        ErrorCategory::Infrastructure => {
+            warn!(code = failure.code(), error = %chain, "dependency failure");
+        }
+        _ => error!(code = failure.code(), error = %chain, "operation failed"),
+    }
+}
+
 /// Decodes a JSON request body, mapping malformed input to a `Validation`
 /// error with code `invalid_json` (the decoder's detail is not exposed).
 pub fn decode_json<T: DeserializeOwned>(request: &Request) -> Result<T, ForgeError> {

@@ -5,7 +5,7 @@ use std::ffi::OsString;
 use thiserror::Error;
 
 /// Process command selected by the first argument.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum Command {
     /// Run the HTTP server (the default).
     Serve,
@@ -19,7 +19,20 @@ pub(crate) enum Command {
     Version,
     /// Print usage.
     Help,
+    /// An application command registered with `App::command`: its index in
+    /// the registration list and its arguments.
+    App(usize, Vec<String>),
 }
+
+/// Names of the built-in commands, which applications cannot replace.
+pub(crate) const BUILT_IN: &[&str] = &[
+    "serve",
+    "healthcheck",
+    "migrate",
+    "rollback",
+    "version",
+    "help",
+];
 
 /// Invalid command line.
 #[derive(Debug, Error, Eq, PartialEq)]
@@ -30,10 +43,17 @@ pub(crate) enum UsageError {
     /// A command was followed by arguments it does not accept.
     #[error("unexpected argument {0:?}")]
     UnexpectedArgument(String),
+    /// An application command argument is not valid UTF-8.
+    #[error("arguments must be valid UTF-8")]
+    NotUnicode,
 }
 
-/// Parses process arguments, excluding the program name.
-pub(crate) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, UsageError> {
+/// Parses process arguments, excluding the program name. `app_commands` are
+/// the names registered with `App::command`, which take arguments.
+pub(crate) fn parse(
+    args: impl IntoIterator<Item = OsString>,
+    app_commands: &[&str],
+) -> Result<Command, UsageError> {
     let mut args = args.into_iter();
     let command = match args.next() {
         None => Command::Serve,
@@ -44,6 +64,16 @@ pub(crate) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command,
             Some("rollback") => Command::Rollback,
             Some("version" | "--version" | "-V") => Command::Version,
             Some("help" | "--help" | "-h") => Command::Help,
+            Some(name) if app_commands.contains(&name) => {
+                let index = app_commands
+                    .iter()
+                    .position(|command| *command == name)
+                    .unwrap_or_default();
+                let arguments = args
+                    .map(|argument| argument.into_string().map_err(|_| UsageError::NotUnicode))
+                    .collect::<Result<Vec<_>, _>>()?;
+                return Ok(Command::App(index, arguments));
+            }
             _ => {
                 return Err(UsageError::UnknownCommand(
                     arg.to_string_lossy().into_owned(),
@@ -59,18 +89,23 @@ pub(crate) fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command,
     Ok(command)
 }
 
-/// Human-readable usage, including every supported configuration variable.
-pub(crate) fn usage(name: &str) -> String {
+/// Human-readable usage, including the application's commands (name and
+/// summary) and every supported configuration variable.
+pub(crate) fn usage(name: &str, app_commands: &[(&str, &str)]) -> String {
+    let mut commands = String::new();
+    for (command, summary) in app_commands {
+        commands.push_str(&format!("  {command:<12} {summary}\n"));
+    }
     format!(
         "\
-Usage: {name} [COMMAND]
+Usage: {name} [COMMAND] [ARGS]
 
 Commands:
   serve        Run the HTTP server (default)
   healthcheck  Probe GET /health/live on the configured address; exit 0 when healthy
   migrate      Apply all pending embedded database migrations
   rollback     Revert the latest reversible database migration
-  version      Print the application name and version (also --version, -V)
+{commands}  version      Print the application name and version (also --version, -V)
   help         Print this help (also --help, -h)
 
 Environment:
@@ -83,7 +118,9 @@ Environment:
   FORGE_LOG                   log filter directives (default: info)
   FORGE_LOG_FORMAT            json | text (default: json in production, text otherwise)
   FORGE_DATABASE_URL           least-privilege runtime URL: postgres://, mysql://, mariadb:// or sqlite:
-  FORGE_MIGRATION_DATABASE_URL migration URL, same schemes (required for migrate/rollback)
+  FORGE_MIGRATION_DATABASE_URL migration URL, same schemes (required for migrate/rollback
+                               and application commands that use the database)
+  FORGE_SETUP_PASSWORD         owner password for setup when not typed or piped (never for serve)
 
 Unknown FORGE_* variables are rejected at startup.
 "
@@ -98,33 +135,63 @@ mod tests {
         values.iter().map(OsString::from).collect()
     }
 
+    fn parse_builtin(args: Vec<OsString>) -> Result<Command, UsageError> {
+        parse(args, &[])
+    }
+
+    #[test]
+    fn application_commands_take_arguments() {
+        assert_eq!(
+            parse(args(&["seed"]), &["setup", "seed"]),
+            Ok(Command::App(1, Vec::new()))
+        );
+        assert_eq!(
+            parse(args(&["setup", "--tenant", "acme"]), &["setup"]),
+            Ok(Command::App(
+                0,
+                vec!["--tenant".to_owned(), "acme".to_owned()]
+            ))
+        );
+        assert_eq!(
+            parse(args(&["setup"]), &[]),
+            Err(UsageError::UnknownCommand("setup".to_owned()))
+        );
+    }
+
     #[test]
     fn no_argument_serves() {
-        assert_eq!(parse(args(&[])), Ok(Command::Serve));
-        assert_eq!(parse(args(&["serve"])), Ok(Command::Serve));
+        assert_eq!(parse_builtin(args(&[])), Ok(Command::Serve));
+        assert_eq!(parse_builtin(args(&["serve"])), Ok(Command::Serve));
     }
 
     #[test]
     fn known_commands_and_aliases_are_recognized() {
-        assert_eq!(parse(args(&["healthcheck"])), Ok(Command::Healthcheck));
-        assert_eq!(parse(args(&["migrate"])), Ok(Command::Migrate));
-        assert_eq!(parse(args(&["rollback"])), Ok(Command::Rollback));
+        assert_eq!(
+            parse_builtin(args(&["healthcheck"])),
+            Ok(Command::Healthcheck)
+        );
+        assert_eq!(parse_builtin(args(&["migrate"])), Ok(Command::Migrate));
+        assert_eq!(parse_builtin(args(&["rollback"])), Ok(Command::Rollback));
         for alias in ["version", "--version", "-V"] {
-            assert_eq!(parse(args(&[alias])), Ok(Command::Version), "{alias}");
+            assert_eq!(
+                parse_builtin(args(&[alias])),
+                Ok(Command::Version),
+                "{alias}"
+            );
         }
         for alias in ["help", "--help", "-h"] {
-            assert_eq!(parse(args(&[alias])), Ok(Command::Help), "{alias}");
+            assert_eq!(parse_builtin(args(&[alias])), Ok(Command::Help), "{alias}");
         }
     }
 
     #[test]
     fn unknown_commands_are_rejected() {
         assert_eq!(
-            parse(args(&["frobnicate"])),
+            parse_builtin(args(&["frobnicate"])),
             Err(UsageError::UnknownCommand("frobnicate".to_owned()))
         );
         assert_eq!(
-            parse(args(&["-v"])),
+            parse_builtin(args(&["-v"])),
             Err(UsageError::UnknownCommand("-v".to_owned()))
         );
     }
@@ -132,7 +199,7 @@ mod tests {
     #[test]
     fn trailing_arguments_are_rejected() {
         assert_eq!(
-            parse(args(&["serve", "--port"])),
+            parse_builtin(args(&["serve", "--port"])),
             Err(UsageError::UnexpectedArgument("--port".to_owned()))
         );
     }
@@ -142,16 +209,17 @@ mod tests {
     fn non_unicode_arguments_are_rejected() {
         use std::os::unix::ffi::OsStringExt;
 
-        let result = parse(vec![OsString::from_vec(vec![0xff])]);
+        let result = parse_builtin(vec![OsString::from_vec(vec![0xff])]);
 
         assert!(matches!(result, Err(UsageError::UnknownCommand(_))));
     }
 
     #[test]
     fn usage_documents_every_configuration_key() {
-        let text = usage("demo");
+        let text = usage("demo", &[("setup", "Create the first tenant and owner")]);
 
         assert!(text.starts_with("Usage: demo [COMMAND]"));
+        assert!(text.contains("  setup        Create the first tenant and owner\n"));
         for command in [
             "serve",
             "healthcheck",

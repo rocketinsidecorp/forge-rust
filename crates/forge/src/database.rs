@@ -75,6 +75,25 @@ impl Declaration {
         }
     }
 
+    /// Connects eagerly with `url`, for application commands.
+    pub(crate) async fn connect(&self, url: &SecretString) -> Result<DatabaseHandle, DbError> {
+        let _ = url;
+        match *self {
+            #[cfg(feature = "postgres")]
+            Self::Postgres(_) => forge_db::Database::connect(url)
+                .await
+                .map(DatabaseHandle::Postgres),
+            #[cfg(feature = "mysql")]
+            Self::MySql(_) => forge_db::Database::connect(url)
+                .await
+                .map(DatabaseHandle::MySql),
+            #[cfg(feature = "sqlite")]
+            Self::Sqlite(_) => forge_db::Database::connect(url)
+                .await
+                .map(DatabaseHandle::Sqlite),
+        }
+    }
+
     /// Connects eagerly with `url` and runs `command`; returns the exit code.
     pub(crate) async fn run_migration_command(
         &self,

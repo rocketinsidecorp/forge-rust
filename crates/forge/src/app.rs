@@ -20,6 +20,7 @@ use tracing::{error, info};
 
 use crate::{
     cli::{self, Command},
+    command::{CommandContext, CommandError, RegisteredCommand},
     compose::{ComposeError, ComposeHook, Composition},
     database::{DatabaseHandle, Declaration, MigrationCommand, UrlPurpose, register_health},
     logging, probe, signal,
@@ -54,6 +55,7 @@ pub struct App {
     rollback: Option<DatabaseCommandHandler>,
     declarations: Vec<Declaration>,
     compose_hooks: Vec<ComposeHook>,
+    commands: Vec<RegisteredCommand>,
 }
 
 impl fmt::Debug for App {
@@ -70,6 +72,14 @@ impl fmt::Debug for App {
                     .declarations
                     .iter()
                     .map(Declaration::method)
+                    .collect::<Vec<_>>(),
+            )
+            .field(
+                "commands",
+                &self
+                    .commands
+                    .iter()
+                    .map(|command| command.name)
                     .collect::<Vec<_>>(),
             )
             .finish()
@@ -90,6 +100,7 @@ impl App {
             rollback: None,
             declarations: Vec::new(),
             compose_hooks: Vec::new(),
+            commands: Vec::new(),
         }
     }
 
@@ -206,6 +217,31 @@ impl App {
         self
     }
 
+    /// Registers an application command, `<binary> <name> [ARGS]`, such as
+    /// `setup` or `seed` (see [`CommandContext`]).
+    ///
+    /// The command runs once inside the Tokio runtime after configuration and
+    /// logging are loaded. When the application declared a database, the
+    /// command's pool is connected with `FORGE_MIGRATION_DATABASE_URL`, the
+    /// administrative credential. `summary` is shown by `help`. Names are
+    /// lowercase letters, digits and `-`; a built-in name (`serve`,
+    /// `migrate`, ...) or a repeated name makes every command exit with
+    /// code 1. A [`CommandError::Usage`] exits with code 2, any other error
+    /// with code 1.
+    #[must_use]
+    pub fn command<F, Fut>(mut self, name: &'static str, summary: &'static str, run: F) -> Self
+    where
+        F: FnOnce(CommandContext) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<(), CommandError>> + Send + 'static,
+    {
+        self.commands.push(RegisteredCommand {
+            name,
+            summary,
+            handler: Box::new(move |context| Box::pin(run(context))),
+        });
+        self
+    }
+
     /// Parses process arguments, runs the selected command and returns the
     /// process exit code.
     ///
@@ -227,8 +263,12 @@ impl App {
         args: impl IntoIterator<Item = OsString>,
         load_config: impl FnOnce() -> Result<AppConfig, ConfigError>,
     ) -> ExitCode {
-        match cli::parse(args) {
+        let names: Vec<&str> = self.commands.iter().map(|command| command.name).collect();
+        match cli::parse(args, &names) {
             Ok(Command::Serve) => self.checked(|app| app.serve(load_config)),
+            Ok(Command::App(index, arguments)) => {
+                self.checked(|app| app.run_application_command(index, arguments, load_config))
+            }
             Ok(Command::Healthcheck) => healthcheck(),
             Ok(Command::Migrate) => {
                 self.checked(|app| app.run_database_command(DatabaseCommand::Migrate, load_config))
@@ -237,16 +277,44 @@ impl App {
                 self.checked(|app| app.run_database_command(DatabaseCommand::Rollback, load_config))
             }
             Ok(Command::Version) => write_stdout(&format!("{} {}\n", self.name, self.version)),
-            Ok(Command::Help) => write_stdout(&cli::usage(self.name)),
+            Ok(Command::Help) => write_stdout(&cli::usage(self.name, &self.summaries())),
             Err(error) => {
-                write_stderr(&format!("error: {error}\n\n{}", cli::usage(self.name)));
+                write_stderr(&format!(
+                    "error: {error}\n\n{}",
+                    cli::usage(self.name, &self.summaries())
+                ));
                 ExitCode::from(EXIT_USAGE)
             }
         }
     }
 
-    /// Rejects an application that declared more than one database backend.
+    fn summaries(&self) -> Vec<(&'static str, &'static str)> {
+        self.commands
+            .iter()
+            .map(|command| (command.name, command.summary))
+            .collect()
+    }
+
+    /// Rejects an application that declared more than one database backend
+    /// or registered an invalid, built-in or repeated command name.
     fn checked(self, run: impl FnOnce(Self) -> ExitCode) -> ExitCode {
+        for (index, command) in self.commands.iter().enumerate() {
+            let repeated = self.commands[..index]
+                .iter()
+                .any(|earlier| earlier.name == command.name);
+            if !crate::command::valid_name(command.name)
+                || cli::BUILT_IN.contains(&command.name)
+                || repeated
+            {
+                write_stderr(&format!(
+                    "error: the application registered the command {:?}; command names are \
+                     unique lowercase letters, digits and '-', and cannot replace a built-in \
+                     command\n",
+                    command.name
+                ));
+                return ExitCode::FAILURE;
+            }
+        }
         if self.declarations.len() > 1 {
             let methods: Vec<_> = self.declarations.iter().map(Declaration::method).collect();
             write_stderr(&format!(
@@ -267,6 +335,7 @@ impl App {
             rollback: _,
             mut declarations,
             compose_hooks,
+            commands: _,
         } = self;
         let declaration = declarations.pop();
 
@@ -405,6 +474,87 @@ impl App {
                     "database command failed"
                 );
                 ExitCode::FAILURE
+            }
+        }
+    }
+}
+
+impl App {
+    /// Runs the application command at `index` with `arguments`.
+    fn run_application_command(
+        mut self,
+        index: usize,
+        arguments: Vec<String>,
+        load_config: impl FnOnce() -> Result<AppConfig, ConfigError>,
+    ) -> ExitCode {
+        let config = match load_config() {
+            Ok(config) => config,
+            Err(error) => return config_error(&error),
+        };
+        if let Err(error) = logging::init(&config.log) {
+            return config_error(&error);
+        }
+        if index >= self.commands.len() {
+            return ExitCode::FAILURE;
+        }
+        let command = self.commands.swap_remove(index);
+        let declaration = self.declarations.pop();
+        let url = match &declaration {
+            Some(declaration) => {
+                match declaration.validate(&config.database, UrlPurpose::Migration) {
+                    Ok(url) => Some(url.clone()),
+                    Err(error) => return config_error(&error),
+                }
+            }
+            None => None,
+        };
+        let runtime = match tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                error!(app = self.name, error = %ErrorChain(&error), "failed to start async runtime");
+                return ExitCode::FAILURE;
+            }
+        };
+        let name = self.name;
+        let result = runtime.block_on(async move {
+            let database = match declaration.zip(url) {
+                Some((declaration, url)) => match declaration.connect(&url).await {
+                    Ok(database) => Some(database),
+                    Err(error) => {
+                        return Err(CommandError::caused_by(
+                            "cannot connect with FORGE_MIGRATION_DATABASE_URL",
+                            error,
+                        ));
+                    }
+                },
+                None => None,
+            };
+            let context = CommandContext::for_process(
+                name,
+                command.name,
+                arguments,
+                config,
+                database.clone(),
+            );
+            let result = (command.handler)(context).await;
+            if let Some(database) = database {
+                database.close().await;
+            }
+            result
+        });
+        runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
+        match result {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                write_stderr(&format!("error: {}\n", ErrorChain(&error)));
+                if error.is_usage() {
+                    ExitCode::from(EXIT_USAGE)
+                } else {
+                    ExitCode::FAILURE
+                }
             }
         }
     }
@@ -654,6 +804,97 @@ mod tests {
 
         assert!(app.migrate.is_some());
         assert!(app.rollback.is_some());
+    }
+
+    #[test]
+    fn application_commands_receive_their_arguments_and_map_errors_to_exit_codes() {
+        use std::sync::{Arc, Mutex};
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&seen);
+        let app = App::new("demo")
+            .command(
+                "setup",
+                "Create the first owner",
+                move |context| async move {
+                    if let Ok(mut seen) = recorded.lock() {
+                        seen.extend(context.arguments().iter().cloned());
+                    }
+                    let options = context.options(&["--tenant"], &[])?;
+                    options.required("--tenant")?;
+                    Ok(())
+                },
+            )
+            .command("seed", "Load seed data", |_| async {
+                Err(CommandError::failed("seeding failed"))
+            });
+
+        assert_eq!(
+            app.run_with(args(&["setup", "--tenant", "acme"]), no_config),
+            ExitCode::SUCCESS
+        );
+        assert_eq!(
+            seen.lock().map(|seen| seen.clone()).unwrap_or_default(),
+            vec!["--tenant".to_owned(), "acme".to_owned()]
+        );
+
+        let usage = App::new("demo").command("setup", "x", |context| async move {
+            context.options(&["--tenant"], &[])?.required("--tenant")?;
+            Ok(())
+        });
+        assert_eq!(
+            usage.run_with(args(&["setup"]), no_config),
+            ExitCode::from(EXIT_USAGE)
+        );
+        let failing = App::new("demo").command("seed", "x", |_| async {
+            Err(CommandError::failed("seeding failed"))
+        });
+        assert_eq!(
+            failing.run_with(args(&["seed"]), no_config),
+            ExitCode::FAILURE
+        );
+        // Commands load the configuration like every other command.
+        let configured = App::new("demo").command("seed", "x", |_| async { Ok(()) });
+        assert_eq!(
+            configured.run_with(args(&["seed"]), || {
+                Err(ConfigError::NotUnicode { key: "FORGE_BIND" })
+            }),
+            ExitCode::from(EXIT_CONFIG)
+        );
+    }
+
+    #[test]
+    fn invalid_or_built_in_command_names_are_refused() {
+        for name in ["migrate", "Setup", ""] {
+            let app = App::new("demo").command(name, "x", |_| async { Ok(()) });
+            assert_eq!(
+                app.run_with(args(&["version"]), no_config),
+                ExitCode::SUCCESS,
+                "informational commands do not check"
+            );
+            let app = App::new("demo").command(name, "x", |_| async { Ok(()) });
+            assert_eq!(app.run_with(args(&["serve"]), no_config), ExitCode::FAILURE);
+        }
+        let repeated = App::new("demo")
+            .command("seed", "x", |_| async { Ok(()) })
+            .command("seed", "y", |_| async { Ok(()) });
+        assert_eq!(
+            repeated.run_with(args(&["seed"]), no_config),
+            ExitCode::FAILURE
+        );
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn database_commands_need_the_migration_credential() {
+        let app = App::new("demo")
+            .postgres(forge_db::Migrator::DEFAULT)
+            .command("seed", "x", |_| async { Ok(()) });
+        let vars = [("FORGE_DATABASE_URL", "postgres://u:p@h/app")];
+        assert_eq!(
+            app.run_with(args(&["seed"]), || config_with(&vars)),
+            ExitCode::from(EXIT_CONFIG)
+        );
     }
 
     #[test]
