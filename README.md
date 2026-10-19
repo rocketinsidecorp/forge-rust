@@ -52,14 +52,111 @@ curl localhost:3000/health/live
 # open http://127.0.0.1:3000 for the welcome page
 ```
 
-Scaffold an HTML CRUD resource through every ring, then add the printed
-module and `compose` lines (the routes stay closed until you choose who may
-use them, see [docs/views.md](docs/views.md#scaffolding-a-resource)):
+### From `forge new` to a working CRUD resource
+
+1. Generate the resource (the migration, entity, use cases, repository,
+   handlers, views and tests; `--dry-run` lists the files without writing):
+
+   ```sh
+   forge generate scaffold invoice number:string total_cents:integer due_at:timestamp? --tenant-scoped
+   ```
+
+2. Wire it. The generator never edits existing files; it prints these lines.
+   Add each `pub mod` line to the named file (keep the `mod` lines sorted):
+
+   ```text
+   src/domain/entities/mod.rs             pub mod invoice;
+   src/application/ports/mod.rs           pub mod invoice_repository;
+   src/application/use_cases/mod.rs       pub mod invoices;
+   src/infrastructure/database/mod.rs     pub mod invoices;
+   src/adapters/http/mod.rs               pub mod access;      (first scaffold only)
+   src/adapters/http/mod.rs               pub mod invoices;
+   src/adapters/http/views/mod.rs         pub mod invoices;
+   ```
+
+   and paste the statements at the end of `fn compose` in
+   `src/bootstrap/mod.rs`, before `Ok(())`. Grant the permissions in the
+   policy: RBAC matches exactly, so a role that edits needs both
+   `invoices:read` (index, show) and `invoices:write` (new, create, edit,
+   update, delete):
+
+   ```rust
+   let mut policy = forge::security::RbacPolicy::new();
+   let editor = forge::security::Role::new("editor").map_err(forge::ComposeError::other)?;
+   for permission in [
+       crate::application::use_cases::invoices::READ_PERMISSION,
+       crate::application::use_cases::invoices::WRITE_PERMISSION,
+   ] {
+       let permission =
+           forge::security::Permission::new(permission).map_err(forge::ComposeError::other)?;
+       policy.allow(editor.clone(), permission);
+   }
+   let pool = composition.postgres()?.pool().clone();
+   let access = crate::adapters::http::access::SessionTenantAccess::new(
+       std::sync::Arc::new(crate::infrastructure::auth::PostgresSessionStore::new(
+           pool.clone(),
+       )),
+       std::sync::Arc::new(crate::infrastructure::tenancy::PgMembershipStore::new(pool)),
+       policy,
+   );
+   let invoices =
+       crate::application::use_cases::invoices::InvoiceService::new(std::sync::Arc::new(
+           crate::infrastructure::database::invoices::PgInvoiceRepository::new(
+               composition.postgres()?.clone(),
+           ),
+       ));
+   crate::adapters::http::invoices::routes(
+       composition.router(),
+       &site,
+       invoices,
+       std::sync::Arc::new(access),
+   )?;
+   ```
+
+   Members whose tenant membership carries the `editor` role can then use
+   `/tenants/<tenant id>/invoices` with a signed-in session. A `--global`
+   resource (`forge generate scaffold post title:string body:text
+   published:boolean --global`) is wired with `DenyAll` and answers `403`
+   until you replace it with your own `GlobalAccess` (see
+   [docs/views.md](docs/views.md#scaffolding-a-resource)).
+
+3. Migrate, test and run:
+
+   ```sh
+   export FORGE_MIGRATION_DATABASE_URL='postgres://app_migrator:app_migrator@127.0.0.1:5432/shop'
+   cargo run -- migrate
+   cargo test
+   export FORGE_DATABASE_URL='postgres://app_runtime:app_runtime@127.0.0.1:5432/shop'
+   cargo run
+   ```
+
+   `cargo run -- rollback` reverts the latest migration. Repository tests
+   against a database server are ignored by default; run them with
+   `FORGE_TEST_DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5432/postgres cargo test -- --include-ignored`.
+
+### Command cheat sheet
 
 ```sh
-forge generate scaffold post title:string body:text published:boolean --global
-forge generate scaffold invoice number:string total_cents:integer --tenant-scoped
+forge id                                       # print a UUIDv7
+forge new shop                                 # full-stack, PostgreSQL, Docker and CI
+forge new shop -d sqlite3                      # or postgresql, mysql, mariadb, none
+forge new shop --api                           # JSON only, no views
+forge new shop --skip-docker --skip-ci --skip-lockfile
+forge generate migration create_customers      # empty reversible .up.sql/.down.sql pair
+forge generate scaffold post title:string body:text? published:boolean --global
+forge generate scaffold person name:string --tenant-scoped --plural people
+forge generate scaffold post title:string --global --dry-run
+forge check && forge lint && forge test        # cargo check / clippy -D warnings / test
+forge format                                   # cargo fmt --all
+forge build                                    # cargo build --release --locked
+cargo run -- migrate                           # application binary: migrate, rollback,
+cargo run -- rollback                          #   healthcheck, version, help, serve
+cargo run -- healthcheck
 ```
+
+Field types for `field:type`: `string`, `text`, `integer`, `boolean`,
+`timestamp` and `uuid`, with `?` for an optional field
+([docs/cli.md](docs/cli.md#forge-generate-scaffold)).
 
 Pick the database like `rails new -d`: `forge new shop -d postgresql|mysql|mariadb|sqlite3`
 (PostgreSQL is the default). Use `forge new shop -d none` for a service that does not need
