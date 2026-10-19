@@ -141,3 +141,101 @@ async fn finish<B: Backend, T>(
     }
     result
 }
+
+/// Merges independently embedded migration sets into one [`Migrator`].
+///
+/// An application's own migrations and those shipped by Forge crates (rate
+/// limiting, cache, ...) share one `_sqlx_migrations` table, so they must be
+/// applied through one migrator: SQLx refuses a set that does not know a version
+/// already recorded. Versions must be unique across the sets (shipped sets use
+/// timestamp versions of the form `YYYYMMDDHHMMSS`), otherwise the merge fails
+/// instead of silently picking one.
+///
+/// ```
+/// use forge_db::{Migrator, combine_migrations};
+///
+/// let combined = combine_migrations(&[&Migrator::DEFAULT, &Migrator::DEFAULT])
+///     .expect("empty sets do not collide");
+/// assert_eq!(combined.iter().count(), 0);
+/// ```
+pub fn combine_migrations(sets: &[&Migrator]) -> Result<Migrator, DbError> {
+    let mut merged: Vec<sqlx::migrate::Migration> = Vec::new();
+    for set in sets {
+        for migration in set.iter() {
+            let clash = merged.iter().any(|existing| {
+                existing.version == migration.version
+                    && existing.migration_type.is_up_migration()
+                        == migration.migration_type.is_up_migration()
+            });
+            if clash {
+                return Err(DbError::configuration(format!(
+                    "migration version {} appears in more than one migration set",
+                    migration.version
+                )));
+            }
+            merged.push(migration.clone());
+        }
+    }
+    Ok(Migrator::with_migrations(merged))
+}
+
+#[cfg(test)]
+mod tests {
+    use sqlx::{
+        SqlSafeStr,
+        migrate::{Migration, MigrationType},
+    };
+
+    use super::*;
+
+    fn set(versions: &[i64]) -> Migrator {
+        Migrator::with_migrations(
+            versions
+                .iter()
+                .flat_map(|version| {
+                    [
+                        Migration::new(
+                            *version,
+                            "m".into(),
+                            MigrationType::ReversibleUp,
+                            "SELECT 1".into_sql_str(),
+                            false,
+                        ),
+                        Migration::new(
+                            *version,
+                            "m".into(),
+                            MigrationType::ReversibleDown,
+                            "SELECT 2".into_sql_str(),
+                            false,
+                        ),
+                    ]
+                })
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn combined_sets_are_ordered_by_version_and_keep_down_migrations() {
+        let combined =
+            combine_migrations(&[&set(&[1, 20_261_019_000_000]), &set(&[2])]).expect("merge");
+        let ups: Vec<i64> = combined
+            .iter()
+            .filter(|m| m.migration_type.is_up_migration())
+            .map(|m| m.version)
+            .collect();
+        assert_eq!(ups, vec![1, 2, 20_261_019_000_000]);
+        assert_eq!(
+            combined
+                .iter()
+                .filter(|m| m.migration_type.is_down_migration())
+                .count(),
+            3
+        );
+    }
+
+    #[test]
+    fn duplicate_versions_are_refused() {
+        let error = combine_migrations(&[&set(&[1, 2]), &set(&[2])]).expect_err("clash");
+        assert!(error.to_string().contains("version 2"), "{error}");
+    }
+}

@@ -42,6 +42,7 @@ pub use database::PgDatabase;
 pub use database::SqliteDatabase;
 pub use database::{Database, DbTransaction, PoolSettings, expect_rows};
 pub use error::DbError;
+pub use migrate::combine_migrations;
 #[cfg(feature = "postgres")]
 pub use postgres::advisory_key;
 /// The SQLx version Forge builds on, for macros such as `sqlx::migrate!`.
