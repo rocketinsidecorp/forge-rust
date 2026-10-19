@@ -1,13 +1,9 @@
 //! The job contract: typed jobs, handlers, execution context and errors.
 
-use std::{
-    fmt,
-    sync::atomic::AtomicBool,
-    time::{Duration, SystemTime},
-};
+use std::{fmt, sync::atomic::AtomicBool, time::Duration};
 
 use async_trait::async_trait;
-use forge_core::{Cancellation, Id};
+use forge_core::{Cancellation, Id, Timestamp};
 use forge_security::PrincipalId;
 use forge_tenancy::{TenantContext, TenantId};
 use serde::{Serialize, de::DeserializeOwned};
@@ -352,7 +348,7 @@ pub(crate) fn sanitize(message: &str) -> String {
 /// ```
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct EnqueueOptions {
-    pub(crate) run_at: Option<SystemTime>,
+    pub(crate) run_at: Option<Timestamp>,
     pub(crate) delay: Option<Duration>,
     pub(crate) priority: Option<i16>,
     pub(crate) unique_key: Option<String>,
@@ -367,7 +363,7 @@ impl EnqueueOptions {
 
     /// Runs no earlier than `time` (database clock).
     #[must_use]
-    pub fn at(mut self, time: SystemTime) -> Self {
+    pub fn at(mut self, time: Timestamp) -> Self {
         self.run_at = Some(time);
         self.delay = None;
         self
@@ -454,7 +450,7 @@ mod tests {
 
     #[test]
     fn enqueue_options_keep_the_last_schedule() {
-        let at = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+        let at = Timestamp::from_unix_micros(10).expect("timestamp");
         let options = EnqueueOptions::new().delay(Duration::from_secs(1)).at(at);
         assert_eq!(options.run_at, Some(at));
         assert_eq!(options.delay, None);

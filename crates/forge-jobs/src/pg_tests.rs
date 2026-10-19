@@ -9,12 +9,12 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
-    time::{Duration, SystemTime},
+    time::Duration,
 };
 
 use async_trait::async_trait;
 use forge_auth::{Session, UnixTimestamp};
-use forge_core::Cancellation;
+use forge_core::{Cancellation, Timestamp};
 use forge_db::{DbError, PgDatabase};
 use forge_security::{Permission, PrincipalId, RbacPolicy, Role};
 use forge_tenancy::{Membership, TenantContext, TenantId};
@@ -695,7 +695,7 @@ async fn two_schedulers_fire_each_tick_exactly_once() {
 
     // Racing replicas on the same tick: one winner.
     let tick = every_minute
-        .latest_at_or_before(SystemTime::now())
+        .latest_at_or_before(Timestamp::now())
         .expect("tick");
     let schedule = Schedule::new("race", every_minute.clone(), &Count { n: 0 }).expect("schedule");
     let job = || schedule.job_for(tick).expect("job");
@@ -713,7 +713,7 @@ async fn two_schedulers_fire_each_tick_exactly_once() {
     );
     assert!(outcomes.contains(&TickOutcome::AlreadyHandled));
     // Replaying an old tick never fires again.
-    let older = tick - Duration::from_secs(60);
+    let older = Timestamp::from_unix_micros(tick.unix_micros() - 60_000_000).expect("older");
     assert_eq!(
         store
             .fire_tick("race", older, Duration::from_secs(300), job())
@@ -722,7 +722,7 @@ async fn two_schedulers_fire_each_tick_exactly_once() {
         TickOutcome::AlreadyHandled
     );
     // A first tick older than the allowed lateness is skipped.
-    let stale = tick - Duration::from_secs(3600);
+    let stale = Timestamp::from_unix_micros(tick.unix_micros() - 3_600_000_000).expect("stale");
     assert_eq!(
         store
             .fire_tick("stale", stale, Duration::from_secs(60), job())

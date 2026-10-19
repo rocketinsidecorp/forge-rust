@@ -15,12 +15,9 @@
 //! Evaluation is always in UTC: there are no time zones and therefore no
 //! daylight-saving gaps or repeated hours.
 
-use std::{
-    fmt,
-    str::FromStr,
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+use std::{fmt, str::FromStr};
 
+use forge_core::Timestamp;
 use thiserror::Error;
 
 /// Longest accepted expression, in bytes.
@@ -33,14 +30,13 @@ const MINUTES_PER_DAY: i64 = 1440;
 /// A parsed cron expression.
 ///
 /// ```
-/// use std::time::{Duration, UNIX_EPOCH};
+/// use forge_core::Timestamp;
 /// use forge_jobs::Cron;
 ///
 /// let every_quarter_hour: Cron = "*/15 * * * *".parse()?;
-/// // 1970-01-01T00:07:00Z -> 00:15:00Z
-/// let next = every_quarter_hour.next_after(UNIX_EPOCH + Duration::from_secs(7 * 60));
-/// assert_eq!(next, Some(UNIX_EPOCH + Duration::from_secs(15 * 60)));
-/// # Ok::<(), forge_jobs::CronError>(())
+/// let next = every_quarter_hour.next_after("2026-10-19T10:07:30Z".parse()?);
+/// assert_eq!(next, Some("2026-10-19T10:15:00Z".parse()?));
+/// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 #[derive(Clone, Eq, PartialEq)]
 pub struct Cron {
@@ -167,20 +163,20 @@ impl Cron {
         }
     }
 
-    /// The first matching minute strictly after `time`, or `None` when
-    /// `time` is before the Unix epoch or no match exists in range.
+    /// The first matching minute strictly after `time`, or `None` past the
+    /// end of the [`Timestamp`] range.
     #[must_use]
-    pub fn next_after(&self, time: SystemTime) -> Option<SystemTime> {
-        let start = floor_minute(time)?.checked_add(1)?;
-        self.search_forward(start).map(minute_time)
+    pub fn next_after(&self, time: Timestamp) -> Option<Timestamp> {
+        let start = floor_minute(time).checked_add(1)?;
+        self.search_forward(start).and_then(minute_time)
     }
 
-    /// The latest matching minute at or before `time`, or `None` when there
-    /// is none since the Unix epoch within the search range.
+    /// The latest matching minute at or before `time`, or `None` before the
+    /// start of the [`Timestamp`] range.
     #[must_use]
-    pub fn latest_at_or_before(&self, time: SystemTime) -> Option<SystemTime> {
-        let start = floor_minute(time)?;
-        self.search_backward(start).map(minute_time)
+    pub fn latest_at_or_before(&self, time: Timestamp) -> Option<Timestamp> {
+        self.search_backward(floor_minute(time))
+            .and_then(minute_time)
     }
 
     /// The expression as written (trimmed).
@@ -207,9 +203,6 @@ impl Cron {
         let mut day = start.div_euclid(MINUTES_PER_DAY);
         let mut until = u32::try_from(start.rem_euclid(MINUTES_PER_DAY)).ok()?;
         for _ in 0..SEARCH_DAYS {
-            if day < 0 {
-                return None;
-            }
             if self.day_matches(day)
                 && let Some(minute) = self.last_time_until(until)
             {
@@ -365,16 +358,19 @@ fn narrow<T: TryFrom<u64> + Default>(bits: u64) -> T {
     T::try_from(bits).unwrap_or_default()
 }
 
-/// Whole minutes since the Unix epoch, rounded down; `None` before it.
-pub(crate) fn floor_minute(time: SystemTime) -> Option<i64> {
-    let seconds = time.duration_since(UNIX_EPOCH).ok()?.as_secs();
-    i64::try_from(seconds / 60).ok()
+const MICROS_PER_MINUTE: i64 = 60_000_000;
+
+/// Whole minutes since the Unix epoch, rounded down.
+pub(crate) const fn floor_minute(time: Timestamp) -> i64 {
+    time.unix_micros().div_euclid(MICROS_PER_MINUTE)
 }
 
-/// The instant at the start of `minute` minutes after the Unix epoch.
-pub(crate) fn minute_time(minute: i64) -> SystemTime {
-    let seconds = u64::try_from(minute).unwrap_or(0).saturating_mul(60);
-    UNIX_EPOCH + Duration::from_secs(seconds)
+/// The instant at the start of `minute` minutes after the Unix epoch, when
+/// it is within the [`Timestamp`] range.
+pub(crate) fn minute_time(minute: i64) -> Option<Timestamp> {
+    minute
+        .checked_mul(MICROS_PER_MINUTE)
+        .and_then(|micros| Timestamp::from_unix_micros(micros).ok())
 }
 
 /// `(year, month 1-12, day 1-31)` of a day count since 1970-01-01
@@ -410,8 +406,12 @@ pub(crate) fn weekday(days: i64) -> u32 {
 mod tests {
     use super::*;
 
-    fn at(days: i64, hour: i64, minute: i64) -> SystemTime {
-        minute_time(days * MINUTES_PER_DAY + hour * 60 + minute)
+    fn at(days: i64, hour: i64, minute: i64) -> Timestamp {
+        minute_time(days * MINUTES_PER_DAY + hour * 60 + minute).expect("in range")
+    }
+
+    fn plus(time: Timestamp, seconds: i64) -> Timestamp {
+        Timestamp::from_unix_micros(time.unix_micros() + seconds * 1_000_000).expect("in range")
     }
 
     /// Days since the epoch of a civil date, by counting (test oracle).
@@ -545,7 +545,7 @@ mod tests {
             quarter.latest_at_or_before(at(day, 10, 14)),
             Some(at(day, 10, 0))
         );
-        let within = at(day, 10, 15) + Duration::from_secs(59);
+        let within = plus(at(day, 10, 15), 59);
         assert_eq!(quarter.latest_at_or_before(within), Some(at(day, 10, 15)));
         assert_eq!(quarter.next_after(within), Some(at(day, 10, 30)));
 
@@ -574,12 +574,12 @@ mod tests {
             Some(at(saturday + 2, 9, 0))
         );
 
-        // Before the epoch there is nothing.
-        assert_eq!(nightly.latest_at_or_before(at(0, 2, 0)), None);
-        assert_eq!(
-            nightly.next_after(UNIX_EPOCH - Duration::from_secs(1)),
-            None
-        );
+        // Searches cross the epoch and stop at the end of the range.
+        assert_eq!(nightly.latest_at_or_before(at(0, 2, 0)), Some(at(-1, 3, 0)));
+        let end: Timestamp = "9999-12-31T23:59:00Z".parse().expect("timestamp");
+        assert_eq!(nightly.next_after(end), None);
+        let start: Timestamp = "0001-01-01T00:00:00Z".parse().expect("timestamp");
+        assert_eq!(nightly.latest_at_or_before(start), None);
     }
 
     /// Deterministic SplitMix64 for reproducible generated cases.
@@ -694,16 +694,16 @@ mod tests {
             let expected_next = (origin + 1..origin + window).find(|m| oracle(*m));
             if let Some(expected) = expected_next {
                 assert_eq!(
-                    cron.next_after(minute_time(origin) + Duration::from_secs(17)),
-                    Some(minute_time(expected)),
+                    cron.next_after(plus(at(0, 0, origin), 17)),
+                    Some(at(0, 0, expected)),
                     "next_after for {expression:?} from minute {origin}"
                 );
             }
             let expected_previous = (origin - window..=origin).rev().find(|m| oracle(*m));
             if let Some(expected) = expected_previous {
                 assert_eq!(
-                    cron.latest_at_or_before(minute_time(origin) + Duration::from_secs(42)),
-                    Some(minute_time(expected)),
+                    cron.latest_at_or_before(plus(at(0, 0, origin), 42)),
+                    Some(at(0, 0, expected)),
                     "latest_at_or_before for {expression:?} from minute {origin}"
                 );
             }

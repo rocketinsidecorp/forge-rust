@@ -1,11 +1,8 @@
 //! PostgreSQL outbox and inbox.
 
-use std::{
-    borrow::Cow,
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+use std::{borrow::Cow, time::Duration};
 
-use forge_core::Id;
+use forge_core::{Id, Timestamp};
 use forge_db::{DbTransaction, Migrator, PgDatabase};
 use forge_tenancy::{TenantContext, TenantId};
 use sqlx::{Postgres, Row, postgres::PgRow};
@@ -95,7 +92,7 @@ async fn insert<E: IntegrationEvent>(
     .bind(E::TYPE)
     .bind(i32::from(E::VERSION))
     .bind(payload)
-    .bind(micros_since_epoch(SystemTime::now()))
+    .bind(Timestamp::now().unix_micros())
     .execute(transaction.connection())
     .await?;
     Ok(id)
@@ -317,10 +314,8 @@ fn envelope(row: &PgRow) -> Result<EventEnvelope, EventsError> {
         version: u16::try_from(row.try_get::<i32, _>("version")?)
             .map_err(|_| EventsError::Corrupt)?,
         tenant_id: tenant_id(row.try_get("tenant_id")?)?,
-        occurred_at: UNIX_EPOCH
-            + Duration::from_micros(
-                u64::try_from(row.try_get::<i64, _>("occurred_at_us")?).unwrap_or(0),
-            ),
+        occurred_at: Timestamp::from_unix_micros(row.try_get("occurred_at_us")?)
+            .map_err(|_| EventsError::Corrupt)?,
         attempt: u32::try_from(row.try_get::<i32, _>("attempts")?)
             .map_err(|_| EventsError::Corrupt)?,
         payload: row.try_get("payload")?,
@@ -339,11 +334,4 @@ fn tenant_id(value: Option<Uuid>) -> Result<Option<TenantId>, EventsError> {
 
 fn millis(duration: Duration) -> i64 {
     i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
-}
-
-fn micros_since_epoch(time: SystemTime) -> i64 {
-    time.duration_since(UNIX_EPOCH)
-        .ok()
-        .and_then(|elapsed| i64::try_from(elapsed.as_micros()).ok())
-        .unwrap_or(0)
 }

@@ -1,9 +1,9 @@
 //! Recurring cron schedules that enqueue a job once per tick, across any
 //! number of replicas.
 
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
-use forge_core::Cancellation;
+use forge_core::{Cancellation, Timestamp};
 use tracing::{debug, info, warn};
 
 use crate::{
@@ -91,10 +91,8 @@ impl Schedule {
         self.spec.name
     }
 
-    pub(crate) fn job_for(&self, tick: SystemTime) -> Result<NewJob, JobsError> {
-        let seconds = tick
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |elapsed| elapsed.as_secs());
+    pub(crate) fn job_for(&self, tick: Timestamp) -> Result<NewJob, JobsError> {
+        let seconds = tick.unix_micros().div_euclid(1_000_000);
         let options =
             EnqueueOptions::new().unique_key(format!("forge.schedule:{}:{seconds}", self.name));
         NewJob::from_parts(self.spec, self.payload.clone(), &options, None)
@@ -103,10 +101,10 @@ impl Schedule {
 
 /// Fires due ticks until `shutdown`; one database round trip per due tick.
 pub(crate) async fn run(store: PgJobStore, schedules: Vec<Schedule>, shutdown: Cancellation) {
-    let mut handled: Vec<Option<SystemTime>> = vec![None; schedules.len()];
+    let mut handled: Vec<Option<Timestamp>> = vec![None; schedules.len()];
     info!(schedules = schedules.len(), "scheduler started");
     while !shutdown.is_cancelled() {
-        let now = SystemTime::now();
+        let now = Timestamp::now();
         for (schedule, last) in schedules.iter().zip(handled.iter_mut()) {
             let Some(due) = schedule.cron.latest_at_or_before(now) else {
                 continue;
@@ -123,7 +121,10 @@ pub(crate) async fn run(store: PgJobStore, schedules: Vec<Schedule>, shutdown: C
             .filter_map(|schedule| schedule.cron.next_after(now))
             .min();
         let wait = next
-            .and_then(|next| next.duration_since(SystemTime::now()).ok())
+            .map(|next| {
+                let micros = next.unix_micros() - Timestamp::now().unix_micros();
+                Duration::from_micros(u64::try_from(micros).unwrap_or(0))
+            })
             .unwrap_or(Duration::from_secs(1))
             .min(MAX_SLEEP);
         // Spread replicas over the first second after a tick.
@@ -137,7 +138,7 @@ pub(crate) async fn run(store: PgJobStore, schedules: Vec<Schedule>, shutdown: C
 }
 
 /// Returns whether the tick is settled (fired, skipped or handled elsewhere).
-async fn fire(store: &PgJobStore, schedule: &Schedule, due: SystemTime) -> bool {
+async fn fire(store: &PgJobStore, schedule: &Schedule, due: Timestamp) -> bool {
     let job = match schedule.job_for(due) {
         Ok(job) => job,
         Err(error) => {

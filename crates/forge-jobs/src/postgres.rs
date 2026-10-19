@@ -7,13 +7,9 @@
 //! `INSERT` on `forge_jobs`, filtered by row-level security to the
 //! transaction's tenant scope.
 
-use std::{
-    borrow::Cow,
-    sync::atomic::Ordering,
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+use std::{borrow::Cow, sync::atomic::Ordering, time::Duration};
 
-use forge_core::Id;
+use forge_core::{Id, Timestamp};
 use forge_db::{DbTransaction, Migrator, PgDatabase};
 use forge_tenancy::{TenantContext, TenantId};
 use sqlx::{PgConnection, Postgres, Row, postgres::PgRow};
@@ -218,7 +214,7 @@ impl NewJob {
                 "unique keys must be 1 to 255 bytes",
             ));
         }
-        let run_at_us = options.run_at.map(micros_since_epoch).transpose()?;
+        let run_at_us = options.run_at.map(Timestamp::unix_micros);
         Ok(Self {
             id: JobId::new(),
             tenant,
@@ -398,7 +394,7 @@ pub struct QueueStats {
     /// Number of jobs.
     pub jobs: u64,
     /// For queued jobs, the earliest run time (queue latency indicator).
-    pub oldest_run_at: Option<SystemTime>,
+    pub oldest_run_at: Option<Timestamp>,
 }
 
 /// A dead job as shown to operators. Payloads are never exposed.
@@ -420,7 +416,7 @@ pub struct DeadJob {
     /// The last recorded error message.
     pub last_error: Option<String>,
     /// When the job entered the dead state.
-    pub failed_at: Option<SystemTime>,
+    pub failed_at: Option<Timestamp>,
 }
 
 /// Retention for finished jobs, applied by a bounded background loop.
@@ -525,7 +521,8 @@ impl PgJobStore {
                         .map_err(|_| JobsError::Corrupt)?,
                     oldest_run_at: row
                         .try_get::<Option<i64>, _>("oldest_run_at_us")?
-                        .map(time_from_micros),
+                        .map(timestamp)
+                        .transpose()?,
                 })
             })
             .collect()
@@ -680,11 +677,11 @@ impl PgJobStore {
     pub(crate) async fn fire_tick(
         &self,
         schedule: &str,
-        tick: SystemTime,
+        tick: Timestamp,
         lateness: Duration,
         job: NewJob,
     ) -> Result<TickOutcome, JobsError> {
-        let tick_us = micros_since_epoch(tick)?;
+        let tick_us = tick.unix_micros();
         let mut transaction = self.database.begin().await?;
         let won: Option<bool> = sqlx::query_scalar(
             "INSERT INTO forge_job_schedules (name, last_tick_at)
@@ -723,7 +720,8 @@ fn dead_job(row: &PgRow) -> Result<DeadJob, JobsError> {
         last_error: row.try_get("last_error")?,
         failed_at: row
             .try_get::<Option<i64>, _>("failed_at_us")?
-            .map(time_from_micros),
+            .map(timestamp)
+            .transpose()?,
     })
 }
 
@@ -740,17 +738,8 @@ pub(crate) fn millis(duration: Duration) -> i64 {
     i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
 }
 
-fn micros_since_epoch(time: SystemTime) -> Result<i64, JobsError> {
-    time.duration_since(UNIX_EPOCH)
-        .ok()
-        .and_then(|elapsed| i64::try_from(elapsed.as_micros()).ok())
-        .ok_or(JobsError::InvalidSetting(
-            "times must be after the Unix epoch",
-        ))
-}
-
-fn time_from_micros(micros: i64) -> SystemTime {
-    UNIX_EPOCH + Duration::from_micros(u64::try_from(micros).unwrap_or(0))
+fn timestamp(micros: i64) -> Result<Timestamp, JobsError> {
+    Timestamp::from_unix_micros(micros).map_err(|_| JobsError::Corrupt)
 }
 
 #[cfg(test)]
@@ -798,8 +787,6 @@ mod tests {
             NewJob::of(&Big(String::new()), &options.clone().unique_key(""), None),
             Err(JobsError::InvalidSetting(_))
         ));
-        let before_epoch = options.at(UNIX_EPOCH - Duration::from_secs(1));
-        assert!(NewJob::of(&Big(String::new()), &before_epoch, None).is_err());
         let ok = NewJob::of(&Big("a".into()), &EnqueueOptions::new().priority(-3), None)
             .expect("valid job");
         assert_eq!(
@@ -810,11 +797,9 @@ mod tests {
 
     #[test]
     fn time_conversions_round_trip() {
-        let time = UNIX_EPOCH + Duration::from_micros(1_792_434_165_935_102);
-        assert_eq!(
-            time_from_micros(micros_since_epoch(time).expect("after epoch")),
-            time
-        );
+        let time = timestamp(1_792_434_165_935_102).expect("timestamp");
+        assert_eq!(time.unix_micros(), 1_792_434_165_935_102);
+        assert!(matches!(timestamp(i64::MAX), Err(JobsError::Corrupt)));
         assert_eq!(millis(Duration::MAX), i64::MAX);
         assert_eq!(migrator().table_name, MIGRATIONS_TABLE);
         assert!(

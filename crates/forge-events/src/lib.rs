@@ -27,10 +27,10 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 #![deny(missing_docs)]
 
-use std::{fmt, time::SystemTime};
+use std::fmt;
 
 use async_trait::async_trait;
-use forge_core::Id;
+use forge_core::{Id, Timestamp};
 use forge_tenancy::TenantId;
 use serde::{Serialize, de::DeserializeOwned};
 use thiserror::Error;
@@ -93,7 +93,7 @@ pub struct EventEnvelope {
     event_type: String,
     version: u16,
     tenant_id: Option<TenantId>,
-    occurred_at: SystemTime,
+    occurred_at: Timestamp,
     attempt: u32,
     payload: String,
 }
@@ -139,7 +139,7 @@ impl EventEnvelope {
 
     /// When the event was appended (application clock).
     #[must_use]
-    pub const fn occurred_at(&self) -> SystemTime {
+    pub const fn occurred_at(&self) -> Timestamp {
         self.occurred_at
     }
 
@@ -302,8 +302,6 @@ pub(crate) fn validate_name(kind: &'static str, value: &str) -> Result<(), Event
 
 #[cfg(test)]
 mod tests {
-    use std::time::UNIX_EPOCH;
-
     use serde::Deserialize;
 
     use super::*;
@@ -324,7 +322,7 @@ mod tests {
             event_type: event_type.to_owned(),
             version,
             tenant_id: None,
-            occurred_at: UNIX_EPOCH,
+            occurred_at: Timestamp::now(),
             attempt: 1,
             payload: payload.to_owned(),
         }

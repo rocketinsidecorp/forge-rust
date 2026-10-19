@@ -40,8 +40,10 @@ impl RlsTestDatabase {
             .map_err(|_| configuration("FORGE_TEST_DATABASE_URL is not set"))?;
         let test = TestDatabase::<Postgres>::create_empty().await?;
         let suffix = Uuid::now_v7().simple().to_string();
-        let migrator_role = format!("forge_test_migrator_{}", &suffix[..20]);
-        let runtime_role = format!("forge_test_runtime_{}", &suffix[..20]);
+        // The whole UUID: its leading digits are mostly the timestamp, and
+        // fixtures created in the same millisecond must not collide.
+        let migrator_role = format!("forge_test_migrator_{suffix}");
+        let runtime_role = format!("forge_test_runtime_{suffix}");
         let password = Uuid::now_v7().simple().to_string();
         let roles = RoleGuard {
             admin: admin_url,
