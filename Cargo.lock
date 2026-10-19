@@ -602,6 +602,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "forge-jobs"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "forge-auth",
+ "forge-config",
+ "forge-core",
+ "forge-db",
+ "forge-security",
+ "forge-tenancy",
+ "getrandom 0.4.3",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "forge-security"
 version = "0.1.0"
 dependencies = [

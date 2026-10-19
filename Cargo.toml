@@ -8,6 +8,7 @@ members = [
     "crates/forge-core",
     "crates/forge-db",
     "crates/forge-http",
+    "crates/forge-jobs",
     "crates/forge-security",
     "crates/forge-tenancy",
     "crates/forge-views",
