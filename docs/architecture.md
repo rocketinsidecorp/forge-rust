@@ -231,6 +231,16 @@ optimistic credential version; a concurrent password change/disable wins and the
 login fails closed rather than overwriting it. See
 [ADR 0014](adr/0014-argon2-session-cookie-and-csrf.md).
 
+Full-stack generated applications protect every unsafe request, signed in or
+not, with the `forge-views` CSRF layer: a 256-bit token in a host-only
+`__Host-forge_csrf` cookie that pages render in a hidden field or meta tag, a
+constant-time comparison before routing, Fetch Metadata/`Origin` rejection of
+cross-site requests, and the `_method` override only after verification.
+Flash messages travel in a host-only cookie and are consumed when rendered.
+Request layers (`forge_http::Middleware`) run before the route table. See
+[ADR 0023](adr/0023-form-csrf-flash-and-method-override.md) and
+[views](views.md).
+
 ### Database and transactions
 
 PostgreSQL is the first database. SQL remains visible, with compile-time checked

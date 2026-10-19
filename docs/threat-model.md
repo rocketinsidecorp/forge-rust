@@ -67,7 +67,8 @@ alone.
 | Threat | Required controls | Verification |
 | --- | --- | --- |
 | Credential stuffing and session theft | Argon2id password hashing with parameter policy, generic login errors, per-account and per-origin throttles, rotation on privilege change, secure/HttpOnly/SameSite cookies, short-lived credentials, revocation | authentication integration and abuse tests |
-| CSRF and cross-origin abuse | SameSite defaults, unpredictable CSRF token for cookie-authenticated mutations, exact-origin CORS allowlist, reject credentialed wildcard origins | browser-protocol integration tests |
+| CSRF and cross-origin abuse | SameSite defaults, unpredictable CSRF token for cookie-authenticated mutations and every unsafe request of an HTML application (host-only `__Host-` double-submit cookie, header or form field, constant-time comparison, query string ignored), Fetch Metadata/`Origin` rejection of cross-site requests, `_method` override only for verified `POST` forms, exact-origin CORS allowlist, reject credentialed wildcard origins | `forge-views` CSRF negative tests, generated `tests/http.rs`, e2e `curl` checks |
+| Cross-site scripting in server-rendered pages | auto-escaping compile-time templates, explicit greppable `\|safe` only on framework-built markup, strict CSP without `unsafe-inline`/`unsafe-eval` (import map allowed by hash) on every response, validated DOM ids, escaped flash messages, vendored integrity-pinned JavaScript, `nosniff` | template escaping and CSP header tests, vendored digest tests |
 | Broken object authorization | authorization at use-case boundary, typed principal and tenant context, deny by default, no authorization based on object-ID secrecy | policy matrix and negative integration tests |
 | Cross-tenant data access | mandatory `TenantContext`, transaction-local PostgreSQL setting, RLS, non-bypass application role, pooled-connection reset, audited separate admin path | two-tenant tests for every repository plus RLS tests |
 | SQL/command/template injection | parameterized SQL, typed command arguments without shell interpolation, contextual output encoding, validated schemas | fuzz/property tests and static review |
@@ -176,6 +177,36 @@ per-origin credential throttling, turnkey HTTP login/logout/tenant-selection
 composition, audit integrity chaining/retention and privileged reader workflows,
 and administrative cross-tenant role separation still require implementation and
 abuse tests.
+
+## Server-rendered views review
+
+Review date: 2026-10-19 ([ADR 0022](adr/0022-server-rendered-views.md),
+[ADR 0023](adr/0023-form-csrf-flash-and-method-override.md)).
+
+Full-stack generated applications register three request layers before
+routing: the strict Content-Security-Policy, `CsrfProtection` and
+`FlashLayer`.
+
+| Threat | Control | Verification |
+| --- | --- | --- |
+| Cross-site form or `fetch` submission | Every unsafe request needs exactly one 256-bit token (header or form field) equal to the `__Host-forge_csrf` cookie (`Secure`, `HttpOnly`, `SameSite=Lax`, no `Domain`); constant-time comparison; repeated/malformed values refused; `403` with a generic body | missing, wrong, repeated, malformed, query-string and header/field-mismatch tests in `forge-views`; generated `tests/http.rs`; e2e |
+| Cookie tossing from a sibling subdomain or plain-HTTP attacker | `__Host-` prefix; `Sec-Fetch-Site: same-site` refused | cookie attribute tests; cross-site tests |
+| Login CSRF / anonymous forms | Token issued before any session, independent of the database | first-visit issuance test |
+| Tunnelled `DELETE` without CSRF | `_method` honored only on `POST`, only `PATCH`/`PUT`/`DELETE`, only after verification (`CsrfVerified` witness), repeated field refused, `GET` never overridden | method-override negative tests |
+| Token leakage through caches | Token-bearing pages are `Cache-Control: no-store`; asset and probe responses never receive `Set-Cookie` | cache and lazy-issuance tests |
+| Flash injection | Messages rendered escaped; cookie `__Host-`, bounded, shape-checked, removed when tampered | flash tests |
+| Form parser abuse | Exactly one UTF-8 form `Content-Type`, body bounded by `FORGE_MAX_BODY_BYTES`, at most 1000 pairs, strict grammar, duplicate scalar fields refused, caller-safe errors | `forge-http` form tests |
+| Asset path traversal or MIME confusion | Exact digested routes only, closed extension allowlist, `nosniff`, SVG sandbox CSP | existing asset tests |
+
+Residual risks: tokens are not masked per response, so HTML compression by a
+proxy combined with reflected input could enable BREACH-style recovery; the
+flash cookie is unsigned (display text only); the `Origin`/`Host` fallback can
+refuse legitimate requests behind `Host`-rewriting proxies for browsers without
+Fetch Metadata; `__Host-` cookies require HTTPS outside `localhost`; a full-stack
+router requires the token on JSON endpoints too (no reviewed exemption mechanism
+yet); multipart forms are not parsed and must send the header. Login-time
+binding of the form token to the session (ADR 0023) remains application code
+until the authentication routes slice.
 
 ## Review cadence
 

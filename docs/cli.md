@@ -17,7 +17,7 @@ from a checkout.
 
 ```text
 forge id
-forge new <name> [-d <DATABASE>] [--skip-docker] [--skip-ci] [--skip-lockfile] [--forge-path <PATH>]
+forge new <name> [-d <DATABASE>] [--api] [--skip-docker] [--skip-ci] [--skip-lockfile] [--forge-path <PATH>]
 forge generate migration <name>
 forge check
 forge test
@@ -39,24 +39,32 @@ creation time and are Forge's default identifier format
 
 ## `forge new <name>`
 
-Creates a new application in `./<name>`. `<name>` becomes the Cargo package name
+Creates a new application in `./<name>`. Like `rails new`, the application is
+full-stack: server-rendered HTML views with a layout, digested assets, Turbo
+and Stimulus through an import map, a strict Content-Security-Policy,
+CSRF-protected forms and flash messages ([Views](#views),
+[ADR 0022](adr/0022-server-rendered-views.md)). `--api` generates a JSON-only
+application instead. `<name>` becomes the Cargo package name
 and the binary name. It must be a valid Cargo package name: start with a
 lowercase ASCII letter and use only lowercase letters, digits, `-` and `_`.
 `forge new` refuses to write into an existing path.
 
 | Flag | Effect |
 | --- | --- |
+| `--api` | Generate an API-only application, like `rails new --api`: JSON handlers, no `templates/`, `assets/`, view models, Askama dependency or HTML request layers. |
 | `--skip-docker` | Do not generate `Dockerfile`, `.dockerignore` or `compose.yaml`. |
 | `--skip-ci` | Do not generate `.github/workflows/ci.yml` or `.github/dependabot.yml`. |
 | `-d`, `--database <DATABASE>` | `postgresql` (default, alias `postgres`), `mysql`, `mariadb`, `sqlite3` (alias `sqlite`) or `none`. `none` omits SQLx, migrations, database Compose services and bootstrap hooks. See [Database backends](#database-backends). |
 | `--skip-lockfile` | Do not run `cargo generate-lockfile` after generation. |
-| `--forge-path <PATH>` | Depend on a local `forge` crate by path instead of the Git tag. For framework contributors, similar to `rails new --dev`. |
+| `--forge-path <PATH>` | Depend on a local `forge` crate by path instead of the Git tag. For framework contributors, similar to `rails new --dev`. Point it at `crates/forge` of a checkout: full-stack applications also take their `forge-views` build dependency from the sibling `crates/forge-views`. |
 
 ### The `forge` dependency
 
 By default the generated `Cargo.toml` depends on `forge` from this repository at
 Git tag `v<cli version>`, so an application is created against the same
-framework version as the CLI that generated it. Until a release tag such as
+framework version as the CLI that generated it. Full-stack applications enable
+the `forge` feature `views` and add `askama` plus a build dependency on
+`forge-views` (feature `build` only, from the same tag) for `build.rs`. Until a release tag such as
 `v0.1.0` is pushed, that dependency cannot resolve. Use `--forge-path` with a
 local checkout in the meantime.
 
@@ -123,9 +131,10 @@ PostgreSQL settings for RLS policies.
 The generated security module uses Argon2id for password authentication, issues
 independent 256-bit bearer/CSRF secrets from the OS CSPRNG, persists only SHA-256
 digests, emits a Secure/HttpOnly/SameSite=Lax `__Host-forge_session` cookie,
-and enforces `x-csrf-token` on unsafe cookie-authenticated methods. These
-mechanisms are infrastructure helpers; Forge does not impose universal login or
-logout routes.
+and enforces the session-bound CSRF token on unsafe cookie-authenticated
+methods: the `x-csrf-token` header, plus the `csrf_token` form field in
+full-stack applications. These mechanisms are infrastructure helpers; Forge
+does not impose universal login or logout routes.
 
 ### Generated tree
 
@@ -140,9 +149,12 @@ shop/
 │       └── ci.yml           #   fmt check, clippy -D warnings, tests, image build
 ├── .gitattributes           # omitted with -d none; SQL migrations use LF
 ├── .gitignore
-├── build.rs                  # omitted with -d none; rebuild on migration changes
+├── assets/                  # omitted with --api; digested and embedded in the binary
+│   ├── application.css
+│   └── application.js       #   imports Turbo, starts Stimulus
+├── build.rs                  # embeds assets/ (omitted with --api); reruns on migration changes (omitted with -d none)
 ├── Cargo.lock               # omitted with --skip-lockfile (or if generation fails)
-├── Cargo.toml               # package `shop`, lib `app`, deps: forge, serde, SQLx + auth mechanism crates
+├── Cargo.toml               # package `shop`, lib `app`, deps: forge, serde, askama, SQLx + auth mechanism crates
 ├── Dockerfile               # omitted with --skip-docker
 ├── README.md
 ├── compose.yaml             # omitted with --skip-docker; 127.0.0.1:3000, stop_grace_period 20s
@@ -161,15 +173,25 @@ shop/
 │   ├── domain/
 │   ├── application/
 │   ├── adapters/
+│   │   └── http/
+│   │       ├── mod.rs       # routes; HTML handlers (JSON with --api)
+│   │       └── views/       # omitted with --api; Site, Layout, view models
 │   ├── infrastructure/
 │   └── bootstrap/
+├── templates/               # omitted with --api; Askama templates
+│   ├── layouts/
+│   │   ├── application.html
+│   │   └── _flash.html
+│   └── welcome/
+│       └── index.html
 └── tests/
     ├── architecture.rs      # ring import boundaries
-    └── container.rs         # omitted with --skip-docker; Dockerfile RUST_VERSION == toolchain
+    ├── container.rs         # omitted with --skip-docker; Dockerfile RUST_VERSION == toolchain
+    └── http.rs              # omitted with --api; layout, CSP, assets, CSRF enforcement
 ```
 
 [`examples/hello-forge`](../examples/hello-forge) is the committed
-database-free output of
+database-free, full-stack output of
 `forge new hello-forge --skip-ci -d none --skip-lockfile --forge-path ../../crates/forge`
 and is the authoritative reference for exact file contents. A golden test in
 `forge-cli` fails if generator output drifts from it. Like a real user
@@ -188,17 +210,26 @@ Notes on the generated package:
   pub fn run() -> ExitCode {
       forge::App::new(env!("CARGO_PKG_NAME"))
           .version(env!("CARGO_PKG_VERSION"))
-          .routes(crate::adapters::http::routes)
+          .compose(|composition| crate::adapters::http::routes(composition.router()))
           .run()
   }
   ```
 
+  The full-stack HTTP adapter registers through `App::compose` because loading
+  the asset table can fail at startup; `--api` applications use
+  `.routes(crate::adapters::http::routes)`.
+
 - `tests/architecture.rs` is a real test that scans source imports. It fails
   when `src/domain` imports `application`, `adapters`, `infrastructure`,
-  `bootstrap`, `forge::http`, or protocol/runtime crates such as `tokio`,
-  `hyper` or `sqlx`, and when `src/application` imports `adapters`,
-  `infrastructure`, `bootstrap` or `forge::http`
-  ([ADR 0002](adr/0002-hexagonal-boundaries.md)).
+  `bootstrap`, `forge::http`, `forge::views`, `askama`, or protocol/runtime
+  crates such as `tokio`, `hyper` or `sqlx`, and when `src/application` imports
+  `adapters`, `infrastructure`, `bootstrap`, `forge::http`, `forge::views` or
+  `askama` ([ADR 0002](adr/0002-hexagonal-boundaries.md)).
+- `tests/http.rs` (full-stack only) dispatches requests through the router
+  without a network: the welcome page is HTML with the layout, the CSP and a
+  CSRF meta tag matching the `__Host-forge_csrf` cookie; Turbo and Stimulus
+  are served digested; a form `POST` without the page's token is `403` and
+  with it reaches the handler.
 - `tests/container.rs` (generated only with the Docker assets) fails when the
   Dockerfile's `ARG RUST_VERSION` differs from the channel in
   `rust-toolchain.toml`. The builder image therefore always uses the same
@@ -210,6 +241,19 @@ Notes on the generated package:
   the database and least-privilege roles are initialized, runs a one-shot
   migration container with the migration credential, then starts the app with
   only the runtime credential. `-d none` removes those database pieces.
+
+### Views
+
+Full-stack applications follow [ADR 0022](adr/0022-server-rendered-views.md)
+and [ADR 0023](adr/0023-form-csrf-flash-and-method-override.md). The guide,
+including a walkthrough that adds a form, is [docs/views.md](views.md). In
+short: Askama templates in `templates/` are checked against view models in
+`src/adapters/http/views/` at compile time; `build.rs` embeds `assets/` with
+content digests; `Site::register` adds the asset routes and the request
+layers (strict CSP on every response, CSRF protection with the `_method`
+override, flash messages). The CSRF and flash cookies are `__Host-` cookies:
+browsers accept them on HTTPS origins and on `http://localhost` and
+`http://127.0.0.1`.
 
 ### Database backends
 

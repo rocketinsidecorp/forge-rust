@@ -160,9 +160,16 @@ Do not weaken production behavior by removing `Secure` or the `__Host-` prefix
 to make browser login work over arbitrary development HTTP. Use an HTTPS local
 proxy/origin when testing the full browser flow.
 
+Full-stack applications also set the `__Host-forge_csrf` and
+`__Host-forge_flash` cookies (same attributes, ADR 0023), so their forms need
+the same HTTPS origin; browsers make an exception for `http://localhost` and
+`http://127.0.0.1` during development. Behind a proxy, keep the browser's
+`Host` (or rely on browsers sending `Sec-Fetch-Site`): the CSRF layer refuses
+requests whose `Origin` does not name the request's `Host`.
+
 Cookie-authenticated POST/PUT/PATCH/DELETE requests must also send exactly one
-`x-csrf-token` header containing the independent CSRF token issued with the
-session. The HttpOnly bearer cookie and CSRF token are intentionally different
+`x-csrf-token` header (or, in full-stack applications, the `csrf_token` form
+field) containing the independent CSRF token issued with the session. The HttpOnly bearer cookie and CSRF token are intentionally different
 256-bit secrets. CORS credential support is not enabled implicitly; applications
 that add cross-origin credentialed requests need an exact reviewed origin
 allowlist.
