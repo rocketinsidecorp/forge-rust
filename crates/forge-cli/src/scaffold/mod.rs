@@ -16,11 +16,12 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 pub(crate) use render::Backend;
+pub(crate) use render::File;
 pub(crate) use spec::Scope;
 
 use crate::CliError;
 use crate::generate::write_new_file;
-use render::{ACCESS_PATH, File};
+use render::ACCESS_PATH;
 use spec::Resource;
 
 /// Arguments of `forge generate scaffold`.
@@ -95,7 +96,7 @@ pub(crate) fn generate(
 /// Formats generated Rust with the application's pinned `rustfmt` (edition
 /// 2024, the application's `rustfmt.toml` if any), exactly as
 /// `cargo fmt` will. A formatter failure aborts before anything is written.
-fn rustfmt(root: &Path, path: &str, source: &str) -> Result<String, CliError> {
+pub(crate) fn rustfmt(root: &Path, path: &str, source: &str) -> Result<String, CliError> {
     let failed = |detail: String| {
         CliError::Scaffold(format!(
             "rustfmt could not format the generated {path}: {detail} (rustfmt is a component \
@@ -270,7 +271,7 @@ fn refuse_collisions(root: &Path, resource: &Resource, files: &[File]) -> Result
 
 /// Writes every file with create-new semantics. On failure, removes the
 /// files and directories this call created, so nothing is half generated.
-fn write_all(root: &Path, files: &[File]) -> Result<(), CliError> {
+pub(crate) fn write_all(root: &Path, files: &[File]) -> Result<(), CliError> {
     let mut written: Vec<PathBuf> = Vec::new();
     let mut directories: Vec<PathBuf> = Vec::new();
     let result = files.iter().try_for_each(|file| {
@@ -347,10 +348,19 @@ fn wiring(
         "std::sync::Arc::new(crate::adapters::http::access::DenyAll)"
     } else if backend == Backend::Postgresql {
         code.push_str(&format!(
-            "    // {plural}: tenant-scoped, under /tenants/{{tenant_id}}/{plural}. Grant\n    \
-             // {plural}:read and {plural}:write to tenant roles in `policy`; RBAC denies\n    \
-             // everything else.\n    \
-             let policy = forge::security::RbacPolicy::new();\n    \
+            "    // {plural}: tenant-scoped, under /tenants/{{tenant_id}}/{plural}. RBAC denies\n    \
+             // every role `policy` does not name: the `owner` role (`setup` gives it to\n    \
+             // the first member) may read and write; grant other tenant roles here.\n    \
+             let mut policy = forge::security::RbacPolicy::new();\n    \
+             let owner = forge::security::Role::new(\"owner\").map_err(forge::ComposeError::other)?;\n    \
+             for permission in [\n        \
+             crate::application::use_cases::{plural}::READ_PERMISSION,\n        \
+             crate::application::use_cases::{plural}::WRITE_PERMISSION,\n    \
+             ] {{\n        \
+             let permission =\n            \
+             forge::security::Permission::new(permission).map_err(forge::ComposeError::other)?;\n        \
+             policy.allow(owner.clone(), permission);\n    \
+             }}\n    \
              let pool = composition.postgres()?.pool().clone();\n    \
              let access = crate::adapters::http::access::SessionTenantAccess::new(\n        \
              std::sync::Arc::new(crate::infrastructure::auth::PostgresSessionStore::new(\n            \
@@ -405,18 +415,20 @@ fn wiring(
     if backend == Backend::Postgresql && tenant {
         out.push_str(&format!(
             "  Permissions match exactly: index and show need `{plural}:read`, new, create,\n  \
-             edit, update and delete need `{plural}:write`, so a role that edits needs\n  \
-             both. To allow a tenant role, make `policy` mutable and add, for example:\n\n    \
-             let editor = forge::security::Role::new(\"editor\").map_err(forge::ComposeError::other)?;\n    \
-             for permission in [\n        \
-             crate::application::use_cases::{plural}::READ_PERMISSION,\n        \
-             crate::application::use_cases::{plural}::WRITE_PERMISSION,\n    \
-             ] {{\n        \
-             let permission =\n            \
-             forge::security::Permission::new(permission).map_err(forge::ComposeError::other)?;\n        \
-             policy.allow(editor.clone(), permission);\n    \
-             }}\n"
+             edit, update and delete need `{plural}:write`. Signed-out browsers are sent\n  \
+             to /session/new (the sign-in pages of `forge new` or\n  \
+             `forge generate authentication`). To allow a read-only tenant role, add after\n  \
+             `let mut policy`, for example:\n\n"
         ));
+        let example = format!(
+            "    let viewer = forge::security::Role::new(\"viewer\").map_err(forge::ComposeError::other)?;\n    \
+             let read = forge::security::Permission::new(\n        \
+             crate::application::use_cases::{plural}::READ_PERMISSION,\n    \
+             )\n    \
+             .map_err(forge::ComposeError::other)?;\n    \
+             policy.allow(viewer, read);\n"
+        );
+        out.push_str(&format_statements(root, &example)?);
     }
     out.push_str(
         "\n  Then apply the migration (`cargo run -- migrate` with FORGE_MIGRATION_DATABASE_URL)\n  \

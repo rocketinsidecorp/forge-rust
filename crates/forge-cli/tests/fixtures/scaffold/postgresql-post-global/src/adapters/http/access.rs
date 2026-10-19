@@ -10,12 +10,20 @@
 //!   authenticates the `__Host-forge_session` cookie, enforces the
 //!   session-bound CSRF token on unsafe methods, loads the membership of the
 //!   tenant in the route (`/tenants/{tenant_id}/...`) and evaluates the RBAC
-//!   policy, producing an authorized [`TenantContext`].
+//!   policy, producing an authorized [`TenantContext`]. The printed wiring
+//!   grants the `owner` role (the role `setup` gives the first member) every
+//!   permission of the resource; other roles are denied until granted.
 //! - Global resources use a [`GlobalAccess`]. Their rows are shared by every
 //!   tenant, so tenant roles cannot authorize them. Implement
 //!   [`GlobalAccess`] with your own rule (for example signed-in operators)
 //!   and replace [`DenyAll`] in `src/bootstrap/mod.rs`; that replacement is
 //!   the explicit decision to open the routes.
+//!
+//! A refused request without a valid session answers `401`. In applications
+//! with the sign-in pages (`forge new` on PostgreSQL, or
+//! `forge generate authentication`), the `SignInRedirect` layer turns that
+//! `401` into a `303` to `/session/new?return_to=...` for browsers; JSON
+//! clients keep the `401`.
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -31,7 +39,8 @@ use crate::infrastructure::security::{RequestAuthError, authenticate_request, en
 /// Why a request was refused. The response never says which proof failed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AccessDenied {
-    /// No valid session: `401 Unauthorized`.
+    /// No valid session: `401 Unauthorized` (browsers are redirected to the
+    /// sign-in page by `SignInRedirect` when the application has one).
     Unauthenticated,
     /// Authenticated but not allowed (or no tenant membership): `403 Forbidden`.
     Forbidden,

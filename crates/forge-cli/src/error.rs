@@ -20,6 +20,9 @@ pub enum CliError {
     Clock(std::time::SystemTimeError),
     /// `forge generate scaffold` refused the request; nothing was written.
     Scaffold(String),
+    /// `forge generate authentication` refused the request; nothing was
+    /// written.
+    Authentication(String),
     DestinationExists(PathBuf),
     CreateDirectory {
         path: PathBuf,
@@ -62,6 +65,9 @@ impl fmt::Display for CliError {
                 write!(formatter, "system clock is before the Unix epoch: {error}")
             }
             Self::Scaffold(reason) => write!(formatter, "cannot generate the scaffold: {reason}"),
+            Self::Authentication(reason) => {
+                write!(formatter, "cannot generate authentication: {reason}")
+            }
             Self::DestinationExists(path) => write!(
                 formatter,
                 "destination `{}` already exists; refusing to overwrite it",
@@ -98,6 +104,7 @@ impl std::error::Error for CliError {
             | Self::InvalidForgePath { .. }
             | Self::InvalidMigrationName { .. }
             | Self::Scaffold(_)
+            | Self::Authentication(_)
             | Self::DestinationExists(_)
             | Self::CargoFailed { .. } => None,
         }

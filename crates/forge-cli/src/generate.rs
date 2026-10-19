@@ -306,6 +306,42 @@ const TEMPLATES: &[Template] = &[
     template!(Group::Ci, ".github/dependabot.yml" => "github/dependabot.yml.tmpl"),
 ];
 
+/// The files of the sign-in pages and `setup` (ADR 0026), exactly as
+/// `forge new` writes them for a full-stack PostgreSQL application.
+pub(crate) fn authentication_files() -> Vec<(&'static str, String)> {
+    TEMPLATES
+        .iter()
+        .filter(|template| template.group == Group::Authentication)
+        .map(|template| {
+            (
+                template.path,
+                render(template.content, &[], AUTHENTICATION_CONDITIONS),
+            )
+        })
+        .collect()
+}
+
+/// The statements `forge new` puts at the end of `compose` to wire the
+/// sign-in pages, from the comment that introduces them to the call of
+/// `authentication::routes`.
+pub(crate) fn authentication_compose_statements() -> Option<String> {
+    let bootstrap = TEMPLATES
+        .iter()
+        .find(|template| template.path == "src/bootstrap/mod.rs")?;
+    let rendered = render(bootstrap.content, &[], AUTHENTICATION_CONDITIONS);
+    let start = rendered.find("    // Sign-in, sign-out")?;
+    let call =
+        "crate::adapters::http::authentication::routes(composition.router(), &site, ports)?;\n";
+    let end = start + rendered[start..].find(call)? + call.len();
+    Some(rendered[start..end].to_owned())
+}
+
+const AUTHENTICATION_CONDITIONS: Conditions = Conditions {
+    docker: false,
+    database: Database::Postgresql,
+    views: true,
+};
+
 /// Modules that exist to make each ring's responsibilities discoverable.
 /// Each is a documented, empty module until a feature needs it.
 const RESERVED_MODULES: &[(&str, &str)] = &[

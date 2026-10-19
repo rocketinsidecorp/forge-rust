@@ -1,5 +1,6 @@
 //! Command-line tooling for creating and maintaining Forge applications.
 
+mod authentication;
 mod cargo;
 mod cli;
 mod error;
@@ -75,6 +76,14 @@ fn execute(
             Ok(())
         }
         Command::Generate { generator } => match generator {
+            GenerateCommand::Authentication { dry_run } => {
+                let outcome = authentication::generate(current_dir, dry_run)?;
+                let verb = if dry_run { "would create" } else { "create" };
+                for path in &outcome.created {
+                    writeln!(output, "  {verb:<12} {path}").map_err(CliError::Output)?;
+                }
+                write!(output, "{}", outcome.wiring).map_err(CliError::Output)
+            }
             GenerateCommand::Migration { name } => {
                 let (up, down) = generate::create_migration(current_dir, &name)?;
                 writeln!(

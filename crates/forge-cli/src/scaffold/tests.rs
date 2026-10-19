@@ -288,7 +288,24 @@ fn wiring_is_printed_and_never_written() {
     assert!(!second.wiring.contains("pub mod access;"));
     assert!(second.wiring.contains("SessionTenantAccess::new("));
     assert!(second.wiring.contains("PgMembershipStore::new(pool)"));
-    // RBAC matches exactly: the example grants both permissions.
+    // RBAC matches exactly: the owner `setup` creates gets both permissions,
+    // and nothing else is granted.
+    assert!(
+        second
+            .wiring
+            .contains("let mut policy = forge::security::RbacPolicy::new();")
+    );
+    assert!(
+        second
+            .wiring
+            .contains("forge::security::Role::new(\"owner\")")
+    );
+    assert!(
+        second
+            .wiring
+            .contains("policy.allow(owner.clone(), permission);")
+    );
+    assert!(second.wiring.contains("policy.allow(viewer, read);"));
     assert!(second.wiring.contains("use_cases::events::READ_PERMISSION"));
     assert!(
         second
