@@ -141,17 +141,34 @@ fn apply_wiring(root: &Path, printed: &str) {
         fs::write(&path, lines.join("\n") + "\n").unwrap_or_else(|error| panic!("{error}"));
     }
 
+    // The grant example printed for PostgreSQL tenant resources, applied
+    // too, so it is proven to compile.
+    let mut grant = Vec::new();
+    let mut in_example = false;
+    for line in printed.lines() {
+        if line.contains("make `policy` mutable and add, for example:") {
+            in_example = true;
+        } else if in_example && line.starts_with("    ") {
+            grant.push(line.to_owned());
+        } else if in_example && !grant.is_empty() {
+            break;
+        }
+    }
+    let policy = "    let policy = forge::security::RbacPolicy::new();\n";
+    let statements = statements.join("\n").replace(
+        policy,
+        &format!(
+            "    let mut policy = forge::security::RbacPolicy::new();\n{}\n",
+            grant.join("\n")
+        ),
+    );
+
     let bootstrap = root.join("src/bootstrap/mod.rs");
     let source = fs::read_to_string(&bootstrap).unwrap_or_else(|error| panic!("{error}"));
     let end = source
         .rfind("    Ok(())\n}\n")
         .unwrap_or_else(|| panic!("compose ends with Ok(()):\n{source}"));
-    let wired = format!(
-        "{}{}\n{}",
-        &source[..end],
-        statements.join("\n"),
-        &source[end..]
-    );
+    let wired = format!("{}{statements}\n{}", &source[..end], &source[end..]);
     fs::write(&bootstrap, wired).unwrap_or_else(|error| panic!("{error}"));
 }
 
@@ -251,6 +268,14 @@ fn sqlite_application_with_scaffolds_passes_its_gates() {
         "sqlite_round_trip_locking_and_pages ... ok",
         "blank_and_too_long_text_is_rejected_with_every_violation ... ok",
         "rings_respect_dependency_direction ... ok",
+        "sub_second_timestamps_are_refused_and_edit_forms_show_whole_seconds ... ok",
+        "use_cases_check_the_grant_of_the_tenant_context ... ok",
+        "an_active_member_with_the_grant_is_authorized_for_its_tenant ... ok",
+        "a_missing_or_unknown_session_is_unauthenticated ... ok",
+        "unsafe_methods_need_the_session_csrf_token ... ok",
+        "another_tenant_or_a_malformed_tenant_is_forbidden ... ok",
+        "a_suspended_membership_is_forbidden ... ok",
+        "a_role_without_the_grant_is_forbidden ... ok",
     ] {
         assert!(tests.contains(test), "{test}\n{tests}");
     }

@@ -11,13 +11,25 @@ use app::adapters::http::access::{AccessDenied, DenyAll, %%ACCESS_TRAIT%%};
 use app::application::ports::%%RESOURCE%%_repository::{
     %%TYPE%%Page, %%TYPE%%Repository, %%TYPE%%StoreError,
 };
+%%if tenant%%
+use app::application::use_cases::%%RESOURCES%%::{
+    READ_PERMISSION, WRITE_PERMISSION, %%TYPE%%Error, %%TYPE%%Service,
+};
+%%end%%
+%%if global%%
 use app::application::use_cases::%%RESOURCES%%::%%TYPE%%Service;
+%%end%%
+%%if http_attributes%%
+use app::domain::entities::%%RESOURCE%%::{%%TYPE%%, %%TYPE%%Attributes, %%TYPE%%Id};
+%%end%%
+%%if !http_attributes%%
 use app::domain::entities::%%RESOURCE%%::{%%TYPE%%, %%TYPE%%Id};
+%%end%%
 use async_trait::async_trait;
 %%if tenant%%
 use forge::auth::{Session, UnixTimestamp};
 %%end%%
-use forge::core::Version;
+use forge::core::%%HTTP_TEST_CORE_IMPORTS%%;
 use forge::http::{HeaderMap, HeaderValue, Method, Request, Response, Router, StatusCode, header};
 use forge::security::Permission;
 %%if tenant%%
@@ -35,6 +47,11 @@ const SHOWN: &str = "%%SHOWN_VALUE%%";
 /// Text of the error shown for [`invalid`].
 const INVALID_MESSAGE: &str = "%%INVALID_MESSAGE%%";
 
+%%if timestamp%%
+/// [`VALID`] with a timestamp that has a fraction of a second.
+const SUBSECOND: &str = "%%SUBSECOND_FORM%%";
+
+%%end%%
 /// A form body with one value that breaks a rule.
 fn invalid() -> String {
     %%INVALID_FORM%%
@@ -223,10 +240,25 @@ fn member_context(
 }
 %%end%%
 
-/// The router of the application with only the %%NOUN%% routes, and the
-/// path of the collection.
+%%if http_attributes%%
+/// Valid attributes, with sub-second timestamps where there are any.
+fn attributes() -> Result<%%TYPE%%Attributes, Box<dyn Error>> {
+    Ok(%%TYPE%%Attributes {
+%%TEST_ATTRIBUTES%%
+    })
+}
+
+%%end%%
+/// The router of the application with only the %%NOUN%% routes, its
+/// repository and the path of the collection.
 struct Harness {
     router: Router,
+%%if timestamp%%
+    repository: Arc<InMemory%%TYPES%%>,
+%%if tenant%%
+    tenant: TenantId,
+%%end%%
+%%end%%
     collection: String,
 }
 
@@ -238,16 +270,26 @@ impl Harness {
         app::adapters::http::%%RESOURCES%%::routes(
             &mut router,
             &site,
-            %%TYPE%%Service::new(repository),
+            %%TYPE%%Service::new(Arc::<InMemory%%TYPES%%>::clone(&repository)),
             access,
         )?;
 %%if tenant%%
-        let collection = format!("/tenants/{}/%%RESOURCES%%", TenantId::new());
+        let tenant = TenantId::new();
+        let collection = format!("/tenants/{tenant}/%%RESOURCES%%");
 %%end%%
 %%if global%%
         let collection = "/%%RESOURCES%%".to_owned();
 %%end%%
-        Ok(Self { router, collection })
+        Ok(Self {
+            router,
+%%if timestamp%%
+            repository,
+%%if tenant%%
+            tenant,
+%%end%%
+%%end%%
+            collection,
+        })
     }
 
     fn allowing() -> Result<Self, Box<dyn Error>> {
@@ -455,12 +497,13 @@ async fn unknown_and_malformed_ids_are_not_found() -> TestResult {
 async fn the_generated_deny_all_default_refuses_every_page() -> TestResult {
     let harness = Harness::new(Arc::new(DenyAll))?;
     let id = %%TYPE%%Id::new();
+    let member = format!("{}/{id}", harness.collection);
 
     for path in [
         harness.collection.clone(),
         format!("{}/new", harness.collection),
-        format!("{}/{id}", harness.collection),
-        format!("{}/{id}/edit", harness.collection),
+        member.clone(),
+        format!("{member}/edit"),
     ] {
         assert_eq!(
             harness.get(&path).await?.status(),
@@ -468,5 +511,91 @@ async fn the_generated_deny_all_default_refuses_every_page() -> TestResult {
             "{path}"
         );
     }
+
+    // CSRF protection is a double-submit check, so any well-formed token in
+    // both the cookie and the form passes it: the allowing router accepts
+    // this one, and the 403s below therefore come from DenyAll.
+    let token = "ab".repeat(32);
+    let allowing = Harness::allowing()?;
+    let accepted = allowing.submit(&allowing.collection, &token, VALID).await?;
+    assert_eq!(accepted.status(), StatusCode::SEE_OTHER);
+    let edit = format!("{VALID}&_method=patch&version=1");
+    for (path, form) in [
+        (harness.collection.as_str(), VALID),
+        (member.as_str(), edit.as_str()),
+        (member.as_str(), "_method=put&version=1"),
+        (member.as_str(), "_method=delete&version=1"),
+    ] {
+        let refused = harness.submit(path, &token, form).await?;
+        assert_eq!(refused.status(), StatusCode::FORBIDDEN, "{path} {form}");
+        assert!(set_cookie(&refused, "__Host-forge_flash").is_none());
+    }
     Ok(())
 }
+%%if timestamp%%
+
+/// Browsers blank a `datetime-local` value with more than three fractional
+/// digits, so forms render whole seconds and refuse anything finer: editing
+/// a record never loses or changes a timestamp silently.
+#[tokio::test]
+async fn sub_second_timestamps_are_refused_and_edit_forms_show_whole_seconds() -> TestResult {
+    let harness = Harness::allowing()?;
+    let token = harness.csrf_token().await?;
+
+    let refused = harness
+        .submit(&harness.collection, &token, SUBSECOND)
+        .await?;
+    assert_eq!(refused.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(body(&refused)?.contains("whole seconds"));
+
+    let stored = %%TYPE%%::new(attributes()?)?;
+%%if tenant%%
+    let context = member_context(harness.tenant, &Permission::new(WRITE_PERMISSION)?)?;
+    harness.repository.insert(&context, &stored).await?;
+%%end%%
+%%if global%%
+    harness.repository.insert(&stored).await?;
+%%end%%
+    let edit = harness
+        .get(&format!("{}/{}/edit", harness.collection, stored.id()))
+        .await?;
+    let page = body(&edit)?;
+    assert_eq!(edit.status(), StatusCode::OK);
+    assert!(page.contains("value=\"2026-01-02T03:04:05\""), "{page}");
+    assert!(!page.contains(".123456"), "{page}");
+    Ok(())
+}
+%%end%%
+%%if tenant%%
+
+/// The HTTP layer asks `%%RESOURCES%%:read` for the index and show pages; the
+/// use cases agree: listing needs the read grant, loading one %%NOUN%% also
+/// accepts the write grant (edit and update load the %%NOUN%% they change),
+/// and changes need the write grant.
+#[tokio::test]
+async fn use_cases_check_the_grant_of_the_tenant_context() -> TestResult {
+    let service = %%TYPE%%Service::new(Arc::new(InMemory%%TYPES%%::default()));
+    let tenant = TenantId::new();
+    let writer = member_context(tenant, &Permission::new(WRITE_PERMISSION)?)?;
+    let reader = member_context(tenant, &Permission::new(READ_PERMISSION)?)?;
+
+    let created = service.create(&writer, attributes()?).await?;
+
+    assert!(matches!(
+        service.list(&writer, None).await,
+        Err(%%TYPE%%Error::Forbidden)
+    ));
+    assert_eq!(service.list(&reader, None).await?.%%RESOURCES%%.len(), 1);
+    assert_eq!(service.find(&reader, created.id()).await?.id(), created.id());
+    assert_eq!(service.find(&writer, created.id()).await?.id(), created.id());
+    assert!(matches!(
+        service.create(&reader, attributes()?).await,
+        Err(%%TYPE%%Error::Forbidden)
+    ));
+    assert!(matches!(
+        service.delete(&reader, created.id(), created.version()).await,
+        Err(%%TYPE%%Error::Forbidden)
+    ));
+    Ok(())
+}
+%%end%%

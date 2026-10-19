@@ -55,9 +55,15 @@ either habit:
      token (ADR 0014, in addition to the form CSRF layer of ADR 0023), the
      principal must have an active membership in the route's tenant, and the
      RBAC policy must grant the permission. The printed policy is empty, so
-     nothing is allowed until roles are granted. The use cases re-check that
-     the `TenantContext` grant belongs to the resource, and links are built
-     from the authorized tenant, never from the raw path.
+     nothing is allowed until roles are granted; because RBAC matches
+     permissions exactly, the printed example grants a role both
+     `<plural>:read` and `<plural>:write`. The use cases re-check the
+     `TenantContext` grant with the same rules as the routes: listing needs
+     read, changes need write, and loading one record accepts either,
+     because the edit and update pages load the record they change under the
+     write grant (a write grant alone still cannot list or show through
+     HTTP). Links are built from the authorized tenant, never from the raw
+     path.
    - On MySQL, MariaDB and SQLite, which have no Forge session or membership
      persistence yet (ADR 0021 section 7), tenant-scoped resources are wired
      with `DenyAll` and the printed comment says why.
@@ -71,7 +77,9 @@ either habit:
    submitted values and the current version on a stale update); identifiers
    are quoted.
 5. **Forge-owned value types.** `forge::core::Timestamp` (UTC, microseconds,
-   RFC 3339 and HTML `datetime-local` text) and the re-exported
+   RFC 3339 and HTML `datetime-local` text; forms render and accept whole
+   seconds only, because browsers blank values with more than three
+   fractional digits) and the re-exported
    `forge::core::Uuid` are the domain types of `timestamp` and `uuid` fields;
    repositories convert with chrono only inside infrastructure. Ports define
    their own typed error (`<Type>StoreError`) because the application ring

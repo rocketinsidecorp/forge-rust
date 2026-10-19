@@ -167,3 +167,350 @@ fn denied(error: RequestAuthError) -> AccessDenied {
         RequestAuthError::AuthenticationUnavailable => AccessDenied::Unavailable,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! `SessionTenantAccess` with in-memory session and membership stores:
+    //! every proof it requires is checked separately.
+
+    use std::error::Error;
+    use std::sync::Mutex;
+
+    use forge::auth::{
+        CsrfTokenDigest, Session, SessionCredentialDigest, SessionId, SessionStoreError,
+    };
+    use forge::http::{HeaderMap, HeaderValue, Method, Router};
+    use forge::security::{PrincipalId, Role};
+    use forge::tenancy::{
+        Membership, MembershipState, MembershipStoreError, MembershipStoreErrorKind,
+    };
+
+    use super::*;
+    use crate::infrastructure::security::{SESSION_COOKIE_NAME, issue_session_secrets};
+
+    type TestResult = Result<(), Box<dyn Error>>;
+
+    const PERMISSION: &str = "probes:write";
+
+    #[derive(Default)]
+    struct Sessions {
+        rows: Mutex<Vec<(Session, SessionCredentialDigest, CsrfTokenDigest)>>,
+    }
+
+    #[async_trait]
+    impl SessionStore for Sessions {
+        async fn insert(
+            &self,
+            session: &Session,
+            credential: &SessionCredentialDigest,
+            csrf: &CsrfTokenDigest,
+        ) -> Result<(), SessionStoreError> {
+            self.rows
+                .lock()
+                .map_err(|_| SessionStoreError::Unavailable)?
+                .push((session.clone(), *credential, *csrf));
+            Ok(())
+        }
+
+        async fn find_by_credential(
+            &self,
+            credential: &SessionCredentialDigest,
+        ) -> Result<Option<Session>, SessionStoreError> {
+            Ok(self
+                .rows
+                .lock()
+                .map_err(|_| SessionStoreError::Unavailable)?
+                .iter()
+                .find(|(_, stored, _)| stored == credential)
+                .map(|(session, _, _)| session.clone()))
+        }
+
+        async fn verify_csrf(
+            &self,
+            session_id: SessionId,
+            csrf: &CsrfTokenDigest,
+        ) -> Result<bool, SessionStoreError> {
+            Ok(self
+                .rows
+                .lock()
+                .map_err(|_| SessionStoreError::Unavailable)?
+                .iter()
+                .any(|(session, _, stored)| session.id() == session_id && stored == csrf))
+        }
+
+        async fn revoke(&self, _: SessionId, _: UnixTimestamp) -> Result<(), SessionStoreError> {
+            Err(SessionStoreError::Unavailable)
+        }
+
+        async fn rotate(
+            &self,
+            _: SessionId,
+            _: UnixTimestamp,
+            _: &Session,
+            _: &SessionCredentialDigest,
+            _: &CsrfTokenDigest,
+        ) -> Result<(), SessionStoreError> {
+            Err(SessionStoreError::Unavailable)
+        }
+    }
+
+    #[derive(Default)]
+    struct Memberships {
+        rows: Mutex<Vec<Membership>>,
+    }
+
+    fn unavailable() -> MembershipStoreError {
+        MembershipStoreError::new(MembershipStoreErrorKind::Unavailable, "unavailable", true)
+    }
+
+    #[async_trait]
+    impl MembershipStore for Memberships {
+        async fn find(
+            &self,
+            tenant_id: TenantId,
+            principal_id: PrincipalId,
+        ) -> Result<Option<Membership>, MembershipStoreError> {
+            Ok(self
+                .rows
+                .lock()
+                .map_err(|_| unavailable())?
+                .iter()
+                .find(|membership| {
+                    membership.tenant_id() == tenant_id && membership.principal_id() == principal_id
+                })
+                .cloned())
+        }
+
+        async fn upsert(&self, membership: &Membership) -> Result<(), MembershipStoreError> {
+            self.rows
+                .lock()
+                .map_err(|_| unavailable())?
+                .push(membership.clone());
+            Ok(())
+        }
+
+        async fn suspend(&self, _: TenantId, _: PrincipalId) -> Result<(), MembershipStoreError> {
+            Err(unavailable())
+        }
+    }
+
+    /// One signed-in principal with a membership in `tenant`, and a router
+    /// whose `/tenants/{tenant_id}/probe` answers 200 only when
+    /// `SessionTenantAccess` grants `probes:write`.
+    struct Fixture {
+        router: Router,
+        tenant: TenantId,
+        bearer: String,
+        csrf: String,
+    }
+
+    async fn fixture(state: MembershipState, granted: bool) -> Result<Fixture, Box<dyn Error>> {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+        let principal = PrincipalId::new();
+        let session = Session::new(
+            principal,
+            UnixTimestamp::from_secs(now - 60),
+            UnixTimestamp::from_secs(now + 3_600),
+        )?;
+        let secrets = issue_session_secrets()?;
+        let sessions = Arc::new(Sessions::default());
+        sessions
+            .insert(&session, &secrets.bearer_digest, &secrets.csrf_digest)
+            .await?;
+
+        let tenant = TenantId::new();
+        let role = Role::new("member")?;
+        let memberships = Arc::new(Memberships::default());
+        memberships
+            .upsert(&Membership::restore(
+                tenant,
+                principal,
+                vec![role.clone()],
+                state,
+            ))
+            .await?;
+
+        let permission = Permission::new(PERMISSION)?;
+        let mut policy = RbacPolicy::new();
+        if granted {
+            policy.allow(role, permission.clone());
+        }
+        let access = Arc::new(SessionTenantAccess::new(sessions, memberships, policy));
+        let mut router = Router::new();
+        for method in [Method::GET, Method::POST] {
+            let access = Arc::clone(&access);
+            let permission = permission.clone();
+            router.route(
+                method,
+                "/tenants/{tenant_id}/probe",
+                move |request: Request| {
+                    let access = Arc::clone(&access);
+                    let permission = permission.clone();
+                    async move {
+                        match access.authorize(&request, &permission).await {
+                            Ok(context) => {
+                                Response::new(StatusCode::OK, context.tenant_id().to_string())
+                            }
+                            Err(denied) => denied.response(),
+                        }
+                    }
+                },
+            )?;
+        }
+        Ok(Fixture {
+            router,
+            tenant,
+            bearer: secrets.bearer.expose().to_owned(),
+            csrf: secrets.csrf.expose().to_owned(),
+        })
+    }
+
+    impl Fixture {
+        async fn status(
+            &self,
+            method: Method,
+            tenant: &str,
+            bearer: Option<&str>,
+            csrf: Option<&str>,
+        ) -> Result<StatusCode, Box<dyn Error>> {
+            let mut headers = HeaderMap::new();
+            if let Some(bearer) = bearer {
+                headers.insert(
+                    "cookie",
+                    HeaderValue::from_str(&format!("{SESSION_COOKIE_NAME}={bearer}"))?,
+                );
+            }
+            if let Some(csrf) = csrf {
+                headers.insert("x-csrf-token", HeaderValue::from_str(csrf)?);
+            }
+            let request = Request::new_for_test(
+                method,
+                format!("/tenants/{tenant}/probe").parse()?,
+                headers,
+                String::new().into(),
+                "127.0.0.1:4000".parse()?,
+                forge::core::Id::<Request>::new().into_uuid(),
+            );
+            Ok(self.router.dispatch(request).await.status())
+        }
+
+        fn tenant(&self) -> String {
+            self.tenant.to_string()
+        }
+    }
+
+    #[tokio::test]
+    async fn an_active_member_with_the_grant_is_authorized_for_its_tenant() -> TestResult {
+        let fixture = fixture(MembershipState::Active, true).await?;
+        let tenant = fixture.tenant();
+        let bearer = Some(fixture.bearer.as_str());
+        let csrf = Some(fixture.csrf.as_str());
+
+        assert_eq!(
+            fixture.status(Method::GET, &tenant, bearer, None).await?,
+            StatusCode::OK
+        );
+        assert_eq!(
+            fixture.status(Method::POST, &tenant, bearer, csrf).await?,
+            StatusCode::OK
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_missing_or_unknown_session_is_unauthenticated() -> TestResult {
+        let fixture = fixture(MembershipState::Active, true).await?;
+        let tenant = fixture.tenant();
+        let unknown = "ab".repeat(32);
+
+        for bearer in [None, Some(unknown.as_str()), Some("not-a-token")] {
+            assert_eq!(
+                fixture.status(Method::GET, &tenant, bearer, None).await?,
+                StatusCode::UNAUTHORIZED,
+                "{bearer:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unsafe_methods_need_the_session_csrf_token() -> TestResult {
+        let fixture = fixture(MembershipState::Active, true).await?;
+        let tenant = fixture.tenant();
+        let bearer = Some(fixture.bearer.as_str());
+        let other = "cd".repeat(32);
+
+        for csrf in [None, Some(other.as_str()), Some("not-a-token")] {
+            assert_eq!(
+                fixture.status(Method::POST, &tenant, bearer, csrf).await?,
+                StatusCode::FORBIDDEN,
+                "{csrf:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn another_tenant_or_a_malformed_tenant_is_forbidden() -> TestResult {
+        let fixture = fixture(MembershipState::Active, true).await?;
+        let bearer = Some(fixture.bearer.as_str());
+
+        for tenant in [TenantId::new().to_string(), "not-a-tenant".to_owned()] {
+            assert_eq!(
+                fixture.status(Method::GET, &tenant, bearer, None).await?,
+                StatusCode::FORBIDDEN,
+                "{tenant}"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_suspended_membership_is_forbidden() -> TestResult {
+        let fixture = fixture(MembershipState::Suspended, true).await?;
+        let tenant = fixture.tenant();
+
+        let status = fixture
+            .status(Method::GET, &tenant, Some(fixture.bearer.as_str()), None)
+            .await?;
+
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_role_without_the_grant_is_forbidden() -> TestResult {
+        let fixture = fixture(MembershipState::Active, false).await?;
+        let tenant = fixture.tenant();
+
+        let status = fixture
+            .status(Method::GET, &tenant, Some(fixture.bearer.as_str()), None)
+            .await?;
+
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn deny_all_refuses_both_kinds_of_resource() -> TestResult {
+        let request = Request::new_for_test(
+            Method::GET,
+            "/".parse()?,
+            HeaderMap::new(),
+            String::new().into(),
+            "127.0.0.1:4000".parse()?,
+            forge::core::Id::<Request>::new().into_uuid(),
+        );
+        let permission = Permission::new(PERMISSION)?;
+
+        assert_eq!(
+            GlobalAccess::authorize(&DenyAll, &request, &permission).await,
+            Err(AccessDenied::Forbidden)
+        );
+        assert!(matches!(
+            TenantAccess::authorize(&DenyAll, &request, &permission).await,
+            Err(AccessDenied::Forbidden)
+        ));
+        Ok(())
+    }
+}

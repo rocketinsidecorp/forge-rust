@@ -112,8 +112,8 @@ impl GlobalAccess for AllowAll {
     }
 }
 
-/// The router of the application with only the post routes, and the
-/// path of the collection.
+/// The router of the application with only the post routes, its
+/// repository and the path of the collection.
 struct Harness {
     router: Router,
     collection: String,
@@ -127,7 +127,7 @@ impl Harness {
         app::adapters::http::posts::routes(
             &mut router,
             &site,
-            PostService::new(repository),
+            PostService::new(Arc::<InMemoryPosts>::clone(&repository)),
             access,
         )?;
         let collection = "/posts".to_owned();
@@ -344,18 +344,38 @@ async fn unknown_and_malformed_ids_are_not_found() -> TestResult {
 async fn the_generated_deny_all_default_refuses_every_page() -> TestResult {
     let harness = Harness::new(Arc::new(DenyAll))?;
     let id = PostId::new();
+    let member = format!("{}/{id}", harness.collection);
 
     for path in [
         harness.collection.clone(),
         format!("{}/new", harness.collection),
-        format!("{}/{id}", harness.collection),
-        format!("{}/{id}/edit", harness.collection),
+        member.clone(),
+        format!("{member}/edit"),
     ] {
         assert_eq!(
             harness.get(&path).await?.status(),
             StatusCode::FORBIDDEN,
             "{path}"
         );
+    }
+
+    // CSRF protection is a double-submit check, so any well-formed token in
+    // both the cookie and the form passes it: the allowing router accepts
+    // this one, and the 403s below therefore come from DenyAll.
+    let token = "ab".repeat(32);
+    let allowing = Harness::allowing()?;
+    let accepted = allowing.submit(&allowing.collection, &token, VALID).await?;
+    assert_eq!(accepted.status(), StatusCode::SEE_OTHER);
+    let edit = format!("{VALID}&_method=patch&version=1");
+    for (path, form) in [
+        (harness.collection.as_str(), VALID),
+        (member.as_str(), edit.as_str()),
+        (member.as_str(), "_method=put&version=1"),
+        (member.as_str(), "_method=delete&version=1"),
+    ] {
+        let refused = harness.submit(path, &token, form).await?;
+        assert_eq!(refused.status(), StatusCode::FORBIDDEN, "{path} {form}");
+        assert!(set_cookie(&refused, "__Host-forge_flash").is_none());
     }
     Ok(())
 }

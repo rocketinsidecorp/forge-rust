@@ -196,6 +196,9 @@ impl<'a> Renderer<'a> {
                 .iter()
                 .any(|field| field.kind.is_textual()),
             "timestamp" => self.has(FieldType::Timestamp),
+            // The HTTP tests build attributes for the tenant grant test and
+            // the sub-second timestamp test.
+            "http_attributes" => self.tenant() || self.has(FieldType::Timestamp),
             _ => false,
         };
         let variables: Vec<(&str, &str)> = self
@@ -347,6 +350,14 @@ impl<'a> Renderer<'a> {
             ("%%CORE_IMPORTS%%", core.join(", ")),
             ("%%REPOSITORY_CORE_IMPORTS%%", use_list(&repository_core)),
             ("%%HTTP_CORE_IMPORTS%%", http_core.join(", ")),
+            (
+                "%%HTTP_TEST_CORE_IMPORTS%%",
+                if self.tenant() || self.has(FieldType::Timestamp) {
+                    use_list(&test_core)
+                } else {
+                    "Version".to_owned()
+                },
+            ),
             ("%%TEST_CORE_IMPORTS%%", use_list(&test_core)),
             ("%%ATTRIBUTE_FIELDS%%", self.attribute_fields()),
             ("%%VALIDATIONS%%", self.validations()),
@@ -376,6 +387,7 @@ impl<'a> Renderer<'a> {
             ("%%SHOW_FIELDS%%", self.show_fields()),
             ("%%FORM_INPUTS%%", self.form_inputs()),
             ("%%VALID_FORM%%", self.valid_form()),
+            ("%%SUBSECOND_FORM%%", self.subsecond_form()),
             ("%%SHOWN_VALUE%%", shown_value(&resource.fields[0])),
             ("%%INVALID_FORM%%", self.invalid_form().0),
             ("%%INVALID_MESSAGE%%", self.invalid_form().1),
@@ -1133,8 +1145,10 @@ impl<'a> Renderer<'a> {
                 FieldType::Timestamp,
                 "timestamp",
                 "Timestamp",
-                "Timestamp::parse(value.trim()).ok()",
-                "must be a date and time (UTC)",
+                // Whole seconds only: the form renders and edits timestamps
+                // with `step="1"`, so a round trip through it is exact.
+                "Timestamp::parse(value.trim())\n        .ok()\n        .filter(|parsed| parsed.subsec_micros() == 0)",
+                "must be a date and time in whole seconds (UTC)",
             ),
             (
                 FieldType::Uuid,
@@ -1255,6 +1269,21 @@ impl<'a> Renderer<'a> {
     fn valid_form(&self) -> String {
         self.fields()
             .map(|field| format!("{}={}", field.name, form_sample(field)))
+            .collect::<Vec<_>>()
+            .join("&")
+    }
+
+    /// The valid form with every timestamp half a second past its sample.
+    fn subsecond_form(&self) -> String {
+        self.fields()
+            .map(|field| {
+                let value = if field.kind == FieldType::Timestamp {
+                    format!("{}.5", form_sample(field))
+                } else {
+                    form_sample(field)
+                };
+                format!("{}={value}", field.name)
+            })
             .collect::<Vec<_>>()
             .join("&")
     }

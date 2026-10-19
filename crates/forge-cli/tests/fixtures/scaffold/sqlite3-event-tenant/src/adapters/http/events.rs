@@ -735,9 +735,11 @@ fn timestamp(errors: &mut FieldErrors, field: &str, value: &str) -> Option<Times
         errors.add(field, "can't be blank");
         return None;
     }
-    let parsed = Timestamp::parse(value.trim()).ok();
+    let parsed = Timestamp::parse(value.trim())
+        .ok()
+        .filter(|parsed| parsed.subsec_micros() == 0);
     if parsed.is_none() {
-        errors.add(field, "must be a date and time (UTC)");
+        errors.add(field, "must be a date and time in whole seconds (UTC)");
     }
     parsed
 }

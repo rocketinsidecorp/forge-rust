@@ -288,6 +288,13 @@ fn wiring_is_printed_and_never_written() {
     assert!(!second.wiring.contains("pub mod access;"));
     assert!(second.wiring.contains("SessionTenantAccess::new("));
     assert!(second.wiring.contains("PgMembershipStore::new(pool)"));
+    // RBAC matches exactly: the example grants both permissions.
+    assert!(second.wiring.contains("use_cases::events::READ_PERMISSION"));
+    assert!(
+        second
+            .wiring
+            .contains("use_cases::events::WRITE_PERMISSION")
+    );
 }
 
 #[test]

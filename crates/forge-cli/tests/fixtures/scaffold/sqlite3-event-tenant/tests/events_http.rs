@@ -9,11 +9,13 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use app::adapters::http::access::{AccessDenied, DenyAll, TenantAccess};
 use app::application::ports::event_repository::{EventPage, EventRepository, EventStoreError};
-use app::application::use_cases::events::EventService;
-use app::domain::entities::event::{Event, EventId};
+use app::application::use_cases::events::{
+    EventError, EventService, READ_PERMISSION, WRITE_PERMISSION,
+};
+use app::domain::entities::event::{Event, EventAttributes, EventId};
 use async_trait::async_trait;
 use forge::auth::{Session, UnixTimestamp};
-use forge::core::Version;
+use forge::core::{Timestamp, Uuid, Version};
 use forge::http::{HeaderMap, HeaderValue, Method, Request, Response, Router, StatusCode, header};
 use forge::security::Permission;
 use forge::security::{PrincipalId, RbacPolicy, Role};
@@ -28,6 +30,9 @@ const VALID: &str = "name=Example+name&notes=Example+notes&starts_at=2026-01-02T
 const SHOWN: &str = "Example name";
 /// Text of the error shown for [`invalid`].
 const INVALID_MESSAGE: &str = "be blank";
+
+/// [`VALID`] with a timestamp that has a fraction of a second.
+const SUBSECOND: &str = "name=Example+name&notes=Example+notes&starts_at=2026-01-02T03%3A04%3A05.5&ends_at=2026-01-02T03%3A04%3A05.5&capacity=42&attendees=42&public=true&featured=true&venue=67e55044-10b1-426f-9247-bb680e5fe0c8&organizer=67e55044-10b1-426f-9247-bb680e5fe0c8";
 
 /// A form body with one value that breaks a rule.
 fn invalid() -> String {
@@ -173,10 +178,28 @@ fn member_context(
     )?)
 }
 
-/// The router of the application with only the event routes, and the
-/// path of the collection.
+/// Valid attributes, with sub-second timestamps where there are any.
+fn attributes() -> Result<EventAttributes, Box<dyn Error>> {
+    Ok(EventAttributes {
+        name: "Example name".to_owned(),
+        notes: Some("Example notes".to_owned()),
+        starts_at: Timestamp::parse("2026-01-02T03:04:05.123456Z")?,
+        ends_at: Some(Timestamp::parse("2026-01-02T03:04:05.123456Z")?),
+        capacity: 42,
+        attendees: Some(42),
+        public: true,
+        featured: Some(true),
+        venue: Uuid::from_u128(0x67e5_5044_10b1_426f_9247_bb68_0e5f_e0c8),
+        organizer: Some(Uuid::from_u128(0x67e5_5044_10b1_426f_9247_bb68_0e5f_e0c8)),
+    })
+}
+
+/// The router of the application with only the event routes, its
+/// repository and the path of the collection.
 struct Harness {
     router: Router,
+    repository: Arc<InMemoryEvents>,
+    tenant: TenantId,
     collection: String,
 }
 
@@ -188,11 +211,17 @@ impl Harness {
         app::adapters::http::events::routes(
             &mut router,
             &site,
-            EventService::new(repository),
+            EventService::new(Arc::<InMemoryEvents>::clone(&repository)),
             access,
         )?;
-        let collection = format!("/tenants/{}/events", TenantId::new());
-        Ok(Self { router, collection })
+        let tenant = TenantId::new();
+        let collection = format!("/tenants/{tenant}/events");
+        Ok(Self {
+            router,
+            repository,
+            tenant,
+            collection,
+        })
     }
 
     fn allowing() -> Result<Self, Box<dyn Error>> {
@@ -405,12 +434,13 @@ async fn unknown_and_malformed_ids_are_not_found() -> TestResult {
 async fn the_generated_deny_all_default_refuses_every_page() -> TestResult {
     let harness = Harness::new(Arc::new(DenyAll))?;
     let id = EventId::new();
+    let member = format!("{}/{id}", harness.collection);
 
     for path in [
         harness.collection.clone(),
         format!("{}/new", harness.collection),
-        format!("{}/{id}", harness.collection),
-        format!("{}/{id}/edit", harness.collection),
+        member.clone(),
+        format!("{member}/edit"),
     ] {
         assert_eq!(
             harness.get(&path).await?.status(),
@@ -418,5 +448,90 @@ async fn the_generated_deny_all_default_refuses_every_page() -> TestResult {
             "{path}"
         );
     }
+
+    // CSRF protection is a double-submit check, so any well-formed token in
+    // both the cookie and the form passes it: the allowing router accepts
+    // this one, and the 403s below therefore come from DenyAll.
+    let token = "ab".repeat(32);
+    let allowing = Harness::allowing()?;
+    let accepted = allowing.submit(&allowing.collection, &token, VALID).await?;
+    assert_eq!(accepted.status(), StatusCode::SEE_OTHER);
+    let edit = format!("{VALID}&_method=patch&version=1");
+    for (path, form) in [
+        (harness.collection.as_str(), VALID),
+        (member.as_str(), edit.as_str()),
+        (member.as_str(), "_method=put&version=1"),
+        (member.as_str(), "_method=delete&version=1"),
+    ] {
+        let refused = harness.submit(path, &token, form).await?;
+        assert_eq!(refused.status(), StatusCode::FORBIDDEN, "{path} {form}");
+        assert!(set_cookie(&refused, "__Host-forge_flash").is_none());
+    }
+    Ok(())
+}
+
+/// Browsers blank a `datetime-local` value with more than three fractional
+/// digits, so forms render whole seconds and refuse anything finer: editing
+/// a record never loses or changes a timestamp silently.
+#[tokio::test]
+async fn sub_second_timestamps_are_refused_and_edit_forms_show_whole_seconds() -> TestResult {
+    let harness = Harness::allowing()?;
+    let token = harness.csrf_token().await?;
+
+    let refused = harness
+        .submit(&harness.collection, &token, SUBSECOND)
+        .await?;
+    assert_eq!(refused.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(body(&refused)?.contains("whole seconds"));
+
+    let stored = Event::new(attributes()?)?;
+    let context = member_context(harness.tenant, &Permission::new(WRITE_PERMISSION)?)?;
+    harness.repository.insert(&context, &stored).await?;
+    let edit = harness
+        .get(&format!("{}/{}/edit", harness.collection, stored.id()))
+        .await?;
+    let page = body(&edit)?;
+    assert_eq!(edit.status(), StatusCode::OK);
+    assert!(page.contains("value=\"2026-01-02T03:04:05\""), "{page}");
+    assert!(!page.contains(".123456"), "{page}");
+    Ok(())
+}
+
+/// The HTTP layer asks `events:read` for the index and show pages; the
+/// use cases agree: listing needs the read grant, loading one event also
+/// accepts the write grant (edit and update load the event they change),
+/// and changes need the write grant.
+#[tokio::test]
+async fn use_cases_check_the_grant_of_the_tenant_context() -> TestResult {
+    let service = EventService::new(Arc::new(InMemoryEvents::default()));
+    let tenant = TenantId::new();
+    let writer = member_context(tenant, &Permission::new(WRITE_PERMISSION)?)?;
+    let reader = member_context(tenant, &Permission::new(READ_PERMISSION)?)?;
+
+    let created = service.create(&writer, attributes()?).await?;
+
+    assert!(matches!(
+        service.list(&writer, None).await,
+        Err(EventError::Forbidden)
+    ));
+    assert_eq!(service.list(&reader, None).await?.events.len(), 1);
+    assert_eq!(
+        service.find(&reader, created.id()).await?.id(),
+        created.id()
+    );
+    assert_eq!(
+        service.find(&writer, created.id()).await?.id(),
+        created.id()
+    );
+    assert!(matches!(
+        service.create(&reader, attributes()?).await,
+        Err(EventError::Forbidden)
+    ));
+    assert!(matches!(
+        service
+            .delete(&reader, created.id(), created.version())
+            .await,
+        Err(EventError::Forbidden)
+    ));
     Ok(())
 }

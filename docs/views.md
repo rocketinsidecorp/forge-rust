@@ -231,7 +231,9 @@ What the generated pages do:
 
 Text that does not parse (`abc` for an integer, a malformed timestamp or
 UUID) is reported together with the business-rule violations of the other
-fields. `timestamp` fields use `<input type="datetime-local">` read as UTC.
+fields. `timestamp` fields use `<input type="datetime-local" step="1">` read
+as UTC, in whole seconds: sub-second input is refused, because browsers blank
+values with more than three fractional digits.
 The templates are ordinary Askama files: edit them freely; the view models in
 `src/adapters/http/views/posts.rs` give every value as display text.
 

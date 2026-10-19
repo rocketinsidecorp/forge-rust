@@ -4,8 +4,10 @@
 //! Events belong to a tenant. Every use case takes the [`TenantContext`]
 //! that the HTTP adapter derived from an authenticated session, an active
 //! membership and an RBAC grant, and checks that the grant is for this
-//! resource: changes need [`WRITE_PERMISSION`], reads need
-//! [`READ_PERMISSION`] or [`WRITE_PERMISSION`].
+//! resource, like the HTTP routes do: listing needs [`READ_PERMISSION`],
+//! changes need [`WRITE_PERMISSION`], and loading one event accepts
+//! either, because the edit and update pages load the event they change
+//! under the write grant.
 
 use std::sync::Arc;
 
@@ -60,7 +62,7 @@ impl EventService {
         context: &TenantContext,
         after: Option<EventId>,
     ) -> Result<EventPage, EventError> {
-        authorize(context, &[READ_PERMISSION, WRITE_PERMISSION])?;
+        authorize(context, &[READ_PERMISSION])?;
         self.repository
             .page(context, after, PAGE_SIZE)
             .await

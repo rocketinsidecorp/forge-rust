@@ -404,12 +404,18 @@ fn wiring(
     ));
     if backend == Backend::Postgresql && tenant {
         out.push_str(&format!(
-            "  To allow a tenant role, make `policy` mutable and add, for example:\n\n    \
-             policy.allow(\n        \
-             forge::security::Role::new(\"editor\").map_err(forge::ComposeError::other)?,\n        \
-             forge::security::Permission::new(crate::application::use_cases::{plural}::WRITE_PERMISSION)\n            \
-             .map_err(forge::ComposeError::other)?,\n    \
-             );\n"
+            "  Permissions match exactly: index and show need `{plural}:read`, new, create,\n  \
+             edit, update and delete need `{plural}:write`, so a role that edits needs\n  \
+             both. To allow a tenant role, make `policy` mutable and add, for example:\n\n    \
+             let editor = forge::security::Role::new(\"editor\").map_err(forge::ComposeError::other)?;\n    \
+             for permission in [\n        \
+             crate::application::use_cases::{plural}::READ_PERMISSION,\n        \
+             crate::application::use_cases::{plural}::WRITE_PERMISSION,\n    \
+             ] {{\n        \
+             let permission =\n            \
+             forge::security::Permission::new(permission).map_err(forge::ComposeError::other)?;\n        \
+             policy.allow(editor.clone(), permission);\n    \
+             }}\n"
         ));
     }
     out.push_str(

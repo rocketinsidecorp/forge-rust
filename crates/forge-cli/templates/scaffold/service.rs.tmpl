@@ -5,8 +5,10 @@
 //! %%LABELS%% belong to a tenant. Every use case takes the [`TenantContext`]
 //! that the HTTP adapter derived from an authenticated session, an active
 //! membership and an RBAC grant, and checks that the grant is for this
-//! resource: changes need [`WRITE_PERMISSION`], reads need
-//! [`READ_PERMISSION`] or [`WRITE_PERMISSION`].
+//! resource, like the HTTP routes do: listing needs [`READ_PERMISSION`],
+//! changes need [`WRITE_PERMISSION`], and loading one %%NOUN%% accepts
+//! either, because the edit and update pages load the %%NOUN%% they change
+//! under the write grant.
 %%end%%
 
 use std::sync::Arc;
@@ -73,7 +75,7 @@ impl %%TYPE%%Service {
         after: Option<%%TYPE%%Id>,
     ) -> Result<%%TYPE%%Page, %%TYPE%%Error> {
 %%if tenant%%
-        authorize(context, &[READ_PERMISSION, WRITE_PERMISSION])?;
+        authorize(context, &[READ_PERMISSION])?;
 %%end%%
         self.repository
             .page(%%CONTEXT_ARG%%after, PAGE_SIZE)

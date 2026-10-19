@@ -305,7 +305,7 @@ application's database backend, with tests. The walkthrough is in
 | Argument | Meaning |
 | --- | --- |
 | `<name>` | Singular resource name, `snake_case` or `PascalCase` (`line_item`, `LineItem`). It names the entity type (`LineItem`), the table, routes and modules use the plural. |
-| `<field:type>...` | At least one field. Types: `string` (at most 255 characters), `text` (at most 65,535), `integer` (`i64`; store money as integer minor units, there is no float), `boolean`, `timestamp` (`forge::core::Timestamp`, UTC), `uuid` (`forge::core::Uuid`, any version). Append `?` for an optional (nullable) field: `due_at:timestamp?`. |
+| `<field:type>...` | At least one field. Types: `string` (at most 255 characters), `text` (at most 65,535), `integer` (`i64`; store money as integer minor units, there is no float), `boolean`, `timestamp` (`forge::core::Timestamp`, UTC; the form edits whole seconds and refuses sub-second input), `uuid` (`forge::core::Uuid`, any version). Append `?` for an optional (nullable) field: `due_at:timestamp?`. |
 | `--global` | Rows are shared by every tenant. Routes `/<plural>/...`, closed by `DenyAll` until the application decides who may use them. |
 | `--tenant-scoped` | Rows belong to a tenant. Routes `/tenants/{tenant_id}/<plural>/...`, `tenant_id` bound from the authorized `TenantContext` in every statement, plus forced row-level security on PostgreSQL. Exactly one of `--global` and `--tenant-scoped` is required. |
 | `--plural <PLURAL>` | The plural when the English rules (`-y` to `-ies`; `-s`, `-x`, `-z`, `-ch`, `-sh` take `-es`; otherwise `-s`) get it wrong. A name that already looks plural is refused unless `--plural` is given. |
@@ -385,17 +385,28 @@ Nothing is public by default:
 - **Tenant-scoped** resources on PostgreSQL are wired with
   `SessionTenantAccess`: a live session (`__Host-forge_session`), the
   session-bound CSRF token on unsafe methods, an active membership in the
-  route's `{tenant_id}` and an RBAC grant. The printed `RbacPolicy` is empty;
-  grant the permissions to tenant roles:
+  route's `{tenant_id}` and an RBAC grant. The printed `RbacPolicy` is empty.
+  Permissions match exactly, so a role that edits needs both grants (the
+  index and show pages, and the redirect after a create or update, need
+  `<plural>:read`):
 
   ```rust
   let mut policy = forge::security::RbacPolicy::new();
-  policy.allow(
-      forge::security::Role::new("editor").map_err(forge::ComposeError::other)?,
-      forge::security::Permission::new(crate::application::use_cases::posts::WRITE_PERMISSION)
-          .map_err(forge::ComposeError::other)?,
-  );
+  let editor = forge::security::Role::new("editor").map_err(forge::ComposeError::other)?;
+  for permission in [
+      crate::application::use_cases::posts::READ_PERMISSION,
+      crate::application::use_cases::posts::WRITE_PERMISSION,
+  ] {
+      let permission =
+          forge::security::Permission::new(permission).map_err(forge::ComposeError::other)?;
+      policy.allow(editor.clone(), permission);
+  }
   ```
+
+  The use cases check the same grants (defense in depth): listing needs
+  `<plural>:read`, changes need `<plural>:write`, and loading one record
+  accepts either because the edit and update pages load the record they
+  change under the write grant.
 
   On MySQL, MariaDB and SQLite, which have no Forge session or membership
   persistence yet, tenant-scoped resources are wired with `DenyAll` until the
