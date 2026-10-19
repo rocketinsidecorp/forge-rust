@@ -259,6 +259,15 @@ Environment:
   FORGE_MIGRATION_DATABASE_URL migration URL, same schemes (required for migrate/rollback
                                and application commands that use the database)
   FORGE_SETUP_PASSWORD         owner password for setup when not typed or piped (never for serve)
+  FORGE_RATE_LIMIT_MAX_KEYS   live buckets of the in-memory rate limiter (default: 100000)
+  FORGE_CACHE_MAX_ENTRIES     entry bound of every cache (default: 10000)
+  FORGE_CACHE_MAX_BYTES       memory bound of the in-memory cache (default: 67108864)
+  FORGE_CACHE_MAX_VALUE_BYTES largest cached value, at most 8388608 (default: 1048576)
+  FORGE_CACHE_DEFAULT_TTL_SECS ttl of writes that pass none (default: 3600)
+  FORGE_STORAGE_ROOT          disk storage directory (absolute in production)
+  FORGE_STORAGE_SIGNING_KEY   unpadded base64url of 32+ bytes; required in production with a root
+  FORGE_STORAGE_MAX_UPLOAD_BYTES largest uploaded file (default: 524288)
+  FORGE_STORAGE_LINK_TTL_SECS default signed link lifetime (default: 900)
 
 Unknown FORGE_* variables are rejected at startup.
 "
