@@ -27,7 +27,12 @@ const MAX_DAYS: i64 = 2_932_896;
 ///   the offset-less `YYYY-MM-DDTHH:MM[:SS[.f]]` that an HTML
 ///   `<input type="datetime-local">` submits, which it reads as UTC. At most
 ///   six fractional digits are accepted; leap seconds are not.
-/// - [`Timestamp::to_datetime_local`] renders the value such an input expects.
+/// - [`Timestamp::to_datetime_local`] renders the value such an input
+///   expects, in whole seconds (`step="1"`): browsers accept at most three
+///   fractional digits and blank anything else, so sub-second precision is
+///   dropped rather than risked. Forms that edit a timestamp should refuse
+///   sub-second input ([`Timestamp::subsec_micros`]) so a round trip through
+///   the form is exact.
 ///
 /// ```
 /// use forge_core::Timestamp;
@@ -36,6 +41,10 @@ const MAX_DAYS: i64 = 2_932_896;
 /// assert_eq!(instant.to_string(), "2026-10-19T06:30:00Z");
 /// assert_eq!(instant.to_datetime_local(), "2026-10-19T06:30:00");
 /// assert_eq!(Timestamp::parse("2026-10-19T06:30")?, instant);
+/// let precise = Timestamp::parse("2026-10-19T06:30:00.250Z")?;
+/// assert_eq!(precise.to_string(), "2026-10-19T06:30:00.250000Z");
+/// assert_eq!(precise.to_datetime_local(), "2026-10-19T06:30:00");
+/// assert_eq!(precise.subsec_micros(), 250_000);
 /// assert!(Timestamp::parse("2026-02-30T00:00").is_err());
 /// # Ok::<(), forge_core::InvalidTimestamp>(())
 /// ```
@@ -164,16 +173,21 @@ impl Timestamp {
         Self::from_unix_micros(seconds * MICROS_PER_SECOND + micros)
     }
 
-    /// `YYYY-MM-DDTHH:MM:SS[.ffffff]` in UTC, the value format of an HTML
-    /// `<input type="datetime-local">`.
+    /// `YYYY-MM-DDTHH:MM:SS` in UTC, the value of an HTML
+    /// `<input type="datetime-local" step="1">`. Sub-second precision is
+    /// truncated: browsers blank a value with more than three fractional
+    /// digits, so this never emits any.
     #[must_use]
     pub fn to_datetime_local(self) -> String {
-        let (year, month, day, hour, minute, second, micros) = self.fields();
-        let mut text = format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}");
-        if micros != 0 {
-            text.push_str(&format!(".{micros:06}"));
-        }
-        text
+        let (year, month, day, hour, minute, second, _) = self.fields();
+        format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}")
+    }
+
+    /// The microseconds within the second (0 to 999,999).
+    #[must_use]
+    pub const fn subsec_micros(self) -> u32 {
+        // rem_euclid is in 0..1_000_000, which fits in u32.
+        self.0.rem_euclid(MICROS_PER_SECOND) as u32
     }
 
     fn fields(self) -> (i64, i64, i64, i64, i64, i64, i64) {
@@ -196,7 +210,12 @@ impl Timestamp {
 
 impl fmt::Display for Timestamp {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{}Z", self.to_datetime_local())
+        let micros = self.subsec_micros();
+        if micros == 0 {
+            write!(formatter, "{}Z", self.to_datetime_local())
+        } else {
+            write!(formatter, "{}.{micros:06}Z", self.to_datetime_local())
+        }
     }
 }
 
@@ -393,6 +412,28 @@ mod tests {
             parse("2026-10-19T08:30").to_datetime_local(),
             "2026-10-19T08:30:00"
         );
+    }
+
+    /// Regression: browsers blank a datetime-local value with more than three
+    /// fractional digits, so the form value is always whole seconds.
+    #[test]
+    fn datetime_local_values_never_have_fractional_seconds() {
+        for (text, local, micros) in [
+            ("2026-10-19T08:30:00.000001Z", "2026-10-19T08:30:00", 1),
+            (
+                "2026-10-19T08:30:59.999999Z",
+                "2026-10-19T08:30:59",
+                999_999,
+            ),
+            ("1969-12-31T23:59:59.5Z", "1969-12-31T23:59:59", 500_000),
+            ("2026-10-19T08:30:00Z", "2026-10-19T08:30:00", 0),
+        ] {
+            let value = parse(text);
+            assert_eq!(value.to_datetime_local(), local, "{text}");
+            assert!(!value.to_datetime_local().contains('.'), "{text}");
+            assert_eq!(value.subsec_micros(), micros, "{text}");
+            assert_eq!(parse(local).subsec_micros(), 0, "{text}");
+        }
         let mut day = MIN_DAYS;
         while day <= MAX_DAYS {
             let (year, month, date) = civil_from_days(day);
