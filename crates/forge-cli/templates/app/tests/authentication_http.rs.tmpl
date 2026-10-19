@@ -612,12 +612,13 @@ async fn every_wrong_field_gets_the_same_answer() -> TestResult {
 async fn attempts_are_throttled_even_with_the_right_password() -> TestResult {
     let fixture = fixture()?;
     let mut browser = Browser::default();
-    for _ in 0..3 {
+    // Changing the organization does not reset the account's count.
+    for tenant in ["acme", "globex", "initech"] {
         let response = browser
             .sign_in(
                 &fixture.router,
-                "acme",
-                "ada@example.com",
+                tenant,
+                "ADA@example.com",
                 "wrong password!",
             )
             .await?;

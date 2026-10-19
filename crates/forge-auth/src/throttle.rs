@@ -37,8 +37,7 @@ impl ThrottleKey {
     ///
     /// `scope` separates independent limits (for example `"sign_in"` and
     /// `"password_reset"`); `account` is the normalized identity the attempt
-    /// names (such as the tenant slug and lowercase login), whether or not
-    /// it exists; `source` is the socket peer address.
+    /// names (such as the lowercase login), whether or not it exists; `source` is the socket peer address.
     #[must_use]
     pub fn new(scope: &str, account: &str, source: Option<IpAddr>) -> Self {
         let account = digest(&[b"account", scope.as_bytes(), account.as_bytes()]);

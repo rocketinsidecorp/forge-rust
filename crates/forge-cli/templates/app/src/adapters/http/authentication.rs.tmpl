@@ -237,7 +237,7 @@ async fn create_session(pages: Arc<Pages>, request: Request) -> Response {
 
     let key = ThrottleKey::new(
         "sign_in",
-        &account_key(&values.tenant, &values.email),
+        &account_key(&values.email),
         Some(request.remote_addr().ip()),
     );
     match ports.sign_in_throttle.attempt(&key).await {
@@ -258,8 +258,8 @@ async fn create_session(pages: Arc<Pages>, request: Request) -> Response {
         Err(_) => return unavailable("sign_in_throttle_unavailable"),
     }
 
-    // The password is verified first, also for an unknown organization, so
-    // every failure costs the same Argon2id work.
+    // The password is verified first, also for an unknown organization, and
+    // the tenant lookups run either way, so every failure costs the same.
     let principal = match authenticate_password(
         ports.credentials.as_ref(),
         ports.hasher.as_ref(),
@@ -274,12 +274,9 @@ async fn create_session(pages: Arc<Pages>, request: Request) -> Response {
             return unavailable("authentication_unavailable");
         }
     };
-    let member = match principal {
-        Some(principal) => match active_tenant(ports, &values.tenant, principal).await {
-            Ok(tenant) => tenant.map(|tenant| (principal, tenant)),
-            Err(failure) => return failed(failure),
-        },
-        None => None,
+    let member = match active_tenant(ports, &values.tenant, principal).await {
+        Ok(tenant) => principal.zip(tenant),
+        Err(failure) => return failed(failure),
     };
     let Some((principal, tenant)) = member else {
         record(
@@ -435,7 +432,7 @@ async fn create_password(pages: Arc<Pages>, request: Request) -> Response {
     let email = form.email.trim().to_owned();
     let key = ThrottleKey::new(
         "password_reset",
-        &account_key(&tenant, &email),
+        &account_key(&email),
         Some(request.remote_addr().ip()),
     );
     match pages.ports.reset_throttle.attempt(&key).await {
@@ -652,10 +649,14 @@ async fn update_password(pages: Arc<Pages>, request: Request) -> Response {
 }
 
 /// The tenant named `tenant` when `principal` is an active member of it.
+///
+/// The same lookups run whether or not the password was right (`None`
+/// looks up a random principal), so the response time does not tell a
+/// right password from a wrong one.
 async fn active_tenant(
     ports: &AuthenticationPorts,
     tenant: &str,
-    principal: PrincipalId,
+    principal: Option<PrincipalId>,
 ) -> Result<Option<TenantId>, ForgeError> {
     let failed = |code: &'static str| {
         ForgeError::new(
@@ -675,13 +676,15 @@ async fn active_tenant(
     else {
         return Ok(None);
     };
+    // `PrincipalId::default()` is a new random UUIDv7 that matches nobody.
+    let candidate = principal.unwrap_or_default();
     let active = ports
         .memberships
-        .find(tenant_id, principal)
+        .find(tenant_id, candidate)
         .await
         .map_err(|error| failed("membership_store_unavailable").with_source(error))?
         .is_some_and(|membership| membership.state() == MembershipState::Active);
-    Ok(active.then_some(tenant_id))
+    Ok((active && principal.is_some()).then_some(tenant_id))
 }
 
 /// Appends an audit event. A failed write is logged and does not change
@@ -786,8 +789,11 @@ fn local_path(candidate: Option<&str>) -> String {
 }
 
 /// The identity a throttle counts attempts against, whether or not it exists.
-fn account_key(tenant: &str, email: &str) -> String {
-    format!("{}\0{}", tenant.to_ascii_lowercase(), email.to_lowercase())
+///
+/// Passwords belong to the principal, not to a tenant, so the key is the
+/// login alone: changing the organization field does not reset the count.
+fn account_key(email: &str) -> String {
+    email.to_lowercase()
 }
 
 fn now() -> Option<UnixTimestamp> {
