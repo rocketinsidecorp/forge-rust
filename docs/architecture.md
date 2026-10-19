@@ -9,8 +9,14 @@ membership and authorized TenantContext contracts, least-privilege PostgreSQL/RL
 digest-only persistent sessions, Argon2id password verification, opaque
 session/CSRF secrets, secure cookie helpers, and append-only audit persistence
 are implemented, including optimistic Argon2id rehash-on-policy-upgrade after a
-successful login. Login throttling, turnkey HTTP auth route composition, and
-stronger audit integrity/retention controls remain open.
+successful login. Full-stack PostgreSQL applications are generated with
+sign-in, sign-out and password-reset pages, bounded in-process sign-in
+throttling, a `setup` command for the first tenant and owner, and seeds
+([ADR 0026](adr/0026-authentication-pages-and-setup.md)). Still open in
+Phase 3: password-reset delivery (no mailer yet; the generated notifier fails
+closed), MFA, a shared persistent throttle for horizontally scaled
+deployments, user invitation and management, identity persistence on MySQL,
+MariaDB and SQLite, and stronger audit integrity/retention controls.
 
 Forge is an opinionated Rust application framework for long-lived services. Its
 value is the integration of explicit application architecture, secure defaults,
@@ -244,6 +250,19 @@ Request layers (`forge_http::Middleware`) run before the route table. See
 [ADR 0023](adr/0023-form-csrf-flash-and-method-override.md) and
 [views](views.md).
 
+Browser sign-in is generated application code in the HTTP adapter ring
+(`src/adapters/http/authentication.rs`, like Rails' authentication
+generator) over framework rules: `forge-auth` throttles attempts per account
+and source (`MemoryLoginThrottle`, bounded and fail-closed when full), sets
+the new-password policy and issues one-time reset tokens persisted only as
+SHA-256 digests; `forge-tenancy` resolves tenants by slug and defines the
+tenant-bound reset store; `forge-views` redirects signed-out browsers to the
+sign-in page with a validated return path (`SignInRedirect`). Sign-in
+verifies the CSRF-layer proof, issues a fresh session and CSRF token and
+revokes any previous session. Administrative commands (`setup`, `seed`) are
+registered with `App::command` and run with the migration credential. See
+[ADR 0026](adr/0026-authentication-pages-and-setup.md).
+
 ### Database and transactions
 
 PostgreSQL is the first database. SQL remains visible, with compile-time checked
@@ -370,7 +389,9 @@ duplicate `*_new` files. `forge generate scaffold` writes only new files and
 prints the module declarations and composition-root lines to add, so existing
 code changes only by the developer's hand
 ([ADR 0024](adr/0024-scaffold-generator.md)); its routes are deny-by-default
-until the application chooses an access policy.
+until the application chooses an access policy. `forge generate
+authentication` adds the sign-in pages that `forge new` generates to an
+older PostgreSQL application the same way.
 
 `forge new` emits the application Docker assets in Phase 1 and `forge build` can
 produce the same release binary locally or in the container build. A development

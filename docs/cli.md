@@ -19,6 +19,7 @@ from a checkout.
 forge id
 forge new <name> [-d <DATABASE>] [--api] [--skip-docker] [--skip-ci] [--skip-lockfile] [--forge-path <PATH>]
 forge generate migration <name>
+forge generate authentication [--dry-run]
 forge generate scaffold <name> <field:type>... (--global | --tenant-scoped) [--plural <PLURAL>] [--dry-run]
 forge check
 forge test
@@ -134,8 +135,16 @@ independent 256-bit bearer/CSRF secrets from the OS CSPRNG, persists only SHA-25
 digests, emits a Secure/HttpOnly/SameSite=Lax `__Host-forge_session` cookie,
 and enforces the session-bound CSRF token on unsafe cookie-authenticated
 methods: the `x-csrf-token` header, plus the `csrf_token` form field in
-full-stack applications. These mechanisms are infrastructure helpers; Forge
-does not impose universal login or logout routes.
+full-stack applications. These mechanisms are infrastructure helpers.
+
+Full-stack PostgreSQL applications also get sign-in, sign-out and
+password-reset pages, the `setup` command and the authentication migration,
+like `rails generate authentication` (see
+[`forge generate authentication`](#forge-generate-authentication), which adds
+the same files to an older application, and
+[ADR 0026](adr/0026-authentication-pages-and-setup.md)). They are generated
+application code, so routes stay reviewable and editable; `--api` and
+non-PostgreSQL applications do not get them.
 
 ### Generated tree
 
@@ -166,7 +175,9 @@ shop/
 │   ├── 00000000000000000001_forge_audit.up.sql
 │   ├── 00000000000000000001_forge_audit.down.sql
 │   ├── 00000000000000000002_forge_identity.up.sql
-│   └── 00000000000000000002_forge_identity.down.sql
+│   ├── 00000000000000000002_forge_identity.down.sql
+│   ├── 00000000000000000003_forge_authentication.up.sql    # PostgreSQL full-stack: tenants, reset tokens
+│   └── 00000000000000000003_forge_authentication.down.sql
 ├── rust-toolchain.toml      # pinned to the framework toolchain
 ├── src/
 │   ├── main.rs              # binary `shop`: calls app::bootstrap::run()
@@ -176,17 +187,25 @@ shop/
 │   ├── adapters/
 │   │   └── http/
 │   │       ├── mod.rs       # routes; HTML handlers (JSON with --api)
+│   │       ├── authentication.rs  # PostgreSQL full-stack: sign-in, sign-out, password reset
 │   │       └── views/       # omitted with --api; Site, Layout, view models
-│   ├── infrastructure/
+│   ├── infrastructure/      # PostgreSQL: audit, auth, tenancy, accounts (tenants, resets, setup)
 │   └── bootstrap/
+│       ├── mod.rs           # run(): App with migrations, compose and commands
+│       ├── seeds.rs         # database applications: `seed`, idempotent, one transaction
+│       └── setup.rs         # PostgreSQL full-stack: `setup`, first tenant and owner
 ├── templates/               # omitted with --api; Askama templates
 │   ├── layouts/
 │   │   ├── application.html
 │   │   └── _flash.html
+│   ├── passwords/           # PostgreSQL full-stack: new.html, edit.html
+│   ├── sessions/            # PostgreSQL full-stack: new.html, _sign_out.html
 │   └── welcome/
 │       └── index.html
 └── tests/
     ├── architecture.rs      # ring import boundaries
+    ├── authentication_http.rs      # PostgreSQL full-stack: the pages with in-memory ports
+    ├── authentication_postgres.rs  # PostgreSQL full-stack: setup and reset store (ignored without FORGE_TEST_DATABASE_URL)
     ├── container.rs         # omitted with --skip-docker; Dockerfile RUST_VERSION == toolchain
     └── http.rs              # omitted with --api; layout, CSP, assets, CSRF enforcement
 ```
@@ -288,6 +307,71 @@ persistence, and tenant membership persistence. Tenant isolation on those
 backends rests on the application layer (bind the tenant predicate from
 `TenantContext`); use PostgreSQL when the database must enforce isolation.
 
+## `forge generate authentication`
+
+```sh
+forge generate authentication --dry-run
+forge generate authentication
+```
+
+The `rails generate authentication` of Forge
+([ADR 0026](adr/0026-authentication-pages-and-setup.md)). `forge new`
+already generates these files for full-stack PostgreSQL applications; run
+the generator in the root of an older one to add them. It writes, all or
+nothing and byte-identical to `forge new`:
+
+```text
+migrations/00000000000000000003_forge_authentication.{up,down}.sql   forge_tenants, forge_password_resets, runtime grants
+src/infrastructure/accounts/mod.rs          PgTenantDirectory, PgPasswordResetStore, provision_owner
+src/adapters/http/authentication.rs         routes, handlers, AuthenticationPorts, SignInRedirect layer
+src/adapters/http/views/authentication.rs   view models
+templates/sessions/{new,_sign_out}.html     sign-in page and sign-out button
+templates/passwords/{new,edit}.html         reset request and new-password pages
+src/bootstrap/setup.rs                      the `setup` command
+tests/authentication_http.rs                the pages with in-memory ports
+tests/authentication_postgres.rs            setup and reset tokens against TestDatabase
+```
+
+It refuses to overwrite any of them (or an existing
+`*_forge_authentication.up.sql`), never edits an existing file and prints
+the wiring: four `pub mod` lines, the statements to append to `fn compose`
+(the stores, Argon2id, two `MemoryLoginThrottle`s, the fail-closed
+`UndeliverablePasswordResets` notifier and the audit sink) and the
+`.command("setup", setup::SUMMARY, setup::run)` line for `fn run`.
+`--dry-run` prints the same without writing. Applications created with
+`--api`, `-d none`, MySQL, MariaDB or SQLite are refused with the reason:
+Forge persists identities, sessions and memberships only in PostgreSQL today.
+
+| Method | Path | Behavior |
+| --- | --- | --- |
+| `GET` | `/session/new` | organization (tenant slug, prefilled from `?tenant=`), email, password; hidden validated `return_to`; a sign-out button when already signed in |
+| `POST` | `/session` | `303` to the validated return path (default `/`) with "Signed in."; `422` with one message for any wrong field; `429` with `Retry-After` when throttled |
+| `DELETE` | `/session` | `_method=delete` form: revoke the session, clear the cookie, rotate the CSRF token, `303` to the sign-in page |
+| `GET`, `POST` | `/passwords/new`, `/passwords` | request a reset link: the same `303` and notice whether or not the account exists |
+| `GET`, `PATCH` | `/passwords/edit?token=`, `/passwords` | choose a new password (12 characters or more); every session of the account is revoked |
+
+Security behavior, all covered by the generated tests:
+
+- every handler that changes credentials refuses a request the CSRF layer
+  did not verify; sign-in issues a new session and CSRF token and revokes
+  the session the browser held;
+- a wrong organization, email or password, a disabled account and an
+  inactive membership all answer the same; unknown logins still cost one
+  Argon2id hash; sign-in and reset attempts are throttled per account and
+  per socket peer (5 and 300 per 15 minutes, in process);
+- reset tokens are 256-bit, single use, valid 15 minutes, bound to the
+  account and tenant, stored as SHA-256 digests and never logged; the reset
+  pages are `no-store` and `Referrer-Policy: no-referrer`;
+- `SignInRedirect` sends a browser that gets `401` from an access policy to
+  `/session/new?return_to=<page>`; JSON clients keep the `401`.
+
+Reset links are delivered by a `forge::auth::PasswordResetNotifier`. Forge
+has no mailer yet, so the generated composition uses
+`UndeliverablePasswordResets`, which delivers nothing and reports
+`NotConfigured` (logged, never shown): the page answers the same, and
+replacing the notifier in `compose` with an adapter for your mail provider
+enables delivery. MFA (TOTP) is not provided yet.
+
 ## `forge generate scaffold`
 
 ```sh
@@ -385,23 +469,27 @@ Nothing is public by default:
 - **Tenant-scoped** resources on PostgreSQL are wired with
   `SessionTenantAccess`: a live session (`__Host-forge_session`), the
   session-bound CSRF token on unsafe methods, an active membership in the
-  route's `{tenant_id}` and an RBAC grant. The printed `RbacPolicy` is empty.
-  Permissions match exactly, so a role that edits needs both grants (the
-  index and show pages, and the redirect after a create or update, need
-  `<plural>:read`):
+  route's `{tenant_id}` and an RBAC grant. The printed `RbacPolicy` grants
+  both permissions to the `owner` role, the role `setup` gives the first
+  member ([ADR 0026](adr/0026-authentication-pages-and-setup.md)), and
+  nothing to any other role. Permissions match exactly, so a role that edits
+  needs both grants (the index and show pages, and the redirect after a
+  create or update, need `<plural>:read`):
 
   ```rust
   let mut policy = forge::security::RbacPolicy::new();
-  let editor = forge::security::Role::new("editor").map_err(forge::ComposeError::other)?;
+  let owner = forge::security::Role::new("owner").map_err(forge::ComposeError::other)?;
   for permission in [
       crate::application::use_cases::posts::READ_PERMISSION,
       crate::application::use_cases::posts::WRITE_PERMISSION,
   ] {
       let permission =
           forge::security::Permission::new(permission).map_err(forge::ComposeError::other)?;
-      policy.allow(editor.clone(), permission);
+      policy.allow(owner.clone(), permission);
   }
   ```
+
+  The output also prints an example that grants a read-only `viewer` role.
 
   The use cases check the same grants (defense in depth): listing needs
   `<plural>:read`, changes need `<plural>:write`, and loading one record
@@ -413,7 +501,8 @@ Nothing is public by default:
   application provides `SessionStore` and `MembershipStore` implementations.
 
 Denials answer `401` (no valid session), `403` or `503` (identity store
-unavailable) with a generic body.
+unavailable) with a generic body. With the sign-in pages, browsers get a
+`303` to `/session/new?return_to=<page>` instead of the `401`.
 
 ### Refusals
 
@@ -452,8 +541,47 @@ Every application built with `forge::App` accepts these subcommands:
 | `healthcheck` | Sends `GET /health/live` to the loopback address on the configured port. Exits `0` if healthy, `1` otherwise. |
 | `migrate` | For database-enabled apps, applies all pending embedded migrations. |
 | `rollback` | For database-enabled apps, reverts the latest reversible migration. |
+| `setup --tenant SLUG --email EMAIL [--organization NAME] [--password-stdin]` | Full-stack PostgreSQL apps: creates the first tenant and its owner (see below). |
+| `seed` | Database apps: runs `seed` in `src/bootstrap/seeds.rs` in one transaction, committed only on success. |
 | `version` | Prints the application version. |
-| `help` | Prints usage. |
+| `help` | Prints usage, including the application's commands. |
+
+`setup` and `seed` are application commands registered with
+`forge::App::command(name, summary, handler)`. Application commands parse
+`--name value` options strictly, never accept a password argument, and,
+when the application declared a database, run with a pool connected through
+`FORGE_MIGRATION_DATABASE_URL`: they create accounts and seed data that the
+least-privilege runtime role must not be able to write. A usage error exits
+with code `2`, any other failure with `1`.
+
+```sh
+export FORGE_MIGRATION_DATABASE_URL='postgres://app_migrator:app_migrator@127.0.0.1:5432/shop'
+cargo run -- setup --tenant acme --email owner@example.com --organization "Acme Inc"
+printf '%s\n' "$OWNER_PASSWORD" | cargo run -- setup --tenant acme --email owner@example.com --password-stdin
+cargo run -- seed
+docker compose run --rm app setup --tenant acme --email owner@example.com --password-stdin < password.txt
+```
+
+`setup` creates the tenant (`forge_tenants`, slug `^[a-z][a-z0-9-]{1,62}$`,
+display name from `--organization` or the slug), the owner principal and an
+active membership with the `owner` role, plus an
+`auth.setup.owner_provisioned` audit event, in one transaction under a
+PostgreSQL advisory lock. It refuses once any tenant exists, so running it
+again (or twice concurrently) creates nothing more and it can never add an
+account to, or take over, a running installation. The password is typed
+twice at a terminal with echo off, piped as one line with
+`--password-stdin`, or read from `FORGE_SETUP_PASSWORD`; it is never an
+argument, never printed or logged, and must have at least 12 characters.
+`setup` prints the tenant id: tenant-scoped scaffold pages live under
+`/tenants/<tenant id>/`.
+
+`seed` is like `rails db:seed`: write idempotent statements (`INSERT ... ON
+CONFLICT DO NOTHING`) so seeding twice changes nothing. Seeds are not for
+accounts or credentials.
+
+The `forge` CLI does not wrap application commands (there is no `forge
+migrate` either): run them through Cargo during development, or call the
+binary directly in a container or release.
 
 `healthcheck` exists because the distroless runtime image has no shell or
 `curl`. The Dockerfile's exec-form `HEALTHCHECK` runs `<binary> healthcheck`.

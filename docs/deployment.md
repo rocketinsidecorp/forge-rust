@@ -127,7 +127,8 @@ from env files, Kubernetes manifests and unit files.
 | `FORGE_LOG` | `info` | `tracing` filter directive, for example `info,shop=debug`. |
 | `FORGE_LOG_FORMAT` | `json` in production, `text` otherwise | `json` or `text`. |
 | `FORGE_DATABASE_URL` | none | Least-privilege PostgreSQL runtime connection URL. Treated as a secret and redacted from ordinary diagnostics. |
-| `FORGE_MIGRATION_DATABASE_URL` | none | PostgreSQL schema-owner/migration URL used only by `migrate` and `rollback`. Treated as a secret and redacted. |
+| `FORGE_MIGRATION_DATABASE_URL` | none | PostgreSQL schema-owner/migration URL used only by `migrate`, `rollback` and application commands such as `setup` and `seed`. Treated as a secret and redacted. |
+| `FORGE_SETUP_PASSWORD` | none | Owner password read only by `setup` when it is neither typed nor piped with `--password-stdin`. Never set it for the serving process. |
 
 Logs go to standard output, and the platform (Docker, Kubernetes, journald)
 collects them. The HTTP layer also enforces a header-read timeout and adds

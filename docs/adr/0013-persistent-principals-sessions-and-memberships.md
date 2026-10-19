@@ -3,7 +3,7 @@
 - Status: Accepted
 - Date: 2026-09-27
 - Refines: [ADR 0010](0010-session-and-tenant-authorization-context.md)
-- Refined by: [ADR 0014](0014-argon2-session-cookie-and-csrf.md)
+- Refined by: [ADR 0014](0014-argon2-session-cookie-and-csrf.md), [ADR 0026](0026-authentication-pages-and-setup.md)
 
 ## Context
 

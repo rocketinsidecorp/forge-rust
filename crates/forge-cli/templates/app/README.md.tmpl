@@ -134,6 +134,32 @@ The generator only creates files; it prints the `pub mod` lines and the
 routes answer `403` until you choose who may use them in
 `src/adapters/http/access.rs`.
 %%end%%
+%%if authentication%%
+
+### Sign in
+
+The application has sign-in, sign-out and password-reset pages
+(`src/adapters/http/authentication.rs`, `templates/sessions/`,
+`templates/passwords/`), like `rails generate authentication`. Create the
+first tenant and its owner with the migration role, then sign in:
+
+```bash
+export FORGE_MIGRATION_DATABASE_URL='%%DATABASE_MIGRATION_URL_LOCAL%%'
+cargo run -- setup --tenant acme --email owner@example.com --organization "Acme Inc"
+unset FORGE_MIGRATION_DATABASE_URL
+export FORGE_DATABASE_URL='%%DATABASE_RUNTIME_URL_LOCAL%%'
+cargo run
+# open http://127.0.0.1:3000/session/new?tenant=acme
+```
+
+`setup` asks for the password twice with echo off (or reads one line with
+`--password-stdin`, or `FORGE_SETUP_PASSWORD`; never an argument), needs at
+least 12 characters, and refuses once a tenant exists. The owner gets the
+`owner` role; tenant-scoped scaffolds grant it their permissions and send
+signed-out browsers to the sign-in page. Password-reset links are not
+delivered until a `PasswordResetNotifier` for your mail provider replaces
+`forge::auth::UndeliverablePasswordResets` in `src/bootstrap/mod.rs`.
+%%end%%
 
 %%end%%
 ```bash
@@ -146,7 +172,11 @@ Binary commands: `serve` (default), `healthcheck`, `version`, `help`.
 %%if database%%
 Database-enabled binaries also support `migrate` and `rollback`.
 `migrate` applies pending embedded migrations; `rollback` reverts the latest
-reversible migration.
+reversible migration. `seed` runs `seed` in `src/bootstrap/seeds.rs` in one
+transaction with `FORGE_MIGRATION_DATABASE_URL`; keep it idempotent.
+%%end%%
+%%if authentication%%
+`setup` creates the first tenant and its owner (see Sign in).
 %%end%%
 
 Configuration uses `FORGE_*` environment variables; unknown `FORGE_*` keys are

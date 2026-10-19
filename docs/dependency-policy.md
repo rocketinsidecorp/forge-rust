@@ -157,6 +157,32 @@ Admission review:
 - The vendored Turbo 8.0.23 and Stimulus 3.2.2 modules were admitted with
   their pinned digests in earlier slices; this slice only serves them.
 
+## Authentication pages dependency decision
+
+[ADR 0026](adr/0026-authentication-pages-and-setup.md) admits one new direct
+dependency and moves two admitted crates into `forge-auth`.
+
+| Crate | Version | Used by | Purpose | Feature policy |
+| --- | --- | --- | --- | --- |
+| `rustix` | `1.1.5` | `forge` (Unix targets only) | turn terminal echo off (`tcgetattr`/`tcsetattr`) while `setup` reads the owner password | defaults disabled; `std`, `termios` |
+| `getrandom` | `0.4.3` | `forge-auth` | 256-bit password reset tokens from the OS CSPRNG | as admitted above |
+| `sha2` | `0.11.0` | `forge-auth` | SHA-256 digests of reset tokens and throttle keys | defaults disabled |
+
+`rustix` review: it was already in the workspace `Cargo.lock` (through
+`tempfile`); it is maintained by the Bytecode Alliance, MIT/Apache-2.0,
+widely used by `std`-adjacent crates, has no build-time network access, and
+on Linux uses its own `linux-raw-sys` syscall backend. It contains `unsafe`
+code for system calls; Forge's own code stays `forbid(unsafe_code)` and calls
+only its safe termios API. No rustix type appears in a Forge public API; the
+replacement strategy is a different safe termios binding or refusing the
+interactive prompt (`--password-stdin` and `FORGE_SETUP_PASSWORD` keep
+working). Non-Unix targets do not compile it and refuse the prompt.
+
+`forge-auth` previously used no cryptographic crate. It now calls the same
+admitted `getrandom` and `sha2` releases as `forge-views` and generated
+applications; it still implements no cryptographic primitive (it hex-encodes
+random bytes and hashes with `sha2`).
+
 ## Features and public API containment
 
 - Set `default-features = false` when defaults add unused protocols, native

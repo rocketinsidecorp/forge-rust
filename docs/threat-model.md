@@ -172,11 +172,13 @@ UPDATE, or DELETE them, and a database trigger rejects audit-row mutation. This
 does not claim tamper-evident cryptographic integrity or immutable external
 storage.
 
-Remaining Phase 3 threat-model controls are not claimed complete: per-account and
-per-origin credential throttling, turnkey HTTP login/logout/tenant-selection
-composition, audit integrity chaining/retention and privileged reader workflows,
-and administrative cross-tenant role separation still require implementation and
-abuse tests.
+Per-account and per-source credential throttling and the HTTP
+sign-in/sign-out/password-reset composition are now generated
+([browser authentication review](#browser-authentication-review)). Remaining
+Phase 3 threat-model controls are not claimed complete: a shared (multi-process)
+throttle, password-reset delivery, MFA, audit integrity chaining/retention and
+privileged reader workflows, and administrative cross-tenant role separation
+still require implementation and abuse tests.
 
 ## Server-rendered views review
 
@@ -205,8 +207,36 @@ refuse legitimate requests behind `Host`-rewriting proxies for browsers without
 Fetch Metadata; `__Host-` cookies require HTTPS outside `localhost`; a full-stack
 router requires the token on JSON endpoints too (no reviewed exemption mechanism
 yet); multipart forms are not parsed and must send the header. Login-time
-binding of the form token to the session (ADR 0023) remains application code
-until the authentication routes slice.
+binding of the form token to the session (ADR 0023) is done by the generated
+sign-in page (below).
+
+## Browser authentication review
+
+Review date: 2026-10-19
+([ADR 0026](adr/0026-authentication-pages-and-setup.md)). Scope: the
+generated sign-in, sign-out and password-reset pages, the `setup` and `seed`
+commands, and the framework rules they rely on.
+
+| Threat | Control | Verification |
+| --- | --- | --- |
+| Online password guessing and credential stuffing | Attempts counted before any credential check per account (tenant slug + login) and per socket peer (`MemoryLoginThrottle`: 5 per account, 300 per source in 15 minutes); `429` with `Retry-After`; a full table refuses instead of evicting live counters; success clears only the account counter; Argon2id | `forge-auth` throttle tests; generated `attempts_are_throttled_even_with_the_right_password` |
+| Account and tenant enumeration | One `422` message for a wrong organization, email or password, a disabled account or an inactive membership; unknown logins still cost one Argon2id hash; reset requests answer the same `303` and flash whether or not the account exists or the link was delivered | `every_wrong_field_gets_the_same_answer`, `reset_requests_answer_the_same_whether_or_not_the_account_exists` |
+| Login CSRF and forged sign-out | Handlers refuse (`403`) unless `CsrfProtection` verified the request (`csrf_verified`); the sign-in form's token is issued before any session; sign-out also checks the session-bound CSRF token (ADR 0014) | `sign_in_without_the_csrf_token_is_forbidden`, `signing_out_needs_the_csrf_token_and_revokes_the_session` |
+| Session fixation and token planting | Sign-in issues a new server-side session and a new CSRF token in fresh cookies and revokes the session the browser held; sign-out and reset clear the session cookie and rotate the CSRF token | `signing_in_issues_a_fresh_session_and_csrf_token_and_returns_to_the_page`, `signing_in_again_revokes_the_previous_session` |
+| Open redirect through `return_to` | `return_path` accepts only local paths (single leading `/`, visible ASCII, no backslash, at most 2048 bytes) when rendering, posting and redirecting; `see_other` re-checks | `forge-views` return-path tests; `return_paths_off_the_site_are_ignored` |
+| Reset token theft or replay | 256-bit CSPRNG token, SHA-256 digest persisted, single use (row lock, every outstanding token of the account used up), 15-minute expiry, bound to principal and tenant membership, never logged or in `Debug`; reset pages `no-store` and `Referrer-Policy: no-referrer`; every session revoked on reset | `forge-auth` token tests; `a_reset_link_works_once_changes_the_password_and_revokes_sessions`; PostgreSQL `reset_tokens_work_once_expire_and_revoke_every_session` |
+| Takeover through `setup` | Runs only with the migration credential, one transaction under an advisory lock, refuses once any tenant exists; password never an argument (`--password-stdin`, `FORGE_SETUP_PASSWORD` or an echo-off prompt), at least 12 characters, never printed; audited | `setup_creates_one_owner_who_can_sign_in_and_refuses_afterwards`, `concurrent_setups_create_exactly_one_tenant`, `setup_refuses_password_arguments_and_short_passwords_before_touching_a_database` |
+| Signed-out browser leaks a protected page | Access policies answer `401`; `SignInRedirect` turns it into a `303` to sign in for HTML clients only; JSON keeps `401` | `forge-views` sign-in redirect tests; `signed_out_browsers_are_sent_to_sign_in_and_api_clients_get_401`; slow scaffold e2e |
+
+Residual risks: throttle counters live in one process (a restart or several
+replicas multiply the budget; a shared store is a follow-up); the source key
+is the socket peer, so clients behind one proxy share a budget and Forge does
+not trust `X-Forwarded-For`; a reset request for an existing account does
+more work (token insert, delivery) than for an unknown one, a timing
+difference bounded by the reset throttle; until a mailer adapter replaces
+`UndeliverablePasswordResets`, reset links are not delivered and the failure is
+only logged; MFA is not implemented; a session lasts 24 hours without
+idle expiry.
 
 ## Review cadence
 
