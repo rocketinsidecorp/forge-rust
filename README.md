@@ -26,7 +26,8 @@ results.
 | 1 | Runtime, CLI, configuration, HTTP, graceful shutdown, health, Docker | Implemented, unreleased |
 | 2 | PostgreSQL, migrations, transaction contracts, repositories | Behavior implemented; CI runner gate still blocked |
 | 3 | Authentication, authorization, tenancy, RLS, audit | Implemented for PostgreSQL (sign-in pages, setup, RBAC, RLS, audit); MFA, reset delivery and other backends pending |
-| 4+ | Jobs/events, telemetry, OpenAPI, AI, hardening | Design only |
+| 4 | PostgreSQL jobs, cron scheduler, outbox, idempotent consumers | Library implemented and tested (`forge` features `jobs`, `events`); `forge new` wiring pending |
+| 5+ | Telemetry, OpenAPI, AI, hardening | Design only |
 
 See the [delivery sequence](docs/architecture.md#delivery-sequence-and-exit-criteria).
 
@@ -214,6 +215,72 @@ docker compose up --build
 > `scripts/e2e-generated-app.sh` handles this by vendoring a copy of the
 > framework into the generated app.
 
+### Background jobs, cron and the outbox
+
+Enable the `jobs` (and optionally `events`) feature of `forge`, declare them on
+the `App`, and register handlers in a composition hook. Generated applications
+do not include this wiring yet. Full guide: [docs/jobs.md](docs/jobs.md).
+
+```rust
+use forge::{App, ComposeError, WorkerMode};
+use forge::jobs::{Job, JobContext, JobError, JobHandler, Schedule};
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SendWelcomeEmail { user_id: uuid::Uuid }
+
+impl Job for SendWelcomeEmail {
+    const NAME: &'static str = "accounts.send_welcome_email";
+    const QUEUE: &'static str = "mailers";
+    const MAX_ATTEMPTS: u16 = 8; // then `dead`
+}
+
+struct WelcomeEmails;
+
+#[async_trait::async_trait]
+impl JobHandler for WelcomeEmails {
+    type Job = SendWelcomeEmail;
+    async fn perform(&self, _: &JobContext, job: SendWelcomeEmail) -> Result<(), JobError> {
+        let _ = job.user_id; // idempotent work; `?` retries with backoff
+        Ok(())
+    }
+}
+
+fn main() -> std::process::ExitCode {
+    App::new("shop")
+        .postgres(sqlx::migrate!())
+        .jobs(WorkerMode::InServe) // or WorkerMode::Dedicated: only `jobs work` runs workers
+        .compose(|composition| {
+            composition.jobs()?
+                .register(WelcomeEmails).map_err(ComposeError::other)?
+                .schedule(Schedule::new(
+                    "nightly.welcome-digest",
+                    "0 3 * * *".parse().map_err(ComposeError::other)?, // UTC cron
+                    &SendWelcomeEmail { user_id: uuid::Uuid::nil() },
+                ).map_err(ComposeError::other)?)
+                .map_err(ComposeError::other)?;
+            Ok(())
+        })
+        .run()
+}
+
+// Enqueue atomically with your business writes (infrastructure code):
+// let mut tx = database.begin().await?;
+// forge::jobs::postgres::enqueue(&mut tx, &SendWelcomeEmail { user_id }, forge::jobs::EnqueueOptions::new()).await?;
+// tx.commit().await?;
+```
+
+```sh
+cargo run -- migrate                    # app migrations + framework job/outbox schemas
+cargo run -- serve                      # HTTP + workers + cron + outbox dispatcher (InServe)
+cargo run -- jobs work                  # workers, cron and dispatcher without HTTP
+cargo run -- jobs status                # job counts per queue and state
+cargo run -- jobs dead 20               # dead jobs, newest first (payloads never shown)
+cargo run -- jobs retry <JOB_ID>        # requeue a dead job with a fresh attempt budget
+cargo run -- jobs discard <JOB_ID>      # delete a dead job
+cargo run -- jobs dead-events           # dead outbox events (feature `events`)
+cargo run -- jobs retry-event <EVENT_ID>
+```
+
 The full command reference is in [docs/cli.md](docs/cli.md). Container,
 Kubernetes and systemd deployment is covered in
 [docs/deployment.md](docs/deployment.md).
@@ -279,7 +346,9 @@ crates/
 ├── forge-core     # lifecycle, errors, UUIDv7 identifiers
 ├── forge-config   # typed FORGE_* configuration and secret redaction
 ├── forge-db       # repository/transaction contracts, including tenant-scoped ports
+├── forge-events   # integration events, transactional outbox, dispatcher, consumer inbox
 ├── forge-http     # HTTP server, routing, middleware, form/query decoding, limits
+├── forge-jobs     # durable PostgreSQL jobs, workers, cron schedules
 ├── forge-security # deny-by-default RBAC roles, permissions and grants
 ├── forge-tenancy  # membership and explicit authorized TenantContext
 ├── forge-views    # server-rendered views: HTML, CSRF, flash, assets, import map, CSP
@@ -302,6 +371,10 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo test --workspace --all-targets --locked
 cargo test --workspace --doc --locked
+
+# PostgreSQL integration suites for jobs, the outbox and the facade (ignored without a server)
+FORGE_TEST_DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5432/postgres \
+  cargo test -p forge-jobs -p forge-events -p forge --all-features -- --include-ignored
 
 # Generated-app end-to-end test (requires bash, curl and Docker)
 bash scripts/e2e-generated-app.sh
@@ -340,6 +413,7 @@ Contribution rules:
 - [Rails parity (Forge-Go and Forge-Rust)](docs/rails-parity.md)
 - [Architecture Decision Records](docs/adr/README.md)
 - [CLI reference](docs/cli.md)
+- [Jobs, schedules, outbox and consumers](docs/jobs.md)
 - [Deployment](docs/deployment.md)
 - [Threat model](docs/threat-model.md)
 - [Dependency policy](docs/dependency-policy.md)

@@ -183,6 +183,27 @@ admitted `getrandom` and `sha2` releases as `forge-views` and generated
 applications; it still implements no cryptographic primitive (it hex-encodes
 random bytes and hashes with `sha2`).
 
+## Phase 4 jobs and events dependency decision
+
+`forge-jobs` and `forge-events` ([ADR 0025](adr/0025-durable-jobs-scheduler-and-outbox.md))
+add **no new third-party package** to the locked graph. They reuse admitted
+workspace dependencies: `sqlx` 0.9 with the `postgres` feature (already used
+by `forge-db`; no `macros` or `json` feature: migrations are embedded with
+`include_str!` and payloads are bound as text and cast to `jsonb`), `tokio`
+(`JoinSet`, timers), `serde`/`serde_json` (job and event payloads),
+`async-trait` (object-safe handler, publisher and subscriber traits),
+`thiserror`, `tracing`, `uuid` (UUIDv7 ids and lease tokens) and `getrandom`
+0.4.3 (retry and poll jitter only; a jitter failure falls back to the
+un-jittered delay, it is not a security property).
+
+Cron parsing is hand-written (about 300 lines, no `unsafe`) instead of
+admitting a cron crate: the five-field UTC grammar is small, the evaluator is
+property-tested against a minute-by-minute oracle and fuzzed with arbitrary
+input, and it avoids a time-zone database dependency. No SQLx, Tokio or
+serde_json type appears in a stable domain/application contract: handlers see
+`Job`, `JobContext`, `JobError`, `Timestamp` and Forge ids; SQLx types appear
+only in the PostgreSQL adapter functions that take a `forge_db::DbTransaction`.
+
 ## Features and public API containment
 
 - Set `default-features = false` when defaults add unused protocols, native

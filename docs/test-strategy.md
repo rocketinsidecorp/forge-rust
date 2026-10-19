@@ -100,6 +100,14 @@ at-least-once duplicate delivery, idempotent consumers, retry jitter within boun
 attempt ceilings, dead letters, scheduled-time semantics, worker crash/reclaim,
 heartbeat expiry, cancellation, concurrency keys, fairness, and saturation.
 
+Phase 4 implementation: `forge-jobs` and `forge-events` run their PostgreSQL
+suites as a per-test non-superuser, non-owner runtime role
+(`forge_jobs::testing::RlsTestDatabase`); they are `#[ignore]`d unless
+`FORGE_TEST_DATABASE_URL` is set and `--include-ignored` is passed. The cron
+evaluator is checked against a minute-by-minute oracle on generated
+expressions and against arbitrary input that must never panic. Concurrency
+keys, per-tenant fairness and saturation tests remain open.
+
 ### Telemetry
 
 Capture an in-memory/export test sink and assert trace linkage across HTTP,

@@ -246,6 +246,31 @@ issuance) when it succeeds; until a mailer adapter replaces
 only logged; MFA is not implemented; a session lasts 24 hours without
 idle expiry.
 
+## Phase 4 review: jobs, schedules and the outbox
+
+Review date: 2026-10-19 ([ADR 0025](adr/0025-durable-jobs-scheduler-and-outbox.md),
+[jobs guide](jobs.md)).
+
+| Threat | Control | Verification |
+| --- | --- | --- |
+| Secrets or personal data in payloads leak through logs, errors or operator output | Payloads are JSON in the database only; logs carry job/event id, name, queue and attempt, never payloads; panic messages and decode errors are not recorded; operator commands never print payloads; envelope `Debug` omits the payload; documentation requires references instead of secrets | `forge-jobs`/`forge-events` unit tests (sanitized errors, payload-free `Debug`); panic test asserts the stored message is generic |
+| Log forging through handler error messages | Stored/logged messages truncated to 1024 bytes and control characters replaced | `job` and dispatcher sanitizer tests |
+| Cross-tenant job or event access | `tenant_id` + RLS policy identical to ADR 0011 (malformed scope fails closed); runtime role has only `SELECT, INSERT`; tenant jobs require an authorized `TenantContext` at enqueue and a matching transaction scope (tenant and principal); the worker reinstalls the job's scope for the handler; idempotency keys are unique per tenant | `row_level_security_isolates_tenants_and_workers_restore_the_scope`, `tenant_events_are_isolated_by_row_level_security` (non-superuser, non-owner runtime role) |
+| Privilege escalation through the cross-tenant worker path | Only `SECURITY DEFINER` functions with fixed semantics, `EXECUTE` revoked from `PUBLIC`, `search_path` pinned to the schema with `pg_temp` last, argument bounds checked; no generic read function | schema test (`schema_reverts_cleanly_and_grants_least_privilege`) checks grants, denied writes/DDL and pinned search paths |
+| Stale or partitioned worker double-completes a reclaimed job | Fenced lease tokens on every transition; lease renewal cancels attempts that lost their lease; `complete_in` commits completion with effects | `expired_leases_are_reclaimed_and_stale_workers_are_fenced_out`, `transactional_completion_is_fenced_and_rolls_back`, `stale_dispatchers_are_fenced_out` |
+| Poison jobs (crash, hang, panic, malformed payload) | Per-attempt timeout; panic isolation per task; lease-expiry reclaim counts the attempt; attempt ceiling then `dead`; undecodable payload or invalid stored scope fails permanently | timeout/panic and lease-expiry dead-letter tests |
+| Queue flooding / resource exhaustion | Bounded per-queue concurrency (≤ 256) and claim batches; payload ≤ 256 KiB; no in-memory queues; bounded pruning batches; idempotency keys for deduplication | registration/settings tests; pruning test |
+| Duplicate side effects from at-least-once delivery | Inbox `(consumer, event_id)` recorded in the effect transaction; concurrent duplicates serialize on the row | `concurrent_duplicate_deliveries_record_one_first_delivery`, end-to-end ledger test |
+| Duplicate cron firing across replicas | Conditional upsert of `last_tick_at` plus per-tick idempotency key, in one transaction | `two_schedulers_fire_each_tick_exactly_once` |
+
+Residual risks: a compromised runtime process can claim, retry or discard
+any tenant's jobs through the definer functions (the same trust it already
+has to set `forge.tenant_id`); tenant membership is not re-checked when a job
+runs, so revocation does not cancel already enqueued work; dead-job error
+messages are visible across tenants to operators; there are no per-tenant
+quotas or rate limits on enqueueing yet (an authorized tenant can fill a
+queue up to the application's own request limits).
+
 ## Review cadence
 
 Update this model when adding a trust boundary, privileged capability, protocol,

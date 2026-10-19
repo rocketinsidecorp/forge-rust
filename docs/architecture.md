@@ -11,12 +11,17 @@ session/CSRF secrets, secure cookie helpers, and append-only audit persistence
 are implemented, including optimistic Argon2id rehash-on-policy-upgrade after a
 successful login. Full-stack PostgreSQL applications are generated with
 sign-in, sign-out and password-reset pages, bounded in-process sign-in
-throttling, a `setup` command for the first tenant and owner, and seeds
-([ADR 0026](adr/0026-authentication-pages-and-setup.md)). Still open in
-Phase 3: password-reset delivery (no mailer yet; the generated notifier fails
-closed), MFA, a shared persistent throttle for horizontally scaled
-deployments, user invitation and management, identity persistence on MySQL,
-MariaDB and SQLite, and stronger audit integrity/retention controls.
+throttling, a `setup` command for the first tenant and owner, and seeds ([ADR
+0026](adr/0026-authentication-pages-and-setup.md)). Still open in Phase 3:
+password-reset delivery (no mailer yet; the generated notifier fails closed),
+MFA, a shared persistent throttle for horizontally scaled deployments, user
+invitation and management, identity persistence on MySQL, MariaDB and SQLite,
+and stronger audit integrity/retention controls. Phase 4 is implemented as a
+library: `forge-jobs` (durable PostgreSQL jobs, fenced leases, workers, cron
+schedules) and `forge-events` (transactional outbox, dispatcher, consumer
+inbox), exposed through the `forge` features `jobs` and `events` ([ADR
+0025](adr/0025-durable-jobs-scheduler-and-outbox.md)); generator wiring for
+`forge new` is pending.
 
 Forge is an opinionated Rust application framework for long-lived services. Its
 value is the integration of explicit application architecture, secure defaults,
@@ -112,8 +117,8 @@ forge/
 │   ├── forge-security      # policy/capability primitives
 │   ├── forge-auth          # authentication/session adapters
 │   ├── forge-tenancy       # tenant context and RLS integration
-│   ├── forge-jobs          # job contracts and PostgreSQL adapter
-│   ├── forge-events        # events, outbox, consumer contracts
+│   ├── forge-jobs          # job contracts, PostgreSQL adapter, workers, cron (Phase 4)
+│   ├── forge-events        # events, outbox, dispatcher, consumer inbox (Phase 4)
 │   ├── forge-cache         # cache port and adapters
 │   ├── forge-storage       # object storage port and adapters
 │   ├── forge-telemetry     # OpenTelemetry lifecycle and context
@@ -323,6 +328,18 @@ events are versioned external contracts written to an outbox in the same commit 
 domain state. Publishers deliver only committed rows. Consumers persist an
 idempotency key before acknowledging. Forge does not promise exactly-once
 delivery; it provides at-least-once delivery plus idempotent handling.
+
+Implementation (ADR 0025): every claim carries a fencing lease token that all
+later transitions must present, so a reclaimed job cannot be acknowledged by
+its stale worker; `complete_in` commits a handler's database effects with
+the job's completion. The runtime role reaches other tenants' rows only
+through `SECURITY DEFINER` claim/transition functions; everything else is
+filtered by the ADR 0011 RLS policy. `Jobs::run` owns one bounded worker loop
+per queue, the scheduler and the pruner under one cancellation, and the
+facade shares that cancellation with the HTTP server. Cron schedules fire
+each tick once across replicas through a conditional upsert of the
+schedule's last tick. MySQL/MariaDB and SQLite are refused, not emulated.
+See the [jobs guide](jobs.md).
 
 ### HTTP, OpenAPI, WebSockets, and SSE
 

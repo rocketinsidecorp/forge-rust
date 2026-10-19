@@ -548,10 +548,15 @@ Every application built with `forge::App` accepts these subcommands:
 | --- | --- |
 | `serve` (default) | Loads and validates `FORGE_*` configuration, starts the HTTP server, and shuts down gracefully on SIGTERM/SIGINT. |
 | `healthcheck` | Sends `GET /health/live` to the loopback address on the configured port. Exits `0` if healthy, `1` otherwise. |
-| `migrate` | For database-enabled apps, applies all pending embedded migrations. |
+| `migrate` | For database-enabled apps, applies all pending embedded migrations (with `App::jobs`/`App::events`, the framework job and outbox schemas first). |
 | `rollback` | For database-enabled apps, reverts the latest reversible migration. |
 | `setup --tenant SLUG --email EMAIL [--organization NAME] [--password-stdin]` | Full-stack PostgreSQL apps: creates the first tenant and its owner (see below). |
 | `seed` | Database apps: runs `seed` in `src/bootstrap/seeds.rs` in one transaction, committed only on success. |
+| `jobs [work]` | With `App::jobs` (feature `jobs`): runs job workers, cron schedules and the outbox dispatcher without HTTP until `SIGTERM`/`SIGINT`. |
+| `jobs status` | Prints job counts per queue and state and the oldest due time. |
+| `jobs dead [LIMIT]` | Lists dead jobs, newest first (default 50, at most 500); payloads are never printed. |
+| `jobs retry JOB_ID` / `jobs discard JOB_ID` | Requeues a dead job with a fresh attempt budget, or deletes it. |
+| `jobs dead-events [LIMIT]` / `jobs retry-event EVENT_ID` | With `App::events`: lists or requeues dead outbox events. |
 | `version` | Prints the application version. |
 | `help` | Prints usage, including the application's commands. |
 

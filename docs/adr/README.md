@@ -24,6 +24,7 @@ does not mean implementation exists.
 | [0022](0022-server-rendered-views.md) | Server-rendered views, Hotwire-compatible, full-stack by default | Accepted |
 | [0023](0023-form-csrf-flash-and-method-override.md) | Form CSRF (host-only double-submit cookie), cookie flash and method override for HTML applications | Accepted |
 | [0024](0024-scaffold-generator.md) | `forge generate scaffold`: printed wiring and deny-by-default access | Accepted |
+| [0025](0025-durable-jobs-scheduler-and-outbox.md) | Durable PostgreSQL jobs, cron schedules, transactional outbox and idempotent consumers | Accepted |
 | [0026](0026-authentication-pages-and-setup.md) | Authentication pages, sign-in redirects, first-owner setup and seeds | Accepted |
 
 New ADRs use the next four-digit number. A changed decision receives a new ADR
