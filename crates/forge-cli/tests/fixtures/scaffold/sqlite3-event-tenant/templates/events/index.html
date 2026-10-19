@@ -1,0 +1,47 @@
+{% extends "layouts/application.html" %}
+
+{% block content %}
+<h1>Events</h1>
+<p><a href="{{ new_path }}">New event</a></p>
+{% if rows.is_empty() %}
+<p>No events yet.</p>
+{% else %}
+<table>
+  <thead>
+    <tr>
+      <th scope="col">Name</th>
+      <th scope="col">Notes</th>
+      <th scope="col">Starts at</th>
+      <th scope="col">Ends at</th>
+      <th scope="col">Capacity</th>
+      <th scope="col">Attendees</th>
+      <th scope="col">Public</th>
+      <th scope="col">Featured</th>
+      <th scope="col">Venue</th>
+      <th scope="col">Organizer</th>
+      <th scope="col">Actions</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for row in rows %}
+    <tr>
+      <td>{{ row.name }}</td>
+      <td>{{ row.notes }}</td>
+      <td>{{ row.starts_at }}</td>
+      <td>{{ row.ends_at }}</td>
+      <td>{{ row.capacity }}</td>
+      <td>{{ row.attendees }}</td>
+      <td>{{ row.public }}</td>
+      <td>{{ row.featured }}</td>
+      <td>{{ row.venue }}</td>
+      <td>{{ row.organizer }}</td>
+      <td><a href="{{ row.show_path }}">Show</a> <a href="{{ row.edit_path }}">Edit</a></td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+{% if let Some(next_path) = next_path %}
+<p><a href="{{ next_path }}">Next page</a></p>
+{% endif %}
+{% endblock %}

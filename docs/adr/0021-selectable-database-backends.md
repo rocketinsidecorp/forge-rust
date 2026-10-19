@@ -3,6 +3,7 @@
 - Status: Accepted
 - Date: 2026-10-14
 - Refines: [ADR 0004](0004-tenancy-and-rls.md) and [ADR 0007](0007-sqlx-postgresql-first.md)
+- Refined by: [ADR 0024](0024-scaffold-generator.md)
 - Decision owner: project owner (2026-10-14: "siga igual o Rails … opção de multi banco")
 
 ## Context

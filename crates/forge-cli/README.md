@@ -5,6 +5,9 @@
 ```text
 forge id                         print a UUIDv7
 forge new <name> [flags]         create an application
+forge generate migration <name>  create a reversible migration pair
+forge generate scaffold <name> <field:type>... --global|--tenant-scoped [--plural P] [--dry-run]
+                                 HTML CRUD through every ring, with tests
 forge check | test | format | lint | build
 ```
 
@@ -24,6 +27,12 @@ checkout (`crates/forge`) instead of the release tag.
 It refuses to overwrite an existing path. Templates live in `templates/app`;
 `examples/hello-forge` is their committed output and a unit test fails when
 the two drift (`FORGE_BLESS=1 cargo test -p forge-cli` regenerates it).
+
+`forge generate scaffold` renders `templates/scaffold` for the application's
+backend, formats the Rust with `rustfmt`, writes only new files (all or
+nothing) and prints the module and `compose` lines to add; its golden output
+is under `tests/fixtures/scaffold` and `tests/scaffold.rs` (ignored, slow)
+builds scaffolded applications end to end.
 
 The quality commands run Cargo directly in the current directory; no shell is
 involved. See [docs/cli.md](../../docs/cli.md) for the full reference.

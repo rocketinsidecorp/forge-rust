@@ -1,0 +1,8 @@
+<form action="{{ action }}" method="post">
+  {{ csrf_field|safe }}
+  {% if let Some(method) = method %}<input type="hidden" name="_method" value="{{ method }}">{% endif %}
+  {% if let Some(version) = version %}<input type="hidden" name="version" value="{{ version }}">{% endif %}
+  {% if let Some(message) = errors.get("base") %}<p class="flash flash-alert" role="alert">{{ message }}</p>{% endif %}
+%%FORM_INPUTS%%
+  <button type="submit">{{ submit }}</button>
+</form>

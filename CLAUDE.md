@@ -172,6 +172,7 @@ After validation, review version-control status and the final diff. Never state 
 - architecture boundaries preserved;
 - security impact reviewed;
 - generated examples/docs match implementation;
+- README.md carries copyable commands to create, run and use every user-facing feature (owner decision, 2026-10-19);
 - targeted tests pass;
 - relevant workspace gates pass;
 - build passes when applicable;

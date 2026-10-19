@@ -1,0 +1,86 @@
+//! View models of the %%NOUN%% pages in `templates/%%RESOURCES%%/`. Values
+//! are prepared as text by `crate::adapters::http::%%RESOURCES%%`; the
+//! templates only lay them out (escaped).
+
+use askama::Template;
+use forge::views::FieldErrors;
+
+use super::Layout;
+
+/// A %%NOUN%% ready for display.
+pub struct %%TYPE%%Row {
+    pub show_path: String,
+    pub edit_path: String,
+%%ROW_STRUCT_FIELDS%%
+}
+
+/// The values of the %%NOUN%% form: as stored, or as submitted when the form
+/// is shown again with errors.
+#[derive(Default)]
+pub struct %%TYPE%%FormValues {
+%%FORM_VALUE_STRUCT_FIELDS%%
+}
+
+/// `templates/%%RESOURCES%%/index.html`.
+#[derive(Template)]
+#[template(path = "%%RESOURCES%%/index.html")]
+pub struct %%TYPE%%Index<'a> {
+    pub layout: Layout<'a>,
+    pub new_path: String,
+    pub rows: Vec<%%TYPE%%Row>,
+    pub next_path: Option<String>,
+}
+
+/// `templates/%%RESOURCES%%/show.html`, with the delete form.
+#[derive(Template)]
+#[template(path = "%%RESOURCES%%/show.html")]
+pub struct %%TYPE%%Show<'a> {
+    pub layout: Layout<'a>,
+    pub csrf_field: String,
+    pub back_path: String,
+    pub version: i64,
+    pub %%RESOURCE%%: %%TYPE%%Row,
+}
+
+/// `templates/%%RESOURCES%%/new.html`, around `_form.html`.
+#[derive(Template)]
+#[template(path = "%%RESOURCES%%/new.html")]
+pub struct %%TYPE%%New<'a> {
+    pub layout: Layout<'a>,
+    pub csrf_field: String,
+    pub action: String,
+    /// `_method` for the form (`None` for a plain `POST`).
+    pub method: Option<&'static str>,
+    /// The optimistic-locking version the form was rendered with.
+    pub version: Option<i64>,
+    pub submit: &'static str,
+    pub back_path: String,
+    pub form: %%TYPE%%FormValues,
+    pub errors: FieldErrors,
+}
+
+/// `templates/%%RESOURCES%%/edit.html`, around `_form.html`.
+#[derive(Template)]
+#[template(path = "%%RESOURCES%%/edit.html")]
+pub struct %%TYPE%%Edit<'a> {
+    pub layout: Layout<'a>,
+    pub csrf_field: String,
+    pub action: String,
+    /// `_method` for the form (`Some("patch")`).
+    pub method: Option<&'static str>,
+    /// The optimistic-locking version the form was rendered with.
+    pub version: Option<i64>,
+    pub submit: &'static str,
+    pub back_path: String,
+    pub show_path: String,
+    pub form: %%TYPE%%FormValues,
+    pub errors: FieldErrors,
+}
+
+/// `templates/%%RESOURCES%%/not_found.html`, answered with `404`.
+#[derive(Template)]
+#[template(path = "%%RESOURCES%%/not_found.html")]
+pub struct %%TYPE%%NotFound<'a> {
+    pub layout: Layout<'a>,
+    pub back_path: String,
+}

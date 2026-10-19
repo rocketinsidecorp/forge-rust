@@ -1,0 +1,18 @@
+{% extends "layouts/application.html" %}
+
+{% block content %}
+<h1>%%LABEL%%</h1>
+<dl>
+%%SHOW_FIELDS%%
+</dl>
+<p>
+  <a href="{{ %%RESOURCE%%.edit_path }}">Edit</a>
+  <a href="{{ back_path }}">Back to %%NOUNS%%</a>
+</p>
+<form action="{{ %%RESOURCE%%.show_path }}" method="post" data-turbo-confirm="Delete this %%NOUN%%?">
+  {{ csrf_field|safe }}
+  <input type="hidden" name="_method" value="delete">
+  <input type="hidden" name="version" value="{{ version }}">
+  <button type="submit">Delete %%NOUN%%</button>
+</form>
+{% endblock %}

@@ -1,0 +1,10 @@
+{% extends "layouts/application.html" %}
+
+{% block content %}
+<h1>Editing %%NOUN%%</h1>
+{% include "%%RESOURCES%%/_form.html" %}
+<p>
+  <a href="{{ show_path }}">Show</a>
+  <a href="{{ back_path }}">Back to %%NOUNS%%</a>
+</p>
+{% endblock %}

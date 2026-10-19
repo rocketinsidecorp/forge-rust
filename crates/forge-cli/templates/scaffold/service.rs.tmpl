@@ -1,0 +1,190 @@
+//! Use cases of the `%%RESOURCES%%` resource: list, show, create, update and
+//! delete with optimistic locking.
+%%if tenant%%
+//!
+//! %%LABELS%% belong to a tenant. Every use case takes the [`TenantContext`]
+//! that the HTTP adapter derived from an authenticated session, an active
+//! membership and an RBAC grant, and checks that the grant is for this
+//! resource, like the HTTP routes do: listing needs [`READ_PERMISSION`],
+//! changes need [`WRITE_PERMISSION`], and loading one %%NOUN%% accepts
+//! either, because the edit and update pages load the %%NOUN%% they change
+//! under the write grant.
+%%end%%
+
+use std::sync::Arc;
+
+use forge::core::Version;
+%%if tenant%%
+use forge::tenancy::TenantContext;
+%%end%%
+
+use crate::application::ports::%%RESOURCE%%_repository::{
+    %%TYPE%%Page, %%TYPE%%Repository, %%TYPE%%StoreError,
+};
+use crate::domain::entities::%%RESOURCE%%::{
+    %%TYPE%%, %%TYPE%%Attributes, %%TYPE%%Id, %%TYPE%%ValidationErrors,
+};
+
+/// Permission to read %%NOUNS%%.
+pub const READ_PERMISSION: &str = "%%RESOURCES%%:read";
+/// Permission to create, change and delete %%NOUNS%%.
+pub const WRITE_PERMISSION: &str = "%%RESOURCES%%:write";
+/// %%LABELS%% per index page.
+pub const PAGE_SIZE: u16 = 25;
+
+/// Why a %%NOUN%% use case failed.
+#[derive(Debug, thiserror::Error)]
+pub enum %%TYPE%%Error {
+    /// The attributes break business rules.
+    #[error("{0}")]
+    Invalid(%%TYPE%%ValidationErrors),
+    /// No such %%NOUN%%.
+    #[error("%%NOUN%% not found")]
+    NotFound,
+    /// The %%NOUN%% changed since the caller read it.
+    #[error("the %%NOUN%% was changed by someone else")]
+    Conflict,
+%%if tenant%%
+    /// The tenant context was authorized for another permission.
+    #[error("permission denied")]
+    Forbidden,
+%%end%%
+    /// Storage failed.
+    #[error("%%NOUN%% storage failed")]
+    Store(#[source] %%TYPE%%StoreError),
+}
+
+/// The %%NOUN%% use cases over a [`%%TYPE%%Repository`].
+#[derive(Clone)]
+pub struct %%TYPE%%Service {
+    repository: Arc<dyn %%TYPE%%Repository>,
+}
+
+impl %%TYPE%%Service {
+    #[must_use]
+    pub fn new(repository: Arc<dyn %%TYPE%%Repository>) -> Self {
+        Self { repository }
+    }
+
+    /// One page of %%NOUNS%%, starting after `after`.
+    pub async fn list(
+        &self,
+%%if tenant%%
+        context: &TenantContext,
+%%end%%
+        after: Option<%%TYPE%%Id>,
+    ) -> Result<%%TYPE%%Page, %%TYPE%%Error> {
+%%if tenant%%
+        authorize(context, &[READ_PERMISSION])?;
+%%end%%
+        self.repository
+            .page(%%CONTEXT_ARG%%after, PAGE_SIZE)
+            .await
+            .map_err(%%TYPE%%Error::Store)
+    }
+
+    /// One %%NOUN%%.
+    pub async fn find(
+        &self,
+%%if tenant%%
+        context: &TenantContext,
+%%end%%
+        id: %%TYPE%%Id,
+    ) -> Result<%%TYPE%%, %%TYPE%%Error> {
+%%if tenant%%
+        authorize(context, &[READ_PERMISSION, WRITE_PERMISSION])?;
+%%end%%
+        self.repository
+            .find(%%CONTEXT_ARG%%id)
+            .await
+            .map_err(%%TYPE%%Error::Store)?
+            .ok_or(%%TYPE%%Error::NotFound)
+    }
+
+    /// Validates and stores a new %%NOUN%%.
+    pub async fn create(
+        &self,
+%%if tenant%%
+        context: &TenantContext,
+%%end%%
+        attributes: %%TYPE%%Attributes,
+    ) -> Result<%%TYPE%%, %%TYPE%%Error> {
+%%if tenant%%
+        authorize(context, &[WRITE_PERMISSION])?;
+%%end%%
+        let %%RESOURCE%% = %%TYPE%%::new(attributes).map_err(%%TYPE%%Error::Invalid)?;
+        self.repository
+            .insert(%%CONTEXT_ARG%%&%%RESOURCE%%)
+            .await
+            .map_err(%%TYPE%%Error::Store)?;
+        Ok(%%RESOURCE%%)
+    }
+
+    /// Replaces the attributes of the %%NOUN%% read at version `expected`.
+    pub async fn update(
+        &self,
+%%if tenant%%
+        context: &TenantContext,
+%%end%%
+        id: %%TYPE%%Id,
+        expected: Version,
+        attributes: %%TYPE%%Attributes,
+    ) -> Result<%%TYPE%%, %%TYPE%%Error> {
+%%if tenant%%
+        authorize(context, &[WRITE_PERMISSION])?;
+%%end%%
+        let %%RESOURCE%% = %%TYPE%%::restore(id, expected, attributes).map_err(%%TYPE%%Error::Invalid)?;
+        match self.repository.update(%%CONTEXT_ARG%%&%%RESOURCE%%).await {
+            Ok(version) => Ok(%%RESOURCE%%.with_version(version)),
+            Err(%%TYPE%%StoreError::Conflict) => Err(self.conflict_or_missing(%%CONTEXT_ARG%%id).await),
+            Err(error) => Err(%%TYPE%%Error::Store(error)),
+        }
+    }
+
+    /// Deletes the %%NOUN%% read at version `expected`.
+    pub async fn delete(
+        &self,
+%%if tenant%%
+        context: &TenantContext,
+%%end%%
+        id: %%TYPE%%Id,
+        expected: Version,
+    ) -> Result<(), %%TYPE%%Error> {
+%%if tenant%%
+        authorize(context, &[WRITE_PERMISSION])?;
+%%end%%
+        match self.repository.delete(%%CONTEXT_ARG%%id, expected).await {
+            Ok(()) => Ok(()),
+            Err(%%TYPE%%StoreError::Conflict) => Err(self.conflict_or_missing(%%CONTEXT_ARG%%id).await),
+            Err(error) => Err(%%TYPE%%Error::Store(error)),
+        }
+    }
+
+    /// A version mismatch is a conflict while the %%NOUN%% exists, and
+    /// "not found" once it is gone.
+    async fn conflict_or_missing(
+        &self,
+%%if tenant%%
+        context: &TenantContext,
+%%end%%
+        id: %%TYPE%%Id,
+    ) -> %%TYPE%%Error {
+        match self.repository.find(%%CONTEXT_ARG%%id).await {
+            Ok(Some(_)) => %%TYPE%%Error::Conflict,
+            Ok(None) => %%TYPE%%Error::NotFound,
+            Err(error) => %%TYPE%%Error::Store(error),
+        }
+    }
+}
+%%if tenant%%
+
+/// Defense in depth: the context must carry a grant for one of `allowed`.
+fn authorize(context: &TenantContext, allowed: &[&str]) -> Result<(), %%TYPE%%Error> {
+    let granted = context.authorization().permission().as_str();
+    if allowed.contains(&granted) {
+        Ok(())
+    } else {
+        Err(%%TYPE%%Error::Forbidden)
+    }
+}
+%%end%%

@@ -3,7 +3,7 @@
 - Status: Accepted
 - Date: 2026-09-27
 - Refines: [ADR 0004](0004-tenancy-and-rls.md)
-- Refined by: [ADR 0013](0013-persistent-principals-sessions-and-memberships.md), [ADR 0014](0014-argon2-session-cookie-and-csrf.md)
+- Refined by: [ADR 0013](0013-persistent-principals-sessions-and-memberships.md), [ADR 0014](0014-argon2-session-cookie-and-csrf.md), [ADR 0024](0024-scaffold-generator.md)
 
 ## Context
 

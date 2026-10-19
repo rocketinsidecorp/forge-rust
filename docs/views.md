@@ -13,8 +13,9 @@ The framework pieces live in the `forge-views` crate, re-exported as
 adapter ring: domain and application code never import `forge::views` or
 `askama`, and the generated `tests/architecture.rs` fails if they do.
 
-`forge generate scaffold` (CRUD resources with views) is a later slice; the
-APIs below are what scaffolded code uses.
+`forge generate scaffold` builds a whole CRUD resource on these APIs
+([Scaffolding a resource](#scaffolding-a-resource),
+[ADR 0024](adr/0024-scaffold-generator.md)).
 
 ## Getting started
 
@@ -32,7 +33,7 @@ on `http://localhost` / `http://127.0.0.1`). The welcome page is made of:
 templates/layouts/application.html  <head>: CSRF meta tag, stylesheet, import map, application.js
 templates/layouts/_flash.html       notice/alert partial
 templates/welcome/index.html        {% extends "layouts/application.html" %}
-src/adapters/http/mod.rs            routes(): Site::load, layers, GET /
+src/adapters/http/mod.rs            site(): Site::load and layers; routes(): GET /
 src/adapters/http/views/mod.rs      Site (assets, import map, CSP, layers) and Layout
 src/adapters/http/views/welcome.rs  WelcomeIndex view model
 assets/application.css              digested and embedded by build.rs
@@ -41,8 +42,9 @@ build.rs                            forge_views::build::embed_assets_with_crate_
 tests/http.rs                       layout, CSP, CSRF and asset tests
 ```
 
-`src/bootstrap` registers the adapter with
-`.compose(|composition| crate::adapters::http::routes(composition.router()))`;
+`src/bootstrap` registers the adapter in its `compose` function:
+`crate::adapters::http::site(router)` loads the `Site` and registers it, and
+`crate::adapters::http::routes(router, &site)` adds the pages.
 `Site::register` adds the asset routes and three request layers, outermost
 first: the Content-Security-Policy, CSRF protection (which also applies the
 `_method` override) and flash messages.
@@ -152,6 +154,88 @@ with the `__Host-forge_csrf` cookie before routing (`403` otherwise);
 next page's layout reads the flash, renders it escaped and removes the cookie.
 With Turbo the same form is submitted with `fetch` and the token travels in
 the `x-csrf-token` header taken from the layout's meta tag.
+
+## Scaffolding a resource
+
+`forge generate scaffold` writes what the form walkthrough above writes by
+hand, for a whole resource and every ring. In a PostgreSQL or SQLite
+application (see [docs/cli.md](cli.md#forge-generate-scaffold) for every
+option):
+
+```sh
+forge generate scaffold post title:string body:text published:boolean --global
+```
+
+It creates the migration pair, `Post` with its validation rules,
+`PostRepository` (port), `PostService` (use cases), the SQLx repository,
+handlers, view models, six templates and two test files, then prints the
+wiring. Add the printed `pub mod` lines to the ring modules and the printed
+statements to the end of `compose` in `src/bootstrap/mod.rs`, then:
+
+```sh
+cargo run -- migrate     # with FORGE_MIGRATION_DATABASE_URL
+cargo test
+```
+
+The routes exist now but answer `403`: a global resource is wired with
+`DenyAll` until you choose who may use it. Replace it in `compose` with an
+implementation of `GlobalAccess`, for example one that admits signed-in
+operators with the generated `authenticate_request`:
+
+```rust
+// src/adapters/http/access.rs (or a module of your own)
+pub struct Operators {
+    pub sessions: Arc<dyn SessionStore>,
+}
+
+#[async_trait]
+impl GlobalAccess for Operators {
+    async fn authorize(&self, request: &Request, _: &Permission) -> Result<(), AccessDenied> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|elapsed| UnixTimestamp::from_secs(elapsed.as_secs()))
+            .map_err(|_| AccessDenied::Unavailable)?;
+        let principal = authenticate_request(self.sessions.as_ref(), request, now)
+            .await
+            .map_err(|_| AccessDenied::Unauthenticated)?;
+        enforce_csrf(self.sessions.as_ref(), request, principal)
+            .await
+            .map_err(|_| AccessDenied::Forbidden)?;
+        // Your rule: may this principal read or change global rows?
+        if is_operator(principal.principal_id()) {
+            Ok(())
+        } else {
+            Err(AccessDenied::Forbidden)
+        }
+    }
+}
+```
+
+A `--tenant-scoped` resource lives under `/tenants/{tenant_id}/posts` and, on
+PostgreSQL, is wired with `SessionTenantAccess` (session, session CSRF token,
+membership, RBAC); grant `posts:read` and `posts:write` to tenant roles in the
+printed `RbacPolicy`. Its rows are isolated by a `tenant_id` predicate in every
+statement and, on PostgreSQL, by forced row-level security.
+
+What the generated pages do:
+
+| Request | Answer |
+| --- | --- |
+| `GET /posts` | the first 25 posts in creation (UUIDv7) order, `?after=<id>` for the next page |
+| `GET /posts/new`, `GET /posts/{id}/edit` | the form (`_form.html`) with the CSRF field; edit adds `_method=patch` and the `version` |
+| `POST /posts` | `303` to the post with a flash notice, or the form again with `422` and an error next to each field |
+| `PATCH /posts/{id}` (form `POST` + `_method`) | `303` with a notice; `422` with errors; `409` when the version is stale, with the submitted values, a message and the current version so saving again is a deliberate overwrite |
+| `DELETE /posts/{id}` (form `POST` + `_method`) | `303` to the index; a stale version redirects back with an alert |
+| an unknown or malformed `{id}` | the `not_found.html` page with `404` |
+| a form without the page's CSRF token | `403` from `CsrfProtection`, before any handler |
+
+Text that does not parse (`abc` for an integer, a malformed timestamp or
+UUID) is reported together with the business-rule violations of the other
+fields. `timestamp` fields use `<input type="datetime-local" step="1">` read
+as UTC, in whole seconds: sub-second input is refused, because browsers blank
+values with more than three fractional digits.
+The templates are ordinary Askama files: edit them freely; the view models in
+`src/adapters/http/views/posts.rs` give every value as display text.
 
 ## Rendering
 
@@ -445,7 +529,7 @@ those rules.
 
 ## Not in this slice
 
-`forge generate scaffold` and `forge generate controller`, development-mode
+JSON scaffolds and `forge generate controller`, development-mode
 asset serving from disk, `forge assets precompile`, `forge dev`, multipart
 forms and file uploads, per-response CSRF token masking, and Turbo Streams over
 SSE/WebSockets (Phase 4).

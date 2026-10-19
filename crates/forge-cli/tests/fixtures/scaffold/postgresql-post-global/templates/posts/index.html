@@ -1,0 +1,33 @@
+{% extends "layouts/application.html" %}
+
+{% block content %}
+<h1>Posts</h1>
+<p><a href="{{ new_path }}">New post</a></p>
+{% if rows.is_empty() %}
+<p>No posts yet.</p>
+{% else %}
+<table>
+  <thead>
+    <tr>
+      <th scope="col">Title</th>
+      <th scope="col">Body</th>
+      <th scope="col">Published</th>
+      <th scope="col">Actions</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for row in rows %}
+    <tr>
+      <td>{{ row.title }}</td>
+      <td>{{ row.body }}</td>
+      <td>{{ row.published }}</td>
+      <td><a href="{{ row.show_path }}">Show</a> <a href="{{ row.edit_path }}">Edit</a></td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+{% if let Some(next_path) = next_path %}
+<p><a href="{{ next_path }}">Next page</a></p>
+{% endif %}
+{% endblock %}

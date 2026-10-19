@@ -163,6 +163,7 @@ A change is done only when:
 - relevant architecture/security contracts remain intact;
 - targeted and required broader checks pass, or execution limitations are explicitly reported;
 - documentation and generated examples match the implementation;
+- README.md carries copyable commands to create, run and use every user-facing feature (owner decision, 2026-10-19);
 - no critical TODO, fake provider, duplicate implementation, or knowingly broken quality gate remains.
 
 ## Final report

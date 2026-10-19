@@ -4,6 +4,7 @@ mod cargo;
 mod cli;
 mod error;
 mod generate;
+mod scaffold;
 
 use std::env;
 use std::io;
@@ -15,6 +16,7 @@ pub use error::CliError;
 use crate::cargo::CargoCommand;
 use crate::cli::{Cli, Command, GenerateCommand};
 use crate::generate::{ForgeSource, NewApplication};
+use crate::scaffold::{ScaffoldOptions, Scope};
 
 /// Parses process arguments and executes the selected Forge command.
 pub fn run() -> Result<(), CliError> {
@@ -82,6 +84,37 @@ fn execute(
                     down.display()
                 )
                 .map_err(CliError::Output)
+            }
+            GenerateCommand::Scaffold {
+                name,
+                fields,
+                tenant_scoped,
+                global: _,
+                plural,
+                dry_run,
+            } => {
+                let options = ScaffoldOptions {
+                    name,
+                    fields,
+                    scope: if tenant_scoped {
+                        Scope::Tenant
+                    } else {
+                        Scope::Global
+                    },
+                    plural,
+                    dry_run,
+                };
+                let version = generate::migration_version()?;
+                let outcome = scaffold::generate(current_dir, &options, &version)?;
+                let verb = if dry_run { "would create" } else { "create" };
+                for path in &outcome.created {
+                    writeln!(output, "  {verb:<12} {path}").map_err(CliError::Output)?;
+                }
+                if outcome.reused_access {
+                    writeln!(output, "  {:<12} src/adapters/http/access.rs", "reuse")
+                        .map_err(CliError::Output)?;
+                }
+                write!(output, "{}", outcome.wiring).map_err(CliError::Output)
             }
         },
         Command::Check => CargoCommand::Check.run(current_dir),

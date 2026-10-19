@@ -159,7 +159,10 @@ unbounded channels are not part of the public API.
 
 Generated entities use nominal IDs whose wire and persistence representation is
 UUIDv7. ID parsing validates UUID version 7 by default; importing legacy IDs must
-be an explicit compatibility path.
+be an explicit compatibility path. Instants in domain and application code are
+`forge::core::Timestamp` (UTC, microsecond precision, RFC 3339 and HTML
+`datetime-local` text); infrastructure converts them to driver types through
+`unix_micros`, so those rings never depend on a date-time crate.
 
 ```rust
 pub struct UserId(uuid::Uuid);
@@ -362,8 +365,12 @@ Liveness never fails because an optional external dependency is unavailable.
 when their backing feature is real. `forge doctor` reports toolchain, configuration,
 and dependency readiness; `forge routes` and `forge openapi` introspect the same
 compiled contract used at runtime. Generators are deterministic, format output,
-refuse destructive overwrites unless explicitly approved, and modify existing
-modules structurally rather than producing duplicate `*_new` files.
+refuse destructive overwrites unless explicitly approved, and never produce
+duplicate `*_new` files. `forge generate scaffold` writes only new files and
+prints the module declarations and composition-root lines to add, so existing
+code changes only by the developer's hand
+([ADR 0024](adr/0024-scaffold-generator.md)); its routes are deny-by-default
+until the application chooses an access policy.
 
 `forge new` emits the application Docker assets in Phase 1 and `forge build` can
 produce the same release binary locally or in the container build. A development

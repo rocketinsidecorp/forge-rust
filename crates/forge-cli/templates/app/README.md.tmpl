@@ -120,6 +120,20 @@ forge generate migration create_customers
 This creates matching `.up.sql` and `.down.sql` files in `migrations/`.
 Migration SQL is checked out with LF line endings so SQLx hashes remain stable
 across operating systems.
+%%if views%%
+
+Generate an HTML CRUD resource (migration, entity, use cases, repository,
+handlers, views and tests) with:
+
+```bash
+forge generate scaffold post title:string body:text published:boolean --global
+```
+
+The generator only creates files; it prints the `pub mod` lines and the
+`compose` statements (in `src/bootstrap/mod.rs`) that wire the resource. Its
+routes answer `403` until you choose who may use them in
+`src/adapters/http/access.rs`.
+%%end%%
 
 %%end%%
 ```bash

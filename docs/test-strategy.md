@@ -131,6 +131,22 @@ tag and the digested Turbo/Stimulus modules, refuse a form `POST` without the
 page's token (`403`) and accept it with the token; the e2e script checks this
 over HTTP and runs the quality gates of an `--api` application.
 
+`forge generate scaffold` has golden fixtures
+(`crates/forge-cli/tests/fixtures/scaffold/`, regenerated with `FORGE_BLESS=1`),
+unit tests for name validation, refusals, `--dry-run`, all-or-nothing writes
+and formatter failure, and a slow end-to-end test
+(`cargo test -p forge-cli --test scaffold -- --ignored`) that generates
+PostgreSQL, SQLite and MySQL applications, scaffolds a global and a
+tenant-scoped resource, applies the printed wiring and runs the
+applications' `cargo fmt --check`, Clippy and tests. With
+`FORGE_TEST_DATABASE_URL` it also runs the PostgreSQL repository and
+row-level-security tests and the scaffold migrations' `migrate`/`rollback`.
+Every scaffold ships tests: domain validation, the HTML flow through the real
+CSRF/flash/method-override layers with an in-memory port (CSRF refusal, `422`,
+`303`, `404`, `409`, the `DenyAll` default) and the repository against
+`TestDatabase` (optimistic locking, cursor pages, cross-tenant isolation and,
+on PostgreSQL, RLS with a role that cannot bypass it).
+
 Phase 1 additionally builds every generated application's multi-stage Dockerfile,
 inspects the final image for non-root identity and forbidden build contents, starts
 it with the documented configuration, waits for the image health check, exercises

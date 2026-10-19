@@ -1,5 +1,7 @@
 use clap::{Parser, Subcommand};
 
+use clap::ArgGroup;
+
 use crate::generate::Database;
 
 #[derive(Debug, Parser)]
@@ -81,5 +83,37 @@ pub(crate) enum GenerateCommand {
     Migration {
         /// Human-readable migration name.
         name: String,
+    },
+    /// Create an HTML CRUD resource through every ring: migration, entity,
+    /// port, use cases, repository, handlers, views and tests (like
+    /// `rails generate scaffold`). Writes only new files and prints the
+    /// wiring to add by hand.
+    #[command(group(
+        ArgGroup::new("scope")
+            .required(true)
+            .args(["tenant_scoped", "global"])
+    ))]
+    Scaffold {
+        /// Singular resource name, snake_case or PascalCase (`line_item`).
+        name: String,
+        /// Fields as name:type, type one of string, text, integer, boolean,
+        /// timestamp, uuid; append `?` for an optional field.
+        #[arg(required = true, value_name = "FIELD:TYPE")]
+        fields: Vec<String>,
+        /// Rows belong to a tenant: routes under /tenants/{tenant_id}/,
+        /// tenant predicates and (PostgreSQL) row-level security.
+        #[arg(long)]
+        tenant_scoped: bool,
+        /// Rows are shared by every tenant; routes stay closed until the
+        /// application chooses who may use them.
+        #[arg(long)]
+        global: bool,
+        /// Plural name when the English rules get it wrong.
+        #[arg(long, value_name = "PLURAL")]
+        plural: Option<String>,
+        /// List the files that would be created and the wiring, without
+        /// writing anything.
+        #[arg(long)]
+        dry_run: bool,
     },
 }

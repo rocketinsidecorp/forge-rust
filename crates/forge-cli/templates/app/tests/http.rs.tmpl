@@ -20,7 +20,8 @@ struct Probe {
 /// layer protects it like any other route.
 fn router() -> Result<Router, Box<dyn Error>> {
     let mut router = Router::new();
-    app::adapters::http::routes(&mut router)?;
+    let site = app::adapters::http::site(&mut router)?;
+    app::adapters::http::routes(&mut router, &site)?;
     router.route(Method::POST, "/test-form", |request: Request| async move {
         match forge::web::decode_form::<Probe>(&request) {
             Ok(probe) => Response::new(StatusCode::CREATED, probe.name),

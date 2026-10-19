@@ -1,0 +1,260 @@
+//! %%BACKEND_LABEL%% storage of %%NOUNS%%, implementing
+//! [`%%TYPE%%Repository`]. SQL and SQLx stay in this module: the port and the
+//! use cases see only domain and Forge types.
+%%if tenant%%
+//!
+//! Tenant isolation: every statement binds the tenant of the authorized
+//! [`TenantContext`] in its `WHERE` clause (or `INSERT` values).
+%%end%%
+%%if rls%%
+//! Each operation also runs in a transaction started by
+//! [`begin_tenant_transaction`], which sets `forge.tenant_id` for the
+//! row-level security policy of the `%%RESOURCES%%` table (defense in depth).
+%%end%%
+//!
+//! Optimistic locking: `UPDATE` and `DELETE` match the expected `version`;
+//! zero affected rows is [`%%TYPE%%StoreError::Conflict`].
+
+use async_trait::async_trait;
+use forge::core::%%REPOSITORY_CORE_IMPORTS%%;
+use forge::db::{DbError, %%DATABASE_TYPE%%};
+%%if tenant%%
+use forge::tenancy::TenantContext;
+%%end%%
+use sqlx::Row;
+use sqlx::%%ROW_PATH%%;
+%%if timestamp%%
+use sqlx::types::chrono::{DateTime, Utc};
+%%end%%
+
+use crate::application::ports::%%RESOURCE%%_repository::{
+    %%TYPE%%Page, %%TYPE%%Repository, %%TYPE%%StoreError,
+};
+use crate::domain::entities::%%RESOURCE%%::{%%TYPE%%, %%TYPE%%Attributes, %%TYPE%%Id};
+%%if rls%%
+use crate::infrastructure::database::begin_tenant_transaction;
+%%end%%
+
+%%SQL_CONSTANTS%%
+
+/// [`%%TYPE%%Repository`] over the application's %%BACKEND_LABEL%% pool.
+#[derive(Clone, Debug)]
+pub struct %%REPOSITORY%% {
+    database: %%DATABASE_TYPE%%,
+}
+
+impl %%REPOSITORY%% {
+    #[must_use]
+    pub fn new(database: %%DATABASE_TYPE%%) -> Self {
+        Self { database }
+    }
+}
+
+#[async_trait]
+impl %%TYPE%%Repository for %%REPOSITORY%% {
+    async fn find(
+        &self,
+%%if tenant%%
+        context: &TenantContext,
+%%end%%
+        id: %%TYPE%%Id,
+    ) -> Result<Option<%%TYPE%%>, %%TYPE%%StoreError> {
+%%if rls%%
+        let mut transaction = begin_tenant_transaction(self.database.pool(), context)
+            .await
+            .map_err(unavailable)?;
+%%end%%
+        let row = sqlx::query(FIND)
+%%if tenant%%
+            .bind(context.tenant_id())
+%%end%%
+            .bind(id)
+            .fetch_optional(%%EXECUTOR%%)
+            .await
+            .map_err(unavailable)?;
+%%if rls%%
+        transaction.commit().await.map_err(unavailable)?;
+%%end%%
+        row.as_ref().map(restore).transpose()
+    }
+
+    async fn page(
+        &self,
+%%if tenant%%
+        context: &TenantContext,
+%%end%%
+        after: Option<%%TYPE%%Id>,
+        limit: u16,
+    ) -> Result<%%TYPE%%Page, %%TYPE%%StoreError> {
+        // One extra row tells whether a next page exists.
+        let fetch = i64::from(limit) + 1;
+%%if rls%%
+        let mut transaction = begin_tenant_transaction(self.database.pool(), context)
+            .await
+            .map_err(unavailable)?;
+%%end%%
+        let rows = match after {
+            None => {
+                sqlx::query(PAGE_FIRST)
+%%if tenant%%
+                    .bind(context.tenant_id())
+%%end%%
+                    .bind(fetch)
+                    .fetch_all(%%EXECUTOR%%)
+                    .await
+            }
+            Some(after) => {
+                sqlx::query(PAGE_AFTER)
+%%if tenant%%
+                    .bind(context.tenant_id())
+%%end%%
+                    .bind(after)
+                    .bind(fetch)
+                    .fetch_all(%%EXECUTOR%%)
+                    .await
+            }
+        }
+        .map_err(unavailable)?;
+%%if rls%%
+        transaction.commit().await.map_err(unavailable)?;
+%%end%%
+        let mut %%RESOURCES%% = rows.iter().map(restore).collect::<Result<Vec<_>, _>>()?;
+        let next = if %%RESOURCES%%.len() > usize::from(limit) {
+            %%RESOURCES%%.truncate(usize::from(limit));
+            %%RESOURCES%%.last().map(%%TYPE%%::id)
+        } else {
+            None
+        };
+        Ok(%%TYPE%%Page { %%RESOURCES%%, next })
+    }
+
+    async fn insert(
+        &self,
+%%if tenant%%
+        context: &TenantContext,
+%%end%%
+        %%RESOURCE%%: &%%TYPE%%,
+    ) -> Result<(), %%TYPE%%StoreError> {
+        let attributes = %%RESOURCE%%.attributes();
+%%if rls%%
+        let mut transaction = begin_tenant_transaction(self.database.pool(), context)
+            .await
+            .map_err(unavailable)?;
+%%end%%
+        sqlx::query(INSERT)
+            .bind(%%RESOURCE%%.id())
+%%if tenant%%
+            .bind(context.tenant_id())
+%%end%%
+            .bind(%%RESOURCE%%.version())
+%%ATTRIBUTE_BINDS%%
+            .execute(%%EXECUTOR%%)
+            .await
+            .map_err(unavailable)?;
+%%if rls%%
+        transaction.commit().await.map_err(unavailable)?;
+%%end%%
+        Ok(())
+    }
+
+    async fn update(
+        &self,
+%%if tenant%%
+        context: &TenantContext,
+%%end%%
+        %%RESOURCE%%: &%%TYPE%%,
+    ) -> Result<Version, %%TYPE%%StoreError> {
+        let attributes = %%RESOURCE%%.attributes();
+        let next = %%RESOURCE%%
+            .version()
+            .next()
+            .map_err(|_| %%TYPE%%StoreError::Conflict)?;
+%%if rls%%
+        let mut transaction = begin_tenant_transaction(self.database.pool(), context)
+            .await
+            .map_err(unavailable)?;
+%%end%%
+        let result = sqlx::query(UPDATE)
+%%ATTRIBUTE_BINDS%%
+%%if tenant%%
+            .bind(context.tenant_id())
+%%end%%
+            .bind(%%RESOURCE%%.id())
+            .bind(%%RESOURCE%%.version())
+            .execute(%%EXECUTOR%%)
+            .await
+            .map_err(unavailable)?;
+%%if rls%%
+        transaction.commit().await.map_err(unavailable)?;
+%%end%%
+        if result.rows_affected() == 1 {
+            Ok(next)
+        } else {
+            Err(%%TYPE%%StoreError::Conflict)
+        }
+    }
+
+    async fn delete(
+        &self,
+%%if tenant%%
+        context: &TenantContext,
+%%end%%
+        id: %%TYPE%%Id,
+        expected: Version,
+    ) -> Result<(), %%TYPE%%StoreError> {
+%%if rls%%
+        let mut transaction = begin_tenant_transaction(self.database.pool(), context)
+            .await
+            .map_err(unavailable)?;
+%%end%%
+        let result = sqlx::query(DELETE)
+%%if tenant%%
+            .bind(context.tenant_id())
+%%end%%
+            .bind(id)
+            .bind(expected)
+            .execute(%%EXECUTOR%%)
+            .await
+            .map_err(unavailable)?;
+%%if rls%%
+        transaction.commit().await.map_err(unavailable)?;
+%%end%%
+        if result.rows_affected() == 1 {
+            Ok(())
+        } else {
+            Err(%%TYPE%%StoreError::Conflict)
+        }
+    }
+}
+
+/// Rebuilds a %%NOUN%% from a row; a value the domain rejects is `Corrupt`.
+fn restore(row: &%%ROW_TYPE%%) -> Result<%%TYPE%%, %%TYPE%%StoreError> {
+    let attributes = %%TYPE%%Attributes {
+%%RESTORE_FIELDS%%
+    };
+    %%TYPE%%::restore(
+        row.try_get("id").map_err(corrupt)?,
+        row.try_get("version").map_err(corrupt)?,
+        attributes,
+    )
+    .map_err(|_| %%TYPE%%StoreError::Corrupt)
+}
+%%if timestamp%%
+
+fn to_datetime(value: Timestamp) -> Result<DateTime<Utc>, %%TYPE%%StoreError> {
+    DateTime::from_timestamp_micros(value.unix_micros()).ok_or(%%TYPE%%StoreError::Corrupt)
+}
+
+fn from_datetime(value: DateTime<Utc>) -> Result<Timestamp, %%TYPE%%StoreError> {
+    Timestamp::from_unix_micros(value.timestamp_micros()).map_err(|_| %%TYPE%%StoreError::Corrupt)
+}
+%%end%%
+
+fn corrupt(_: sqlx::Error) -> %%TYPE%%StoreError {
+    %%TYPE%%StoreError::Corrupt
+}
+
+/// Classifies the driver error (kept as the source for logs).
+fn unavailable(error: sqlx::Error) -> %%TYPE%%StoreError {
+    %%TYPE%%StoreError::Unavailable(Box::new(DbError::from(error)))
+}

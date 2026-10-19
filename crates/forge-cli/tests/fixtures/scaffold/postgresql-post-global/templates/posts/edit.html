@@ -1,0 +1,10 @@
+{% extends "layouts/application.html" %}
+
+{% block content %}
+<h1>Editing post</h1>
+{% include "posts/_form.html" %}
+<p>
+  <a href="{{ show_path }}">Show</a>
+  <a href="{{ back_path }}">Back to posts</a>
+</p>
+{% endblock %}

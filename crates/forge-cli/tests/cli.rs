@@ -258,3 +258,84 @@ fn skip_database_flag_is_replaced_by_database_none() {
     assert!(!output.status.success());
     assert!(!directory.path().join("api").exists());
 }
+
+#[test]
+fn generate_scaffold_dry_run_lists_files_and_requires_a_scope() {
+    let directory = tempfile::tempdir().expect("temporary directory should be available");
+    let created = forge(
+        directory.path(),
+        &[
+            "new",
+            "shop",
+            "--skip-lockfile",
+            "--skip-docker",
+            "--forge-path",
+            "../forge",
+        ],
+    );
+    assert!(created.status.success(), "{created:?}");
+    let root = directory.path().join("shop");
+
+    let without_scope = forge(&root, &["generate", "scaffold", "post", "title:string"]);
+    assert!(!without_scope.status.success());
+    assert!(String::from_utf8_lossy(&without_scope.stderr).contains("--tenant-scoped"));
+
+    let both = forge(
+        &root,
+        &[
+            "generate",
+            "scaffold",
+            "post",
+            "title:string",
+            "--global",
+            "--tenant-scoped",
+        ],
+    );
+    assert!(!both.status.success());
+
+    let dry_run = forge(
+        &root,
+        &[
+            "generate",
+            "scaffold",
+            "post",
+            "title:string",
+            "--global",
+            "--dry-run",
+        ],
+    );
+    assert!(dry_run.status.success(), "{dry_run:?}");
+    let stdout = String::from_utf8_lossy(&dry_run.stdout);
+    assert!(
+        stdout.contains("would create src/domain/entities/post.rs"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("pub mod post_repository;"), "{stdout}");
+    assert!(!root.join("src/domain/entities/post.rs").exists());
+
+    let invalid = forge(
+        &root,
+        &["generate", "scaffold", "post", "price:float", "--global"],
+    );
+    assert!(!invalid.status.success());
+    assert!(String::from_utf8_lossy(&invalid.stderr).contains("no float type"));
+}
+
+#[test]
+fn generate_scaffold_refuses_api_and_database_free_applications() {
+    let directory = tempfile::tempdir().expect("temporary directory should be available");
+    for (name, flags) in [("api", &["--api"][..]), ("plain", &["-d", "none"][..])] {
+        let mut arguments = vec!["new", name, "--skip-lockfile", "--skip-docker"];
+        arguments.extend_from_slice(flags);
+        assert!(forge(directory.path(), &arguments).status.success());
+
+        let refused = forge(
+            &directory.path().join(name),
+            &["generate", "scaffold", "post", "title:string", "--global"],
+        );
+
+        assert!(!refused.status.success(), "{name}");
+        let stderr = String::from_utf8_lossy(&refused.stderr);
+        assert!(stderr.contains("cannot generate the scaffold"), "{stderr}");
+    }
+}
