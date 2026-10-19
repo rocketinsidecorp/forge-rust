@@ -23,6 +23,7 @@ does not mean implementation exists.
 | [0021](0021-selectable-database-backends.md) | Selectable database backends with `forge new -d` | Accepted |
 | [0022](0022-server-rendered-views.md) | Server-rendered views, Hotwire-compatible, full-stack by default | Accepted |
 | [0023](0023-form-csrf-flash-and-method-override.md) | Form CSRF (host-only double-submit cookie), cookie flash and method override for HTML applications | Accepted |
+| [0024](0024-scaffold-generator.md) | `forge generate scaffold`: printed wiring and deny-by-default access | Accepted |
 
 New ADRs use the next four-digit number. A changed decision receives a new ADR
 that marks the prior record `Superseded`; accepted records are not rewritten to

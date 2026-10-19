@@ -19,6 +19,7 @@ from a checkout.
 forge id
 forge new <name> [-d <DATABASE>] [--api] [--skip-docker] [--skip-ci] [--skip-lockfile] [--forge-path <PATH>]
 forge generate migration <name>
+forge generate scaffold <name> <field:type>... (--global | --tenant-scoped) [--plural <PLURAL>] [--dry-run]
 forge check
 forge test
 forge format
@@ -286,6 +287,134 @@ runtime/migrator roles, audit event persistence, identity/session/credential
 persistence, and tenant membership persistence. Tenant isolation on those
 backends rests on the application layer (bind the tenant predicate from
 `TenantContext`); use PostgreSQL when the database must enforce isolation.
+
+## `forge generate scaffold`
+
+```sh
+forge generate scaffold post title:string body:text published:boolean --global
+forge generate scaffold invoice number:string total_cents:integer due_at:timestamp? --tenant-scoped
+```
+
+The `rails generate scaffold` of Forge ([ADR 0022](adr/0022-server-rendered-views.md)
+decision 7, [ADR 0024](adr/0024-scaffold-generator.md)): run in the root of a
+full-stack database application, it generates a server-rendered HTML CRUD
+(index, show, new/create, edit/update, delete) through every ring, for the
+application's database backend, with tests. The walkthrough is in
+[docs/views.md](views.md#scaffolding-a-resource).
+
+| Argument | Meaning |
+| --- | --- |
+| `<name>` | Singular resource name, `snake_case` or `PascalCase` (`line_item`, `LineItem`). It names the entity type (`LineItem`), the table, routes and modules use the plural. |
+| `<field:type>...` | At least one field. Types: `string` (at most 255 characters), `text` (at most 65,535), `integer` (`i64`; store money as integer minor units, there is no float), `boolean`, `timestamp` (`forge::core::Timestamp`, UTC), `uuid` (`forge::core::Uuid`, any version). Append `?` for an optional (nullable) field: `due_at:timestamp?`. |
+| `--global` | Rows are shared by every tenant. Routes `/<plural>/...`, closed by `DenyAll` until the application decides who may use them. |
+| `--tenant-scoped` | Rows belong to a tenant. Routes `/tenants/{tenant_id}/<plural>/...`, `tenant_id` bound from the authorized `TenantContext` in every statement, plus forced row-level security on PostgreSQL. Exactly one of `--global` and `--tenant-scoped` is required. |
+| `--plural <PLURAL>` | The plural when the English rules (`-y` to `-ies`; `-s`, `-x`, `-z`, `-ch`, `-sh` take `-es`; otherwise `-s`) get it wrong. A name that already looks plural is refused unless `--plural` is given. |
+| `--dry-run` | Print the files that would be created and the wiring; write nothing. |
+
+Names are validated before anything is read: snake_case ASCII, at most 40
+characters, not a Rust keyword or common SQL keyword, not a reserved column
+(`id`, `tenant_id`, `version`, `created_at`, `updated_at`) or a name the
+generated code already uses (`csrf_token`, `clone`, ...), at most 32 fields
+without duplicates, and constraint names within PostgreSQL's 63-byte limit.
+
+### What it generates
+
+For `post title:string body:text published:boolean --global` in a PostgreSQL
+application:
+
+```text
+migrations/<version>_create_posts.up.sql     table, UUIDv7 key from Rust, version, timestamps, checks, grants
+migrations/<version>_create_posts.down.sql   DROP TABLE
+src/domain/entities/post.rs                  Post, PostId, PostAttributes, typed validation errors + unit tests
+src/application/ports/post_repository.rs     PostRepository port, PostPage, PostStoreError
+src/application/use_cases/posts.rs           PostService (list/find/create/update/delete), permissions
+src/infrastructure/database/posts.rs         PgPostRepository (SQLx, optimistic locking, cursor pages)
+src/adapters/http/access.rs                  access policies (first scaffold only; reused after)
+src/adapters/http/posts.rs                   routes and handlers
+src/adapters/http/views/posts.rs             Askama view models
+templates/posts/{index,show,new,edit,_form,not_found}.html
+tests/posts_http.rs                          HTML flow with an in-memory port
+tests/posts_repository.rs                    repository against TestDatabase
+```
+
+Generated Rust is formatted with the application's pinned `rustfmt` before
+anything is written. The generator writes only new files: if any of them, or
+a `*_create_<plural>` migration, already exists it refuses and writes nothing;
+a failed write removes what was written. Output is deterministic (golden
+fixtures under `crates/forge-cli/tests/fixtures/scaffold/`).
+
+| Backend | Migration | Repository | Tenant isolation |
+| --- | --- | --- | --- |
+| PostgreSQL | `uuid`, `timestamptz`, `bigint`, `boolean`, `text` with length checks; `REVOKE ALL FROM PUBLIC` and grants to `app_runtime` when the role exists | `PgPostRepository` | `tenant_id` predicate in every statement, each operation in `begin_tenant_transaction`, forced RLS policy on `forge.tenant_id` |
+| MySQL / MariaDB | `BINARY(16)`, `DATETIME(6)`, `BIGINT`, `BOOLEAN`, `VARCHAR(255)`, `MEDIUMTEXT` | `MySqlPostRepository` | `tenant_id` predicate in every statement (no RLS, ADR 0021) |
+| SQLite | `BLOB`, `TEXT`, `INTEGER` with boolean and length checks | `SqlitePostRepository` | `tenant_id` predicate in every statement (no RLS, ADR 0021) |
+
+### Wiring
+
+`forge generate scaffold` never edits an existing file. It prints the module
+declarations to add (one `pub mod` line in each ring's `mod.rs`, kept sorted)
+and the statements to append to the `compose` function in
+`src/bootstrap/mod.rs`, already formatted with full paths:
+
+```rust
+    // posts: global. DenyAll refuses every request until you decide who may
+    // use them: implement GlobalAccess (src/adapters/http/access.rs).
+    let posts = crate::application::use_cases::posts::PostService::new(std::sync::Arc::new(
+        crate::infrastructure::database::posts::PgPostRepository::new(
+            composition.postgres()?.clone(),
+        ),
+    ));
+    crate::adapters::http::posts::routes(
+        composition.router(),
+        &site,
+        posts,
+        std::sync::Arc::new(crate::adapters::http::access::DenyAll),
+    )?;
+```
+
+### Access
+
+Every route asks its access policy for `<plural>:read` (index, show) or
+`<plural>:write` (new, create, edit, update, delete) before doing anything.
+Nothing is public by default:
+
+- **Global** resources are wired with `DenyAll` (`403`). Replace it with your
+  own `GlobalAccess` implementation in `compose`; that is the explicit
+  decision to open the routes. Tenant roles cannot authorize global rows
+  because every tenant reads them.
+- **Tenant-scoped** resources on PostgreSQL are wired with
+  `SessionTenantAccess`: a live session (`__Host-forge_session`), the
+  session-bound CSRF token on unsafe methods, an active membership in the
+  route's `{tenant_id}` and an RBAC grant. The printed `RbacPolicy` is empty;
+  grant the permissions to tenant roles:
+
+  ```rust
+  let mut policy = forge::security::RbacPolicy::new();
+  policy.allow(
+      forge::security::Role::new("editor").map_err(forge::ComposeError::other)?,
+      forge::security::Permission::new(crate::application::use_cases::posts::WRITE_PERMISSION)
+          .map_err(forge::ComposeError::other)?,
+  );
+  ```
+
+  On MySQL, MariaDB and SQLite, which have no Forge session or membership
+  persistence yet, tenant-scoped resources are wired with `DenyAll` until the
+  application provides `SessionStore` and `MembershipStore` implementations.
+
+Denials answer `401` (no valid session), `403` or `503` (identity store
+unavailable) with a generic body.
+
+### Refusals
+
+The scaffold refuses, with an explanation and without writing:
+
+- `forge new --api` applications: the scaffold generates HTML pages; JSON
+  scaffolds are not available yet.
+- `forge new -d none` applications: there is no database.
+- Applications without the `compose` function, the `forge` dev-dependency
+  with the `testing` feature or (PostgreSQL tenant resources)
+  `begin_tenant_transaction`, all of which `forge new` generates.
+- An `src/adapters/http/access.rs` that lacks the generated traits.
 
 ## `forge check`, `forge test`, `forge format`, `forge lint`
 

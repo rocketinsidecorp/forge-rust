@@ -52,6 +52,15 @@ curl localhost:3000/health/live
 # open http://127.0.0.1:3000 for the welcome page
 ```
 
+Scaffold an HTML CRUD resource through every ring, then add the printed
+module and `compose` lines (the routes stay closed until you choose who may
+use them, see [docs/views.md](docs/views.md#scaffolding-a-resource)):
+
+```sh
+forge generate scaffold post title:string body:text published:boolean --global
+forge generate scaffold invoice number:string total_cents:integer --tenant-scoped
+```
+
 Pick the database like `rails new -d`: `forge new shop -d postgresql|mysql|mariadb|sqlite3`
 (PostgreSQL is the default). Use `forge new shop -d none` for a service that does not need
 PostgreSQL, and `forge new shop --api` for a JSON-only service without views.
@@ -116,6 +125,11 @@ Kubernetes and systemd deployment is covered in
   digest-only persisted
   sessions, tenant membership persistence, append-only PostgreSQL audit storage,
   a health-ordered Compose database, and `forge generate migration <name>`.
+- `forge generate scaffold <name> field:type... --global|--tenant-scoped`:
+  migration, entity, port, use cases, SQLx repository, HTML handlers, views
+  and tests for the application's backend, deny-by-default access, tenant
+  predicates plus forced RLS on PostgreSQL, and printed wiring instead of
+  edits to existing files ([ADR 0024](docs/adr/0024-scaffold-generator.md)).
 - Typed `FORGE_*` environment configuration. Database URLs are redacted from
   normal debug/serialization output, and unknown `FORGE_*` keys are
   rejected at startup.
