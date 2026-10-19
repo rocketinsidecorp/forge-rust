@@ -5,9 +5,13 @@
 //! and `cargo test`.
 //!
 //! With `FORGE_TEST_DATABASE_URL` the PostgreSQL application also runs its
-//! ignored repository and row-level-security tests and applies and reverts
-//! the scaffold migrations with its own `migrate`/`rollback` commands (with
-//! `FORGE_TEST_MYSQL_URL` the MySQL repository tests run too).
+//! ignored repository, row-level-security and authentication tests, applies
+//! and reverts the scaffold migrations with its own `migrate`/`rollback`
+//! commands, creates the first owner with `setup`, loads seeds, and a browser
+//! session signs in, uses the tenant-scoped scaffold pages and signs out
+//! against the running server (with `FORGE_TEST_MYSQL_URL` the MySQL
+//! repository tests run too). A PostgreSQL application stripped of its
+//! sign-in pages regains them with `forge generate authentication`.
 //!
 //! These tests build whole applications and resolve dependencies with
 //! `cargo generate-lockfile`, so they are ignored by default:
@@ -17,8 +21,11 @@
 //! ```
 
 use std::fs;
+use std::io::{Read as _, Write as _};
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Child, Command, Output, Stdio};
+use std::time::Duration;
 
 use forge_db::sqlx;
 use forge_db::testing::TestDatabase;
@@ -55,6 +62,52 @@ fn run(
     arguments: &[&str],
     environment: &[(&str, &str)],
 ) -> Output {
+    let output = run_unchecked(directory, program, arguments, environment, None);
+    assert!(
+        output.status.success(),
+        "{program} {arguments:?} failed in {}:\n{}\n{}",
+        directory.display(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output
+}
+
+/// Runs `program` with `stdin` piped in, whatever its exit status.
+fn run_unchecked(
+    directory: &Path,
+    program: &str,
+    arguments: &[&str],
+    environment: &[(&str, &str)],
+    stdin: Option<&str>,
+) -> Output {
+    let mut command = command(directory, program, arguments, environment);
+    command
+        .stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .unwrap_or_else(|error| panic!("{program} {arguments:?} did not start: {error}"));
+    if let (Some(input), Some(mut pipe)) = (stdin, child.stdin.take()) {
+        pipe.write_all(input.as_bytes())
+            .unwrap_or_else(|error| panic!("stdin: {error}"));
+    }
+    child
+        .wait_with_output()
+        .unwrap_or_else(|error| panic!("{program} {arguments:?}: {error}"))
+}
+
+fn command(
+    directory: &Path,
+    program: &str,
+    arguments: &[&str],
+    environment: &[(&str, &str)],
+) -> Command {
     let mut command = Command::new(program);
     command.args(arguments).current_dir(directory).env(
         "CARGO_TARGET_DIR",
@@ -73,17 +126,7 @@ fn run(
     for (name, value) in environment {
         command.env(name, value);
     }
-    let output = command
-        .output()
-        .unwrap_or_else(|error| panic!("{program} {arguments:?} did not start: {error}"));
-    assert!(
-        output.status.success(),
-        "{program} {arguments:?} failed in {}:\n{}\n{}",
-        directory.display(),
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    output
+    command
 }
 
 /// Applies the printed wiring like a careful developer: each `pub mod`
@@ -92,6 +135,7 @@ fn run(
 fn apply_wiring(root: &Path, printed: &str) {
     let mut declarations = Vec::new();
     let mut statements = Vec::new();
+    let mut commands = Vec::new();
     let mut section = 0;
     for line in printed.lines() {
         let trimmed = line.trim();
@@ -99,6 +143,14 @@ fn apply_wiring(root: &Path, printed: &str) {
             section = 1;
         } else if trimmed.starts_with("2. In src/bootstrap/mod.rs") {
             section = 2;
+        } else if trimmed.starts_with("3. In src/bootstrap/mod.rs, in `fn run`") {
+            section = 4;
+        } else if section == 4 {
+            if line.starts_with("    ") {
+                commands.push(line.to_owned());
+            } else if !commands.is_empty() {
+                section = 5;
+            }
         } else if section == 1 {
             if let Some((file, declaration)) = trimmed.split_once(" pub mod ") {
                 declarations.push((file.trim().to_owned(), format!("pub mod {declaration}")));
@@ -115,6 +167,8 @@ fn apply_wiring(root: &Path, printed: &str) {
         !declarations.is_empty() && !statements.is_empty(),
         "{printed}"
     );
+    // Every printed line was applied: nothing of section 2 may be lost.
+    assert!(section >= 2, "{printed}");
 
     for (file, declaration) in declarations {
         let path = root.join(&file);
@@ -141,12 +195,12 @@ fn apply_wiring(root: &Path, printed: &str) {
         fs::write(&path, lines.join("\n") + "\n").unwrap_or_else(|error| panic!("{error}"));
     }
 
-    // The grant example printed for PostgreSQL tenant resources, applied
+    // The role example printed for PostgreSQL tenant resources, applied
     // too, so it is proven to compile.
     let mut grant = Vec::new();
     let mut in_example = false;
     for line in printed.lines() {
-        if line.contains("make `policy` mutable and add, for example:") {
+        if line.contains("`let mut policy`, for example:") {
             in_example = true;
         } else if in_example && line.starts_with("    ") {
             grant.push(line.to_owned());
@@ -154,17 +208,19 @@ fn apply_wiring(root: &Path, printed: &str) {
             break;
         }
     }
-    let policy = "    let policy = forge::security::RbacPolicy::new();\n";
-    let statements = statements.join("\n").replace(
-        policy,
-        &format!(
-            "    let mut policy = forge::security::RbacPolicy::new();\n{}\n",
-            grant.join("\n")
-        ),
-    );
+    let policy = "    let mut policy = forge::security::RbacPolicy::new();\n";
+    let statements = statements
+        .join("\n")
+        .replace(policy, &format!("{policy}{}\n", grant.join("\n")));
 
     let bootstrap = root.join("src/bootstrap/mod.rs");
-    let source = fs::read_to_string(&bootstrap).unwrap_or_else(|error| panic!("{error}"));
+    let mut source = fs::read_to_string(&bootstrap).unwrap_or_else(|error| panic!("{error}"));
+    if !commands.is_empty() {
+        let run = source
+            .find("        .run()\n")
+            .unwrap_or_else(|| panic!("run ends with .run():\n{source}"));
+        source.insert_str(run, &format!("{}\n", commands.join("\n")));
+    }
     let end = source
         .rfind("    Ok(())\n}\n")
         .unwrap_or_else(|| panic!("compose ends with Ok(()):\n{source}"));
@@ -312,6 +368,11 @@ fn postgresql_application_with_scaffolds_passes_its_gates_and_migrations_revert(
     for test in [
         "postgres_round_trip_locking_and_pages ... ok",
         "postgres_row_level_security_isolates_tenants ... ok",
+        "every_wrong_field_gets_the_same_answer ... ok",
+        "a_reset_link_works_once_changes_the_password_and_revokes_sessions ... ok",
+        "setup_creates_one_owner_who_can_sign_in_and_refuses_afterwards ... ok",
+        "concurrent_setups_create_exactly_one_tenant ... ok",
+        "reset_tokens_work_once_expire_and_revoke_every_session ... ok",
     ] {
         assert!(tests.contains(test), "{test}\n{tests}");
     }
@@ -361,9 +422,408 @@ fn postgresql_application_with_scaffolds_passes_its_gates_and_migrations_revert(
         assert!(table("forge_principals").await.is_some());
         migrate("migrate");
         assert_eq!(table("events").await.as_deref(), Some("events"));
+
+        // Seeds are idempotent: running them twice succeeds.
+        for _ in 0..2 {
+            let seeded = migrate("seed");
+            assert!(seeded.contains("Seed data loaded."), "{seeded}");
+        }
+        sign_in_use_a_tenant_scaffold_and_sign_out(&root, &binary, &url);
         database
             .cleanup()
             .await
             .unwrap_or_else(|error| panic!("cleanup: {error}"));
     });
+}
+
+const OWNER_PASSWORD: &str = "correct horse battery";
+
+/// A free loopback port.
+fn free_port() -> u16 {
+    TcpListener::bind("127.0.0.1:0")
+        .and_then(|listener| listener.local_addr())
+        .map(|address| address.port())
+        .unwrap_or_else(|error| panic!("free port: {error}"))
+}
+
+/// The application server; killed when dropped.
+struct Server(Child);
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// One HTTP/1.1 response.
+struct Reply {
+    status: u16,
+    headers: Vec<(String, String)>,
+    body: String,
+}
+
+impl Reply {
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(header, _)| header.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
+}
+
+/// A browser: sends the cookies responses set, asks for HTML.
+#[derive(Default)]
+struct Browser {
+    cookies: Vec<(String, String)>,
+}
+
+impl Browser {
+    fn request(&mut self, port: u16, method: &str, path: &str, form: Option<&str>) -> Reply {
+        let mut stream = TcpStream::connect(("127.0.0.1", port))
+            .unwrap_or_else(|error| panic!("connect: {error}"));
+        stream
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap_or_else(|error| panic!("{error}"));
+        let cookies: Vec<String> = self
+            .cookies
+            .iter()
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect();
+        let body = form.unwrap_or_default();
+        let mut request = format!(
+            "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\
+             Accept: text/html,application/xhtml+xml\r\nContent-Length: {}\r\n",
+            body.len()
+        );
+        if !cookies.is_empty() {
+            request.push_str(&format!("Cookie: {}\r\n", cookies.join("; ")));
+        }
+        if form.is_some() {
+            request.push_str("Content-Type: application/x-www-form-urlencoded\r\n");
+        }
+        request.push_str("\r\n");
+        request.push_str(body);
+        stream
+            .write_all(request.as_bytes())
+            .unwrap_or_else(|error| panic!("send: {error}"));
+        let mut raw = Vec::new();
+        stream
+            .read_to_end(&mut raw)
+            .unwrap_or_else(|error| panic!("receive: {error}"));
+        let raw = String::from_utf8_lossy(&raw).into_owned();
+        let (head, body) = raw.split_once("\r\n\r\n").unwrap_or((raw.as_str(), ""));
+        let mut lines = head.lines();
+        let status = lines
+            .next()
+            .and_then(|line| line.split(' ').nth(1))
+            .and_then(|code| code.parse().ok())
+            .unwrap_or_else(|| panic!("status line in {head}"));
+        let headers: Vec<(String, String)> = lines
+            .filter_map(|line| line.split_once(':'))
+            .map(|(name, value)| (name.trim().to_owned(), value.trim().to_owned()))
+            .collect();
+        for (name, value) in &headers {
+            if !name.eq_ignore_ascii_case("set-cookie") {
+                continue;
+            }
+            let pair = value.split(';').next().unwrap_or_default();
+            let Some((cookie, content)) = pair.split_once('=') else {
+                continue;
+            };
+            self.cookies.retain(|(existing, _)| existing != cookie);
+            if !content.is_empty() && !value.contains("Max-Age=0") {
+                self.cookies.push((cookie.to_owned(), content.to_owned()));
+            }
+        }
+        Reply {
+            status,
+            headers,
+            body: body.to_owned(),
+        }
+    }
+
+    fn cookie(&self, name: &str) -> Option<String> {
+        self.cookies
+            .iter()
+            .find(|(cookie, _)| cookie == name)
+            .map(|(_, value)| value.clone())
+    }
+
+    fn csrf(&self) -> String {
+        self.cookie("__Host-forge_csrf")
+            .unwrap_or_else(|| panic!("no CSRF cookie in {:?}", self.cookies))
+    }
+}
+
+fn form_encode(value: &str) -> String {
+    value
+        .bytes()
+        .map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' => {
+                char::from(byte).to_string()
+            }
+            _ => format!("%{byte:02X}"),
+        })
+        .collect()
+}
+
+/// `setup` creates the owner; a browser is sent to sign in by a tenant page,
+/// signs in, lists and creates events, signs out, and is sent to sign in
+/// again with its old session cookie.
+fn sign_in_use_a_tenant_scaffold_and_sign_out(root: &Path, binary: &str, url: &str) {
+    let migration = [("FORGE_MIGRATION_DATABASE_URL", url)];
+    let setup = [
+        "setup",
+        "--tenant",
+        "acme",
+        "--email",
+        "owner@example.com",
+        "--organization",
+        "Acme Inc",
+        "--password-stdin",
+    ];
+    let created = run_unchecked(
+        root,
+        binary,
+        &setup,
+        &migration,
+        Some(&format!("{OWNER_PASSWORD}\n")),
+    );
+    let printed = String::from_utf8_lossy(&created.stdout).into_owned();
+    assert!(
+        created.status.success(),
+        "{printed}{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    assert!(!printed.contains(OWNER_PASSWORD));
+    let tenant = printed
+        .split("Created tenant acme (")
+        .nth(1)
+        .and_then(|rest| rest.split(')').next())
+        .unwrap_or_else(|| panic!("tenant id in {printed}"))
+        .to_owned();
+    let again = run_unchecked(
+        root,
+        binary,
+        &setup,
+        &migration,
+        Some(&format!("{OWNER_PASSWORD}\n")),
+    );
+    assert_eq!(again.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&again.stderr).contains("already set up"));
+
+    let port = free_port();
+    let bind = format!("127.0.0.1:{port}");
+    let mut serve = command(
+        root,
+        binary,
+        &["serve"],
+        &[("FORGE_DATABASE_URL", url), ("FORGE_BIND", &bind)],
+    );
+    let _server = Server(
+        serve
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap_or_else(|error| panic!("serve: {error}")),
+    );
+    let mut ready = false;
+    for _ in 0..200 {
+        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            ready = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(ready, "the server did not start on {bind}");
+
+    let mut browser = Browser::default();
+    let events = format!("/tenants/{tenant}/events");
+    let sent = browser.request(port, "GET", &events, None);
+    assert_eq!(sent.status, 303, "{}", sent.body);
+    let sign_in = sent.header("location").unwrap_or_default().to_owned();
+    assert_eq!(
+        sign_in,
+        format!("/session/new?return_to=%2Ftenants%2F{tenant}%2Fevents")
+    );
+    let page = browser.request(port, "GET", &sign_in, None);
+    assert_eq!(page.status, 200);
+    assert!(
+        page.body
+            .contains(&format!("name=\"return_to\" value=\"{events}\""))
+    );
+
+    let anonymous = browser.csrf();
+    let form = format!(
+        "csrf_token={anonymous}&tenant=acme&email=owner%40example.com&password={}&return_to={}",
+        form_encode(OWNER_PASSWORD),
+        form_encode(&events)
+    );
+    let signed_in = browser.request(port, "POST", "/session", Some(&form));
+    assert_eq!(signed_in.status, 303, "{}", signed_in.body);
+    assert_eq!(signed_in.header("location"), Some(events.as_str()));
+    let session = browser.cookie("__Host-forge_session").unwrap_or_default();
+    assert_eq!(session.len(), 64);
+    assert_ne!(browser.csrf(), anonymous);
+
+    let index = browser.request(port, "GET", &events, None);
+    assert_eq!(index.status, 200, "{}", index.body);
+    let create = format!(
+        "csrf_token={}&name=Launch&starts_at=2026-01-02T03%3A04%3A05&capacity=42&public=true&\
+         venue=67e55044-10b1-426f-9247-bb680e5fe0c8",
+        browser.csrf()
+    );
+    let created = browser.request(port, "POST", &events, Some(&create));
+    assert_eq!(created.status, 303, "{}", created.body);
+    let shown = created.header("location").unwrap_or_default().to_owned();
+    assert!(shown.starts_with(&format!("{events}/")), "{shown}");
+    let show = browser.request(port, "GET", &shown, None);
+    assert_eq!(show.status, 200);
+    assert!(show.body.contains("Launch"));
+
+    let csrf = browser.csrf();
+    let signed_out = browser.request(
+        port,
+        "POST",
+        "/session",
+        Some(&format!("csrf_token={csrf}&_method=delete")),
+    );
+    assert_eq!(signed_out.status, 303, "{}", signed_out.body);
+    assert_eq!(signed_out.header("location"), Some("/session/new"));
+    assert!(browser.cookie("__Host-forge_session").is_none());
+
+    // The revoked session no longer opens the page.
+    let mut stale = Browser::default();
+    stale
+        .cookies
+        .push(("__Host-forge_session".to_owned(), session));
+    let refused = stale.request(port, "GET", &events, None);
+    assert_eq!(refused.status, 303);
+}
+
+#[test]
+#[ignore = "slow: builds generated applications; run with --ignored"]
+fn postgresql_application_regains_its_sign_in_pages_with_generate_authentication() {
+    let forge = env!("CARGO_BIN_EXE_forge");
+    let parent = tempfile::tempdir().unwrap_or_else(|error| panic!("{error}"));
+    let forge_path = workspace().join("crates/forge");
+    let forge_path = forge_path.to_string_lossy();
+    run(
+        parent.path(),
+        forge,
+        &[
+            "new",
+            "regained",
+            "--skip-docker",
+            "--skip-ci",
+            "--skip-lockfile",
+            "--forge-path",
+            &forge_path,
+        ],
+        &[],
+    );
+    let root = parent.path().join("regained");
+
+    // forge new already has the pages: the generator refuses and lists them.
+    let refused = run_unchecked(&root, forge, &["generate", "authentication"], &[], None);
+    assert!(!refused.status.success());
+    let message = String::from_utf8_lossy(&refused.stderr).into_owned();
+    assert!(message.contains("refusing to overwrite"), "{message}");
+    let files: Vec<String> = message
+        .lines()
+        .filter_map(|line| line.strip_prefix("  "))
+        .map(str::to_owned)
+        .collect();
+    assert!(files.len() >= 10, "{message}");
+
+    // Make it an application created before the generator: no files, no wiring.
+    let originals: Vec<(String, String)> = files
+        .iter()
+        .map(|file| {
+            let path = root.join(file);
+            let content =
+                fs::read_to_string(&path).unwrap_or_else(|error| panic!("{file}: {error}"));
+            fs::remove_file(&path).unwrap_or_else(|error| panic!("{file}: {error}"));
+            (file.clone(), content)
+        })
+        .collect();
+    for (file, line) in [
+        ("src/infrastructure/mod.rs", "pub mod accounts;\n"),
+        ("src/adapters/http/mod.rs", "pub mod authentication;\n"),
+        (
+            "src/adapters/http/views/mod.rs",
+            "pub mod authentication;\n",
+        ),
+        ("src/bootstrap/mod.rs", "pub mod setup;\n"),
+        (
+            "src/bootstrap/mod.rs",
+            "        .command(\"setup\", setup::SUMMARY, setup::run)\n",
+        ),
+    ] {
+        let path = root.join(file);
+        let source = fs::read_to_string(&path).unwrap_or_else(|error| panic!("{error}"));
+        assert!(source.contains(line), "{file}: {line}");
+        fs::write(&path, source.replacen(line, "", 1)).unwrap_or_else(|error| panic!("{error}"));
+    }
+    let bootstrap = root.join("src/bootstrap/mod.rs");
+    let source = fs::read_to_string(&bootstrap).unwrap_or_else(|error| panic!("{error}"));
+    let start = source
+        .find("    // Sign-in, sign-out")
+        .unwrap_or_else(|| panic!("{source}"));
+    let call =
+        "crate::adapters::http::authentication::routes(composition.router(), &site, ports)?;\n";
+    let end = source[start..]
+        .find(call)
+        .map(|offset| start + offset + call.len())
+        .unwrap_or_else(|| panic!("{source}"));
+    fs::write(
+        &bootstrap,
+        format!("{}{}", &source[..start], &source[end..]),
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
+
+    let dry = run(
+        &root,
+        forge,
+        &["generate", "authentication", "--dry-run"],
+        &[],
+    );
+    assert!(originals.iter().all(|(file, _)| !root.join(file).exists()));
+    let output = run(&root, forge, &["generate", "authentication"], &[]);
+    let printed = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert_eq!(
+        String::from_utf8_lossy(&dry.stdout).replace("would create", "create      "),
+        printed
+    );
+    for (file, content) in &originals {
+        let written = fs::read_to_string(root.join(file)).unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(&written, content, "{file} is byte-identical to forge new's");
+    }
+    apply_wiring(&root, &printed);
+
+    run(&root, "cargo", &["generate-lockfile", "--quiet"], &[]);
+    run(&root, "cargo", &["fmt", "--all", "--", "--check"], &[]);
+    run(
+        &root,
+        "cargo",
+        &[
+            "clippy",
+            "--all-targets",
+            "--locked",
+            "--quiet",
+            "--",
+            "-D",
+            "warnings",
+        ],
+        &[],
+    );
+    let tests = test_output(&root, false);
+    for test in [
+        "signing_in_issues_a_fresh_session_and_csrf_token_and_returns_to_the_page ... ok",
+        "reset_requests_answer_the_same_whether_or_not_the_account_exists ... ok",
+        "setup_refuses_password_arguments_and_short_passwords_before_touching_a_database ... ok",
+    ] {
+        assert!(tests.contains(test), "{test}\n{tests}");
+    }
 }
