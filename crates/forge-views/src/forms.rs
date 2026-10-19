@@ -1,11 +1,11 @@
-//! Form helpers: CSRF markup and HTTP method tunnelling.
+//! Form helpers: CSRF markup, HTTP method tunnelling and field errors.
 
 use forge_auth::CsrfToken;
-use forge_http::Method;
+use forge_http::{FormError, Method};
 
-/// Header that carries the CSRF token on `fetch`/Turbo requests. This is the
-/// header the Phase 3 enforcement in generated applications reads
-/// (`x-csrf-token`).
+/// Header that carries the CSRF token on `fetch`/Turbo requests
+/// (`x-csrf-token`), read by [`CsrfProtection`](crate::CsrfProtection) and
+/// by the session-bound check in generated applications.
 pub const CSRF_HEADER_NAME: &str = "x-csrf-token";
 
 /// `name` of the `<meta>` element that exposes the token to Turbo and
@@ -13,13 +13,17 @@ pub const CSRF_HEADER_NAME: &str = "x-csrf-token";
 pub const CSRF_META_NAME: &str = "csrf-token";
 
 /// `name` of the hidden form field that carries the token in HTML form
-/// submissions. The server-side CSRF check for form posts must read this
-/// field with the same rules as [`CSRF_HEADER_NAME`].
-pub const CSRF_FIELD_NAME: &str = "csrf_token";
+/// submissions (`csrf_token`). [`CsrfProtection`](crate::CsrfProtection)
+/// reads it with the same rules as [`CSRF_HEADER_NAME`];
+/// `forge_http::Request::form` never passes it to the application's type.
+pub const CSRF_FIELD_NAME: &str = forge_http::CSRF_FIELD_NAME;
 
 /// `name` of the form field that tunnels `PATCH`, `PUT` and `DELETE`
-/// through `POST`.
-pub const METHOD_FIELD_NAME: &str = "_method";
+/// through `POST` (`_method`).
+pub const METHOD_FIELD_NAME: &str = forge_http::METHOD_FIELD_NAME;
+
+/// The [`FieldErrors`] key for errors that concern the whole form.
+pub const BASE_FIELD: &str = "base";
 
 /// `<meta name="csrf-token" content="...">` for the layout `<head>`, so
 /// Turbo and scripts can send the token in [`CSRF_HEADER_NAME`].
@@ -69,6 +73,77 @@ fn escape_attribute(value: &str) -> String {
     out
 }
 
+/// Validation messages keyed by form field, for rendering a form again with
+/// `422 Unprocessable Entity` next to the offending inputs.
+///
+/// ```
+/// use forge_views::FieldErrors;
+///
+/// let mut errors = FieldErrors::new();
+/// errors.add("name", "can't be blank");
+/// assert_eq!(errors.get("name"), Some("can't be blank"));
+/// assert!(errors.get("price").is_none());
+/// ```
+///
+/// Templates read it with `{% if let Some(message) = errors.get("name") %}`;
+/// messages are escaped like any other value.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct FieldErrors {
+    entries: Vec<(String, String)>,
+}
+
+impl FieldErrors {
+    /// No errors.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Records `message` for `field` (use [`BASE_FIELD`] for the whole form).
+    pub fn add(&mut self, field: impl Into<String>, message: impl Into<String>) {
+        self.entries.push((field.into(), message.into()));
+    }
+
+    /// The first message recorded for `field`.
+    #[must_use]
+    pub fn get(&self, field: &str) -> Option<&str> {
+        self.entries
+            .iter()
+            .find(|(name, _)| name == field)
+            .map(|(_, message)| message.as_str())
+    }
+
+    /// Whether no error was recorded.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// The number of recorded errors.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Every `(field, message)` pair in insertion order.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.entries
+            .iter()
+            .map(|(field, message)| (field.as_str(), message.as_str()))
+    }
+}
+
+impl From<&FormError> for FieldErrors {
+    /// The caller-safe message of a form decoding failure, on its field (or
+    /// [`BASE_FIELD`] when it concerns the whole body). Request input is
+    /// never copied into the message.
+    fn from(error: &FormError) -> Self {
+        let mut errors = Self::new();
+        errors.add(error.field().unwrap_or(BASE_FIELD), error.kind().message());
+        errors
+    }
+}
+
 /// Proof, at the call site, that the request's CSRF token has already been
 /// validated.
 ///
@@ -85,7 +160,8 @@ impl CsrfVerified {
     /// Records that CSRF validation succeeded for the current request.
     ///
     /// Call this only after the CSRF token (hidden field or header) has been
-    /// verified against the session.
+    /// verified. [`CsrfProtection`](crate::CsrfProtection) does this itself
+    /// and exposes the proof through [`csrf_verified`](crate::csrf_verified).
     #[must_use]
     pub fn after_check() -> Self {
         Self(())
@@ -168,6 +244,57 @@ mod tests {
         }
         assert_eq!(meta.matches('"').count(), 4);
         assert_eq!(field.matches('"').count(), 6);
+    }
+
+    #[test]
+    fn field_errors_keep_the_first_message_per_field() {
+        let mut errors = FieldErrors::new();
+        assert!(errors.is_empty());
+        errors.add("name", "can't be blank");
+        errors.add("name", "is too short");
+        errors.add(BASE_FIELD, "try again");
+        assert_eq!(errors.len(), 3);
+        assert_eq!(errors.get("name"), Some("can't be blank"));
+        assert_eq!(errors.get(BASE_FIELD), Some("try again"));
+        assert_eq!(errors.iter().count(), 3);
+    }
+
+    #[test]
+    fn field_errors_from_form_errors_use_caller_safe_messages() {
+        #[derive(Debug, serde::Deserialize)]
+        struct Input {
+            #[serde(rename = "price")]
+            _price: u32,
+        }
+        let mut headers = forge_http::HeaderMap::new();
+        headers.insert(
+            forge_http::header::CONTENT_TYPE,
+            forge_http::HeaderValue::from_static("application/x-www-form-urlencoded"),
+        );
+        let request = forge_http::Request::new_for_test(
+            Method::POST,
+            forge_http::Uri::from_static("/"),
+            headers,
+            bytes::Bytes::from_static(b"price=secret"),
+            "127.0.0.1:4000".parse().expect("address"),
+            uuid::Uuid::now_v7(),
+        );
+        let error = request.form::<Input>().expect_err("invalid price");
+
+        let errors = FieldErrors::from(&error);
+
+        assert_eq!(errors.get("price"), Some("form field has an invalid value"));
+        assert!(
+            errors
+                .iter()
+                .all(|(_, message)| !message.contains("secret"))
+        );
+    }
+
+    #[test]
+    fn field_names_are_the_reserved_form_fields() {
+        assert_eq!(CSRF_FIELD_NAME, "csrf_token");
+        assert_eq!(METHOD_FIELD_NAME, "_method");
     }
 
     #[test]

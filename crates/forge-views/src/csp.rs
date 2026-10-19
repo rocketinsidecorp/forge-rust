@@ -1,6 +1,6 @@
 //! Content-Security-Policy and companion headers for HTML responses.
 
-use forge_http::{HeaderValue, Response, header};
+use forge_http::{BoxResponseFuture, HeaderValue, Middleware, Next, Request, Response, header};
 use thiserror::Error;
 
 use crate::ImportMap;
@@ -116,6 +116,29 @@ impl ContentSecurityPolicy {
     }
 }
 
+/// As a request layer, the policy is applied to every response that does not
+/// already carry a `Content-Security-Policy` (an SVG asset keeps its own
+/// sandboxing policy), so no HTML page can be served without it:
+///
+/// ```
+/// let mut router = forge_http::Router::new();
+/// router.layer(forge_views::ContentSecurityPolicy::strict());
+/// ```
+impl Middleware for ContentSecurityPolicy {
+    fn handle<'a>(&'a self, request: Request, next: Next<'a>) -> BoxResponseFuture<'a> {
+        Box::pin(async move {
+            let mut response = next.run(request).await;
+            if !response
+                .headers()
+                .contains_key(header::CONTENT_SECURITY_POLICY)
+            {
+                self.apply(&mut response);
+            }
+            response
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -200,6 +223,49 @@ mod tests {
                 .with_script_hash(&format!("{}z=", "A".repeat(42)))
                 .expect_err("over bound"),
             CspError::TooManyScriptHashes
+        );
+    }
+
+    #[tokio::test]
+    async fn as_a_layer_it_covers_every_response_but_keeps_existing_policies() {
+        use forge_http::{Method, Router};
+
+        use crate::test_support::get;
+
+        let mut router = Router::new();
+        router.layer(ContentSecurityPolicy::strict());
+        router
+            .route(Method::GET, "/page", |_| async {
+                Response::empty(StatusCode::OK)
+            })
+            .expect("route");
+        router
+            .route(Method::GET, "/image.svg", |_| async {
+                let mut response = Response::empty(StatusCode::OK);
+                response.headers_mut().insert(
+                    header::CONTENT_SECURITY_POLICY,
+                    HeaderValue::from_static("default-src 'none'; sandbox"),
+                );
+                response
+            })
+            .expect("route");
+
+        let page = router.dispatch(get("/page")).await;
+        let missing = router.dispatch(get("/missing")).await;
+        let svg = router.dispatch(get("/image.svg")).await;
+
+        let strict = ContentSecurityPolicy::strict().header_value();
+        assert_eq!(
+            header_of(&page, "content-security-policy"),
+            Some(strict.as_str())
+        );
+        assert_eq!(
+            header_of(&missing, "content-security-policy"),
+            Some(strict.as_str())
+        );
+        assert_eq!(
+            header_of(&svg, "content-security-policy"),
+            Some("default-src 'none'; sandbox")
         );
     }
 

@@ -12,8 +12,15 @@
 //! - [`ImportMap`]: bare module specifiers mapped to digested URLs, with the
 //!   hash a strict CSP needs.
 //! - [`ContentSecurityPolicy`]: a strict default policy without
-//!   `unsafe-inline`.
-//! - [`csrf_meta`], [`csrf_field`], [`method_override`]: form helpers.
+//!   `unsafe-inline`, also usable as a request layer.
+//! - [`CsrfProtection`]: the request layer that enforces CSRF tokens on
+//!   every unsafe request (hidden `csrf_token` field or `x-csrf-token`
+//!   header) and applies the CSRF-verified `_method` override before
+//!   routing; [`csrf_token`] gives handlers the token to render.
+//! - [`csrf_meta`], [`csrf_field`], [`method_override`], [`FieldErrors`]:
+//!   form helpers.
+//! - [`Flash`] and [`FlashLayer`]: one-shot `notice`/`alert` messages.
+//! - [`vendor`]: the pinned Turbo and Stimulus modules as embedded assets.
 //!
 //! Views belong in the HTTP adapter ring; domain and application code never
 //! see this crate. See `docs/views.md` for the developer guide.
@@ -39,7 +46,11 @@ mod assets;
 #[cfg(feature = "runtime")]
 mod csp;
 #[cfg(feature = "runtime")]
+mod csrf;
+#[cfg(feature = "runtime")]
 mod encoding;
+#[cfg(feature = "runtime")]
+mod flash;
 #[cfg(feature = "runtime")]
 mod forms;
 #[cfg(feature = "runtime")]
@@ -58,9 +69,16 @@ pub use assets::{AssetEntry, AssetError, AssetSet, DEFAULT_PREFIX};
 #[cfg(feature = "runtime")]
 pub use csp::{ContentSecurityPolicy, CspError};
 #[cfg(feature = "runtime")]
+pub use csrf::{
+    CSRF_COOKIE_NAME, CsrfError, CsrfProtection, csrf_cookie, csrf_token, csrf_verified,
+    presented_csrf_token,
+};
+#[cfg(feature = "runtime")]
+pub use flash::{FLASH_COOKIE_NAME, Flash, FlashError, FlashLayer, MAX_FLASH_MESSAGE_BYTES, flash};
+#[cfg(feature = "runtime")]
 pub use forms::{
-    CSRF_FIELD_NAME, CSRF_HEADER_NAME, CSRF_META_NAME, CsrfVerified, METHOD_FIELD_NAME, csrf_field,
-    csrf_meta, method_override,
+    BASE_FIELD, CSRF_FIELD_NAME, CSRF_HEADER_NAME, CSRF_META_NAME, CsrfVerified, FieldErrors,
+    METHOD_FIELD_NAME, csrf_field, csrf_meta, method_override,
 };
 #[cfg(feature = "runtime")]
 pub use import_map::{ImportMap, ImportMapBuilder, ImportMapError};
