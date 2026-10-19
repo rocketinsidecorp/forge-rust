@@ -11,15 +11,20 @@ use forge::http::{Method, Request, Response, Router};
 
 use self::views::{Site, welcome::WelcomeIndex};
 
-/// Registers the digested assets, the request layers every HTML page relies
-/// on (Content-Security-Policy, CSRF protection with the `_method` override,
-/// flash messages) and the application's routes. Forge adds `/health`,
-/// `/health/live` and `/health/ready` itself.
-pub fn routes(router: &mut Router) -> Result<(), ComposeError> {
+/// Loads the site and registers the digested assets and the request layers
+/// every HTML page relies on (Content-Security-Policy, CSRF protection with
+/// the `_method` override, flash messages). Every page renders its layout
+/// from the returned site.
+pub fn site(router: &mut Router) -> Result<Arc<Site>, ComposeError> {
     let site = Arc::new(Site::load()?);
     site.register(router).map_err(ComposeError::other)?;
+    Ok(site)
+}
 
-    let index_site = Arc::clone(&site);
+/// Registers the application's routes. Forge adds `/health`, `/health/live`
+/// and `/health/ready` itself.
+pub fn routes(router: &mut Router, site: &Arc<Site>) -> Result<(), ComposeError> {
+    let index_site = Arc::clone(site);
     router.route(Method::GET, "/", move |request: Request| {
         let site = Arc::clone(&index_site);
         async move { index(&site, &request) }

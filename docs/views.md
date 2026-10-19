@@ -32,7 +32,7 @@ on `http://localhost` / `http://127.0.0.1`). The welcome page is made of:
 templates/layouts/application.html  <head>: CSRF meta tag, stylesheet, import map, application.js
 templates/layouts/_flash.html       notice/alert partial
 templates/welcome/index.html        {% extends "layouts/application.html" %}
-src/adapters/http/mod.rs            routes(): Site::load, layers, GET /
+src/adapters/http/mod.rs            site(): Site::load and layers; routes(): GET /
 src/adapters/http/views/mod.rs      Site (assets, import map, CSP, layers) and Layout
 src/adapters/http/views/welcome.rs  WelcomeIndex view model
 assets/application.css              digested and embedded by build.rs
@@ -41,8 +41,9 @@ build.rs                            forge_views::build::embed_assets_with_crate_
 tests/http.rs                       layout, CSP, CSRF and asset tests
 ```
 
-`src/bootstrap` registers the adapter with
-`.compose(|composition| crate::adapters::http::routes(composition.router()))`;
+`src/bootstrap` registers the adapter in its `compose` function:
+`crate::adapters::http::site(router)` loads the `Site` and registers it, and
+`crate::adapters::http::routes(router, &site)` adds the pages.
 `Site::register` adds the asset routes and three request layers, outermost
 first: the Content-Security-Policy, CSRF protection (which also applies the
 `_method` override) and flash messages.

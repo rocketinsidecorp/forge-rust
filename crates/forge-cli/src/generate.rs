@@ -69,8 +69,9 @@ impl Database {
     }
 
     /// Cargo options of the `forge` dependency that select this backend and,
-    /// for full-stack applications, the `views` feature.
-    fn forge_features(self, views: bool) -> String {
+    /// for full-stack applications, the `views` feature (plus `testing` for
+    /// the dev-dependency that provides `TestDatabase`).
+    fn forge_features(self, views: bool, testing: bool) -> String {
         let (default_features, mut features) = match self {
             Self::Postgresql => (true, Vec::new()),
             Self::Mysql | Self::Mariadb => (false, vec!["mysql"]),
@@ -79,6 +80,9 @@ impl Database {
         };
         if views {
             features.push("views");
+        }
+        if testing {
+            features.push("testing");
         }
         let mut options = String::new();
         if !default_features {
@@ -401,7 +405,10 @@ pub(crate) fn create_application(
     options: &NewApplication,
 ) -> Result<PathBuf, CliError> {
     validate_application_name(&options.name)?;
-    let forge_dependency = forge_dependency(&options.forge, options.database, options.views)?;
+    let forge_test_dependency =
+        forge_dependency(&options.forge, options.database, options.views, true)?;
+    let forge_dependency =
+        forge_dependency(&options.forge, options.database, options.views, false)?;
 
     let destination = parent.join(&options.name);
     match fs::create_dir(&destination) {
@@ -417,7 +424,12 @@ pub(crate) fn create_application(
         }
     }
 
-    let result = write_application(&destination, options, &forge_dependency);
+    let result = write_application(
+        &destination,
+        options,
+        &forge_dependency,
+        &forge_test_dependency,
+    );
 
     if result.is_err() {
         let _cleanup_result = fs::remove_dir_all(&destination);
@@ -482,14 +494,15 @@ fn is_reserved_name(name: &str) -> bool {
     RESERVED.contains(&name)
 }
 
-/// Renders the `forge` dependency, including the backend and `views`
-/// features, as a TOML inline table.
+/// Renders the `forge` dependency, including the backend, `views` and (for
+/// the dev-dependency) `testing` features, as a TOML inline table.
 fn forge_dependency(
     source: &ForgeSource,
     database: Database,
     views: bool,
+    testing: bool,
 ) -> Result<String, CliError> {
-    let features = database.forge_features(views);
+    let features = database.forge_features(views, testing);
     match source {
         ForgeSource::GitTag => Ok(format!(
             "{{ git = \"{FORGE_REPOSITORY}\", tag = \"v{FORGE_VERSION}\"{features} }}"
@@ -541,6 +554,7 @@ fn write_application(
     root: &Path,
     options: &NewApplication,
     forge_dependency: &str,
+    forge_test_dependency: &str,
 ) -> Result<(), CliError> {
     let database_name = options.name.replace('-', "_");
     let urls = DatabaseUrls::new(options.database, &database_name);
@@ -549,6 +563,7 @@ fn write_application(
         ("%%APP_NAME%%", options.name.as_str()),
         ("%%RUST_VERSION%%", RUST_VERSION),
         ("%%FORGE_DEPENDENCY%%", forge_dependency),
+        ("%%FORGE_TEST_DEPENDENCY%%", forge_test_dependency),
         (
             "%%FORGE_VIEWS_BUILD_DEPENDENCY%%",
             forge_views_dependency.as_str(),
@@ -1375,10 +1390,18 @@ mod tests {
             );
 
             let bootstrap = read(&root, "src/bootstrap/mod.rs");
+            assert!(bootstrap.contains(".compose(compose)"));
             assert!(bootstrap.contains(
-                ".compose(|composition| crate::adapters::http::routes(composition.router()))"
+                "let site = crate::adapters::http::site(composition.router())?;\n    \
+                 crate::adapters::http::routes(composition.router(), &site)?;"
             ));
             assert!(!bootstrap.contains(".routes("));
+            assert_eq!(
+                manifest.contains("features = [\"views\", \"testing\"]")
+                    || manifest.contains("\"views\", \"testing\"] }"),
+                database.is_enabled(),
+                "{database:?}: TestDatabase dev-dependency"
+            );
 
             let views = read(&root, "src/adapters/http/views/mod.rs");
             for needle in [

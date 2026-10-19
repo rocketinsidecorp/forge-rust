@@ -35,6 +35,10 @@ tokio = { version = "1.53.1", features = ["rt"] }
 forge-views = %%FORGE_VIEWS_BUILD_DEPENDENCY%%
 
 [dev-dependencies]
+%%if database%%
+# `forge::db::testing::TestDatabase` for repository integration tests.
+forge = %%FORGE_TEST_DEPENDENCY%%
+%%end%%
 tokio = { version = "1.53.1", features = ["macros", "rt"] }
 %%end%%
 
