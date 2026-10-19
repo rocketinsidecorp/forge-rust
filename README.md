@@ -6,10 +6,12 @@ dependency direction), the process lifecycle, secure defaults, and the delivery
 path, starting with a production-oriented container image. It does not replace
 Tokio, hyper, or Cargo. It builds on them and wires them together.
 
-Like `rails new` in Rails 8, `forge new` generates a `Dockerfile`,
-`.dockerignore`, a CI workflow and a Dependabot configuration by default, so a
-fresh application can be built, checked and run as a container from its first
-commit.
+Like `rails new` in Rails 8, `forge new` generates a full-stack application
+(server-rendered HTML views, Turbo and Stimulus without a Node toolchain,
+CSRF-protected forms) plus a `Dockerfile`, `.dockerignore`, a CI workflow and
+a Dependabot configuration by default, so a fresh application can be built,
+checked and run as a container from its first commit. `forge new --api`
+generates a JSON-only service.
 
 ## Status
 
@@ -47,11 +49,12 @@ cargo run -- migrate
 export FORGE_DATABASE_URL='postgres://app_runtime:app_runtime@127.0.0.1:5432/shop'
 cargo run
 curl localhost:3000/health/live
+# open http://127.0.0.1:3000 for the welcome page
 ```
 
 Pick the database like `rails new -d`: `forge new shop -d postgresql|mysql|mariadb|sqlite3`
 (PostgreSQL is the default). Use `forge new shop -d none` for a service that does not need
-PostgreSQL.
+PostgreSQL, and `forge new shop --api` for a JSON-only service without views.
 
 Build and run the container image. It is a distroless runtime running as a
 non-root user, with a built-in health check:
@@ -90,7 +93,16 @@ Kubernetes and systemd deployment is covered in
 
 - A plain Cargo package with `src/{domain,application,adapters,infrastructure,bootstrap}`
   and a `tests/architecture.rs` test that fails when the domain or application
-  rings import forbidden layers or protocol crates.
+  rings import forbidden layers, protocol crates or the view layer.
+- Server-rendered views ([docs/views.md](docs/views.md), omitted with `--api`):
+  compile-time checked, auto-escaping Askama templates with a layout and flash
+  partial, view models in `src/adapters/http/views/`, `assets/` digested and
+  embedded in the binary by `build.rs`, vendored integrity-pinned Turbo and
+  Stimulus through an import map, a strict Content-Security-Policy on every
+  response, CSRF protection for every unsafe request (hidden field or
+  `x-csrf-token`, host-only cookie, `403` otherwise) with the `_method`
+  override, one-shot flash messages, strict form decoding with field errors,
+  and a `tests/http.rs` that proves the stack.
 - `forge::App`: the framework owns the Tokio runtime, structured logging (JSON in
   production), SIGTERM/SIGINT graceful shutdown with a drain deadline, and the
   `/health`, `/health/live` and `/health/ready` routes.
@@ -125,9 +137,10 @@ crates/
 ├── forge-core     # lifecycle, errors, UUIDv7 identifiers
 ├── forge-config   # typed FORGE_* configuration and secret redaction
 ├── forge-db       # repository/transaction contracts, including tenant-scoped ports
-├── forge-http     # HTTP server, limits, health routes, request IDs
+├── forge-http     # HTTP server, routing, middleware, form/query decoding, limits
 ├── forge-security # deny-by-default RBAC roles, permissions and grants
 ├── forge-tenancy  # membership and explicit authorized TenantContext
+├── forge-views    # server-rendered views: HTML, CSRF, flash, assets, import map, CSP
 └── forge-cli      # the `forge` executable and application generator
 examples/
 └── hello-forge    # committed `forge new` output; standalone package (not a

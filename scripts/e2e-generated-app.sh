@@ -2,7 +2,9 @@
 # End-to-end check of forge new. With Docker available this exercises the
 # Phase 2 PostgreSQL path: reversible migrations, host serving, Compose startup,
 # health and graceful shutdown. FORGE_E2E_SKIP_DOCKER=1 keeps a database-free
-# host-only smoke path for environments without Docker.
+# host-only smoke path for environments without Docker. Both paths serve the
+# full-stack HTML page (layout, CSP, CSRF, digested Hotwire assets) and check
+# the quality gates of an --api application.
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -348,7 +350,36 @@ env "${env_args[@]}" "target/debug/$app_name" &
 server_pid=$!
 wait_for_http "http://127.0.0.1:$port/health/live"
 curl --silent --fail "http://127.0.0.1:$port/health/ready" | grep -q '"ready"' || fail "readiness body"
-curl --silent --fail "http://127.0.0.1:$port/" | grep -q "\"application\":\"$app_name\"" || fail "index route"
+
+index_html="$work_dir/index.html"
+index_headers="$work_dir/index.headers"
+curl --silent --fail --dump-header "$index_headers" --output "$index_html" "http://127.0.0.1:$port/" \
+  || fail "index route"
+grep -q "<h1>$app_name</h1>" "$index_html" || fail "index must render the welcome view in the layout"
+grep -qi '^content-type: text/html; charset=utf-8' "$index_headers" || fail "index must be HTML"
+grep -qi "^content-security-policy: default-src 'self'; script-src 'self' 'sha256-" "$index_headers" \
+  || fail "HTML responses must carry the strict CSP with the import map hash"
+grep -q '<script type="importmap">' "$index_html" || fail "layout must render the import map"
+csrf_token="$(sed -n 's/^set-cookie: __Host-forge_csrf=\([0-9a-f]\{64\}\);.*/\1/Ip' "$index_headers" | head -n 1)"
+[[ -n "$csrf_token" ]] || fail "the page must issue the __Host-forge_csrf cookie"
+grep -q "<meta name=\"csrf-token\" content=\"$csrf_token\">" "$index_html" \
+  || fail "layout must render the CSRF meta tag with the cookie's token"
+for module in turbo stimulus; do
+  module_path="$(grep -o "/assets/vendor/$module-[0-9a-f]\{16\}\.js" "$index_html" | head -n 1)"
+  [[ -n "$module_path" ]] || fail "import map must pin the digested $module module"
+  curl --silent --fail --dump-header - --output /dev/null "http://127.0.0.1:$port$module_path" \
+    | grep -qi '^content-type: text/javascript' || fail "$module must be served from the embedded assets"
+done
+post_status() {
+  curl --silent --output /dev/null --write-out '%{http_code}' -X POST "$@" "http://127.0.0.1:$port/"
+}
+[[ "$(post_status --data 'name=x')" == 403 ]] || fail "a form POST without a CSRF token must be refused"
+[[ "$(post_status -H "cookie: __Host-forge_csrf=$csrf_token" --data '_method=DELETE')" == 403 ]] \
+  || fail "a method override without a CSRF token must be refused"
+[[ "$(post_status -H "cookie: __Host-forge_csrf=$csrf_token" -H 'sec-fetch-site: cross-site' \
+  --data "csrf_token=$csrf_token")" == 403 ]] || fail "a cross-site form POST must be refused"
+[[ "$(post_status -H "cookie: __Host-forge_csrf=$csrf_token" --data "csrf_token=$csrf_token")" == 405 ]] \
+  || fail "a form POST with the page's CSRF token must pass to routing (405: / is GET only)"
 [[ "$(curl --silent --output /dev/null --write-out '%{http_code}' "http://127.0.0.1:$port/missing")" == 404 ]]   || fail "unknown route must return 404"
 env "${env_args[@]}" "target/debug/$app_name" healthcheck || fail "healthcheck subcommand"
 if FORGE_BIDN="typo" "target/debug/$app_name" healthcheck 2>/dev/null; then
@@ -363,6 +394,19 @@ if env "${env_args[@]}" "target/debug/$app_name" healthcheck 2>/dev/null; then
   fail "healthcheck must fail when the server is down"
 fi
 echo "host run OK"
+
+log "Checking an --api application's quality gates"
+api_dir="$work_dir/forge-e2e-api"
+(cd "$work_dir" && "$forge" new forge-e2e-api --api --database none --skip-docker --skip-ci \
+  --skip-lockfile --forge-path "$app_dir/.forge/crates/forge" >/dev/null)
+[[ ! -e "$api_dir/templates" && ! -e "$api_dir/assets" ]] || fail "--api must not generate views"
+(
+  cd "$api_dir"
+  cargo generate-lockfile --quiet
+  cargo fmt --all -- --check
+  cargo clippy --quiet --all-targets --locked -- -D warnings
+  cargo test --quiet --locked
+) || fail "--api application quality gates"
 
 if [[ "$skip_docker" == 1 ]]; then
   log "Skipping database/container checks (FORGE_E2E_SKIP_DOCKER=1)"
@@ -389,7 +433,7 @@ if docker run --rm --entrypoint /bin/sh "$image" -c true >/dev/null 2>&1; then
   fail "the runtime image must not contain a shell"
 fi
 
-curl --silent --fail "http://127.0.0.1:3000/" | grep -q "\"application\":\"$app_name\""   || fail "container index route"
+curl --silent --fail "http://127.0.0.1:3000/" | grep -q "<h1>$app_name</h1>" || fail "container index route"
 docker compose logs app 2>&1 | grep -m1 -q ' | {' || fail "production logs must be JSON"
 
 # The named volume must preserve the migrated schema across an application restart.

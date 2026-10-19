@@ -3,6 +3,7 @@
 - Status: Accepted
 - Date: 2026-09-27
 - Refines: [ADR 0010](0010-session-and-tenant-authorization-context.md), [ADR 0013](0013-persistent-principals-sessions-and-memberships.md)
+- Refined by: [ADR 0023](0023-form-csrf-flash-and-method-override.md) (CSRF token in HTML forms)
 
 ## Context
 

@@ -54,8 +54,11 @@ time where possible instead of sleeps.
 
 ### HTTP and contracts
 
-Test routing, extraction, limits, content type, malformed JSON, validation, error
-redaction/status mapping, request IDs, deadlines, CORS, CSRF, compression, streaming
+Test routing, middleware order, extraction, limits, content type, malformed JSON
+and form bodies, validation, error redaction/status mapping, request IDs,
+deadlines, CORS, CSRF (missing, wrong, repeated, malformed, query-string and
+cross-site tokens; method override only after verification), flash, CSP,
+compression, streaming
 backpressure, disconnect cancellation, SSE/WebSocket limits, and graceful shutdown.
 The same endpoint declaration must produce runtime validation and matching OpenAPI;
 contract snapshots are reviewed, not blindly rewritten.
@@ -122,7 +125,11 @@ Exercise commands as subprocesses. Golden fixtures verify deterministic trees an
 content on Linux, macOS, and Windows where supported. Test invalid field grammars,
 name collisions, path traversal, partial-write recovery, refusal to overwrite,
 formatter failure, useful diagnostics, and that a generated app formats, checks,
-tests, builds, migrates, starts, serves a route, and shuts down.
+tests, builds, migrates, starts, serves a route, and shuts down. Full-stack
+apps additionally serve the HTML page with the CSP, the CSRF cookie and meta
+tag and the digested Turbo/Stimulus modules, refuse a form `POST` without the
+page's token (`403`) and accept it with the token; the e2e script checks this
+over HTTP and runs the quality gates of an `--api` application.
 
 Phase 1 additionally builds every generated application's multi-stage Dockerfile,
 inspects the final image for non-root identity and forbidden build contents, starts

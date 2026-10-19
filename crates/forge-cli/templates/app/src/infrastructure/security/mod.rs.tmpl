@@ -417,9 +417,19 @@ pub async fn authenticate_request(
 
 /// Enforces CSRF for methods that can mutate state.
 ///
+%%if views%%
+/// Safe methods do not require a token. Unsafe methods require exactly one
+/// canonical token, from the `x-csrf-token` header or the `csrf_token` field
+/// of a form body (read with the same rules as `forge::views::CsrfProtection`),
+/// whose digest is bound to the authenticated server-side session. At login,
+/// set the form CSRF cookie to the session's token with
+/// `forge::views::csrf_cookie` so HTML forms carry it.
+%%end%%
+%%if !views%%
 /// Safe methods do not require the CSRF header. Unsafe methods require exactly
 /// one canonical token whose digest is bound to the authenticated server-side
 /// session.
+%%end%%
 pub async fn enforce_csrf(
     store: &dyn SessionStore,
     request: &Request,
@@ -429,6 +439,12 @@ pub async fn enforce_csrf(
         return Ok(());
     }
 
+%%if views%%
+    let token = forge::views::presented_csrf_token(request)
+        .map_err(|_| RequestAuthError::InvalidCsrf)?
+        .ok_or(RequestAuthError::MissingCsrf)?;
+%%end%%
+%%if !views%%
     let mut values = request.headers().get_all(CSRF_HEADER_NAME).iter();
     let value = values.next().ok_or(RequestAuthError::MissingCsrf)?;
     if values.next().is_some() {
@@ -436,6 +452,7 @@ pub async fn enforce_csrf(
     }
     let value = value.to_str().map_err(|_| RequestAuthError::InvalidCsrf)?;
     let token = csrf_from_header(value).map_err(|_| RequestAuthError::InvalidCsrf)?;
+%%end%%
     let digest = csrf_digest(&token);
 
     match store

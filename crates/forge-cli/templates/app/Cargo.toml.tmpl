@@ -13,6 +13,9 @@ name = "%%APP_NAME%%"
 path = "src/main.rs"
 
 [dependencies]
+%%if views%%
+askama = { version = "0.16.1", default-features = false, features = ["derive", "std"] }
+%%end%%
 forge = %%FORGE_DEPENDENCY%%
 serde = { version = "1", features = ["derive"] }
 %%if database%%
@@ -24,6 +27,15 @@ sha2 = { version = "0.11.0", default-features = false }
 sqlx = { version = "0.9", default-features = false, features = ["chrono", "json", "macros", "migrate", "%%DATABASE_DRIVER%%", "runtime-tokio", "tls-rustls-ring-webpki", "uuid"] }
 thiserror = "2.0.21"
 tokio = { version = "1.53.1", features = ["rt"] }
+%%end%%
+%%if views%%
+
+[build-dependencies]
+# Only the asset embedding helper used by build.rs: no HTTP or template graph.
+forge-views = %%FORGE_VIEWS_BUILD_DEPENDENCY%%
+
+[dev-dependencies]
+tokio = { version = "1.53.1", features = ["macros", "rt"] }
 %%end%%
 
 [lints.rust]

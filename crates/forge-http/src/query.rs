@@ -1,4 +1,5 @@
-//! Strict `application/x-www-form-urlencoded` query-string decoding.
+//! Strict `application/x-www-form-urlencoded` decoding for query strings
+//! and, through [`Mode::Form`], request bodies (see `form.rs`).
 //!
 //! The query is split on `&` into `name=value` pairs; `+` decodes to a space
 //! and `%XX` escapes must form UTF-8. Anything ambiguous is rejected rather
@@ -14,12 +15,17 @@
 //! not parse). Unknown parameters are ignored unless the target type uses
 //! `#[serde(deny_unknown_fields)]`; deserializing into `()` accepts only an
 //! empty query.
+//!
+//! Form bodies use the same grammar with HTML form semantics on top: a name
+//! may repeat only when its field is a sequence (`Vec<T>`), `bool` also
+//! accepts the checkbox values `on` and `1` (and `0`), and an empty value is
+//! `None` for an `Option` field.
 
 use std::{borrow::Cow, collections::BTreeMap, fmt};
 
 use serde::de::{
-    self, DeserializeOwned, DeserializeSeed, Deserializer, IntoDeserializer, MapAccess, Visitor,
-    value::StrDeserializer,
+    self, DeserializeOwned, DeserializeSeed, Deserializer, IntoDeserializer, MapAccess, SeqAccess,
+    Visitor, value::StrDeserializer,
 };
 use thiserror::Error;
 
@@ -72,7 +78,7 @@ pub struct QueryError {
 }
 
 impl QueryError {
-    fn new(kind: QueryErrorKind, parameter: Option<&str>) -> Self {
+    pub(crate) fn new(kind: QueryErrorKind, parameter: Option<&str>) -> Self {
         Self {
             kind,
             parameter: parameter.map(echo),
@@ -92,6 +98,11 @@ impl QueryError {
     pub fn parameter(&self) -> Option<&str> {
         self.parameter.as_deref()
     }
+
+    /// Splits the error for conversion into another boundary error.
+    pub(crate) fn into_parts(self) -> (QueryErrorKind, Option<String>, Option<String>) {
+        (self.kind, self.parameter, self.detail)
+    }
 }
 
 /// Bounds attacker-controlled names before they are echoed.
@@ -99,19 +110,48 @@ fn echo(parameter: &str) -> String {
     parameter.chars().take(MAX_ECHOED_PARAMETER_CHARS).collect()
 }
 
-/// Decodes a raw query string (the part after `?`, if any) into `T`.
-pub(crate) fn decode<T: DeserializeOwned>(query: Option<&str>) -> Result<T, QueryError> {
-    let pairs = parse(query.unwrap_or_default())?;
-    T::deserialize(QueryDeserializer { pairs: &pairs }).map_err(DeError::into_query_error)
+/// Which `application/x-www-form-urlencoded` dialect is decoded.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Mode {
+    /// Query strings: every name at most once, `bool` is `true`/`false`.
+    Query,
+    /// HTML form bodies: repeated names fill sequences, checkbox booleans,
+    /// empty optional values are `None`.
+    Form,
 }
 
-/// Splits and decodes a query into unique `name → value` pairs.
-fn parse(query: &str) -> Result<BTreeMap<Cow<'_, str>, Cow<'_, str>>, QueryError> {
-    let mut pairs = BTreeMap::new();
-    if query.is_empty() {
+/// Decoded `name → values` pairs, in name order.
+pub(crate) type Pairs<'q> = BTreeMap<Cow<'q, str>, Vec<Cow<'q, str>>>;
+
+/// Decodes a raw query string (the part after `?`, if any) into `T`.
+pub(crate) fn decode<T: DeserializeOwned>(query: Option<&str>) -> Result<T, QueryError> {
+    let pairs = parse(query.unwrap_or_default(), Mode::Query, &[])?;
+    deserialize(&pairs, Mode::Query)
+}
+
+/// Deserializes already parsed pairs into `T`.
+pub(crate) fn deserialize<T: DeserializeOwned>(
+    pairs: &Pairs<'_>,
+    mode: Mode,
+) -> Result<T, QueryError> {
+    T::deserialize(QueryDeserializer { pairs, mode }).map_err(DeError::into_query_error)
+}
+
+/// Splits and decodes `input` into `name → values` pairs.
+///
+/// In [`Mode::Query`] a repeated name is an error here; in [`Mode::Form`]
+/// the values are kept in order and the target type decides. Names listed in
+/// `skip` (compared after decoding) are dropped.
+pub(crate) fn parse<'q>(
+    input: &'q str,
+    mode: Mode,
+    skip: &[&str],
+) -> Result<Pairs<'q>, QueryError> {
+    let mut pairs = Pairs::new();
+    if input.is_empty() {
         return Ok(pairs);
     }
-    for segment in query.split('&') {
+    for segment in input.split('&') {
         let Some((raw_name, raw_value)) = segment.split_once('=') else {
             let parameter = (!segment.is_empty()).then_some(segment);
             return Err(QueryError::new(QueryErrorKind::Malformed, parameter));
@@ -123,13 +163,16 @@ fn parse(query: &str) -> Result<BTreeMap<Cow<'_, str>, Cow<'_, str>>, QueryError
             .map_err(|_| QueryError::new(QueryErrorKind::Malformed, Some(raw_name)))?;
         let value = percent_decode(raw_value, true)
             .map_err(|_| QueryError::new(QueryErrorKind::Malformed, Some(&name)))?;
-        if pairs.contains_key(&name) {
+        if skip.contains(&name.as_ref()) {
+            continue;
+        }
+        if mode == Mode::Query && pairs.contains_key(&name) {
             return Err(QueryError::new(
                 QueryErrorKind::DuplicateParameter,
                 Some(&name),
             ));
         }
-        pairs.insert(name, value);
+        pairs.entry(name).or_default().push(value);
     }
     Ok(pairs)
 }
@@ -207,9 +250,10 @@ impl de::Error for DeError {
     }
 }
 
-/// Deserializes the whole query as a map of parameters.
+/// Deserializes the whole input as a map of parameters.
 struct QueryDeserializer<'m, 'q> {
-    pairs: &'m BTreeMap<Cow<'q, str>, Cow<'q, str>>,
+    pairs: &'m Pairs<'q>,
+    mode: Mode,
 }
 
 impl<'de> Deserializer<'de> for QueryDeserializer<'_, '_> {
@@ -218,6 +262,7 @@ impl<'de> Deserializer<'de> for QueryDeserializer<'_, '_> {
     fn deserialize_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, DeError> {
         visitor.visit_map(Parameters {
             pairs: self.pairs.iter(),
+            mode: self.mode,
             value: None,
         })
     }
@@ -256,10 +301,11 @@ impl<'de> Deserializer<'de> for QueryDeserializer<'_, '_> {
     }
 }
 
-/// Yields each parameter name, then its value.
+/// Yields each parameter name, then its values.
 struct Parameters<'m, 'q> {
-    pairs: std::collections::btree_map::Iter<'m, Cow<'q, str>, Cow<'q, str>>,
-    value: Option<(&'m str, &'m str)>,
+    pairs: std::collections::btree_map::Iter<'m, Cow<'q, str>, Vec<Cow<'q, str>>>,
+    mode: Mode,
+    value: Option<(&'m str, &'m [Cow<'q, str>])>,
 }
 
 impl<'de> MapAccess<'de> for Parameters<'_, '_> {
@@ -269,10 +315,10 @@ impl<'de> MapAccess<'de> for Parameters<'_, '_> {
         &mut self,
         seed: K,
     ) -> Result<Option<K::Value>, DeError> {
-        let Some((name, value)) = self.pairs.next() else {
+        let Some((name, values)) = self.pairs.next() else {
             return Ok(None);
         };
-        self.value = Some((name, value));
+        self.value = Some((name, values));
         let key: StrDeserializer<'_, DeError> = name.as_ref().into_deserializer();
         seed.deserialize(key)
             .map(Some)
@@ -280,11 +326,14 @@ impl<'de> MapAccess<'de> for Parameters<'_, '_> {
     }
 
     fn next_value_seed<V: DeserializeSeed<'de>>(&mut self, seed: V) -> Result<V::Value, DeError> {
-        let Some((name, value)) = self.value.take() else {
+        let Some((name, values)) = self.value.take() else {
             return Err(de::Error::custom("value requested before its name"));
         };
-        seed.deserialize(ValueDeserializer(value))
-            .map_err(|error| error.at(name))
+        seed.deserialize(ValueDeserializer {
+            values,
+            mode: self.mode,
+        })
+        .map_err(|error| error.at(name))
     }
 
     fn size_hint(&self) -> Option<usize> {
@@ -292,16 +341,33 @@ impl<'de> MapAccess<'de> for Parameters<'_, '_> {
     }
 }
 
-/// Deserializes one decoded value, parsing it as whatever type is requested.
-struct ValueDeserializer<'v>(&'v str);
+/// Deserializes the decoded value(s) of one name, parsing them as whatever
+/// type is requested. Every type except a sequence needs exactly one value.
+struct ValueDeserializer<'m, 'q> {
+    values: &'m [Cow<'q, str>],
+    mode: Mode,
+}
 
-impl ValueDeserializer<'_> {
+impl ValueDeserializer<'_, '_> {
+    /// The only value; a repeated name is an error for non-sequence fields.
+    fn single(&self) -> Result<&str, DeError> {
+        match self.values {
+            [value] => Ok(value),
+            [] => Err(de::Error::custom("parameter has no value")),
+            _ => Err(DeError::new(
+                QueryErrorKind::DuplicateParameter,
+                None,
+                "parameter must not be repeated",
+            )),
+        }
+    }
+
     fn parse<T>(&self) -> Result<T, DeError>
     where
         T: std::str::FromStr,
         T::Err: fmt::Display,
     {
-        self.0.parse().map_err(de::Error::custom)
+        self.single()?.parse().map_err(de::Error::custom)
     }
 }
 
@@ -315,18 +381,21 @@ macro_rules! parse_value {
     };
 }
 
-impl<'de> Deserializer<'de> for ValueDeserializer<'_> {
+impl<'de> Deserializer<'de> for ValueDeserializer<'_, '_> {
     type Error = DeError;
 
     fn deserialize_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, DeError> {
-        visitor.visit_str(self.0)
+        visitor.visit_str(self.single()?)
     }
 
     fn deserialize_bool<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, DeError> {
-        match self.0 {
-            "true" => visitor.visit_bool(true),
-            "false" => visitor.visit_bool(false),
-            _ => Err(de::Error::custom("expected `true` or `false`")),
+        match (self.single()?, self.mode) {
+            ("true", _) | ("on" | "1", Mode::Form) => visitor.visit_bool(true),
+            ("false", _) | ("0", Mode::Form) => visitor.visit_bool(false),
+            (_, Mode::Query) => Err(de::Error::custom("expected `true` or `false`")),
+            (_, Mode::Form) => Err(de::Error::custom(
+                "expected `true`, `on` or `1`, or `false` or `0`",
+            )),
         }
     }
 
@@ -347,11 +416,27 @@ impl<'de> Deserializer<'de> for ValueDeserializer<'_> {
     }
 
     fn deserialize_option<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, DeError> {
+        // A single blank form input (`age=`) is an absent optional value; a
+        // repeated field is an optional sequence.
+        if self.mode == Mode::Form && matches!(self.values, [value] if value.is_empty()) {
+            return visitor.visit_none();
+        }
         visitor.visit_some(self)
     }
 
+    fn deserialize_seq<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, DeError> {
+        match self.mode {
+            Mode::Form => visitor.visit_seq(Values {
+                values: self.values.iter(),
+                mode: self.mode,
+            }),
+            // Query strings have no sequences; report the type mismatch.
+            Mode::Query => visitor.visit_str(self.single()?),
+        }
+    }
+
     fn deserialize_unit<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, DeError> {
-        if self.0.is_empty() {
+        if self.single()?.is_empty() {
             visitor.visit_unit()
         } else {
             Err(de::Error::custom("expected an empty value"))
@@ -380,13 +465,46 @@ impl<'de> Deserializer<'de> for ValueDeserializer<'_> {
         _variants: &'static [&'static str],
         visitor: V,
     ) -> Result<V::Value, DeError> {
-        let variant: StrDeserializer<'_, DeError> = self.0.into_deserializer();
+        let variant: StrDeserializer<'_, DeError> = self.single()?.into_deserializer();
         visitor.visit_enum(variant)
     }
 
+    /// A field the target type does not declare is skipped however often it
+    /// repeats; only `deny_unknown_fields` refuses it.
+    fn deserialize_ignored_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, DeError> {
+        visitor.visit_unit()
+    }
+
     serde::forward_to_deserialize_any! {
-        str string bytes byte_buf seq tuple tuple_struct map struct identifier
-        ignored_any
+        str string bytes byte_buf tuple tuple_struct map struct identifier
+    }
+}
+
+/// The values of a repeated form field, one element each.
+struct Values<'m, 'q> {
+    values: std::slice::Iter<'m, Cow<'q, str>>,
+    mode: Mode,
+}
+
+impl<'de> SeqAccess<'de> for Values<'_, '_> {
+    type Error = DeError;
+
+    fn next_element_seed<T: DeserializeSeed<'de>>(
+        &mut self,
+        seed: T,
+    ) -> Result<Option<T::Value>, DeError> {
+        let Some(value) = self.values.next() else {
+            return Ok(None);
+        };
+        seed.deserialize(ValueDeserializer {
+            values: std::slice::from_ref(value),
+            mode: self.mode,
+        })
+        .map(Some)
+    }
+
+    fn size_hint(&self) -> Option<usize> {
+        Some(self.values.len())
     }
 }
 

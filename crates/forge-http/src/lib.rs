@@ -11,7 +11,7 @@ use std::{
 
 use bytes::Bytes;
 use forge_config::ServerConfig;
-pub use http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header};
+pub use http::{Extensions, HeaderMap, HeaderValue, Method, StatusCode, Uri, header};
 use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
 use hyper::{
     body::{Body as _, Incoming},
@@ -30,10 +30,15 @@ use tracing::{Instrument, info_span, warn};
 use uuid::Uuid;
 
 mod encoding;
+mod form;
 mod query;
 mod routing;
 
-use crate::query::QueryError;
+pub use form::{
+    CSRF_FIELD_NAME, FORM_CONTENT_TYPE, FormError, FormErrorKind, MAX_FORM_FIELDS,
+    METHOD_FIELD_NAME, RESERVED_FORM_FIELDS,
+};
+pub use query::{QueryError, QueryErrorKind};
 
 /// Pause after a failed `accept` so transient errors such as `EMFILE` do not
 /// turn the accept loop into a busy loop.
@@ -41,6 +46,9 @@ const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(50);
 const JSON_CONTENT_TYPE: &str = "application/json";
 
 type BoxHandlerFuture = Pin<Box<dyn Future<Output = Response> + Send + 'static>>;
+
+/// Response future returned by [`Middleware::handle`] and [`Next::run`].
+pub type BoxResponseFuture<'a> = Pin<Box<dyn Future<Output = Response> + Send + 'a>>;
 
 /// An HTTP request detached from the underlying protocol implementation.
 #[derive(Debug)]
@@ -52,6 +60,7 @@ pub struct Request {
     path_params: HashMap<String, String>,
     remote_addr: SocketAddr,
     request_id: Uuid,
+    extensions: Extensions,
 }
 
 impl Request {
@@ -91,6 +100,28 @@ impl Request {
         self.request_id
     }
 
+    /// Typed per-request values attached by [`Middleware`] layers (for
+    /// example the CSRF token a page must render) and read by handlers.
+    #[must_use]
+    pub fn extensions(&self) -> &Extensions {
+        &self.extensions
+    }
+
+    /// Mutable access to the per-request values, for [`Middleware`] layers.
+    #[must_use]
+    pub fn extensions_mut(&mut self) -> &mut Extensions {
+        &mut self.extensions
+    }
+
+    /// Replaces the request method before routing.
+    ///
+    /// This exists for [`Middleware`] that runs before the route table, such
+    /// as the CSRF-verified `_method` override of HTML forms; a handler never
+    /// needs it because routing has already happened.
+    pub fn set_method(&mut self, method: Method) {
+        self.method = method;
+    }
+
     /// Creates a new request for testing purposes.
     ///
     /// This constructor is intended for use in tests only.
@@ -110,6 +141,7 @@ impl Request {
             path_params: HashMap::new(),
             remote_addr,
             request_id,
+            extensions: Extensions::new(),
         }
     }
 
@@ -126,6 +158,37 @@ impl Request {
     /// `#[serde(deny_unknown_fields)]`.
     pub fn query<T: DeserializeOwned>(&self) -> Result<T, QueryError> {
         crate::query::decode(self.uri.query())
+    }
+
+    /// Decodes an HTML form body (`application/x-www-form-urlencoded`) into
+    /// `T`.
+    ///
+    /// The request must carry exactly one form `Content-Type` (an optional
+    /// `charset` must be UTF-8) and at most [`MAX_FORM_FIELDS`] pairs. The
+    /// grammar is the strict query-string grammar; a field may repeat only
+    /// when it is a sequence (`Vec<T>`), `bool` accepts the checkbox values
+    /// `on`/`1`/`true` and `0`/`false` (declare checkboxes
+    /// `#[serde(default)] bool`, since an unchecked box sends nothing), and a
+    /// blank value is `None` for `Option` fields. The framework fields in
+    /// [`RESERVED_FORM_FIELDS`] (`csrf_token`, `_method`) are skipped, so
+    /// `#[serde(deny_unknown_fields)]` rejects only real unknown fields.
+    pub fn form<T: DeserializeOwned>(&self) -> Result<T, FormError> {
+        crate::form::decode(&self.headers, &self.body)
+    }
+
+    /// Returns the single decoded value of form field `name`, including the
+    /// reserved framework fields. `Ok(None)` when the field is absent; a
+    /// repeated field is [`FormErrorKind::DuplicateField`] and a request
+    /// without a form body is [`FormErrorKind::UnsupportedMediaType`].
+    pub fn form_value(&self, name: &str) -> Result<Option<String>, FormError> {
+        crate::form::value(&self.headers, &self.body, name)
+    }
+
+    /// Whether the request carries exactly one form-encoded (UTF-8)
+    /// `Content-Type`.
+    #[must_use]
+    pub fn has_form_body(&self) -> bool {
+        crate::form::is_form(&self.headers)
     }
 
     /// Parses a named parameter captured by a dynamic route such as
@@ -261,11 +324,55 @@ where
     }
 }
 
+/// A request layer that runs before routing.
+///
+/// Layers see every request the router receives, in registration order (the
+/// first registered layer is the outermost), and may change it (for example
+/// its method), attach [`Request::extensions`], answer without calling the
+/// rest of the chain, or adjust the response that [`Next::run`] returns.
+pub trait Middleware: Send + Sync + 'static {
+    /// Handles `request`; call `next.run(request)` to continue to the
+    /// remaining layers and then the route table.
+    fn handle<'a>(&'a self, request: Request, next: Next<'a>) -> BoxResponseFuture<'a>;
+}
+
+/// The rest of the layer chain, ending with route matching.
+pub struct Next<'a> {
+    layers: &'a [Arc<dyn Middleware>],
+    router: &'a Router,
+}
+
+impl fmt::Debug for Next<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Next")
+            .field("remaining_layers", &self.layers.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'a> Next<'a> {
+    /// Runs the remaining layers, then routes the request.
+    pub fn run(self, request: Request) -> BoxResponseFuture<'a> {
+        match self.layers.split_first() {
+            Some((layer, layers)) => layer.handle(
+                request,
+                Next {
+                    layers,
+                    router: self.router,
+                },
+            ),
+            None => Box::pin(self.router.route_request(request)),
+        }
+    }
+}
+
 /// Immutable route table once attached to a server.
 #[derive(Default)]
 pub struct Router {
     root: routing::Node,
     routes: Vec<(Method, String)>,
+    layers: Vec<Arc<dyn Middleware>>,
 }
 
 impl fmt::Debug for Router {
@@ -279,6 +386,7 @@ impl fmt::Debug for Router {
         formatter
             .debug_struct("Router")
             .field("routes", &routes)
+            .field("layers", &self.layers.len())
             .finish()
     }
 }
@@ -321,6 +429,14 @@ impl Router {
         Ok(self)
     }
 
+    /// Adds a [`Middleware`] layer that runs before routing for every request,
+    /// including requests that match no route. Layers run in registration
+    /// order: the first one added is the outermost.
+    pub fn layer(&mut self, middleware: impl Middleware) -> &mut Self {
+        self.layers.push(Arc::new(middleware));
+        self
+    }
+
     /// Registers the standard liveness and readiness probes.
     ///
     /// `GET /health`, `GET /health/live` and `GET /health/ready` answer `200`
@@ -338,9 +454,11 @@ impl Router {
         })
     }
 
-    /// Routes one request to its handler without a network connection.
+    /// Runs one request through the layers and the route table without a
+    /// network connection.
     ///
-    /// The raw (still percent-encoded) path is matched segment by segment;
+    /// Layers added with [`Router::layer`] run first, in registration order;
+    /// then the request is routed. The raw (still percent-encoded) path is matched segment by segment;
     /// static segments win over `{name}` captures. Unmatched paths answer
     /// `404`. A matched path without a handler for the request method
     /// answers `405` with an `Allow` header listing the registered methods in
@@ -349,6 +467,16 @@ impl Router {
     /// past routing; other malformed escapes are reported by
     /// [`Request::path_param_as`] when the handler reads the parameter.
     pub async fn dispatch(&self, request: Request) -> Response {
+        Next {
+            layers: &self.layers,
+            router: self,
+        }
+        .run(request)
+        .await
+    }
+
+    /// Matches the request against the route table and calls its handler.
+    async fn route_request(&self, request: Request) -> Response {
         let path = request.uri.path().to_owned();
         let mut captures = Vec::new();
         let Some(node) = self.root.find(&path, &mut captures) else {
@@ -640,6 +768,7 @@ async fn handle_request(
                 path_params: HashMap::new(),
                 remote_addr,
                 request_id,
+                extensions: Extensions::new(),
             };
             router.dispatch(request).await
         };
@@ -742,7 +871,133 @@ mod tests {
             path_params: HashMap::new(),
             remote_addr: "127.0.0.1:4000".parse().expect("valid test address"),
             request_id: Uuid::now_v7(),
+            extensions: Extensions::new(),
         }
+    }
+
+    /// Test layer: records its name in the `x-trace` request/response
+    /// headers, optionally rewrites the method or answers directly.
+    struct Trace {
+        name: &'static str,
+        rewrite: Option<Method>,
+        answer: Option<StatusCode>,
+    }
+
+    impl Middleware for Trace {
+        fn handle<'a>(&'a self, mut request: Request, next: Next<'a>) -> BoxResponseFuture<'a> {
+            Box::pin(async move {
+                if let Some(status) = self.answer {
+                    return Response::empty(status);
+                }
+                if let Some(method) = &self.rewrite {
+                    request.set_method(method.clone());
+                }
+                request.extensions_mut().insert(self.name);
+                let mut response = next.run(request).await;
+                response
+                    .headers_mut()
+                    .append("x-trace", HeaderValue::from_static(self.name));
+                response
+            })
+        }
+    }
+
+    fn trace(name: &'static str) -> Trace {
+        Trace {
+            name,
+            rewrite: None,
+            answer: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn layers_run_in_registration_order_before_routing() {
+        let mut router = Router::new();
+        router
+            .route(Method::DELETE, "/items", |request: Request| async move {
+                let seen = request
+                    .extensions()
+                    .get::<&'static str>()
+                    .copied()
+                    .unwrap_or("none");
+                Response::new(StatusCode::OK, seen)
+            })
+            .expect("route registers");
+        router.layer(trace("outer")).layer(Trace {
+            rewrite: Some(Method::DELETE),
+            ..trace("inner")
+        });
+
+        let response = router.dispatch(request(Method::POST, "/items")).await;
+
+        // The inner layer rewrote POST to DELETE before the route table ran.
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(response.body, "inner");
+        let traced: Vec<_> = response
+            .headers
+            .get_all("x-trace")
+            .iter()
+            .map(|value| value.to_str().expect("ASCII"))
+            .collect();
+        assert_eq!(traced, ["inner", "outer"]);
+        assert!(format!("{router:?}").contains("layers: 2"));
+    }
+
+    #[tokio::test]
+    async fn layers_see_unrouted_requests_and_can_answer_directly() {
+        let mut router = Router::new();
+        router.layer(trace("outer"));
+        let not_found = router.dispatch(request(Method::GET, "/missing")).await;
+        assert_eq!(not_found.status, StatusCode::NOT_FOUND);
+        assert_eq!(
+            not_found.headers.get("x-trace").map(HeaderValue::as_bytes),
+            Some(&b"outer"[..])
+        );
+
+        router.layer(Trace {
+            answer: Some(StatusCode::FORBIDDEN),
+            ..trace("guard")
+        });
+        let refused = router.dispatch(request(Method::GET, "/missing")).await;
+        assert_eq!(refused.status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn request_form_decodes_bodies_and_reads_reserved_fields() {
+        #[derive(Debug, serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Login {
+            email: String,
+            #[serde(default)]
+            remember: bool,
+        }
+        let mut form = request(Method::POST, "/session");
+        form.headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/x-www-form-urlencoded"),
+        );
+        form.body =
+            Bytes::from_static(b"email=a%40example.com&remember=on&csrf_token=t&_method=PUT");
+
+        assert!(form.has_form_body());
+        let login: Login = form.form().expect("valid form");
+        assert_eq!(login.email, "a@example.com");
+        assert!(login.remember);
+        assert_eq!(
+            form.form_value(CSRF_FIELD_NAME).expect("valid"),
+            Some("t".to_owned())
+        );
+        assert_eq!(
+            form.form_value(METHOD_FIELD_NAME).expect("valid"),
+            Some("PUT".to_owned())
+        );
+
+        let json = request(Method::POST, "/session");
+        assert!(!json.has_form_body());
+        assert_eq!(
+            json.form::<Login>().expect_err("no form").kind(),
+            FormErrorKind::UnsupportedMediaType
+        );
     }
 
     #[tokio::test]

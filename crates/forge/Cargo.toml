@@ -17,6 +17,7 @@ forge-db = { path = "../forge-db" }
 forge-http = { path = "../forge-http" }
 forge-security = { path = "../forge-security" }
 forge-tenancy = { path = "../forge-tenancy" }
+forge-views = { path = "../forge-views", optional = true, default-features = false, features = ["runtime"] }
 serde.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
@@ -32,6 +33,8 @@ mysql = ["forge-db/mysql"]
 sqlite = ["forge-db/sqlite"]
 # `Composition::for_testing` and `forge::db::testing::TestDatabase`.
 testing = ["forge-db/testing"]
+# Server-rendered views (ADR 0022): `forge::views` and `forge::web::html`.
+views = ["dep:forge-views"]
 
 [dev-dependencies]
 bytes.workspace = true

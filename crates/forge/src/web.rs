@@ -20,6 +20,12 @@ use forge_http::{PathParamError, Request, Response, StatusCode};
 use serde::{Serialize, de::DeserializeOwned};
 use tracing::{error, warn};
 
+/// Renders an Askama view as an HTML response (feature `views`); see
+/// `forge::views::html`. `html_with_status` answers another status, such as
+/// `422` for a form shown again with errors.
+#[cfg(feature = "views")]
+pub use forge_views::{html, html_with_status};
+
 /// Serializes `value` as a JSON response. Serialization failures (a bug in a
 /// `Serialize` implementation) become an empty `500` and are logged.
 #[must_use]
@@ -104,6 +110,61 @@ pub fn decode_query<T: DeserializeOwned>(request: &Request) -> Result<T, ForgeEr
         );
         if let Some(parameter) = failure.parameter() {
             error = error.with_metadata("parameter", parameter.to_owned());
+        }
+        error.with_source(failure)
+    })
+}
+
+/// Decodes an HTML form body (`application/x-www-form-urlencoded`) into `T`
+/// (see [`Request::form`] for the strict grammar, checkbox booleans, blank
+/// optional values and the skipped `csrf_token`/`_method` fields).
+///
+/// Every failure is a `Validation` error (`422`) with code `invalid_form`
+/// and a caller-safe message; when it concerns one field its name, truncated
+/// to 64 characters, is in the `field` metadata. A body that is not
+/// form-encoded is also `invalid_form`. Handlers that render the form again
+/// use [`Request::form`] directly and turn the `FormError` into field errors.
+///
+/// ```rust
+/// use bytes::Bytes;
+/// use forge::http::{HeaderMap, HeaderValue, Method, Request, Uri, header};
+/// use uuid::Uuid;
+///
+/// #[derive(serde::Deserialize)]
+/// #[serde(deny_unknown_fields)]
+/// struct NewProduct {
+///     name: String,
+///     #[serde(default)]
+///     published: bool,
+/// }
+///
+/// let mut headers = HeaderMap::new();
+/// headers.insert(
+///     header::CONTENT_TYPE,
+///     HeaderValue::from_static("application/x-www-form-urlencoded"),
+/// );
+/// let request = Request::new_for_test(
+///     Method::POST,
+///     Uri::from_static("/products"),
+///     headers,
+///     Bytes::from_static(b"name=Desk&published=on&csrf_token=ignored"),
+///     "127.0.0.1:4000".parse().unwrap(),
+///     Uuid::now_v7(),
+/// );
+/// let product: NewProduct = forge::web::decode_form(&request)?;
+/// assert_eq!(product.name, "Desk");
+/// assert!(product.published);
+/// # Ok::<(), forge::core::ForgeError>(())
+/// ```
+pub fn decode_form<T: DeserializeOwned>(request: &Request) -> Result<T, ForgeError> {
+    request.form().map_err(|failure| {
+        let mut error = ForgeError::new(
+            ErrorCategory::Validation,
+            "invalid_form",
+            failure.kind().message(),
+        );
+        if let Some(field) = failure.field() {
+            error = error.with_metadata("field", field.to_owned());
         }
         error.with_source(failure)
     })
@@ -314,6 +375,64 @@ mod tests {
         assert_eq!(rendered["code"], "invalid_path_parameter");
         assert_eq!(rendered["metadata"]["parameter"], "id");
         assert!(!rendered.to_string().contains("secret-value"));
+    }
+
+    fn form_request(content_type: &str, body: &'static str) -> Request {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            forge_http::header::CONTENT_TYPE,
+            forge_http::HeaderValue::from_str(content_type).expect("valid header"),
+        );
+        Request::new_for_test(
+            forge_http::Method::POST,
+            Uri::from_static("/products"),
+            headers,
+            Bytes::from_static(body.as_bytes()),
+            "127.0.0.1:4000".parse().expect("valid test address"),
+            Uuid::now_v7(),
+        )
+    }
+
+    #[derive(serde::Deserialize, Debug)]
+    #[serde(deny_unknown_fields)]
+    struct NewProduct {
+        name: String,
+        price: u32,
+    }
+
+    #[test]
+    fn decode_form_maps_failures_to_invalid_form_with_the_field() {
+        const FORM: &str = "application/x-www-form-urlencoded";
+        let product: NewProduct =
+            decode_form(&form_request(FORM, "name=Desk&price=10")).expect("valid form");
+        assert_eq!((product.name.as_str(), product.price), ("Desk", 10));
+
+        for (content_type, body, field) in [
+            (FORM, "name=Desk&price=secret", Some("price")),
+            (FORM, "name=a&name=b&price=1", Some("name")),
+            (FORM, "price=1", Some("name")),
+            (FORM, "name=a&price=1&admin=1", Some("admin")),
+            (FORM, "name=a&&price=1", None),
+            ("application/json", "{}", None),
+        ] {
+            let failure =
+                decode_form::<NewProduct>(&form_request(content_type, body)).expect_err(body);
+            assert_eq!(failure.category(), ErrorCategory::Validation, "{body}");
+            assert_eq!(failure.code(), "invalid_form", "{body}");
+            assert_eq!(
+                failure
+                    .metadata()
+                    .get("field")
+                    .and_then(serde_json::Value::as_str),
+                field,
+                "{body}"
+            );
+            assert!(!failure.message().contains("secret"), "{body}");
+        }
+        assert_eq!(
+            error(&decode_form::<NewProduct>(&form_request(FORM, "")).expect_err("empty")).status(),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
     }
 
     #[test]

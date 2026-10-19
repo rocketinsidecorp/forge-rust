@@ -13,8 +13,16 @@ name = "hello-forge"
 path = "src/main.rs"
 
 [dependencies]
-forge = { path = "../../crates/forge", default-features = false }
+askama = { version = "0.16.1", default-features = false, features = ["derive", "std"] }
+forge = { path = "../../crates/forge", default-features = false, features = ["views"] }
 serde = { version = "1", features = ["derive"] }
+
+[build-dependencies]
+# Only the asset embedding helper used by build.rs: no HTTP or template graph.
+forge-views = { path = "../../crates/forge-views", default-features = false, features = ["build"] }
+
+[dev-dependencies]
+tokio = { version = "1.53.1", features = ["macros", "rt"] }
 
 [lints.rust]
 unsafe_code = "forbid"

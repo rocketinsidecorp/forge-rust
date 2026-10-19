@@ -134,13 +134,26 @@ impl AssetSet {
         Self::with_prefix(DEFAULT_PREFIX, table)
     }
 
+    /// Validates several tables, such as the application's `FORGE_ASSETS`
+    /// and [`vendor::HOTWIRE_ASSETS`](crate::vendor::HOTWIRE_ASSETS), and
+    /// serves them together under [`DEFAULT_PREFIX`]. A logical name present
+    /// in two tables is [`AssetError::Duplicate`].
+    pub fn from_tables(tables: &[&'static [AssetEntry]]) -> Result<Self, AssetError> {
+        Self::build(DEFAULT_PREFIX, tables)
+    }
+
     /// Validates `table` and serves it under `prefix` (an absolute path such
     /// as `/assets`, without a trailing slash).
     pub fn with_prefix(prefix: &str, table: &'static [AssetEntry]) -> Result<Self, AssetError> {
+        Self::build(prefix, &[table])
+    }
+
+    fn build(prefix: &str, tables: &[&'static [AssetEntry]]) -> Result<Self, AssetError> {
         validate_prefix(prefix)?;
-        let mut assets = Vec::with_capacity(table.len());
-        let mut by_logical = HashMap::with_capacity(table.len());
-        for entry in table {
+        let count = tables.iter().map(|table| table.len()).sum();
+        let mut assets = Vec::with_capacity(count);
+        let mut by_logical = HashMap::with_capacity(count);
+        for entry in tables.iter().flat_map(|table| table.iter()) {
             let served = Served::new(prefix, *entry)?;
             if by_logical.insert(entry.logical, assets.len()).is_some() {
                 return Err(AssetError::Duplicate(entry.logical.to_owned()));
@@ -594,6 +607,24 @@ mod tests {
             AssetSet::new(DUPLICATE).expect_err("duplicate"),
             AssetError::Duplicate(_)
         ));
+    }
+
+    #[test]
+    fn from_tables_serves_several_tables_and_rejects_cross_table_duplicates() {
+        let merged = AssetSet::from_tables(&[TABLE, crate::vendor::HOTWIRE_ASSETS])
+            .expect("disjoint tables");
+        assert_eq!(
+            merged.len(),
+            TABLE.len() + crate::vendor::HOTWIRE_ASSETS.len()
+        );
+        assert_eq!(merged.path("app.css"), Some(CSS_URL));
+        assert!(merged.path(crate::vendor::TURBO_ASSET).is_some());
+
+        assert!(matches!(
+            AssetSet::from_tables(&[TABLE, TABLE]).expect_err("same names twice"),
+            AssetError::Duplicate(_)
+        ));
+        assert!(AssetSet::from_tables(&[]).expect("empty").is_empty());
     }
 
     #[test]

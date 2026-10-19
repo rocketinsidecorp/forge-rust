@@ -120,6 +120,43 @@ Only its parser/builder and `Secure`, `HttpOnly`, `SameSite`, `Path`
 attributes are required.
 
 
+## Server-rendered views dependency decision
+
+The form CSRF/flash slice ([ADR 0023](adr/0023-form-csrf-flash-and-method-override.md))
+adds three direct dependencies to `forge-views` (feature `runtime`) and makes
+`askama` a direct dependency of full-stack generated applications.
+
+| Crate | Version | Purpose | Feature policy |
+| --- | --- | --- | --- |
+| `cookie` | `0.18.2` | parse `Cookie` headers and build `Set-Cookie` values for `__Host-forge_csrf` and `__Host-forge_flash` | defaults disabled; `percent-encode` only (flash values); signed/private jars disabled |
+| `getrandom` | `0.4.3` | 256-bit CSRF tokens from the OS CSPRNG | default platform backend only |
+| `subtle` | `2.6.1` | constant-time comparison of the presented and cookie tokens | defaults disabled |
+| `askama` (generated apps) | `0.16.1` | the `Template` derive for the application's view models | defaults disabled; `derive`, `std`; same version as `forge-views` |
+
+Admission review:
+
+- `cookie` and `getrandom` were admitted in the Phase 3 authentication
+  decision above with the same versions; this slice adds a framework consumer.
+  `cookie` brings `time` 0.3 (`time`, `time-core`, `time-macros`, `deranged`,
+  `num-conv`, `powerfmt`; MIT OR Apache-2.0, maintained by the time-rs
+  project, `time-macros` is a build-time proc macro) for cookie expiry; Forge
+  uses only `Max-Age=0` removal. `percent-encoding` was already in the graph.
+- `subtle` (dalek-cryptography, BSD-3-Clause, no build script or proc macro,
+  no unsafe in the comparison path, no RustSec advisories) was already in the
+  locked graph through RustCrypto crates; it is used only for
+  `ConstantTimeEq` on fixed-length token bytes. Forge does not implement the
+  comparison itself.
+- None of the three types appears in a public `forge-views` signature; tokens
+  stay `forge_auth::CsrfToken` and responses `forge_http::Response`.
+  Replacement: any RFC 6265 cookie parser, any CSPRNG crate, any audited
+  constant-time equality.
+- Full-stack generated applications declare `askama` because the derive must
+  be named by the application crate; `--api` applications do not. Their
+  `build.rs` depends on `forge-views` with `default-features = false,
+  features = ["build"]` (SHA-2 and the standard library only).
+- The vendored Turbo 8.0.23 and Stimulus 3.2.2 modules were admitted with
+  their pinned digests in earlier slices; this slice only serves them.
+
 ## Features and public API containment
 
 - Set `default-features = false` when defaults add unused protocols, native
