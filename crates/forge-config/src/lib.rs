@@ -38,7 +38,16 @@ pub const KNOWN_KEYS: &[&str] = &[
     "FORGE_LOG_FORMAT",
     "FORGE_DATABASE_URL",
     "FORGE_MIGRATION_DATABASE_URL",
+    SETUP_PASSWORD_KEY,
 ];
+
+/// The owner password the `setup` command of generated applications reads
+/// when it is not typed at a terminal or piped with `--password-stdin`.
+///
+/// It is a known key so configuration loading accepts it, but it is never
+/// part of [`AppConfig`]: only the command that asks for it reads it, and
+/// it should never be set for the serving process.
+pub const SETUP_PASSWORD_KEY: &str = "FORGE_SETUP_PASSWORD";
 
 /// Runtime environment controls safety-sensitive defaults.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -810,6 +819,7 @@ mod tests {
             "json",
             "postgres://runtime:secret@localhost/app",
             "postgres://migrator:secret@localhost/app",
+            "correct horse battery staple",
         ];
         let pairs: Vec<(&str, &str)> = KNOWN_KEYS.iter().copied().zip(values).collect();
         assert_eq!(pairs.len(), KNOWN_KEYS.len());
