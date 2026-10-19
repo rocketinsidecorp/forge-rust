@@ -1,0 +1,10 @@
+{% extends "layouts/application.html" %}
+
+{% block content %}
+<h1>{{ application }}</h1>
+<p>Version {{ version }} is running on Forge.</p>
+<p>
+  This page is <code>templates/welcome/index.html</code>, rendered from the
+  view model in <code>src/adapters/http/views/welcome.rs</code>.
+</p>
+{% endblock %}

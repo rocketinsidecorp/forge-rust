@@ -1,0 +1,18 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{{ layout.title }}</title>
+    {% if let Some(csrf_meta) = layout.csrf_meta %}{{ csrf_meta|safe }}{% endif %}
+    <link rel="stylesheet" href="{{ layout.stylesheet }}">
+    {{ layout.import_map|safe }}
+    <script type="module" src="{{ layout.javascript }}"></script>
+  </head>
+  <body>
+    {% include "layouts/_flash.html" %}
+    <main>
+      {% block content %}{% endblock %}
+    </main>
+  </body>
+</html>

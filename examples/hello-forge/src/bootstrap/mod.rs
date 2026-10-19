@@ -8,6 +8,6 @@ use std::process::ExitCode;
 pub fn run() -> ExitCode {
     forge::App::new(env!("CARGO_PKG_NAME"))
         .version(env!("CARGO_PKG_VERSION"))
-        .routes(crate::adapters::http::routes)
+        .compose(|composition| crate::adapters::http::routes(composition.router()))
         .run()
 }

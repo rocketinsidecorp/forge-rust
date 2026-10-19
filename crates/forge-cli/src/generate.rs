@@ -68,14 +68,30 @@ impl Database {
         }
     }
 
-    /// Cargo options of the `forge` dependency that select this backend.
-    fn forge_features(self) -> &'static str {
-        match self {
-            Self::Postgresql => "",
-            Self::Mysql | Self::Mariadb => ", default-features = false, features = [\"mysql\"]",
-            Self::Sqlite3 => ", features = [\"sqlite\"]",
-            Self::Disabled => ", default-features = false",
+    /// Cargo options of the `forge` dependency that select this backend and,
+    /// for full-stack applications, the `views` feature.
+    fn forge_features(self, views: bool) -> String {
+        let (default_features, mut features) = match self {
+            Self::Postgresql => (true, Vec::new()),
+            Self::Mysql | Self::Mariadb => (false, vec!["mysql"]),
+            Self::Sqlite3 => (true, vec!["sqlite"]),
+            Self::Disabled => (false, Vec::new()),
+        };
+        if views {
+            features.push("views");
         }
+        let mut options = String::new();
+        if !default_features {
+            options.push_str(", default-features = false");
+        }
+        if !features.is_empty() {
+            let quoted: Vec<String> = features
+                .iter()
+                .map(|feature| format!("\"{feature}\""))
+                .collect();
+            options.push_str(&format!(", features = [{}]", quoted.join(", ")));
+        }
+        options
     }
 
     /// Lists what `forge new` does not generate for this backend, if anything.
@@ -109,6 +125,8 @@ pub(crate) struct NewApplication {
     pub(crate) docker: bool,
     pub(crate) ci: bool,
     pub(crate) database: Database,
+    /// Full-stack (server-rendered views, ADR 0022); `false` with `--api`.
+    pub(crate) views: bool,
     pub(crate) forge: ForgeSource,
 }
 
@@ -121,6 +139,12 @@ enum Group {
     Postgres,
     PostgresDocker,
     Sqlite,
+    /// Full-stack applications only.
+    Views,
+    /// `--api` applications only.
+    Api,
+    /// Applications with a database or views.
+    BuildScript,
 }
 
 struct Template {
@@ -149,11 +173,35 @@ const TEMPLATES: &[Template] = &[
     template!(Group::Always, "src/domain/mod.rs" => "src/domain/mod.rs.tmpl"),
     template!(Group::Always, "src/application/mod.rs" => "src/application/mod.rs.tmpl"),
     template!(Group::Always, "src/adapters/mod.rs" => "src/adapters/mod.rs.tmpl"),
-    template!(Group::Always, "src/adapters/http/mod.rs" => "src/adapters/http/mod.rs.tmpl"),
+    template!(Group::Api, "src/adapters/http/mod.rs" => "src/adapters/http/mod.rs.tmpl"),
+    template!(Group::Views, "src/adapters/http/mod.rs" => "src/adapters/http/mod_views.rs.tmpl"),
+    template!(
+        Group::Views,
+        "src/adapters/http/views/mod.rs" => "src/adapters/http/views/mod.rs.tmpl"
+    ),
+    template!(
+        Group::Views,
+        "src/adapters/http/views/welcome.rs" => "src/adapters/http/views/welcome.rs.tmpl"
+    ),
+    template!(
+        Group::Views,
+        "templates/layouts/application.html" => "templates/layouts/application.html.tmpl"
+    ),
+    template!(
+        Group::Views,
+        "templates/layouts/_flash.html" => "templates/layouts/_flash.html.tmpl"
+    ),
+    template!(
+        Group::Views,
+        "templates/welcome/index.html" => "templates/welcome/index.html.tmpl"
+    ),
+    template!(Group::Views, "assets/application.css" => "assets/application.css.tmpl"),
+    template!(Group::Views, "assets/application.js" => "assets/application.js.tmpl"),
+    template!(Group::Views, "tests/http.rs" => "tests/http.rs.tmpl"),
     template!(Group::Always, "src/infrastructure/mod.rs" => "src/infrastructure/mod.rs.tmpl"),
     template!(Group::Always, "src/bootstrap/mod.rs" => "src/bootstrap/mod.rs.tmpl"),
     template!(Group::Always, "tests/architecture.rs" => "tests/architecture.rs.tmpl"),
-    template!(Group::Database, "build.rs" => "build.rs.tmpl"),
+    template!(Group::BuildScript, "build.rs" => "build.rs.tmpl"),
     template!(Group::Database, ".gitattributes" => "gitattributes.tmpl"),
     template!(Group::Database, "migrations/.gitkeep" => "migrations/gitkeep.tmpl"),
     template!(
@@ -353,7 +401,7 @@ pub(crate) fn create_application(
     options: &NewApplication,
 ) -> Result<PathBuf, CliError> {
     validate_application_name(&options.name)?;
-    let forge_dependency = forge_dependency(&options.forge, options.database)?;
+    let forge_dependency = forge_dependency(&options.forge, options.database, options.views)?;
 
     let destination = parent.join(&options.name);
     match fs::create_dir(&destination) {
@@ -434,28 +482,59 @@ fn is_reserved_name(name: &str) -> bool {
     RESERVED.contains(&name)
 }
 
-/// Renders the `forge` dependency, including the backend features, as a TOML
-/// inline table.
-fn forge_dependency(source: &ForgeSource, database: Database) -> Result<String, CliError> {
-    let features = database.forge_features();
+/// Renders the `forge` dependency, including the backend and `views`
+/// features, as a TOML inline table.
+fn forge_dependency(
+    source: &ForgeSource,
+    database: Database,
+    views: bool,
+) -> Result<String, CliError> {
+    let features = database.forge_features(views);
     match source {
         ForgeSource::GitTag => Ok(format!(
             "{{ git = \"{FORGE_REPOSITORY}\", tag = \"v{FORGE_VERSION}\"{features} }}"
         )),
         ForgeSource::Path(path) => {
-            let rejected = path.is_empty()
-                || path.chars().any(|character| {
-                    character == '"' || character == '\\' || character.is_control()
-                });
-            if rejected {
-                return Err(CliError::InvalidForgePath {
-                    path: path.clone(),
-                    reason: "use a non-empty path with forward slashes and no quotes or control characters",
-                });
-            }
+            validate_forge_path(path)?;
             Ok(format!("{{ path = \"{path}\"{features} }}"))
         }
     }
+}
+
+/// Renders the `forge-views` build dependency of full-stack applications:
+/// only the asset embedding helper, from the same release tag or checkout as
+/// `forge`. With `--forge-path`, `forge-views` is the sibling directory of
+/// the `forge` crate (`crates/forge-views` next to `crates/forge`).
+fn forge_views_build_dependency(source: &ForgeSource) -> Result<String, CliError> {
+    const BUILD_ONLY: &str = "default-features = false, features = [\"build\"]";
+    match source {
+        ForgeSource::GitTag => Ok(format!(
+            "{{ git = \"{FORGE_REPOSITORY}\", tag = \"v{FORGE_VERSION}\", {BUILD_ONLY} }}"
+        )),
+        ForgeSource::Path(path) => {
+            validate_forge_path(path)?;
+            let forge = path.trim_end_matches('/');
+            let sibling = match forge.rsplit_once('/') {
+                Some((parent, _)) => format!("{parent}/forge-views"),
+                None => "forge-views".to_owned(),
+            };
+            Ok(format!("{{ path = \"{sibling}\", {BUILD_ONLY} }}"))
+        }
+    }
+}
+
+fn validate_forge_path(path: &str) -> Result<(), CliError> {
+    let rejected = path.is_empty()
+        || path
+            .chars()
+            .any(|character| character == '"' || character == '\\' || character.is_control());
+    if rejected {
+        return Err(CliError::InvalidForgePath {
+            path: path.to_owned(),
+            reason: "use a non-empty path with forward slashes and no quotes or control characters",
+        });
+    }
+    Ok(())
 }
 
 fn write_application(
@@ -465,10 +544,15 @@ fn write_application(
 ) -> Result<(), CliError> {
     let database_name = options.name.replace('-', "_");
     let urls = DatabaseUrls::new(options.database, &database_name);
+    let forge_views_dependency = forge_views_build_dependency(&options.forge)?;
     let variables = [
         ("%%APP_NAME%%", options.name.as_str()),
         ("%%RUST_VERSION%%", RUST_VERSION),
         ("%%FORGE_DEPENDENCY%%", forge_dependency),
+        (
+            "%%FORGE_VIEWS_BUILD_DEPENDENCY%%",
+            forge_views_dependency.as_str(),
+        ),
         ("%%DATABASE_NAME%%", database_name.as_str()),
         ("%%DATABASE_DRIVER%%", options.database.driver()),
         ("%%DATABASE_LABEL%%", options.database.label()),
@@ -499,13 +583,19 @@ fn write_application(
             Group::Postgres => options.database == Database::Postgresql,
             Group::PostgresDocker => options.database == Database::Postgresql && options.docker,
             Group::Sqlite => options.database == Database::Sqlite3,
+            Group::Views => options.views,
+            Group::Api => !options.views,
+            Group::BuildScript => options.views || options.database.is_enabled(),
         };
         if enabled {
             let content = render(
                 template.content,
                 &variables,
-                options.docker,
-                options.database,
+                Conditions {
+                    docker: options.docker,
+                    database: options.database,
+                    views: options.views,
+                },
             );
             write_file(&root.join(template.path), &content)?;
         }
@@ -581,14 +671,29 @@ impl DatabaseUrls {
     }
 }
 
+/// The capabilities template conditionals can test.
+#[derive(Clone, Copy)]
+struct Conditions {
+    docker: bool,
+    database: Database,
+    views: bool,
+}
+
 /// Substitutes template variables and evaluates nested capability conditionals.
 ///
 /// `%%if name%%` / `%%if !name%%` ... `%%end%%` blocks nest. Known names are
-/// `docker`, `database` (any backend), `postgresql`, `mysql`, `mariadb`,
-/// `mysql_family` (MySQL or MariaDB) and `sqlite`. Unknown names are false.
-fn render(template: &str, variables: &[(&str, &str)], docker: bool, database: Database) -> String {
+/// `docker`, `views` (full-stack, not `--api`), `database` (any backend),
+/// `postgresql`, `mysql`, `mariadb`, `mysql_family` (MySQL or MariaDB) and
+/// `sqlite`. Unknown names are false.
+fn render(template: &str, variables: &[(&str, &str)], conditions: Conditions) -> String {
+    let Conditions {
+        docker,
+        database,
+        views,
+    } = conditions;
     let condition = |name: &str| match name {
         "docker" => docker,
+        "views" => views,
         "database" => database.is_enabled(),
         "postgresql" => database == Database::Postgresql,
         "mysql" => database == Database::Mysql,
@@ -693,6 +798,7 @@ mod tests {
             docker: true,
             ci: true,
             database: Database::Postgresql,
+            views: true,
             forge: ForgeSource::GitTag,
         }
     }
@@ -876,7 +982,10 @@ mod tests {
         assert!(postgres_init.contains("CREATE ROLE app_runtime"));
         assert!(postgres_init.contains("NOBYPASSRLS"));
         assert!(manifest.contains(&format!(
-            "forge = {{ git = \"https://github.com/fabriciobonjorno/forge-rust\", tag = \"v{FORGE_VERSION}\" }}"
+            "forge = {{ git = \"https://github.com/fabriciobonjorno/forge-rust\", tag = \"v{FORGE_VERSION}\", features = [\"views\"] }}"
+        )));
+        assert!(manifest.contains(&format!(
+            "forge-views = {{ git = \"https://github.com/fabriciobonjorno/forge-rust\", tag = \"v{FORGE_VERSION}\", default-features = false, features = [\"build\"] }}"
         )));
 
         let dockerfile = read(&root, "Dockerfile");
@@ -1017,7 +1126,10 @@ mod tests {
     fn postgresql_is_the_default_backend_with_default_features() {
         let (_parent, root) = generate(Database::Postgresql, true);
 
-        assert!(read(&root, "Cargo.toml").contains("forge = { path = \"../forge/crates/forge\" }"));
+        assert!(
+            read(&root, "Cargo.toml")
+                .contains("forge = { path = \"../forge/crates/forge\", features = [\"views\"] }")
+        );
         assert!(read(&root, "Cargo.toml").contains("\"postgres\", \"runtime-tokio\""));
         assert!(read(&root, "src/bootstrap/mod.rs").contains(".postgres(sqlx::migrate!())"));
         assert!(read(&root, "compose.yaml").contains("postgres:18.6-trixie@sha256:"));
@@ -1034,7 +1146,7 @@ mod tests {
 
         let manifest = read(&root, "Cargo.toml");
         assert!(manifest.contains(
-            "forge = { path = \"../forge/crates/forge\", default-features = false, features = [\"mysql\"] }"
+            "forge = { path = \"../forge/crates/forge\", default-features = false, features = [\"mysql\", \"views\"] }"
         ));
         assert!(manifest.contains("\"mysql\", \"runtime-tokio\""));
         assert!(!manifest.contains("\"postgres\""));
@@ -1058,7 +1170,7 @@ mod tests {
         let (_parent, root) = generate(Database::Mariadb, true);
 
         let manifest = read(&root, "Cargo.toml");
-        assert!(manifest.contains("default-features = false, features = [\"mysql\"]"));
+        assert!(manifest.contains("default-features = false, features = [\"mysql\", \"views\"]"));
         assert!(manifest.contains("\"mysql\", \"runtime-tokio\""));
         assert!(read(&root, "src/bootstrap/mod.rs").contains(".mysql(sqlx::migrate!())"));
         let compose = read(&root, "compose.yaml");
@@ -1077,10 +1189,9 @@ mod tests {
         let (_parent, root) = generate(Database::Sqlite3, true);
 
         let manifest = read(&root, "Cargo.toml");
-        assert!(
-            manifest
-                .contains("forge = { path = \"../forge/crates/forge\", features = [\"sqlite\"] }")
-        );
+        assert!(manifest.contains(
+            "forge = { path = \"../forge/crates/forge\", features = [\"sqlite\", \"views\"] }"
+        ));
         assert!(manifest.contains("\"sqlite\", \"runtime-tokio\""));
         assert!(read(&root, "src/bootstrap/mod.rs").contains(".sqlite(sqlx::migrate!())"));
         let compose = read(&root, "compose.yaml");
@@ -1112,7 +1223,10 @@ mod tests {
     fn none_has_no_database_assets_and_minimal_forge_features() {
         let (_parent, root) = generate(Database::Disabled, true);
 
-        assert!(read(&root, "Cargo.toml").contains("default-features = false }"));
+        assert!(
+            read(&root, "Cargo.toml")
+                .contains("default-features = false, features = [\"views\"] }")
+        );
         assert!(!read(&root, "Cargo.toml").contains("sqlx"));
         assert!(!read(&root, "src/bootstrap/mod.rs").contains("migrate"));
         assert!(!root.join("migrations").exists());
@@ -1129,9 +1243,19 @@ mod tests {
             Database::Disabled,
         ] {
             for docker in [true, false] {
-                let (_parent, root) = generate(database, docker);
-                for (path, content) in snapshot(&root) {
-                    assert!(!content.contains("%%"), "{database:?} {path}");
+                for views in [true, false] {
+                    let parent = tempfile::tempdir().expect("temporary directory");
+                    let options = NewApplication {
+                        database,
+                        docker,
+                        views,
+                        forge: ForgeSource::Path("../forge/crates/forge".to_owned()),
+                        ..options("sample-app")
+                    };
+                    let root = create_application(parent.path(), &options).expect("generation");
+                    for (path, content) in snapshot(&root) {
+                        assert!(!content.contains("%%"), "{database:?} {views} {path}");
+                    }
                 }
             }
         }
@@ -1178,7 +1302,171 @@ mod tests {
 
         let root = create_application(parent.path(), &options).expect("generation should succeed");
 
-        assert!(read(&root, "Cargo.toml").contains("forge = { path = \"../forge/crates/forge\" }"));
+        let manifest = read(&root, "Cargo.toml");
+        assert!(
+            manifest
+                .contains("forge = { path = \"../forge/crates/forge\", features = [\"views\"] }")
+        );
+        assert!(manifest.contains(
+            "forge-views = { path = \"../forge/crates/forge-views\", default-features = false, features = [\"build\"] }"
+        ));
+    }
+
+    #[test]
+    fn forge_views_build_dependency_is_the_sibling_of_the_forge_crate() {
+        for (forge, views) in [
+            ("../forge/crates/forge", "../forge/crates/forge-views"),
+            (
+                "/src/forge-rust/crates/forge/",
+                "/src/forge-rust/crates/forge-views",
+            ),
+            (".forge/crates/forge", ".forge/crates/forge-views"),
+            ("forge", "forge-views"),
+        ] {
+            let dependency = forge_views_build_dependency(&ForgeSource::Path(forge.to_owned()))
+                .expect("valid path");
+            assert_eq!(
+                dependency,
+                format!(
+                    "{{ path = \"{views}\", default-features = false, features = [\"build\"] }}"
+                ),
+                "{forge}"
+            );
+        }
+        assert!(forge_views_build_dependency(&ForgeSource::Path("a\"b".to_owned())).is_err());
+    }
+
+    /// Files that only full-stack applications have.
+    const VIEW_FILES: &[&str] = &[
+        "src/adapters/http/views/mod.rs",
+        "src/adapters/http/views/welcome.rs",
+        "templates/layouts/application.html",
+        "templates/layouts/_flash.html",
+        "templates/welcome/index.html",
+        "assets/application.css",
+        "assets/application.js",
+        "tests/http.rs",
+    ];
+
+    #[test]
+    fn full_stack_is_the_default_with_views_assets_and_html_layers() {
+        for database in [Database::Postgresql, Database::Sqlite3, Database::Disabled] {
+            let (_parent, root) = generate(database, true);
+            for file in VIEW_FILES {
+                assert!(root.join(file).is_file(), "{database:?}: {file}");
+            }
+            let manifest = read(&root, "Cargo.toml");
+            assert!(
+                manifest.contains("askama = { version = \"0.16.1\""),
+                "{database:?}"
+            );
+            assert!(manifest.contains("[build-dependencies]\n"), "{database:?}");
+            assert!(
+                manifest
+                    .contains("tokio = { version = \"1.53.1\", features = [\"macros\", \"rt\"] }")
+            );
+            assert!(manifest.contains("\"views\"]"), "{database:?}");
+
+            let build = read(&root, "build.rs");
+            assert!(build.contains("embed_assets_with_crate_path(\"assets\", \"forge::views\")"));
+            assert_eq!(
+                build.contains("rerun-if-changed=migrations"),
+                database.is_enabled()
+            );
+
+            let bootstrap = read(&root, "src/bootstrap/mod.rs");
+            assert!(bootstrap.contains(
+                ".compose(|composition| crate::adapters::http::routes(composition.router()))"
+            ));
+            assert!(!bootstrap.contains(".routes("));
+
+            let views = read(&root, "src/adapters/http/views/mod.rs");
+            for needle in [
+                "vendor::HOTWIRE_ASSETS",
+                "CsrfProtection::new()",
+                "FlashLayer::new()",
+                ".with_import_map(&import_map)",
+                "include!(concat!(env!(\"OUT_DIR\"), \"/forge_assets.rs\"))",
+            ] {
+                assert!(views.contains(needle), "{needle}");
+            }
+            let layout = read(&root, "templates/layouts/application.html");
+            assert!(layout.contains("{{ csrf_meta|safe }}"));
+            assert!(layout.contains("{{ layout.import_map|safe }}"));
+            assert!(layout.contains("<script type=\"module\" src=\"{{ layout.javascript }}\">"));
+            assert!(
+                !layout.contains("<script>"),
+                "no inline script but the import map"
+            );
+            assert!(!layout.contains("style="), "no inline style attributes");
+            assert!(!layout.contains("http"), "no CDN");
+            assert!(
+                read(&root, "templates/welcome/index.html")
+                    .contains("{% extends \"layouts/application.html\" %}")
+            );
+
+            let architecture = read(&root, "tests/architecture.rs");
+            assert!(architecture.contains("\"askama\""));
+            assert!(architecture.contains("\"forge::views\""));
+            assert!(read(&root, "README.md").contains("## Views"));
+        }
+    }
+
+    #[test]
+    fn api_generates_the_json_only_shape() {
+        for database in [Database::Postgresql, Database::Disabled] {
+            let parent = tempfile::tempdir().expect("temporary directory should be available");
+            let options = NewApplication {
+                database,
+                views: false,
+                forge: ForgeSource::Path("../forge/crates/forge".to_owned()),
+                ..options("sample-api")
+            };
+            let root = create_application(parent.path(), &options).expect("generation succeeds");
+
+            for file in VIEW_FILES {
+                assert!(!root.join(file).exists(), "{database:?}: {file}");
+            }
+            assert!(!root.join("templates").exists());
+            assert!(!root.join("assets").exists());
+            let manifest = read(&root, "Cargo.toml");
+            for needle in [
+                "askama",
+                "forge-views",
+                "views",
+                "[build-dependencies]",
+                "[dev-dependencies]",
+            ] {
+                assert!(!manifest.contains(needle), "{database:?}: {needle}");
+            }
+            assert!(
+                read(&root, "src/bootstrap/mod.rs")
+                    .contains(".routes(crate::adapters::http::routes)")
+            );
+            assert!(read(&root, "src/adapters/http/mod.rs").contains("Response::json"));
+            assert!(!read(&root, "README.md").contains("## Views"));
+            assert_eq!(root.join("build.rs").exists(), database.is_enabled());
+        }
+    }
+
+    #[test]
+    fn session_csrf_check_reads_the_form_field_only_in_full_stack_applications() {
+        let (_parent, full_stack) = generate(Database::Postgresql, false);
+        let security = read(&full_stack, "src/infrastructure/security/mod.rs");
+        assert!(security.contains("forge::views::presented_csrf_token(request)"));
+
+        let parent = tempfile::tempdir().expect("temporary directory should be available");
+        let api = create_application(
+            parent.path(),
+            &NewApplication {
+                views: false,
+                ..options("sample-api")
+            },
+        )
+        .expect("generation succeeds");
+        let security = read(&api, "src/infrastructure/security/mod.rs");
+        assert!(!security.contains("forge::views"));
+        assert!(security.contains("get_all(CSRF_HEADER_NAME)"));
     }
 
     #[test]
@@ -1212,8 +1500,8 @@ mod tests {
         assert_eq!(read(&existing, "keep.txt"), "user data");
     }
 
-    /// `examples/hello-forge` is the committed database-free output of
-    /// `forge new hello-forge --skip-ci -d none --forge-path ../../crates/forge`.
+    /// `examples/hello-forge` is the committed database-free, full-stack output
+    /// of `forge new hello-forge --skip-ci -d none --forge-path ../../crates/forge`.
     /// Regenerate it with `FORGE_BLESS=1 cargo test -p forge-cli`.
     #[test]
     fn hello_forge_example_matches_generator_output() {

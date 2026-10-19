@@ -77,7 +77,7 @@ fn database_none_omits_postgres_and_migration_assets() {
 
     let output = forge(
         directory.path(),
-        &["new", "api", "-d", "none", "--skip-lockfile"],
+        &["new", "api", "-d", "none", "--api", "--skip-lockfile"],
     );
 
     assert!(output.status.success(), "{output:?}");
@@ -88,6 +88,55 @@ fn database_none_omits_postgres_and_migration_assets() {
     assert!(!compose.contains("postgres:"));
     assert!(!root.join("migrations").exists());
     assert!(!root.join("build.rs").exists());
+}
+
+#[test]
+fn new_is_full_stack_by_default_and_api_opts_out() {
+    let directory = tempfile::tempdir().expect("temporary directory should be available");
+
+    let full_stack = forge(
+        directory.path(),
+        &["new", "shop", "-d", "none", "--skip-lockfile"],
+    );
+    let api = forge(
+        directory.path(),
+        &["new", "service", "-d", "none", "--api", "--skip-lockfile"],
+    );
+
+    assert!(full_stack.status.success(), "{full_stack:?}");
+    assert!(api.status.success(), "{api:?}");
+    let shop = directory.path().join("shop");
+    for path in [
+        "build.rs",
+        "templates/layouts/application.html",
+        "templates/welcome/index.html",
+        "assets/application.css",
+        "assets/application.js",
+        "src/adapters/http/views/mod.rs",
+        "tests/http.rs",
+    ] {
+        assert!(shop.join(path).is_file(), "{path} should be generated");
+    }
+    let manifest = std::fs::read_to_string(shop.join("Cargo.toml")).expect("manifest");
+    assert!(manifest.contains("askama"));
+    assert!(manifest.contains("features = [\"views\"]"));
+
+    let service = directory.path().join("service");
+    for path in [
+        "build.rs",
+        "templates",
+        "assets",
+        "src/adapters/http/views",
+        "tests/http.rs",
+    ] {
+        assert!(
+            !service.join(path).exists(),
+            "{path} must not be generated with --api"
+        );
+    }
+    let manifest = std::fs::read_to_string(service.join("Cargo.toml")).expect("manifest");
+    assert!(!manifest.contains("askama"));
+    assert!(!manifest.contains("views"));
 }
 
 #[test]
@@ -151,7 +200,14 @@ fn database_flag_accepts_aliases_and_prints_the_notice_for_non_postgres_backends
 
         let output = forge(
             directory.path(),
-            &["new", "api", "--database", value, "--skip-lockfile"],
+            &[
+                "new",
+                "api",
+                "--database",
+                value,
+                "--api",
+                "--skip-lockfile",
+            ],
         );
 
         assert!(output.status.success(), "{value}: {output:?}");

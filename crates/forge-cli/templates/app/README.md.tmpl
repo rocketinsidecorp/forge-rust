@@ -12,6 +12,38 @@ src/bootstrap       composition root and process lifecycle
 ```
 
 `tests/architecture.rs` fails when an inner ring imports an outer one.
+%%if views%%
+
+## Views
+
+Pages are rendered on the server, as in Rails
+([ADR 0022](https://github.com/fabriciobonjorno/forge-rust/blob/main/docs/adr/0022-server-rendered-views.md)):
+
+```text
+templates/layouts/application.html  layout: CSRF meta tag, stylesheet, import map
+templates/layouts/_flash.html       one-shot notice/alert messages
+templates/welcome/index.html        the page served at /
+src/adapters/http/views/            view models checked against the templates at compile time
+assets/                             CSS and JavaScript, digested and embedded by build.rs
+```
+
+Templates use [Askama](https://askama.rs): `{{ value }}` is HTML-escaped and a
+template error is a build error. Turbo and Stimulus are vendored by Forge and
+loaded through the import map; no Node toolchain is needed. Every response
+carries a strict Content-Security-Policy (same-origin scripts and styles, the
+import map allowed by hash, no inline scripts or `style` attributes).
+
+Every form that changes state must carry the page's CSRF token:
+`forge::views::csrf_field(&token)` renders the hidden `csrf_token` input and
+Turbo sends the `<meta name="csrf-token">` value in `x-csrf-token`. Unsafe
+requests without a matching token are refused with `403`. A `POST` form can
+tunnel `PATCH`, `PUT` or `DELETE` in a `_method` field. Decode form bodies with
+`forge::web::decode_form`, answer a successful submission with
+`forge::views::see_other` (`303`) and attach a message with
+`forge::views::Flash`. The CSRF and flash cookies use the `__Host-` prefix
+and are `Secure`: browsers accept them on `https://` and on
+`http://localhost`/`127.0.0.1`.
+%%end%%
 
 ## Development
 

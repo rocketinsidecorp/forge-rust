@@ -1,0 +1,6 @@
+{% if let Some(notice) = layout.flash.notice() %}
+<p class="flash flash-notice" role="status">{{ notice }}</p>
+{% endif %}
+{% if let Some(alert) = layout.flash.alert() %}
+<p class="flash flash-alert" role="alert">{{ alert }}</p>
+{% endif %}

@@ -24,7 +24,8 @@ impl Cli {
 pub(crate) enum Command {
     /// Generate a sortable UUIDv7 identifier.
     Id,
-    /// Create a new application with hexagonal boundaries, Docker and CI.
+    /// Create a new full-stack application (server-rendered views; `--api`
+    /// for JSON only) with hexagonal boundaries, Docker and CI.
     New {
         /// Cargo package name and destination directory.
         name: String,
@@ -44,6 +45,11 @@ pub(crate) enum Command {
             default_value_t = Database::Postgresql
         )]
         database: Database,
+        /// Generate an API-only application (like `rails new --api`): JSON
+        /// handlers without views, templates, assets, Askama or the HTML
+        /// request layers.
+        #[arg(long)]
+        api: bool,
         /// Do not run `cargo generate-lockfile` after generation.
         #[arg(long)]
         skip_lockfile: bool,

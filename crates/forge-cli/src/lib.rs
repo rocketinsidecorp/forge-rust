@@ -35,6 +35,7 @@ fn execute(
             skip_docker,
             skip_ci,
             database,
+            api,
             skip_lockfile,
             forge_path,
         } => {
@@ -43,6 +44,7 @@ fn execute(
                 docker: !skip_docker,
                 ci: !skip_ci,
                 database,
+                views: !api,
                 forge: forge_path.map_or(ForgeSource::GitTag, ForgeSource::Path),
             };
             let destination = generate::create_application(current_dir, &options)?;

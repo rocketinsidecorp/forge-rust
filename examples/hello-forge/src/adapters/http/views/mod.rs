@@ -1,0 +1,106 @@
+//! Server-rendered views (ADR 0022). A view model is a plain struct checked
+//! against its template in `templates/` at compile time by Askama; every
+//! `{{ value }}` is HTML-escaped unless the template opts out with `|safe`.
+//!
+//! [`Site`] configures the asset pipeline (the counterpart of Rails'
+//! `config/importmap.rb` and stylesheet tags) and [`Layout`] is what every
+//! page hands to `templates/layouts/application.html`.
+
+pub mod welcome;
+
+use std::error::Error;
+
+use forge::http::{Request, Router};
+use forge::views::{
+    AssetError, AssetSet, ContentSecurityPolicy, CsrfProtection, Flash, FlashLayer, ImportMap,
+    csrf_meta, csrf_token, flash, vendor,
+};
+
+// `FORGE_ASSETS`: every file under assets/, digested and embedded by build.rs.
+include!(concat!(env!("OUT_DIR"), "/forge_assets.rs"));
+
+/// Digested assets, the import map and the Content-Security-Policy shared by
+/// every page, built once at startup.
+#[derive(Debug)]
+pub struct Site {
+    assets: AssetSet,
+    import_map: ImportMap,
+    policy: ContentSecurityPolicy,
+    stylesheet: String,
+    javascript: String,
+}
+
+impl Site {
+    /// Validates the embedded assets (the application's and the vendored
+    /// Turbo and Stimulus modules) and pins the JavaScript modules.
+    pub fn load() -> Result<Self, Box<dyn Error + Send + Sync>> {
+        let assets = AssetSet::from_tables(&[FORGE_ASSETS, vendor::HOTWIRE_ASSETS])?;
+        // Bare specifiers that `import` statements in assets/*.js may use.
+        let import_map = ImportMap::builder()
+            .pin("@hotwired/turbo", vendor::TURBO_ASSET)
+            .pin("@hotwired/stimulus", vendor::STIMULUS_ASSET)
+            .build(&assets)?;
+        // Same-origin resources only; the import map is the one inline
+        // script, allowed by its hash.
+        let policy = ContentSecurityPolicy::strict().with_import_map(&import_map);
+        let stylesheet = asset_path(&assets, "application.css")?;
+        let javascript = asset_path(&assets, "application.js")?;
+        Ok(Self {
+            assets,
+            import_map,
+            policy,
+            stylesheet,
+            javascript,
+        })
+    }
+
+    /// Registers one route per digested asset and the request layers, from
+    /// the outermost: the Content-Security-Policy on every response, CSRF
+    /// protection for every unsafe request (it also applies the `_method`
+    /// override of HTML forms before routing) and flash messages.
+    pub fn register(&self, router: &mut Router) -> Result<(), AssetError> {
+        self.assets.register(router)?;
+        router
+            .layer(self.policy.clone())
+            .layer(CsrfProtection::new())
+            .layer(FlashLayer::new());
+        Ok(())
+    }
+
+    /// The layout data of a page rendered for `request`. Reading it consumes
+    /// the flash and issues the CSRF token the page's forms carry.
+    pub fn layout<'a>(&'a self, request: &Request, title: &'a str) -> Layout<'a> {
+        Layout {
+            title,
+            csrf_meta: csrf_token(request).map(|token| csrf_meta(&token)),
+            flash: flash(request),
+            import_map: self.import_map.script_tag(),
+            stylesheet: &self.stylesheet,
+            javascript: &self.javascript,
+        }
+    }
+}
+
+fn asset_path(assets: &AssetSet, logical: &str) -> Result<String, Box<dyn Error + Send + Sync>> {
+    match assets.path(logical) {
+        Some(path) => Ok(path.to_owned()),
+        None => Err(format!("assets/{logical} is missing").into()),
+    }
+}
+
+/// What `templates/layouts/application.html` renders around every page.
+pub struct Layout<'a> {
+    /// The document title.
+    pub title: &'a str,
+    /// `<meta name="csrf-token">` for Turbo and `fetch`. `None` only when
+    /// CSRF protection is not installed, and then every form is refused.
+    pub csrf_meta: Option<String>,
+    /// The one-shot notice/alert set by the previous response.
+    pub flash: Flash,
+    /// The `<script type="importmap">` element (allowed by hash in the CSP).
+    pub import_map: &'a str,
+    /// Digested URL of `assets/application.css`.
+    pub stylesheet: &'a str,
+    /// Digested URL of `assets/application.js`.
+    pub javascript: &'a str,
+}

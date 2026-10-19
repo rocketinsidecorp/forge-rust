@@ -23,6 +23,11 @@ pub fn run() -> ExitCode {
 %%if sqlite%%
         .sqlite(sqlx::migrate!())
 %%end%%
+%%if views%%
+        .compose(|composition| crate::adapters::http::routes(composition.router()))
+%%end%%
+%%if !views%%
         .routes(crate::adapters::http::routes)
+%%end%%
         .run()
 }
