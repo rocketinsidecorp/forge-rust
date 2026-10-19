@@ -196,7 +196,7 @@ by `forge-db`; no `macros` or `json` feature: migrations are embedded with
 0.4.3 (retry and poll jitter only; a jitter failure falls back to the
 un-jittered delay, it is not a security property).
 
-Cron parsing is hand-written (about 300 lines, no `unsafe`) instead of
+Cron parsing is hand-written (about 400 lines with documentation, no `unsafe`) instead of
 admitting a cron crate: the five-field UTC grammar is small, the evaluator is
 property-tested against a minute-by-minute oracle and fuzzed with arbitrary
 input, and it avoids a time-zone database dependency. No SQLx, Tokio or
