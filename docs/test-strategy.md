@@ -147,6 +147,22 @@ CSRF/flash/method-override layers with an in-memory port (CSRF refusal, `422`,
 `TestDatabase` (optimistic locking, cursor pages, cross-tenant isolation and,
 on PostgreSQL, RLS with a role that cannot bypass it).
 
+The generated sign-in pages ([ADR 0026](adr/0026-authentication-pages-and-setup.md))
+ship `tests/authentication_http.rs` (the pages through the real CSRF and
+flash layers with in-memory ports: success with fresh session and CSRF
+token, one uniform failure for every wrong field, throttling with
+`Retry-After`, CSRF refusals, open-redirect return paths, sign-out, session
+fixation, reset non-enumeration, single-use and expired reset links, sessions
+revoked on reset, the sign-in redirect) and `tests/authentication_postgres.rs`
+(`setup` refusing password arguments and short passwords, creating one owner
+and refusing afterwards, concurrent `setup` runs creating exactly one tenant,
+and reset redemption against PostgreSQL). With `FORGE_TEST_DATABASE_URL` the
+slow scaffold test also runs `setup` and `seed` and drives a browser session
+over HTTP against the running server: sign-in redirect, sign-in, tenant
+scaffold pages, sign-out, revoked session; a second slow test restores the
+pages with `forge generate authentication`. `forge-cli` unit tests check that
+the generator's files are byte-identical to `forge new`'s and its refusals.
+
 Phase 1 additionally builds every generated application's multi-stage Dockerfile,
 inspects the final image for non-root identity and forbidden build contents, starts
 it with the documented configuration, waits for the image health check, exercises
