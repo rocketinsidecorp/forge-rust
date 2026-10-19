@@ -149,6 +149,9 @@ enum Group {
     Api,
     /// Applications with a database or views.
     BuildScript,
+    /// Full-stack PostgreSQL applications: sign-in pages and `setup`
+    /// (ADR 0026). Also the files of `forge generate authentication`.
+    Authentication,
 }
 
 struct Template {
@@ -224,6 +227,52 @@ const TEMPLATES: &[Template] = &[
         Group::Postgres,
         "migrations/00000000000000000002_forge_identity.down.sql" => "migrations/00000000000000000002_forge_identity.down.sql.tmpl"
     ),
+    template!(
+        Group::Authentication,
+        "migrations/00000000000000000003_forge_authentication.up.sql" => "migrations/00000000000000000003_forge_authentication.up.sql.tmpl"
+    ),
+    template!(
+        Group::Authentication,
+        "migrations/00000000000000000003_forge_authentication.down.sql" => "migrations/00000000000000000003_forge_authentication.down.sql.tmpl"
+    ),
+    template!(
+        Group::Authentication,
+        "src/infrastructure/accounts/mod.rs" => "src/infrastructure/accounts/mod.rs.tmpl"
+    ),
+    template!(
+        Group::Authentication,
+        "src/adapters/http/authentication.rs" => "src/adapters/http/authentication.rs.tmpl"
+    ),
+    template!(
+        Group::Authentication,
+        "src/adapters/http/views/authentication.rs" => "src/adapters/http/views/authentication.rs.tmpl"
+    ),
+    template!(
+        Group::Authentication,
+        "templates/sessions/new.html" => "templates/sessions/new.html.tmpl"
+    ),
+    template!(
+        Group::Authentication,
+        "templates/sessions/_sign_out.html" => "templates/sessions/_sign_out.html.tmpl"
+    ),
+    template!(
+        Group::Authentication,
+        "templates/passwords/new.html" => "templates/passwords/new.html.tmpl"
+    ),
+    template!(
+        Group::Authentication,
+        "templates/passwords/edit.html" => "templates/passwords/edit.html.tmpl"
+    ),
+    template!(Group::Authentication, "src/bootstrap/setup.rs" => "src/bootstrap/setup.rs.tmpl"),
+    template!(
+        Group::Authentication,
+        "tests/authentication_http.rs" => "tests/authentication_http.rs.tmpl"
+    ),
+    template!(
+        Group::Authentication,
+        "tests/authentication_postgres.rs" => "tests/authentication_postgres.rs.tmpl"
+    ),
+    template!(Group::Database, "src/bootstrap/seeds.rs" => "src/bootstrap/seeds.rs.tmpl"),
     template!(
         Group::Postgres,
         "src/infrastructure/audit/mod.rs" => "src/infrastructure/audit/mod.rs.tmpl"
@@ -607,6 +656,7 @@ fn write_application(
             Group::Views => options.views,
             Group::Api => !options.views,
             Group::BuildScript => options.views || options.database.is_enabled(),
+            Group::Authentication => options.database == Database::Postgresql && options.views,
         };
         if enabled {
             let content = render(
@@ -703,7 +753,8 @@ struct Conditions {
 /// Substitutes template variables and evaluates nested capability conditionals.
 ///
 /// `%%if name%%` / `%%if !name%%` ... `%%end%%` blocks nest. Known names are
-/// `docker`, `views` (full-stack, not `--api`), `database` (any backend),
+/// `docker`, `views` (full-stack, not `--api`), `authentication` (full-stack
+/// PostgreSQL: sign-in pages and `setup`), `database` (any backend),
 /// `postgresql`, `mysql`, `mariadb`, `mysql_family` (MySQL or MariaDB) and
 /// `sqlite`. Unknown names are false.
 fn render(template: &str, variables: &[(&str, &str)], conditions: Conditions) -> String {
@@ -715,6 +766,7 @@ fn render(template: &str, variables: &[(&str, &str)], conditions: Conditions) ->
     let condition = |name: &str| match name {
         "docker" => docker,
         "views" => views,
+        "authentication" => views && database == Database::Postgresql,
         "database" => database.is_enabled(),
         "postgresql" => database == Database::Postgresql,
         "mysql" => database == Database::Mysql,
@@ -1247,6 +1299,84 @@ mod tests {
             assert!(!root.join("storage").exists());
             assert!(!read(&root, ".gitignore").contains("storage"));
             assert!(!read(&root, "Dockerfile").contains("/data"));
+        }
+    }
+
+    const AUTHENTICATION_FILES: &[&str] = &[
+        "migrations/00000000000000000003_forge_authentication.up.sql",
+        "migrations/00000000000000000003_forge_authentication.down.sql",
+        "src/infrastructure/accounts/mod.rs",
+        "src/adapters/http/authentication.rs",
+        "src/adapters/http/views/authentication.rs",
+        "templates/sessions/new.html",
+        "templates/sessions/_sign_out.html",
+        "templates/passwords/new.html",
+        "templates/passwords/edit.html",
+        "src/bootstrap/setup.rs",
+        "tests/authentication_http.rs",
+        "tests/authentication_postgres.rs",
+    ];
+
+    #[test]
+    fn full_stack_postgresql_applications_get_the_sign_in_pages_setup_and_seeds() {
+        let parent = tempfile::tempdir().expect("temporary directory should be available");
+        let root = create_application(parent.path(), &options("auth-app"))
+            .expect("application generation should succeed");
+
+        for file in AUTHENTICATION_FILES {
+            assert!(root.join(file).is_file(), "{file}");
+        }
+        assert!(root.join("src/bootstrap/seeds.rs").is_file());
+        let bootstrap = read(&root, "src/bootstrap/mod.rs");
+        assert!(bootstrap.contains("pub mod seeds;\npub mod setup;\n"));
+        assert!(bootstrap.contains(".command(\"setup\", setup::SUMMARY, setup::run)"));
+        assert!(bootstrap.contains(".command(\"seed\", seeds::SUMMARY, seeds::run)"));
+        assert!(bootstrap.contains("crate::adapters::http::authentication::routes("));
+        assert!(bootstrap.contains("forge::auth::UndeliverablePasswordResets"));
+        assert!(read(&root, "src/infrastructure/mod.rs").contains("pub mod accounts;"));
+        assert!(read(&root, "src/adapters/http/mod.rs").contains("pub mod authentication;"));
+        assert!(read(&root, "src/adapters/http/views/mod.rs").contains("pub mod authentication;"));
+        let migration = read(
+            &root,
+            "migrations/00000000000000000003_forge_authentication.up.sql",
+        );
+        assert!(migration.contains("token_digest bytea NOT NULL UNIQUE"));
+        assert!(migration.contains("GRANT UPDATE (used_at) ON TABLE forge_password_resets"));
+        assert!(!migration.contains("gen_random_uuid"));
+    }
+
+    #[test]
+    fn only_full_stack_postgresql_applications_get_the_sign_in_pages() {
+        for (database, views) in [
+            (Database::Postgresql, false),
+            (Database::Mysql, true),
+            (Database::Sqlite3, true),
+            (Database::Disabled, true),
+        ] {
+            let parent = tempfile::tempdir().expect("temporary directory should be available");
+            let mut options = options("plain-app");
+            options.database = database;
+            options.views = views;
+            let root = create_application(parent.path(), &options)
+                .expect("application generation should succeed");
+
+            for file in AUTHENTICATION_FILES {
+                assert!(!root.join(file).exists(), "{database:?} {views}: {file}");
+            }
+            let bootstrap = read(&root, "src/bootstrap/mod.rs");
+            assert!(
+                !bootstrap.contains("pub mod setup;"),
+                "{database:?} {views}"
+            );
+            assert_eq!(
+                root.join("src/bootstrap/seeds.rs").is_file(),
+                database != Database::Disabled,
+                "{database:?}"
+            );
+            assert_eq!(
+                bootstrap.contains(".command(\"seed\""),
+                database != Database::Disabled
+            );
         }
     }
 

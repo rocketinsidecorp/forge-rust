@@ -6,6 +6,9 @@
 //! `config/importmap.rb` and stylesheet tags) and [`Layout`] is what every
 //! page hands to `templates/layouts/application.html`.
 
+%%if authentication%%
+pub mod authentication;
+%%end%%
 pub mod welcome;
 
 use std::error::Error;

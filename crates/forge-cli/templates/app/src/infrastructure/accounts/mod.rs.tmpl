@@ -1,0 +1,336 @@
+//! PostgreSQL persistence of browser authentication (ADR 0026): the tenant
+//! directory used at sign-in, one-time password reset tokens, and the first
+//! tenant and owner created by `setup`.
+//!
+//! Reset tokens are stored only as SHA-256 digests. Redeeming one changes the
+//! password, revokes every session of the account and uses up its other reset
+//! tokens in a single transaction.
+
+use async_trait::async_trait;
+use forge::audit::{AuditAction, AuditActor, AuditEvent, AuditOutcome};
+use forge::auth::{PasswordHash, PasswordResetTokenDigest, UnixTimestamp};
+use forge::core::Id;
+use forge::security::PrincipalId;
+use forge::tenancy::{
+    AccountStoreError, PasswordResetGrant, PasswordResetStore, RedeemedPasswordReset,
+    TenantDirectory, TenantId, TenantSlug,
+};
+use sqlx::{PgPool, types::Uuid};
+
+/// The role `setup` gives the first member of the first tenant. Generated
+/// access policies grant it every permission of the resources they protect.
+pub const OWNER_ROLE: &str = "owner";
+
+/// Advisory lock name that serializes concurrent `setup` runs.
+const SETUP_LOCK: &str = "forge:identity_setup";
+
+/// Tenants by slug.
+#[derive(Clone, Debug)]
+pub struct PgTenantDirectory {
+    pool: PgPool,
+}
+
+impl PgTenantDirectory {
+    /// Creates a directory using the least-privilege runtime pool.
+    #[must_use]
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait]
+impl TenantDirectory for PgTenantDirectory {
+    async fn find_by_slug(&self, slug: &TenantSlug) -> Result<Option<TenantId>, AccountStoreError> {
+        let id = sqlx::query_scalar::<_, Uuid>("SELECT id FROM forge_tenants WHERE slug = $1")
+            .bind(slug.as_str())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(classify)?;
+        id.map(|id| TenantId::from_uuid(id).map_err(|_| AccountStoreError::Corrupt))
+            .transpose()
+    }
+}
+
+/// Marker of password reset record identifiers.
+#[derive(Debug)]
+pub enum PasswordResetMarker {}
+
+/// One-time password reset tokens.
+#[derive(Clone, Debug)]
+pub struct PgPasswordResetStore {
+    pool: PgPool,
+}
+
+impl PgPasswordResetStore {
+    /// Creates a store using the least-privilege runtime pool.
+    #[must_use]
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait]
+impl PasswordResetStore for PgPasswordResetStore {
+    async fn issue(&self, grant: &PasswordResetGrant) -> Result<(), AccountStoreError> {
+        sqlx::query(
+            "INSERT INTO forge_password_resets (
+                id, principal_id, tenant_id, token_digest, issued_at, expires_at
+             ) VALUES (
+                $1, $2, $3, $4,
+                to_timestamp($5::double precision),
+                to_timestamp($6::double precision)
+             )",
+        )
+        .bind(Id::<PasswordResetMarker>::new().into_uuid())
+        .bind(grant.principal_id().into_uuid())
+        .bind(grant.tenant_id().into_uuid())
+        .bind(grant.digest().as_bytes().as_slice())
+        .bind(seconds(grant.issued_at())?)
+        .bind(seconds(grant.expires_at())?)
+        .execute(&self.pool)
+        .await
+        .map_err(classify)?;
+        Ok(())
+    }
+
+    async fn redeem(
+        &self,
+        digest: &PasswordResetTokenDigest,
+        now: UnixTimestamp,
+        password_hash: &PasswordHash,
+    ) -> Result<Option<RedeemedPasswordReset>, AccountStoreError> {
+        let now = seconds(now)?;
+        let mut transaction = self.pool.begin().await.map_err(classify)?;
+
+        // Locks the token row, so a concurrent redemption waits and then sees
+        // it used. The account must still be enabled and an active member of
+        // the tenant the reset was requested through.
+        let row = sqlx::query_as::<_, (Uuid, Uuid)>(
+            "SELECT reset.principal_id, reset.tenant_id
+             FROM forge_password_resets AS reset
+             JOIN forge_principals AS principal ON principal.id = reset.principal_id
+             JOIN forge_tenant_memberships AS membership
+               ON membership.principal_id = reset.principal_id
+              AND membership.tenant_id = reset.tenant_id
+             WHERE reset.token_digest = $1
+               AND reset.used_at IS NULL
+               AND reset.expires_at > to_timestamp($2::double precision)
+               AND principal.disabled_at IS NULL
+               AND membership.state = 'active'
+             FOR UPDATE OF reset",
+        )
+        .bind(digest.as_bytes().as_slice())
+        .bind(now)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(classify)?;
+        let Some((principal_id, tenant_id)) = row else {
+            transaction.rollback().await.map_err(classify)?;
+            return Ok(None);
+        };
+
+        let changed = sqlx::query(
+            "UPDATE forge_principals
+             SET password_hash = $2,
+                 updated_at = clock_timestamp(),
+                 version = version + 1
+             WHERE id = $1
+               AND disabled_at IS NULL",
+        )
+        .bind(principal_id)
+        .bind(password_hash.expose())
+        .execute(&mut *transaction)
+        .await
+        .map_err(classify)?;
+        if changed.rows_affected() != 1 {
+            return Err(AccountStoreError::Conflict);
+        }
+
+        sqlx::query(
+            "UPDATE forge_sessions
+             SET revoked_at = GREATEST(issued_at, to_timestamp($2::double precision))
+             WHERE principal_id = $1
+               AND revoked_at IS NULL",
+        )
+        .bind(principal_id)
+        .bind(now)
+        .execute(&mut *transaction)
+        .await
+        .map_err(classify)?;
+
+        sqlx::query(
+            "UPDATE forge_password_resets
+             SET used_at = GREATEST(issued_at, to_timestamp($2::double precision))
+             WHERE principal_id = $1
+               AND used_at IS NULL",
+        )
+        .bind(principal_id)
+        .bind(now)
+        .execute(&mut *transaction)
+        .await
+        .map_err(classify)?;
+
+        transaction.commit().await.map_err(classify)?;
+        Ok(Some(RedeemedPasswordReset {
+            principal_id: PrincipalId::from_uuid(principal_id)
+                .map_err(|_| AccountStoreError::Corrupt)?,
+            tenant_id: TenantId::from_uuid(tenant_id).map_err(|_| AccountStoreError::Corrupt)?,
+        }))
+    }
+}
+
+/// The first tenant and its owner, as `setup` creates them.
+#[derive(Debug)]
+pub struct OwnerAccount {
+    /// The tenant's slug, typed at sign-in.
+    pub tenant: TenantSlug,
+    /// The tenant's display name.
+    pub organization: String,
+    /// The owner's login (email address).
+    pub login: String,
+    /// The owner's hashed password.
+    pub password_hash: PasswordHash,
+    /// When the owner is created (also the audit event time).
+    pub now: UnixTimestamp,
+}
+
+/// What `provision_owner` created.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProvisionedOwner {
+    /// The new tenant.
+    pub tenant_id: TenantId,
+    /// The new owner.
+    pub principal_id: PrincipalId,
+}
+
+/// Why `setup` created nothing.
+#[derive(Debug, thiserror::Error)]
+pub enum SetupError {
+    /// A tenant exists: `setup` only bootstraps an empty identity database,
+    /// so it can never add an account to, or take over, a running
+    /// installation.
+    #[error(
+        "identity is already set up: a tenant exists, and setup only provisions an empty \
+         identity database"
+    )]
+    AlreadyProvisioned,
+    /// A principal with the owner's login exists.
+    #[error("a principal with this login already exists")]
+    LoginTaken,
+    /// The database refused or failed the transaction.
+    #[error("the database failed while creating the owner")]
+    Database(#[source] sqlx::Error),
+    /// A value could not be represented.
+    #[error("invalid setup value")]
+    Invalid,
+}
+
+impl From<sqlx::Error> for SetupError {
+    fn from(error: sqlx::Error) -> Self {
+        Self::Database(error)
+    }
+}
+
+/// Creates the first tenant, its owner principal and the owner's active
+/// membership with the [`OWNER_ROLE`], plus an `auth.setup.owner_provisioned`
+/// audit event, in one transaction.
+///
+/// A transaction-scoped advisory lock serializes concurrent runs, and the
+/// transaction refuses with [`SetupError::AlreadyProvisioned`] when any
+/// tenant exists, so repeated or concurrent runs create nothing more.
+/// Identifiers are UUIDv7 values generated in Rust. `pool` must use the
+/// migration credential: the runtime role cannot create principals.
+pub async fn provision_owner(
+    pool: &PgPool,
+    account: &OwnerAccount,
+) -> Result<ProvisionedOwner, SetupError> {
+    let tenant_id = TenantId::new();
+    let principal_id = PrincipalId::new();
+    let action =
+        AuditAction::new("auth.setup.owner_provisioned").map_err(|_| SetupError::Invalid)?;
+    let event = AuditEvent::new(
+        account.now,
+        AuditActor::System,
+        Some(tenant_id),
+        action,
+        AuditOutcome::Succeeded,
+    );
+    let occurred_at =
+        i64::try_from(event.occurred_at().as_secs()).map_err(|_| SetupError::Invalid)?;
+
+    let mut transaction = pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(forge::db::advisory_key(SETUP_LOCK))
+        .execute(&mut *transaction)
+        .await?;
+    let provisioned = sqlx::query_scalar::<_, bool>("SELECT EXISTS (SELECT 1 FROM forge_tenants)")
+        .fetch_one(&mut *transaction)
+        .await?;
+    if provisioned {
+        return Err(SetupError::AlreadyProvisioned);
+    }
+    let taken = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (SELECT 1 FROM forge_principals WHERE lower(login) = lower($1))",
+    )
+    .bind(&account.login)
+    .fetch_one(&mut *transaction)
+    .await?;
+    if taken {
+        return Err(SetupError::LoginTaken);
+    }
+
+    sqlx::query("INSERT INTO forge_tenants (id, slug, name) VALUES ($1, $2, $3)")
+        .bind(tenant_id.into_uuid())
+        .bind(account.tenant.as_str())
+        .bind(&account.organization)
+        .execute(&mut *transaction)
+        .await?;
+    sqlx::query("INSERT INTO forge_principals (id, login, password_hash) VALUES ($1, $2, $3)")
+        .bind(principal_id.into_uuid())
+        .bind(&account.login)
+        .bind(account.password_hash.expose())
+        .execute(&mut *transaction)
+        .await?;
+    sqlx::query(
+        "INSERT INTO forge_tenant_memberships (tenant_id, principal_id, roles, state)
+         VALUES ($1, $2, $3, 'active')",
+    )
+    .bind(tenant_id.into_uuid())
+    .bind(principal_id.into_uuid())
+    .bind(vec![OWNER_ROLE.to_owned()])
+    .execute(&mut *transaction)
+    .await?;
+    sqlx::query(
+        "INSERT INTO forge_audit_events (
+            id, occurred_at_unix, actor_kind, principal_id, tenant_id, action, outcome
+         ) VALUES ($1, $2, 'system', NULL, $3, $4, 'succeeded')",
+    )
+    .bind(event.id().into_uuid())
+    .bind(occurred_at)
+    .bind(tenant_id.into_uuid())
+    .bind(event.action().as_str())
+    .execute(&mut *transaction)
+    .await?;
+    transaction.commit().await?;
+
+    Ok(ProvisionedOwner {
+        tenant_id,
+        principal_id,
+    })
+}
+
+fn seconds(timestamp: UnixTimestamp) -> Result<i64, AccountStoreError> {
+    i64::try_from(timestamp.as_secs()).map_err(|_| AccountStoreError::Corrupt)
+}
+
+fn classify(error: sqlx::Error) -> AccountStoreError {
+    match error
+        .as_database_error()
+        .and_then(|database| database.code())
+    {
+        Some(code) if code == "23505" || code == "23503" || code == "23514" => {
+            AccountStoreError::Conflict
+        }
+        _ => AccountStoreError::Unavailable,
+    }
+}

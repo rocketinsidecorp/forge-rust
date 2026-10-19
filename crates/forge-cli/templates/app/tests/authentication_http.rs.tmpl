@@ -1,0 +1,1039 @@
+//! The sign-in, sign-out and password-reset pages end to end through the
+//! application's router, without a network or database: the identity ports
+//! are in-memory fakes that follow the PostgreSQL adapters' contracts, and
+//! the password hasher is a fast stand-in for Argon2id.
+
+use std::collections::HashMap;
+use std::error::Error;
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
+
+use async_trait::async_trait;
+use forge::audit::{AuditError, AuditEvent, AuditOutcome, AuditReceipt, AuditSink};
+use forge::auth::{
+    CsrfTokenDigest, MemoryLoginThrottle, PasswordCredential, PasswordCredentialStore,
+    PasswordCredentialStoreError, PasswordCredentialVersion, PasswordHash, PasswordHashError,
+    PasswordHasher, PasswordResetDelivery, PasswordResetDeliveryError, PasswordResetNotifier,
+    PasswordResetTokenDigest, Session, SessionCredentialDigest, SessionId, SessionStore,
+    SessionStoreError, ThrottleConfig, UnixTimestamp,
+};
+use forge::http::{HeaderMap, HeaderValue, Method, Request, Response, Router, StatusCode, header};
+use forge::security::{PrincipalId, Role};
+use forge::tenancy::{
+    AccountStoreError, Membership, MembershipState, MembershipStore, MembershipStoreError,
+    MembershipStoreErrorKind, PasswordResetGrant, PasswordResetStore, RedeemedPasswordReset,
+    TenantDirectory, TenantId, TenantSlug,
+};
+
+use app::adapters::http::authentication::{AuthenticationPorts, routes};
+
+type TestResult = Result<(), Box<dyn Error>>;
+
+const FORM: &str = "application/x-www-form-urlencoded";
+const BROWSER: &str = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8";
+const PASSWORD: &str = "correct horse battery";
+const INVALID: &str = "That organization, email and password do not match an account.";
+
+struct Account {
+    principal: PrincipalId,
+    login: String,
+    hash: PasswordHash,
+    disabled: bool,
+    version: u64,
+}
+
+struct Reset {
+    grant: PasswordResetGrant,
+    used: bool,
+}
+
+/// Every fake port over one shared state.
+#[derive(Default)]
+struct World {
+    accounts: Mutex<Vec<Account>>,
+    sessions: Mutex<Vec<(Session, SessionCredentialDigest, CsrfTokenDigest)>>,
+    memberships: Mutex<Vec<Membership>>,
+    tenants: Mutex<HashMap<String, TenantId>>,
+    resets: Mutex<Vec<Reset>>,
+    deliveries: Mutex<Vec<(String, String)>>,
+    audit: Mutex<Vec<(String, AuditOutcome)>>,
+    hashes: Mutex<u32>,
+    deliver_fails: bool,
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+fn fake_hash(password: &[u8]) -> Result<PasswordHash, PasswordHashError> {
+    let hex: String = password.iter().map(|byte| format!("{byte:02x}")).collect();
+    PasswordHash::new(format!("$argon2id$fake${hex}")).map_err(|_| PasswordHashError::InvalidHash)
+}
+
+#[async_trait]
+impl PasswordHasher for World {
+    async fn hash(&self, password: &[u8]) -> Result<PasswordHash, PasswordHashError> {
+        *lock(&self.hashes) += 1;
+        fake_hash(password)
+    }
+
+    async fn verify(
+        &self,
+        password: &[u8],
+        expected: &PasswordHash,
+    ) -> Result<bool, PasswordHashError> {
+        *lock(&self.hashes) += 1;
+        Ok(fake_hash(password)? == *expected)
+    }
+}
+
+#[async_trait]
+impl PasswordCredentialStore for World {
+    async fn find_by_login(
+        &self,
+        login: &str,
+    ) -> Result<Option<PasswordCredential>, PasswordCredentialStoreError> {
+        lock(&self.accounts)
+            .iter()
+            .find(|account| account.login.eq_ignore_ascii_case(login))
+            .map(|account| {
+                let version = PasswordCredentialVersion::new(account.version)
+                    .ok_or(PasswordCredentialStoreError::CorruptRecord)?;
+                Ok(PasswordCredential::new(
+                    account.principal,
+                    account.hash.clone(),
+                    account.disabled,
+                    version,
+                ))
+            })
+            .transpose()
+    }
+
+    async fn replace_password_hash(
+        &self,
+        _: PrincipalId,
+        _: PasswordCredentialVersion,
+        _: &PasswordHash,
+    ) -> Result<(), PasswordCredentialStoreError> {
+        Err(PasswordCredentialStoreError::Conflict)
+    }
+}
+
+#[async_trait]
+impl SessionStore for World {
+    async fn insert(
+        &self,
+        session: &Session,
+        credential: &SessionCredentialDigest,
+        csrf: &CsrfTokenDigest,
+    ) -> Result<(), SessionStoreError> {
+        lock(&self.sessions).push((session.clone(), *credential, *csrf));
+        Ok(())
+    }
+
+    async fn find_by_credential(
+        &self,
+        credential: &SessionCredentialDigest,
+    ) -> Result<Option<Session>, SessionStoreError> {
+        Ok(lock(&self.sessions)
+            .iter()
+            .find(|(_, stored, _)| stored == credential)
+            .map(|(session, _, _)| session.clone()))
+    }
+
+    async fn verify_csrf(
+        &self,
+        id: SessionId,
+        csrf: &CsrfTokenDigest,
+    ) -> Result<bool, SessionStoreError> {
+        Ok(lock(&self.sessions).iter().any(|(session, _, stored)| {
+            session.id() == id && stored == csrf && session.revoked_at().is_none()
+        }))
+    }
+
+    async fn revoke(&self, id: SessionId, at: UnixTimestamp) -> Result<(), SessionStoreError> {
+        for (session, _, _) in lock(&self.sessions).iter_mut() {
+            if session.id() == id {
+                return session.revoke(at).map_err(|_| SessionStoreError::Conflict);
+            }
+        }
+        Err(SessionStoreError::Conflict)
+    }
+
+    async fn rotate(
+        &self,
+        _: SessionId,
+        _: UnixTimestamp,
+        _: &Session,
+        _: &SessionCredentialDigest,
+        _: &CsrfTokenDigest,
+    ) -> Result<(), SessionStoreError> {
+        Err(SessionStoreError::Unavailable)
+    }
+}
+
+#[async_trait]
+impl MembershipStore for World {
+    async fn find(
+        &self,
+        tenant: TenantId,
+        principal: PrincipalId,
+    ) -> Result<Option<Membership>, MembershipStoreError> {
+        Ok(lock(&self.memberships)
+            .iter()
+            .find(|membership| {
+                membership.tenant_id() == tenant && membership.principal_id() == principal
+            })
+            .cloned())
+    }
+
+    async fn upsert(&self, membership: &Membership) -> Result<(), MembershipStoreError> {
+        lock(&self.memberships).push(membership.clone());
+        Ok(())
+    }
+
+    async fn suspend(&self, _: TenantId, _: PrincipalId) -> Result<(), MembershipStoreError> {
+        Err(MembershipStoreError::new(
+            MembershipStoreErrorKind::Unavailable,
+            "unavailable",
+            true,
+        ))
+    }
+}
+
+#[async_trait]
+impl TenantDirectory for World {
+    async fn find_by_slug(&self, slug: &TenantSlug) -> Result<Option<TenantId>, AccountStoreError> {
+        Ok(lock(&self.tenants).get(slug.as_str()).copied())
+    }
+}
+
+#[async_trait]
+impl PasswordResetStore for World {
+    async fn issue(&self, grant: &PasswordResetGrant) -> Result<(), AccountStoreError> {
+        lock(&self.resets).push(Reset {
+            grant: grant.clone(),
+            used: false,
+        });
+        Ok(())
+    }
+
+    /// The PostgreSQL adapter's contract, in memory.
+    async fn redeem(
+        &self,
+        digest: &PasswordResetTokenDigest,
+        now: UnixTimestamp,
+        password_hash: &PasswordHash,
+    ) -> Result<Option<RedeemedPasswordReset>, AccountStoreError> {
+        let mut resets = lock(&self.resets);
+        let Some(found) = resets
+            .iter()
+            .find(|reset| {
+                reset.grant.digest() == digest && !reset.used && reset.grant.expires_at() > now
+            })
+            .map(|reset| (reset.grant.principal_id(), reset.grant.tenant_id()))
+        else {
+            return Ok(None);
+        };
+        let (principal, tenant) = found;
+        let member = lock(&self.memberships).iter().any(|membership| {
+            membership.principal_id() == principal
+                && membership.tenant_id() == tenant
+                && membership.state() == MembershipState::Active
+        });
+        let mut accounts = lock(&self.accounts);
+        let Some(account) = accounts
+            .iter_mut()
+            .find(|account| account.principal == principal && !account.disabled)
+        else {
+            return Ok(None);
+        };
+        if !member {
+            return Ok(None);
+        }
+        account.hash = password_hash.clone();
+        account.version += 1;
+        for (session, _, _) in lock(&self.sessions).iter_mut() {
+            if session.principal_id() == principal {
+                let _ = session.revoke(now);
+            }
+        }
+        for reset in resets
+            .iter_mut()
+            .filter(|reset| reset.grant.principal_id() == principal)
+        {
+            reset.used = true;
+        }
+        Ok(Some(RedeemedPasswordReset {
+            principal_id: principal,
+            tenant_id: tenant,
+        }))
+    }
+}
+
+#[async_trait]
+impl PasswordResetNotifier for World {
+    async fn deliver(
+        &self,
+        delivery: &PasswordResetDelivery,
+    ) -> Result<(), PasswordResetDeliveryError> {
+        if self.deliver_fails {
+            return Err(PasswordResetDeliveryError::NotConfigured);
+        }
+        lock(&self.deliveries).push((
+            delivery.login().to_owned(),
+            delivery.token().expose().to_owned(),
+        ));
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl AuditSink for World {
+    async fn append(&self, event: &AuditEvent) -> Result<AuditReceipt, AuditError> {
+        lock(&self.audit).push((event.action().as_str().to_owned(), event.outcome()));
+        Ok(AuditReceipt::stored(event.id()))
+    }
+}
+
+/// `acme` with the active owner Ada and the disabled Eve; `globex`, where
+/// Ada has no membership.
+struct Fixture {
+    world: Arc<World>,
+    router: Router,
+    ada: PrincipalId,
+}
+
+fn fixture() -> Result<Fixture, Box<dyn Error>> {
+    fixture_with(false, 3)
+}
+
+fn fixture_with(deliver_fails: bool, account_limit: u32) -> Result<Fixture, Box<dyn Error>> {
+    let world = Arc::new(World {
+        deliver_fails,
+        ..World::default()
+    });
+    let acme = TenantId::new();
+    lock(&world.tenants).insert("acme".to_owned(), acme);
+    lock(&world.tenants).insert("globex".to_owned(), TenantId::new());
+    let ada = PrincipalId::new();
+    let eve = PrincipalId::new();
+    for (principal, login, disabled) in [
+        (ada, "ada@example.com", false),
+        (eve, "eve@example.com", true),
+    ] {
+        lock(&world.accounts).push(Account {
+            principal,
+            login: login.to_owned(),
+            hash: fake_hash(PASSWORD.as_bytes())?,
+            disabled,
+            version: 1,
+        });
+        lock(&world.memberships).push(Membership::active(
+            acme,
+            principal,
+            vec![Role::new("owner")?],
+        ));
+    }
+
+    let throttle = || -> Result<Arc<MemoryLoginThrottle>, Box<dyn Error>> {
+        Ok(Arc::new(MemoryLoginThrottle::new(ThrottleConfig {
+            window: Duration::from_secs(900),
+            account_limit,
+            source_limit: 300,
+            max_entries: 1_000,
+        })?))
+    };
+    let ports = AuthenticationPorts {
+        credentials: world.clone(),
+        hasher: world.clone(),
+        sessions: world.clone(),
+        memberships: world.clone(),
+        tenants: world.clone(),
+        resets: world.clone(),
+        notifier: world.clone(),
+        audit: world.clone(),
+        sign_in_throttle: throttle()?,
+        reset_throttle: throttle()?,
+    };
+    let mut router = Router::new();
+    let site = app::adapters::http::site(&mut router)?;
+    app::adapters::http::routes(&mut router, &site)?;
+    routes(&mut router, &site, ports)?;
+    // A protected page: what an access policy answers without a session.
+    router.route(Method::GET, "/protected", |_| async {
+        Response::new(StatusCode::UNAUTHORIZED, "authentication required")
+    })?;
+    Ok(Fixture { world, router, ada })
+}
+
+/// A cookie jar that sends what responses set.
+#[derive(Clone, Default)]
+struct Browser {
+    cookies: HashMap<String, String>,
+}
+
+impl Browser {
+    fn keep(&mut self, response: &Response) {
+        for value in response.headers().get_all(header::SET_COOKIE) {
+            let Ok(value) = value.to_str() else { continue };
+            let pair = value.split(';').next().unwrap_or_default();
+            let Some((name, content)) = pair.split_once('=') else {
+                continue;
+            };
+            if content.is_empty() || value.contains("Max-Age=0") {
+                self.cookies.remove(name);
+            } else {
+                self.cookies.insert(name.to_owned(), content.to_owned());
+            }
+        }
+    }
+
+    fn cookie(&self, name: &str) -> Option<String> {
+        self.cookies.get(name).cloned()
+    }
+
+    fn csrf(&self) -> String {
+        self.cookie("__Host-forge_csrf").unwrap_or_default()
+    }
+
+    fn request(&self, method: Method, uri: &str, body: &str) -> Result<Request, Box<dyn Error>> {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::ACCEPT, HeaderValue::from_static(BROWSER));
+        if !body.is_empty() {
+            headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(FORM));
+        }
+        if !self.cookies.is_empty() {
+            let cookies: Vec<String> = self
+                .cookies
+                .iter()
+                .map(|(name, value)| format!("{name}={value}"))
+                .collect();
+            headers.insert(header::COOKIE, HeaderValue::from_str(&cookies.join("; "))?);
+        }
+        Ok(Request::new_for_test(
+            method,
+            uri.parse()?,
+            headers,
+            body.to_owned().into(),
+            "127.0.0.1:4000".parse()?,
+            forge::core::Id::<Request>::new().into_uuid(),
+        ))
+    }
+
+    async fn get(&mut self, router: &Router, uri: &str) -> Result<Response, Box<dyn Error>> {
+        let response = router.dispatch(self.request(Method::GET, uri, "")?).await;
+        self.keep(&response);
+        Ok(response)
+    }
+
+    /// Posts `fields` with this browser's CSRF token.
+    async fn post(
+        &mut self,
+        router: &Router,
+        uri: &str,
+        fields: &[(&str, &str)],
+    ) -> Result<Response, Box<dyn Error>> {
+        let mut body = format!("csrf_token={}", self.csrf());
+        for (name, value) in fields {
+            body.push_str(&format!("&{name}={}", encode(value)));
+        }
+        let response = router
+            .dispatch(self.request(Method::POST, uri, &body)?)
+            .await;
+        self.keep(&response);
+        Ok(response)
+    }
+
+    /// Opens the sign-in page (which issues the CSRF cookie) and signs in.
+    async fn sign_in(
+        &mut self,
+        router: &Router,
+        tenant: &str,
+        email: &str,
+        password: &str,
+    ) -> Result<Response, Box<dyn Error>> {
+        self.get(router, "/session/new").await?;
+        self.post(
+            router,
+            "/session",
+            &[("tenant", tenant), ("email", email), ("password", password)],
+        )
+        .await
+    }
+}
+
+fn encode(value: &str) -> String {
+    value
+        .bytes()
+        .map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' => {
+                char::from(byte).to_string()
+            }
+            _ => format!("%{byte:02X}"),
+        })
+        .collect()
+}
+
+fn text(response: &Response) -> String {
+    String::from_utf8_lossy(response.body()).into_owned()
+}
+
+fn header_of(response: &Response, name: header::HeaderName) -> Option<String> {
+    response
+        .headers()
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
+}
+
+fn audited(world: &World, action: &str, outcome: AuditOutcome) -> bool {
+    lock(&world.audit)
+        .iter()
+        .any(|(recorded, result)| recorded == action && *result == outcome)
+}
+
+fn live_sessions(world: &World, principal: PrincipalId) -> usize {
+    lock(&world.sessions)
+        .iter()
+        .filter(|(session, _, _)| {
+            session.principal_id() == principal && session.revoked_at().is_none()
+        })
+        .count()
+}
+
+#[tokio::test]
+async fn signing_in_issues_a_fresh_session_and_csrf_token_and_returns_to_the_page() -> TestResult {
+    let fixture = fixture()?;
+    let mut browser = Browser::default();
+    let page = browser
+        .get(
+            &fixture.router,
+            "/session/new?return_to=%2Ftenants%2F1%2Fposts",
+        )
+        .await?;
+    assert_eq!(page.status(), StatusCode::OK);
+    assert!(text(&page).contains("name=\"return_to\" value=\"/tenants/1/posts\""));
+    let anonymous = browser.csrf();
+    assert_eq!(anonymous.len(), 64);
+
+    let response = browser
+        .post(
+            &fixture.router,
+            "/session",
+            &[
+                ("tenant", " ACME "),
+                ("email", "Ada@Example.com"),
+                ("password", PASSWORD),
+                ("return_to", "/tenants/1/posts"),
+            ],
+        )
+        .await?;
+
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        header_of(&response, header::LOCATION).as_deref(),
+        Some("/tenants/1/posts")
+    );
+    assert_eq!(
+        header_of(&response, header::CACHE_CONTROL).as_deref(),
+        Some("no-store")
+    );
+    let session = browser
+        .cookie("__Host-forge_session")
+        .ok_or("session cookie")?;
+    assert_eq!(session.len(), 64);
+    assert_ne!(
+        browser.csrf(),
+        anonymous,
+        "the CSRF token is rotated at sign-in"
+    );
+    assert_eq!(live_sessions(&fixture.world, fixture.ada), 1);
+    assert!(audited(
+        &fixture.world,
+        "auth.sign_in",
+        AuditOutcome::Succeeded
+    ));
+
+    // The page shows the signed-in state and a sign-out form.
+    let signed_in = browser.get(&fixture.router, "/session/new").await?;
+    assert!(text(&signed_in).contains("You are signed in."));
+    Ok(())
+}
+
+#[tokio::test]
+async fn every_wrong_field_gets_the_same_answer() -> TestResult {
+    let fixture = fixture_with(false, 100)?;
+    for (tenant, email, password) in [
+        ("acme", "ada@example.com", "wrong password!"),
+        ("acme", "nobody@example.com", PASSWORD),
+        ("globex", "ada@example.com", PASSWORD),
+        ("initech", "ada@example.com", PASSWORD),
+        ("Not A Slug!", "ada@example.com", PASSWORD),
+        ("acme", "eve@example.com", PASSWORD),
+        ("", "", ""),
+    ] {
+        let mut browser = Browser::default();
+        let hashes = *lock(&fixture.world.hashes);
+        let response = browser
+            .sign_in(&fixture.router, tenant, email, password)
+            .await?;
+
+        assert_eq!(
+            response.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{tenant} {email}"
+        );
+        let page = text(&response);
+        assert!(page.contains(INVALID), "{tenant} {email}");
+        assert!(
+            !page.contains(password) || password.is_empty(),
+            "the password is never echoed"
+        );
+        assert!(browser.cookie("__Host-forge_session").is_none());
+        assert!(
+            *lock(&fixture.world.hashes) > hashes,
+            "every failure costs a hash: {email}"
+        );
+    }
+    assert_eq!(live_sessions(&fixture.world, fixture.ada), 0);
+    assert!(audited(
+        &fixture.world,
+        "auth.sign_in",
+        AuditOutcome::Failed
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn attempts_are_throttled_even_with_the_right_password() -> TestResult {
+    let fixture = fixture()?;
+    let mut browser = Browser::default();
+    for _ in 0..3 {
+        let response = browser
+            .sign_in(
+                &fixture.router,
+                "acme",
+                "ada@example.com",
+                "wrong password!",
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+    let hashes = *lock(&fixture.world.hashes);
+    let throttled = browser
+        .sign_in(&fixture.router, "acme", "ada@example.com", PASSWORD)
+        .await?;
+
+    assert_eq!(throttled.status(), StatusCode::TOO_MANY_REQUESTS);
+    let retry_after: u64 = header_of(&throttled, header::RETRY_AFTER)
+        .ok_or("Retry-After")?
+        .parse()?;
+    assert!((1..=900).contains(&retry_after));
+    assert!(text(&throttled).contains("Too many sign-in attempts"));
+    assert_eq!(
+        *lock(&fixture.world.hashes),
+        hashes,
+        "no password check while throttled"
+    );
+    assert!(browser.cookie("__Host-forge_session").is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn sign_in_without_the_csrf_token_is_forbidden() -> TestResult {
+    let fixture = fixture()?;
+    let mut browser = Browser::default();
+    browser.get(&fixture.router, "/session/new").await?;
+    let body = format!(
+        "tenant=acme&email=ada%40example.com&password={}",
+        encode(PASSWORD)
+    );
+
+    let without_token = fixture
+        .router
+        .dispatch(browser.request(Method::POST, "/session", &body)?)
+        .await;
+    let without_cookie = fixture
+        .router
+        .dispatch(Browser::default().request(
+            Method::POST,
+            "/session",
+            &format!("{body}&csrf_token={}", browser.csrf()),
+        )?)
+        .await;
+
+    assert_eq!(without_token.status(), StatusCode::FORBIDDEN);
+    assert_eq!(without_cookie.status(), StatusCode::FORBIDDEN);
+    assert_eq!(live_sessions(&fixture.world, fixture.ada), 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn return_paths_off_the_site_are_ignored() -> TestResult {
+    let fixture = fixture_with(false, 100)?;
+    for hostile in [
+        "//evil.example/x",
+        "https://evil.example/",
+        "/\\evil.example",
+        "javascript:alert(1)",
+    ] {
+        let mut browser = Browser::default();
+        let page = browser
+            .get(
+                &fixture.router,
+                &format!("/session/new?return_to={}", encode(hostile)),
+            )
+            .await?;
+        assert!(!text(&page).contains("evil.example"), "{hostile}");
+        assert!(!text(&page).contains("name=\"return_to\""), "{hostile}");
+
+        let response = browser
+            .post(
+                &fixture.router,
+                "/session",
+                &[
+                    ("tenant", "acme"),
+                    ("email", "ada@example.com"),
+                    ("password", PASSWORD),
+                    ("return_to", hostile),
+                ],
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER, "{hostile}");
+        assert_eq!(
+            header_of(&response, header::LOCATION).as_deref(),
+            Some("/"),
+            "{hostile}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn signed_out_browsers_are_sent_to_sign_in_and_api_clients_get_401() -> TestResult {
+    let fixture = fixture()?;
+    let response = Browser::default()
+        .get(&fixture.router, "/protected?page=2")
+        .await?;
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        header_of(&response, header::LOCATION).as_deref(),
+        Some("/session/new?return_to=%2Fprotected%3Fpage%3D2")
+    );
+
+    let mut headers = HeaderMap::new();
+    headers.insert(header::ACCEPT, HeaderValue::from_static("application/json"));
+    let api = fixture
+        .router
+        .dispatch(Request::new_for_test(
+            Method::GET,
+            "/protected".parse()?,
+            headers,
+            String::new().into(),
+            "127.0.0.1:4000".parse()?,
+            forge::core::Id::<Request>::new().into_uuid(),
+        ))
+        .await;
+    assert_eq!(api.status(), StatusCode::UNAUTHORIZED);
+    Ok(())
+}
+
+#[tokio::test]
+async fn signing_in_again_revokes_the_previous_session() -> TestResult {
+    let fixture = fixture()?;
+    let mut browser = Browser::default();
+    browser
+        .sign_in(&fixture.router, "acme", "ada@example.com", PASSWORD)
+        .await?;
+    let first = browser.cookie("__Host-forge_session");
+    browser
+        .sign_in(&fixture.router, "acme", "ada@example.com", PASSWORD)
+        .await?;
+
+    assert_ne!(browser.cookie("__Host-forge_session"), first);
+    assert_eq!(live_sessions(&fixture.world, fixture.ada), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn signing_out_needs_the_csrf_token_and_revokes_the_session() -> TestResult {
+    let fixture = fixture()?;
+    let mut browser = Browser::default();
+    browser
+        .sign_in(&fixture.router, "acme", "ada@example.com", PASSWORD)
+        .await?;
+    let token = browser.csrf();
+
+    let forged = fixture
+        .router
+        .dispatch(browser.request(Method::POST, "/session", "_method=delete")?)
+        .await;
+    assert_eq!(forged.status(), StatusCode::FORBIDDEN);
+    assert_eq!(live_sessions(&fixture.world, fixture.ada), 1);
+
+    let response = browser
+        .post(&fixture.router, "/session", &[("_method", "delete")])
+        .await?;
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        header_of(&response, header::LOCATION).as_deref(),
+        Some("/session/new")
+    );
+    assert_eq!(live_sessions(&fixture.world, fixture.ada), 0);
+    assert!(browser.cookie("__Host-forge_session").is_none());
+    assert_ne!(
+        browser.csrf(),
+        token,
+        "the CSRF token is rotated at sign-out"
+    );
+    assert!(audited(
+        &fixture.world,
+        "auth.sign_out",
+        AuditOutcome::Succeeded
+    ));
+
+    // Signing out again is harmless.
+    let again = browser
+        .post(&fixture.router, "/session", &[("_method", "delete")])
+        .await?;
+    assert_eq!(again.status(), StatusCode::SEE_OTHER);
+    Ok(())
+}
+
+/// Status, location and flash cookie of a reset request.
+async fn reset_request(
+    fixture: &Fixture,
+    tenant: &str,
+    email: &str,
+) -> Result<(StatusCode, Option<String>, Option<String>), Box<dyn Error>> {
+    let mut browser = Browser::default();
+    browser.get(&fixture.router, "/passwords/new").await?;
+    let response = browser
+        .post(
+            &fixture.router,
+            "/passwords",
+            &[("tenant", tenant), ("email", email)],
+        )
+        .await?;
+    let flash = response
+        .headers()
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .find(|value| value.starts_with("__Host-forge_flash="))
+        .map(str::to_owned);
+    Ok((
+        response.status(),
+        header_of(&response, header::LOCATION),
+        flash,
+    ))
+}
+
+#[tokio::test]
+async fn reset_requests_answer_the_same_whether_or_not_the_account_exists() -> TestResult {
+    for deliver_fails in [false, true] {
+        let fixture = fixture_with(deliver_fails, 100)?;
+        let known = reset_request(&fixture, "acme", "ada@example.com").await?;
+        for (tenant, email) in [
+            ("acme", "nobody@example.com"),
+            ("acme", "eve@example.com"),
+            ("globex", "ada@example.com"),
+            ("Not A Slug!", "ada@example.com"),
+        ] {
+            assert_eq!(
+                reset_request(&fixture, tenant, email).await?,
+                known,
+                "{tenant} {email}"
+            );
+        }
+        assert_eq!(known.0, StatusCode::SEE_OTHER);
+        assert_eq!(known.1.as_deref(), Some("/session/new"));
+        let delivered = lock(&fixture.world.deliveries).len();
+        assert_eq!(
+            delivered,
+            usize::from(!deliver_fails),
+            "only the real account gets a link"
+        );
+        assert_eq!(lock(&fixture.world.resets).len(), 1);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_reset_link_works_once_changes_the_password_and_revokes_sessions() -> TestResult {
+    let fixture = fixture_with(false, 10)?;
+    let mut signed_in = Browser::default();
+    signed_in
+        .sign_in(&fixture.router, "acme", "ada@example.com", PASSWORD)
+        .await?;
+    assert_eq!(live_sessions(&fixture.world, fixture.ada), 1);
+
+    reset_request(&fixture, "acme", "ada@example.com").await?;
+    let token = lock(&fixture.world.deliveries)
+        .first()
+        .map(|(_, token)| token.clone())
+        .ok_or("delivered")?;
+
+    let mut browser = Browser::default();
+    let page = browser
+        .get(&fixture.router, &format!("/passwords/edit?token={token}"))
+        .await?;
+    assert_eq!(page.status(), StatusCode::OK);
+    assert_eq!(
+        header_of(&page, header::CACHE_CONTROL).as_deref(),
+        Some("no-store")
+    );
+    assert_eq!(
+        header_of(&page, header::REFERRER_POLICY).as_deref(),
+        Some("no-referrer")
+    );
+    assert!(text(&page).contains(&format!("name=\"token\" value=\"{token}\"")));
+
+    let short = browser
+        .post(
+            &fixture.router,
+            "/passwords",
+            &[
+                ("_method", "patch"),
+                ("token", &token),
+                ("password", "short"),
+                ("password_confirmation", "short"),
+            ],
+        )
+        .await?;
+    assert_eq!(short.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(text(&short).contains("at least 12 characters"));
+    let mismatch = browser
+        .post(
+            &fixture.router,
+            "/passwords",
+            &[
+                ("_method", "patch"),
+                ("token", &token),
+                ("password", "a brand new secret"),
+                ("password_confirmation", "another secret!"),
+            ],
+        )
+        .await?;
+    assert_eq!(mismatch.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    let changed = browser
+        .post(
+            &fixture.router,
+            "/passwords",
+            &[
+                ("_method", "patch"),
+                ("token", &token),
+                ("password", "a brand new secret"),
+                ("password_confirmation", "a brand new secret"),
+            ],
+        )
+        .await?;
+    assert_eq!(changed.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        header_of(&changed, header::LOCATION).as_deref(),
+        Some("/session/new")
+    );
+    assert_eq!(
+        header_of(&changed, header::REFERRER_POLICY).as_deref(),
+        Some("no-referrer")
+    );
+    assert_eq!(
+        live_sessions(&fixture.world, fixture.ada),
+        0,
+        "every session is revoked"
+    );
+    assert!(audited(
+        &fixture.world,
+        "auth.password_reset.completed",
+        AuditOutcome::Succeeded
+    ));
+
+    let reused = browser
+        .post(
+            &fixture.router,
+            "/passwords",
+            &[
+                ("_method", "patch"),
+                ("token", &token),
+                ("password", "yet another secret"),
+                ("password_confirmation", "yet another secret"),
+            ],
+        )
+        .await?;
+    assert_eq!(reused.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        header_of(&reused, header::LOCATION).as_deref(),
+        Some("/passwords/new")
+    );
+
+    let old = Browser::default()
+        .sign_in(&fixture.router, "acme", "ada@example.com", PASSWORD)
+        .await?;
+    assert_eq!(old.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let new = Browser::default()
+        .sign_in(
+            &fixture.router,
+            "acme",
+            "ada@example.com",
+            "a brand new secret",
+        )
+        .await?;
+    assert_eq!(new.status(), StatusCode::SEE_OTHER);
+    Ok(())
+}
+
+#[tokio::test]
+async fn expired_or_malformed_reset_links_are_refused() -> TestResult {
+    let fixture = fixture()?;
+    reset_request(&fixture, "acme", "ada@example.com").await?;
+    let token = lock(&fixture.world.deliveries)
+        .first()
+        .map(|(_, token)| token.clone())
+        .ok_or("delivered")?;
+    // Fifteen minutes later the grant has expired.
+    {
+        let mut resets = lock(&fixture.world.resets);
+        let reset = resets.first_mut().ok_or("issued")?;
+        let issued = reset.grant.issued_at().as_secs();
+        reset.grant = PasswordResetGrant::new(
+            reset.grant.principal_id(),
+            reset.grant.tenant_id(),
+            *reset.grant.digest(),
+            UnixTimestamp::from_secs(issued - 1_000),
+            UnixTimestamp::from_secs(issued - 100),
+        )?;
+    }
+    let mut browser = Browser::default();
+    browser.get(&fixture.router, "/passwords/new").await?;
+    let expired = browser
+        .post(
+            &fixture.router,
+            "/passwords",
+            &[
+                ("_method", "patch"),
+                ("token", &token),
+                ("password", "a brand new secret"),
+                ("password_confirmation", "a brand new secret"),
+            ],
+        )
+        .await?;
+    assert_eq!(
+        header_of(&expired, header::LOCATION).as_deref(),
+        Some("/passwords/new")
+    );
+
+    let malformed = browser
+        .get(&fixture.router, "/passwords/edit?token=not-a-token")
+        .await?;
+    assert_eq!(malformed.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        header_of(&malformed, header::LOCATION).as_deref(),
+        Some("/passwords/new")
+    );
+    Ok(())
+}
