@@ -37,6 +37,12 @@ pub use forge_db as db;
 pub use forge_http as http;
 pub use forge_security as security;
 pub use forge_tenancy as tenancy;
+/// Server-rendered views: HTML responses, CSRF protection, flash messages,
+/// digested assets, the import map and the Content-Security-Policy (feature
+/// `views`, ADR 0022). HTTP adapters only; domain and application code never
+/// use it.
+#[cfg(feature = "views")]
+pub use forge_views as views;
 
 pub use app::App;
 pub use compose::{ComposeError, Composition};
