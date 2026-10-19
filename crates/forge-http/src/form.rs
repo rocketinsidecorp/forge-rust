@@ -320,6 +320,32 @@ mod tests {
     }
 
     #[test]
+    fn undeclared_repeated_fields_are_ignored_without_deny_unknown_fields() {
+        #[derive(Debug, Deserialize)]
+        struct Search {
+            name: String,
+        }
+        let search: Search =
+            decode(&form(), b"name=a&tag=1&tag=2").expect("undeclared fields are skipped");
+        assert_eq!(search.name, "a");
+    }
+
+    #[test]
+    fn optional_sequences_accept_repeated_fields() {
+        #[derive(Debug, Deserialize)]
+        struct Filter {
+            tags: Option<Vec<String>>,
+        }
+        let filter: Filter = decode(&form(), b"tags=a&tags=b").expect("optional sequence");
+        assert_eq!(
+            filter.tags.as_deref(),
+            Some(&["a".to_owned(), "b".to_owned()][..])
+        );
+        let blank: Filter = decode(&form(), b"tags=").expect("blank optional");
+        assert_eq!(blank.tags, None);
+    }
+
+    #[test]
     fn reserved_fields_never_reach_the_application_type() {
         let product = decode_product(&format!(
             "{CSRF_FIELD_NAME}=abc&{METHOD_FIELD_NAME}=patch&name=a&price=1&csrf%5Ftoken=again"

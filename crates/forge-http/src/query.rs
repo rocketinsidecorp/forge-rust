@@ -416,8 +416,9 @@ impl<'de> Deserializer<'de> for ValueDeserializer<'_, '_> {
     }
 
     fn deserialize_option<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, DeError> {
-        // A blank form input (`age=`) is an absent optional value.
-        if self.mode == Mode::Form && self.single()?.is_empty() {
+        // A single blank form input (`age=`) is an absent optional value; a
+        // repeated field is an optional sequence.
+        if self.mode == Mode::Form && matches!(self.values, [value] if value.is_empty()) {
             return visitor.visit_none();
         }
         visitor.visit_some(self)
@@ -468,9 +469,14 @@ impl<'de> Deserializer<'de> for ValueDeserializer<'_, '_> {
         visitor.visit_enum(variant)
     }
 
+    /// A field the target type does not declare is skipped however often it
+    /// repeats; only `deny_unknown_fields` refuses it.
+    fn deserialize_ignored_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, DeError> {
+        visitor.visit_unit()
+    }
+
     serde::forward_to_deserialize_any! {
         str string bytes byte_buf tuple tuple_struct map struct identifier
-        ignored_any
     }
 }
 

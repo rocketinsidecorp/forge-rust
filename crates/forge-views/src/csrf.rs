@@ -204,9 +204,9 @@ pub fn presented_csrf_token(request: &Request) -> Result<Option<CsrfToken>, Csrf
 
 /// `Set-Cookie` value storing `token` in the `__Host-forge_csrf` cookie.
 ///
-/// [`CsrfProtection`] sets it itself; an application calls it when it binds
-/// the form token to a new server-side session at login (ADR 0023), so that
-/// the session's CSRF secret and the cookie agree.
+/// [`CsrfProtection`] sets it itself. At login an application calls it with
+/// the new session's freshly issued CSRF token (never the pre-login anonymous
+/// token), so that the session's CSRF secret and the cookie agree (ADR 0023).
 #[must_use]
 pub fn csrf_cookie(token: &CsrfToken) -> String {
     Cookie::build((CSRF_COOKIE_NAME, token.expose().to_owned()))
