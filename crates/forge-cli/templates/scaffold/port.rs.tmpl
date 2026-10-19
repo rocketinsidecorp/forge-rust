@@ -1,0 +1,93 @@
+//! Storage port of the `%%RESOURCES%%` resource, implemented in
+//! `crate::infrastructure::database::%%RESOURCES%%` and by in-memory fakes in
+//! tests. It speaks only domain and Forge types: no SQL or driver types.
+
+use async_trait::async_trait;
+use forge::core::Version;
+%%if tenant%%
+use forge::tenancy::TenantContext;
+%%end%%
+
+use crate::domain::entities::%%RESOURCE%%::{%%TYPE%%, %%TYPE%%Id};
+
+/// One page of %%NOUNS%% in identifier order (UUIDv7, so creation order).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct %%TYPE%%Page {
+    pub %%RESOURCES%%: Vec<%%TYPE%%>,
+    /// The cursor of the next page, when there is one.
+    pub next: Option<%%TYPE%%Id>,
+}
+
+/// Why storage could not complete an operation. Messages never contain SQL,
+/// row values or credentials.
+#[derive(Debug, thiserror::Error)]
+pub enum %%TYPE%%StoreError {
+    /// The stored version differs from the expected one, or the row is gone.
+    #[error("the %%NOUN%% was changed or deleted concurrently")]
+    Conflict,
+    /// A stored row does not satisfy the domain rules.
+    #[error("stored %%NOUN%% data is invalid")]
+    Corrupt,
+    /// The database failed; the source is for logs only.
+    #[error("%%NOUN%% storage is unavailable")]
+    Unavailable(#[source] Box<dyn std::error::Error + Send + Sync>),
+}
+
+/// Persistence of [`%%TYPE%%`] values with optimistic locking.
+%%if tenant%%
+///
+/// Every operation takes the authorized [`TenantContext`] and only ever sees
+/// rows of its tenant.
+%%end%%
+#[async_trait]
+pub trait %%TYPE%%Repository: Send + Sync {
+    /// Loads one %%NOUN%%.
+    async fn find(
+        &self,
+%%if tenant%%
+        context: &TenantContext,
+%%end%%
+        id: %%TYPE%%Id,
+    ) -> Result<Option<%%TYPE%%>, %%TYPE%%StoreError>;
+
+    /// Reads at most `limit` %%NOUNS%% whose identifier follows `after`.
+    async fn page(
+        &self,
+%%if tenant%%
+        context: &TenantContext,
+%%end%%
+        after: Option<%%TYPE%%Id>,
+        limit: u16,
+    ) -> Result<%%TYPE%%Page, %%TYPE%%StoreError>;
+
+    /// Stores a new %%NOUN%%.
+    async fn insert(
+        &self,
+%%if tenant%%
+        context: &TenantContext,
+%%end%%
+        %%RESOURCE%%: &%%TYPE%%,
+    ) -> Result<(), %%TYPE%%StoreError>;
+
+    /// Replaces the stored %%NOUN%% if its version is still
+    /// `%%RESOURCE%%.version()` and returns the new version; otherwise fails
+    /// with [`%%TYPE%%StoreError::Conflict`].
+    async fn update(
+        &self,
+%%if tenant%%
+        context: &TenantContext,
+%%end%%
+        %%RESOURCE%%: &%%TYPE%%,
+    ) -> Result<Version, %%TYPE%%StoreError>;
+
+    /// Deletes the %%NOUN%% if its version is still `expected`; otherwise
+    /// fails with [`%%TYPE%%StoreError::Conflict`].
+    async fn delete(
+        &self,
+%%if tenant%%
+        context: &TenantContext,
+%%end%%
+        id: %%TYPE%%Id,
+        expected: Version,
+    ) -> Result<(), %%TYPE%%StoreError>;
+}

@@ -1,0 +1,29 @@
+{% extends "layouts/application.html" %}
+
+{% block content %}
+<h1>%%LABELS%%</h1>
+<p><a href="{{ new_path }}">New %%NOUN%%</a></p>
+{% if rows.is_empty() %}
+<p>No %%NOUNS%% yet.</p>
+{% else %}
+<table>
+  <thead>
+    <tr>
+%%INDEX_HEADERS%%
+      <th scope="col">Actions</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for row in rows %}
+    <tr>
+%%INDEX_CELLS%%
+      <td><a href="{{ row.show_path }}">Show</a> <a href="{{ row.edit_path }}">Edit</a></td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+{% if let Some(next_path) = next_path %}
+<p><a href="{{ next_path }}">Next page</a></p>
+{% endif %}
+{% endblock %}

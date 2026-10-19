@@ -20,4 +20,7 @@ clap.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+# tests/scaffold.rs provisions a PostgreSQL database for migrate/rollback.
+forge-db = { path = "../forge-db", features = ["postgres", "testing"] }
 tempfile.workspace = true
+tokio.workspace = true

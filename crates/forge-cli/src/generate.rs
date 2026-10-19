@@ -326,12 +326,18 @@ const RESERVED_MODULES: &[(&str, &str)] = &[
     ),
 ];
 
-pub(crate) fn create_migration(root: &Path, name: &str) -> Result<(PathBuf, PathBuf), CliError> {
-    let normalized = normalize_migration_name(name)?;
+/// A positive, time-sortable migration version: nanoseconds since the Unix
+/// epoch.
+pub(crate) fn migration_version() -> Result<String, CliError> {
     let elapsed = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(CliError::Clock)?;
-    let version = elapsed.as_nanos();
+    Ok(elapsed.as_nanos().to_string())
+}
+
+pub(crate) fn create_migration(root: &Path, name: &str) -> Result<(PathBuf, PathBuf), CliError> {
+    let normalized = normalize_migration_name(name)?;
+    let version = migration_version()?;
     let migrations = root.join("migrations");
     fs::create_dir_all(&migrations).map_err(|source| CliError::CreateDirectory {
         path: migrations.clone(),
@@ -717,7 +723,17 @@ fn render(template: &str, variables: &[(&str, &str)], conditions: Conditions) ->
         "sqlite" => database == Database::Sqlite3,
         _ => false,
     };
+    render_template(template, variables, condition)
+}
 
+/// Evaluates `%%if name%%` / `%%if !name%%` ... `%%end%%` blocks (which
+/// nest) with `condition`, then substitutes `variables` in order. The
+/// directive lines themselves are removed.
+pub(crate) fn render_template(
+    template: &str,
+    variables: &[(&str, &str)],
+    condition: impl Fn(&str) -> bool,
+) -> String {
     let mut output = String::with_capacity(template.len());
     let mut stack = vec![true];
 
@@ -766,7 +782,7 @@ fn render(template: &str, variables: &[(&str, &str)], conditions: Conditions) ->
     output
 }
 
-fn write_new_file(path: &Path, content: &str) -> Result<(), CliError> {
+pub(crate) fn write_new_file(path: &Path, content: &str) -> Result<(), CliError> {
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)

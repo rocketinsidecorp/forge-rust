@@ -1,0 +1,37 @@
+{% extends "layouts/application.html" %}
+
+{% block content %}
+<h1>Event</h1>
+<dl>
+  <dt>Name</dt>
+  <dd>{{ event.name }}</dd>
+  <dt>Notes</dt>
+  <dd>{{ event.notes }}</dd>
+  <dt>Starts at</dt>
+  <dd>{{ event.starts_at }}</dd>
+  <dt>Ends at</dt>
+  <dd>{{ event.ends_at }}</dd>
+  <dt>Capacity</dt>
+  <dd>{{ event.capacity }}</dd>
+  <dt>Attendees</dt>
+  <dd>{{ event.attendees }}</dd>
+  <dt>Public</dt>
+  <dd>{{ event.public }}</dd>
+  <dt>Featured</dt>
+  <dd>{{ event.featured }}</dd>
+  <dt>Venue</dt>
+  <dd>{{ event.venue }}</dd>
+  <dt>Organizer</dt>
+  <dd>{{ event.organizer }}</dd>
+</dl>
+<p>
+  <a href="{{ event.edit_path }}">Edit</a>
+  <a href="{{ back_path }}">Back to events</a>
+</p>
+<form action="{{ event.show_path }}" method="post" data-turbo-confirm="Delete this event?">
+  {{ csrf_field|safe }}
+  <input type="hidden" name="_method" value="delete">
+  <input type="hidden" name="version" value="{{ version }}">
+  <button type="submit">Delete event</button>
+</form>
+{% endblock %}

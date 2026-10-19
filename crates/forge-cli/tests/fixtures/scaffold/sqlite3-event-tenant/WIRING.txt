@@ -1,0 +1,37 @@
+
+Forge did not edit any existing file. Wire the resource by hand:
+
+  1. Declare the new modules (each in the listed file, keeping `mod` lines sorted):
+
+       src/domain/entities/mod.rs             pub mod event;
+       src/application/ports/mod.rs           pub mod event_repository;
+       src/application/use_cases/mod.rs       pub mod events;
+       src/infrastructure/database/mod.rs     pub mod events;
+       src/adapters/http/mod.rs               pub mod access;
+       src/adapters/http/mod.rs               pub mod events;
+       src/adapters/http/views/mod.rs         pub mod events;
+
+  2. In src/bootstrap/mod.rs, at the end of `fn compose`, before `Ok(())`:
+
+    // events: tenant-scoped, under /tenants/{tenant_id}/events. SQLite has no
+    // Forge session or membership persistence yet (ADR 0021), so DenyAll
+    // refuses every request until you provide SessionStore and
+    // MembershipStore implementations for SessionTenantAccess.
+    let events = crate::application::use_cases::events::EventService::new(std::sync::Arc::new(
+        crate::infrastructure::database::events::SqliteEventRepository::new(
+            composition.sqlite()?.clone(),
+        ),
+    ));
+    crate::adapters::http::events::routes(
+        composition.router(),
+        &site,
+        events,
+        std::sync::Arc::new(crate::adapters::http::access::DenyAll),
+    )?;
+
+  Every route asks the access policy for `events:read` or `events:write`
+  first; src/adapters/http/access.rs explains the deny-by-default choice.
+
+  Then apply the migration (`cargo run -- migrate` with FORGE_MIGRATION_DATABASE_URL)
+  and run `cargo test` (repository tests on a database server need
+  `cargo test -- --include-ignored` and FORGE_TEST_* URLs, see docs/database.md).

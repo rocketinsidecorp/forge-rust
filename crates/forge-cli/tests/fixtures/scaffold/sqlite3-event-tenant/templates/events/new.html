@@ -1,0 +1,7 @@
+{% extends "layouts/application.html" %}
+
+{% block content %}
+<h1>New event</h1>
+{% include "events/_form.html" %}
+<p><a href="{{ back_path }}">Back to events</a></p>
+{% endblock %}

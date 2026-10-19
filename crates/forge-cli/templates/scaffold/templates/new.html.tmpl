@@ -1,0 +1,7 @@
+{% extends "layouts/application.html" %}
+
+{% block content %}
+<h1>New %%NOUN%%</h1>
+{% include "%%RESOURCES%%/_form.html" %}
+<p><a href="{{ back_path }}">Back to %%NOUNS%%</a></p>
+{% endblock %}
