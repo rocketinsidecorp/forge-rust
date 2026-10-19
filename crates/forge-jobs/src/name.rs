@@ -12,9 +12,17 @@ pub const MAX_QUEUE_NAME: usize = 64;
 /// Longest job or schedule name, in bytes.
 pub const MAX_JOB_NAME: usize = 128;
 
-/// Returns whether `value` is a valid name of at most `max` bytes.
+/// Returns whether `value` is a valid Forge name of at most `max` bytes:
+/// lowercase ASCII letters, digits and `_ . : -`, starting and ending with a
+/// letter or digit. Queue, job, schedule, event-type and consumer names all
+/// use this grammar.
+///
+/// ```
+/// assert!(forge_jobs::is_valid_name("billing.invoice_paid", 128));
+/// assert!(!forge_jobs::is_valid_name("Billing Invoice", 128));
+/// ```
 #[must_use]
-pub(crate) fn is_valid(value: &str, max: usize) -> bool {
+pub fn is_valid(value: &str, max: usize) -> bool {
     let bytes = value.as_bytes();
     let edge = |byte: &u8| byte.is_ascii_lowercase() || byte.is_ascii_digit();
     !bytes.is_empty()

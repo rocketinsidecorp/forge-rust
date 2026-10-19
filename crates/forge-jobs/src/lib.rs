@@ -69,7 +69,7 @@ pub use error::{JobsError, ensure_supported};
 pub use job::{
     EnqueueOptions, Enqueued, Job, JobContext, JobError, JobHandler, JobId, JobMarker, JobTenant,
 };
-pub use name::{MAX_JOB_NAME, MAX_QUEUE_NAME};
+pub use name::{MAX_JOB_NAME, MAX_QUEUE_NAME, is_valid as is_valid_name};
 pub use runtime::{Jobs, MAX_CONCURRENCY, WorkerSettings};
 pub use scheduler::Schedule;
 
