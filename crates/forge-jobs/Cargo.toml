@@ -24,6 +24,11 @@ tokio.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 
+[features]
+# `testing::RlsTestDatabase`: an isolated PostgreSQL database with separate
+# migrator and runtime roles, for integration tests.
+testing = ["forge-db/testing"]
+
 [dev-dependencies]
 forge-auth = { path = "../forge-auth" }
 forge-db = { path = "../forge-db", features = ["postgres", "testing"] }

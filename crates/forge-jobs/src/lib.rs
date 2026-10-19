@@ -54,9 +54,13 @@ mod cron;
 mod error;
 mod job;
 mod name;
+#[cfg(test)]
+mod pg_tests;
 pub mod postgres;
 mod runtime;
 mod scheduler;
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
 mod worker;
 
 pub use backoff::Backoff;

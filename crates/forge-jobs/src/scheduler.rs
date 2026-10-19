@@ -91,7 +91,7 @@ impl Schedule {
         self.spec.name
     }
 
-    fn job_for(&self, tick: SystemTime) -> Result<NewJob, JobsError> {
+    pub(crate) fn job_for(&self, tick: SystemTime) -> Result<NewJob, JobsError> {
         let seconds = tick
             .duration_since(UNIX_EPOCH)
             .map_or(0, |elapsed| elapsed.as_secs());
