@@ -411,9 +411,7 @@ impl App {
         } = self;
         let declaration = declarations.pop();
         #[cfg(feature = "jobs")]
-        let jobs_slot: JobsSlot = jobs
-            .filter(|jobs| jobs.mode == WorkerMode::InServe)
-            .map(JobsParts::new);
+        let (jobs_slot, run_jobs_in_serve) = jobs_for_serve(jobs);
         #[cfg(not(feature = "jobs"))]
         let jobs_slot: JobsSlot = ();
 
@@ -462,6 +460,8 @@ impl App {
             Err(code) => return code,
         };
         let background = background_for(jobs_slot, database.as_ref());
+        #[cfg(feature = "jobs")]
+        let background = background.filter(|_| run_jobs_in_serve);
 
         let result = runtime.block_on(serve_until_signal(
             name, version, config, router, database, workers, background,
@@ -734,6 +734,15 @@ impl App {
             }
         }
     }
+}
+
+/// The registry handed to `serve`'s composition hooks and whether `serve`
+/// runs it. Hooks always see the registry, so the same composition function
+/// works for `serve` and `jobs work` in both modes.
+#[cfg(feature = "jobs")]
+fn jobs_for_serve(jobs: Option<JobsDeclaration>) -> (JobsSlot, bool) {
+    let run = jobs.is_some_and(|jobs| jobs.mode == WorkerMode::InServe);
+    (jobs.map(JobsParts::new), run)
 }
 
 /// The job runtime for the composed registrations and the PostgreSQL pool.
@@ -1570,6 +1579,14 @@ mod tests {
                 composition.events(),
                 Err(ComposeError::EventsNotDeclared)
             ));
+
+            // Hooks get the registry in both modes; only InServe runs it in `serve`.
+            let (slot, run) = jobs_for_serve(Some(JobsDeclaration::new(WorkerMode::Dedicated)));
+            assert!(slot.is_some() && !run);
+            let (slot, run) = jobs_for_serve(Some(JobsDeclaration::new(WorkerMode::InServe)));
+            assert!(slot.is_some() && run);
+            let (slot, run) = jobs_for_serve(None);
+            assert!(slot.is_none() && !run);
         }
 
         #[derive(Serialize, Deserialize)]
