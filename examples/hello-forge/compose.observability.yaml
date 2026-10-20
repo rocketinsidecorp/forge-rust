@@ -22,7 +22,8 @@ services:
       FORGE_TELEMETRY_OTLP_ENDPOINT: http://otel-collector:4318
       # The image runs with FORGE_ENV=production, which requires an https
       # collector unless plaintext is allowed: the collector is reached only
-      # over the compose project's private network.
+      # over the compose project's private network. Never copy this setting
+      # to a deployment that exports to a collector across a real network.
       FORGE_TELEMETRY_OTLP_ALLOW_PLAINTEXT: "true"
       FORGE_TELEMETRY_METRICS_INTERVAL: 15s
       # Every log line also goes to the collector, with trace_id and
