@@ -27,16 +27,16 @@ the work is finished and waiting for its review; **Planned** means not started.
 | Turbo Streams over SSE | Action Cable | In review | Done (`scaffold --broadcast`, ADR 0031) |
 | Traces, metrics, log correlation | (gems) | Done (OpenTelemetry, Prometheus) | Done (OpenTelemetry, Prometheus; ADR 0033) |
 | Preconfigured Prometheus, Grafana, Tempo, Loki | — | Done (`compose.observability.yaml`, Forge-Go ADR 0038) | Done (`compose.observability.yaml`, [ADR 0034](adr/0034-local-observability-stack.md)) |
-| Zero-downtime deploys, rollback, remote logs | Kamal | In review (`forge deploy`) | Planned |
+| Zero-downtime deploys, rollback, remote logs | Kamal | Done (`forge deploy`, `forge logs`, `forge-proxy`) | Planned |
 | Live reload and database lifecycle | `bin/dev`, `db:*` | In review (`forge dev`, `forge db`) | In review (`forge dev`, `forge db create\|drop\|reset\|setup\|prepare\|migrate\|rollback\|status\|seed`, `forge migrate\|rollback\|setup\|seed`, `forge doctor`, `forge version`, [ADR 0036](adr/0036-application-lifecycle-commands.md)) |
-| Encrypted credentials, attribute encryption | `credentials:edit`, AR Encryption | In review | Planned |
+| Encrypted credentials, attribute encryption | `credentials:edit`, AR Encryption | Done (`forge credentials`, `encryption`) | Planned |
 | i18n | I18n | Done (`config/locales/*.json`, `t`, CLDR plurals, `forge new --locale`, `forge i18n check`, Forge-Go ADR 0042) | Done (`config/locales/*.json`, `layout.i18n.t`, CLDR plurals, `forge new --locale`, `forge i18n check`, [ADR 0037](adr/0037-internationalization.md), [i18n](i18n.md)) |
-| OpenAPI from typed routes | — | Planned | Done (`#[derive(OpenApiSchema)]`, `forge::openapi::typed`/`describe`, `GET /openapi.json`, `FORGE_OPENAPI_ENABLED`, `forge openapi`, [ADR 0039](adr/0039-openapi-from-typed-routes.md), [OpenAPI](openapi.md)) |
+| OpenAPI from typed routes | — | Done (Forge-Go ADR 0043) | Done (`#[derive(OpenApiSchema)]`, `forge::openapi::typed`/`describe`, `GET /openapi.json`, `FORGE_OPENAPI_ENABLED`, `forge openapi`, [ADR 0039](adr/0039-openapi-from-typed-routes.md), [OpenAPI](openapi.md)) |
 | Controller, model, mailer and job generators | `rails g` | Done (Forge-Go ADR 0041) | Done (`forge generate model\|controller\|mailer\|job --queue`, [ADR 0038](adr/0038-generators-and-destroy.md), [generators](generators.md)) |
 | Undo a generator | `rails d` | Done (`forge destroy`, Forge-Go ADR 0041) | Done (`forge destroy`, [ADR 0038](adr/0038-generators-and-destroy.md)) |
 | Continuous fuzzing, SBOM, signed images | — | Planned | Planned |
 | Published benchmarks | — | Planned | Planned |
-| Getting Started guide | Rails Guides | Planned | Planned |
+| Getting Started guide | Rails Guides | Done (Forge-Go docs/GETTING_STARTED.md) | Planned |
 
 ## Parity follow-ups
 
