@@ -236,6 +236,10 @@ const RESERVED_LOCALS: &[&str] = &[
 /// `adapters::http::streams`).
 const RESERVED_PLURALS: &[&str] = &["access", "assets", "health", "streams", "tenants", "views"];
 
+/// The formatting scopes of the locale files, which `l` and `number` read
+/// and `forge i18n check` never reports: a scaffold's text cannot live there.
+pub(crate) const FORMATTING_SCOPES: &[&str] = &["date", "time", "number"];
+
 /// Parses `NAME field:type[?]...` plus the scope flags into a [`Resource`].
 pub(crate) fn parse(
     name: &str,
@@ -266,6 +270,13 @@ pub(crate) fn parse(
                  or --plural"
             ));
         }
+    }
+    if FORMATTING_SCOPES.contains(&plural.as_str()) {
+        return invalid(format!(
+            "plural `{plural}` is a formatting scope of the locale files ({}), which `l` and \
+             `number` read and `forge i18n check` skips; pass another --plural",
+            FORMATTING_SCOPES.join(", ")
+        ));
     }
     if RESERVED_PLURALS.contains(&plural.as_str()) {
         return invalid(format!(

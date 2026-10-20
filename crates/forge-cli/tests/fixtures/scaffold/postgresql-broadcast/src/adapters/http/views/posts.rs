@@ -1,9 +1,11 @@
 //! View models of the post pages in `templates/posts/`. Values
 //! are prepared as text by `crate::adapters::http::posts`; the
-//! templates only lay them out (escaped).
+//! templates only lay them out (escaped), with the text of
+//! `config/locales/posts.LOCALE.json`.
 
 use askama::Template;
 use forge::views::FieldErrors;
+use forge::views::I18n;
 
 use super::Layout;
 
@@ -47,6 +49,8 @@ pub struct PostIndex<'a> {
 #[template(path = "posts/_row.html")]
 pub struct PostRowFragment {
     pub row: PostRow,
+    /// The default locale: a live update reaches every subscriber.
+    pub i18n: I18n,
 }
 
 /// `templates/posts/show.html`, with the delete form.
@@ -71,7 +75,8 @@ pub struct PostNew<'a> {
     pub method: Option<&'static str>,
     /// The optimistic-locking version the form was rendered with.
     pub version: Option<i64>,
-    pub submit: &'static str,
+    /// The submit button, translated.
+    pub submit: String,
     pub back_path: String,
     pub form: PostFormValues,
     pub errors: FieldErrors,
@@ -88,7 +93,8 @@ pub struct PostEdit<'a> {
     pub method: Option<&'static str>,
     /// The optimistic-locking version the form was rendered with.
     pub version: Option<i64>,
-    pub submit: &'static str,
+    /// The submit button, translated.
+    pub submit: String,
     pub back_path: String,
     pub show_path: String,
     pub form: PostFormValues,

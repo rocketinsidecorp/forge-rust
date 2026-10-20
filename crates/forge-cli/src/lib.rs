@@ -8,6 +8,7 @@ mod dev;
 mod doctor;
 mod error;
 mod generate;
+mod i18n;
 mod lifecycle;
 mod process;
 mod project;
@@ -22,7 +23,9 @@ pub use error::CliError;
 
 use crate::application::{Application as _, CargoApplication};
 use crate::cargo::CargoCommand;
-use crate::cli::{Cli, Command, DbCommand, DestructiveArgs, GenerateCommand, MigrateView};
+use crate::cli::{
+    Cli, Command, DbCommand, DestructiveArgs, GenerateCommand, I18nCommand, MigrateView,
+};
 use crate::generate::{ForgeSource, NewApplication};
 use crate::lifecycle::{Db, Destructive, Lifecycle};
 use crate::process::Signals;
@@ -51,6 +54,7 @@ fn execute(
             api,
             skip_lockfile,
             forge_path,
+            locale,
         } => {
             let options = NewApplication {
                 name,
@@ -59,6 +63,7 @@ fn execute(
                 database,
                 views: !api,
                 forge: forge_path.map_or(ForgeSource::GitTag, ForgeSource::Path),
+                locale,
             };
             let destination = generate::create_application(current_dir, &options)?;
             writeln!(
@@ -150,6 +155,9 @@ fn execute(
         Command::Version => {
             writeln!(output, "forge {}", env!("CARGO_PKG_VERSION")).map_err(CliError::Output)
         }
+        Command::I18n {
+            command: I18nCommand::Check { json },
+        } => i18n::check(current_dir, json, output),
         Command::Doctor { json } => doctor::run(
             json,
             env::vars_os().collect(),

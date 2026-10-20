@@ -1,34 +1,37 @@
 {% extends "layouts/application.html" %}
 
+{% block title %}{{ layout.i18n.t("events.index.title") }}{% endblock %}
+
 {% block content %}
-<h1>Events</h1>
+<h1>{{ layout.i18n.t("events.index.title") }}</h1>
 {% if let Some(stream_source) = stream_source %}{{ stream_source|safe }}{% endif %}
-<p><a href="{{ new_path }}">New event</a></p>
+<p><a href="{{ new_path }}">{{ layout.i18n.t("events.index.new") }}</a></p>
 <table>
   <thead>
     <tr>
-      <th scope="col">Name</th>
-      <th scope="col">Notes</th>
-      <th scope="col">Starts at</th>
-      <th scope="col">Ends at</th>
-      <th scope="col">Capacity</th>
-      <th scope="col">Attendees</th>
-      <th scope="col">Public</th>
-      <th scope="col">Featured</th>
-      <th scope="col">Venue</th>
-      <th scope="col">Organizer</th>
-      <th scope="col">Actions</th>
+      <th scope="col">{{ layout.i18n.t("events.fields.name") }}</th>
+      <th scope="col">{{ layout.i18n.t("events.fields.notes") }}</th>
+      <th scope="col">{{ layout.i18n.t("events.fields.starts_at") }}</th>
+      <th scope="col">{{ layout.i18n.t("events.fields.ends_at") }}</th>
+      <th scope="col">{{ layout.i18n.t("events.fields.capacity") }}</th>
+      <th scope="col">{{ layout.i18n.t("events.fields.attendees") }}</th>
+      <th scope="col">{{ layout.i18n.t("events.fields.public") }}</th>
+      <th scope="col">{{ layout.i18n.t("events.fields.featured") }}</th>
+      <th scope="col">{{ layout.i18n.t("events.fields.venue") }}</th>
+      <th scope="col">{{ layout.i18n.t("events.fields.organizer") }}</th>
+      <th scope="col">{{ layout.i18n.t("events.index.actions") }}</th>
     </tr>
   </thead>
   <tbody id="events">
+    {% let i18n = layout.i18n.clone() %}
     {% for row in rows %}
     {% include "events/_row.html" %}
     {% else %}
-    <tr id="events_empty"><td>No events yet.</td></tr>
+    <tr id="events_empty"><td>{{ layout.i18n.t("events.index.empty") }}</td></tr>
     {% endfor %}
   </tbody>
 </table>
 {% if let Some(next_path) = next_path %}
-<p><a href="{{ next_path }}">Next page</a></p>
+<p><a href="{{ next_path }}">{{ layout.i18n.t("events.index.next_page") }}</a></p>
 {% endif %}
 {% endblock %}

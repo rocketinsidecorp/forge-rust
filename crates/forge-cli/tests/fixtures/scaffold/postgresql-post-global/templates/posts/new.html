@@ -1,7 +1,9 @@
 {% extends "layouts/application.html" %}
 
+{% block title %}{{ layout.i18n.t("posts.new.title") }}{% endblock %}
+
 {% block content %}
-<h1>New post</h1>
+<h1>{{ layout.i18n.t("posts.new.title") }}</h1>
 {% include "posts/_form.html" %}
-<p><a href="{{ back_path }}">Back to posts</a></p>
+<p><a href="{{ back_path }}">{{ layout.i18n.t("posts.back") }}</a></p>
 {% endblock %}

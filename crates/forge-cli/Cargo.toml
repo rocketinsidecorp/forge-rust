@@ -20,7 +20,12 @@ clap.workspace = true
 # `forge doctor` validates the same FORGE_* settings the application loads and
 # redacts database URLs with the same helpers (no new package in Cargo.lock).
 forge-config = { path = "../forge-config" }
-# Reads Cargo's `--message-format=json` to find the binary it built.
+# `forge i18n check` loads config/locales with the translator's own parser
+# and rules (no new package in Cargo.lock).
+forge-i18n = { path = "../forge-i18n" }
+# Reads Cargo's `--message-format=json` to find the binary it built, and
+# writes the `forge i18n check --json` report.
+serde.workspace = true
 serde_json.workspace = true
 # One signal thread (SIGINT/SIGTERM) owned by the commands that run children.
 tokio.workspace = true

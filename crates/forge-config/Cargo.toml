@@ -10,6 +10,8 @@ repository.workspace = true
 
 [dependencies]
 base64.workspace = true
+# Validates FORGE_I18N_DEFAULT_LOCALE with the translator's own locale grammar.
+forge-i18n = { path = "../forge-i18n" }
 serde.workspace = true
 thiserror.workspace = true
 # The URL parser SQLx itself uses, so a database URL means the same here as it

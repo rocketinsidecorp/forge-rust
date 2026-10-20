@@ -1,0 +1,33 @@
+//! Translations (Rails I18n, ADR 0037 of Forge): the JSON files of
+//! `config/locales`, embedded in the binary by build.rs. Pages translate
+//! with `layout.i18n.t(KEY)`, handlers with `i18n.t(KEY).text()`;
+//! `forge i18n check` lists what a locale lacks.
+
+use forge::config::{AppConfig, Environment};
+use forge::i18n::{LoadError, Options, Translator};
+
+// `FORGE_LOCALES`: every config/locales/*.json file, embedded by build.rs.
+include!(concat!(env!("OUT_DIR"), "/forge_locales.rs"));
+
+/// The application's default locale (`forge new --locale`): what requests
+/// that ask for no available locale get, and what production shows for a
+/// missing translation. `FORGE_I18N_DEFAULT_LOCALE` overrides it per
+/// deployment; either way it needs its `config/locales/LOCALE.json`.
+pub const DEFAULT_LOCALE: &str = "en";
+
+/// Loads the embedded translations. Development and test show a missing
+/// translation as `translation missing: LOCALE.KEY`; production falls back
+/// to the default locale. Duplicate keys or malformed files stop start-up.
+pub fn translator(config: &AppConfig) -> Result<Translator, LoadError> {
+    let default_locale = config
+        .i18n
+        .default_locale
+        .as_deref()
+        .unwrap_or(DEFAULT_LOCALE);
+    Translator::from_files(
+        FORGE_LOCALES,
+        Options::new()
+            .default_locale(default_locale)
+            .show_missing(config.environment != Environment::Production),
+    )
+}

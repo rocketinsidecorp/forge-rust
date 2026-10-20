@@ -1,37 +1,39 @@
 {% extends "layouts/application.html" %}
 
+{% block title %}{{ layout.i18n.t("events.show.title") }}{% endblock %}
+
 {% block content %}
-<h1>Event</h1>
+<h1>{{ layout.i18n.t("events.show.title") }}</h1>
 <dl>
-  <dt>Name</dt>
+  <dt>{{ layout.i18n.t("events.fields.name") }}</dt>
   <dd>{{ event.name }}</dd>
-  <dt>Notes</dt>
+  <dt>{{ layout.i18n.t("events.fields.notes") }}</dt>
   <dd>{{ event.notes }}</dd>
-  <dt>Starts at</dt>
+  <dt>{{ layout.i18n.t("events.fields.starts_at") }}</dt>
   <dd>{{ event.starts_at }}</dd>
-  <dt>Ends at</dt>
+  <dt>{{ layout.i18n.t("events.fields.ends_at") }}</dt>
   <dd>{{ event.ends_at }}</dd>
-  <dt>Capacity</dt>
+  <dt>{{ layout.i18n.t("events.fields.capacity") }}</dt>
   <dd>{{ event.capacity }}</dd>
-  <dt>Attendees</dt>
+  <dt>{{ layout.i18n.t("events.fields.attendees") }}</dt>
   <dd>{{ event.attendees }}</dd>
-  <dt>Public</dt>
+  <dt>{{ layout.i18n.t("events.fields.public") }}</dt>
   <dd>{{ event.public }}</dd>
-  <dt>Featured</dt>
+  <dt>{{ layout.i18n.t("events.fields.featured") }}</dt>
   <dd>{{ event.featured }}</dd>
-  <dt>Venue</dt>
+  <dt>{{ layout.i18n.t("events.fields.venue") }}</dt>
   <dd>{{ event.venue }}</dd>
-  <dt>Organizer</dt>
+  <dt>{{ layout.i18n.t("events.fields.organizer") }}</dt>
   <dd>{{ event.organizer }}</dd>
 </dl>
 <p>
-  <a href="{{ event.edit_path }}">Edit</a>
-  <a href="{{ back_path }}">Back to events</a>
+  <a href="{{ event.edit_path }}">{{ layout.i18n.t("events.index.edit") }}</a>
+  <a href="{{ back_path }}">{{ layout.i18n.t("events.back") }}</a>
 </p>
-<form action="{{ event.show_path }}" method="post" data-turbo-confirm="Delete this event?">
+<form action="{{ event.show_path }}" method="post" data-turbo-confirm="{{ layout.i18n.t("events.show.confirm_delete") }}">
   {{ csrf_field|safe }}
   <input type="hidden" name="_method" value="delete">
   <input type="hidden" name="version" value="{{ version }}">
-  <button type="submit">Delete event</button>
+  <button type="submit">{{ layout.i18n.t("events.show.delete") }}</button>
 </form>
 {% endblock %}

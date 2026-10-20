@@ -1,0 +1,54 @@
+{
+  "pt-BR": {
+    "sessions": {
+      "new": {
+        "title": "Entrar",
+        "organization": "Organização",
+        "organization_hint_html": "O nome curto da sua organização, como <code>acme</code>.",
+        "email": "E-mail",
+        "password": "Senha",
+        "submit": "Entrar",
+        "forgot_password": "Esqueceu sua senha?",
+        "already_signed_in": "Você já entrou. Entre novamente para trocar de conta, ou saia."
+      },
+      "sign_out": "Sair",
+      "signed_in": "Você entrou.",
+      "signed_out": "Você saiu.",
+      "invalid_credentials": "Essa organização, e-mail e senha não correspondem a uma conta."
+    },
+    "passwords": {
+      "new": {
+        "title": "Esqueceu sua senha?",
+        "instructions": "Informe sua organização e seu e-mail. Se corresponderem a uma conta, enviaremos um link para escolher uma nova senha.",
+        "organization": "Organização",
+        "email": "E-mail",
+        "submit": "Enviar link de redefinição",
+        "back": "Voltar para entrar"
+      },
+      "edit": {
+        "title": "Escolha uma nova senha",
+        "password": "Nova senha",
+        "password_confirmation": "Confirme a nova senha",
+        "submit": "Alterar senha"
+      },
+      "reset_requested": "Se essa conta existir, enviamos instruções de redefinição de senha para o e-mail dela.",
+      "invalid_link": "Esse link de redefinição é inválido ou expirou. Solicite um novo.",
+      "changed": "Sua senha foi alterada. Entre com a nova senha.",
+      "errors": {
+        "too_short": "A nova senha deve ter pelo menos %{count} caracteres",
+        "mismatch": "A confirmação não corresponde à senha",
+        "invalid": "A nova senha não é válida"
+      }
+    },
+    "throttled": {
+      "sign_in": {
+        "one": "Muitas tentativas de entrada. Tente novamente em um minuto.",
+        "other": "Muitas tentativas de entrada. Tente novamente em %{count} minutos."
+      },
+      "reset": {
+        "one": "Muitas tentativas de redefinição. Tente novamente em um minuto.",
+        "other": "Muitas tentativas de redefinição. Tente novamente em %{count} minutos."
+      }
+    }
+  }
+}

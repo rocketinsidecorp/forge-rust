@@ -1,0 +1,49 @@
+{
+  "en": {
+    "posts": {
+      "back": "Back to posts",
+      "edit": {
+        "conflict": "This post was changed by someone else after you opened the form. Review your changes and save again to overwrite.",
+        "title": "Editing post"
+      },
+      "fields": {
+        "body": "Body",
+        "published": "Published",
+        "title": "Title"
+      },
+      "flash": {
+        "created": "Post was successfully created.",
+        "deleted": "Post was successfully deleted.",
+        "no_version": "The delete form has no valid version; reload the page.",
+        "stale": "This post was changed by someone else. Review it and delete it again.",
+        "updated": "Post was successfully updated."
+      },
+      "form": {
+        "create": "Create post",
+        "no_version": "The form has no valid version; reload the page.",
+        "update": "Update post"
+      },
+      "index": {
+        "actions": "Actions",
+        "edit": "Edit",
+        "empty": "No posts yet.",
+        "new": "New post",
+        "next_page": "Next page",
+        "show": "Show",
+        "title": "Posts"
+      },
+      "new": {
+        "title": "New post"
+      },
+      "not_found": {
+        "message": "The post does not exist or was deleted.",
+        "title": "Post not found"
+      },
+      "show": {
+        "confirm_delete": "Delete this post?",
+        "delete": "Delete post",
+        "title": "Post"
+      }
+    }
+  }
+}

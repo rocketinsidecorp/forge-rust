@@ -1,4 +1,5 @@
-//! The welcome page served at `/`.
+//! The welcome page served at `/`. Its text is the `welcome.*` keys of
+//! `config/locales`.
 
 use askama::Template;
 
@@ -13,4 +14,6 @@ pub struct WelcomeIndex<'a> {
     pub logo: &'a str,
     pub application: &'a str,
     pub version: &'a str,
+    /// Whether the application has the sign-in pages.
+    pub sign_in: bool,
 }

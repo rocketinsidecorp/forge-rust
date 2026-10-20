@@ -522,6 +522,7 @@ dependencies = [
  "forge-db",
  "forge-events",
  "forge-http",
+ "forge-i18n",
  "forge-jobs",
  "forge-mail",
  "forge-ratelimit",
@@ -623,7 +624,9 @@ dependencies = [
  "clap",
  "forge-config",
  "forge-db",
+ "forge-i18n",
  "rustix",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",
@@ -635,6 +638,7 @@ name = "forge-config"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "forge-i18n",
  "serde",
  "serde_json",
  "thiserror",
@@ -712,6 +716,18 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "forge-i18n"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -860,6 +876,7 @@ dependencies = [
  "forge-auth",
  "forge-core",
  "forge-http",
+ "forge-i18n",
  "getrandom 0.4.3",
  "serde",
  "serde_json",

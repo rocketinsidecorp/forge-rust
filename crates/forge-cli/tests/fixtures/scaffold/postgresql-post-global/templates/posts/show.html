@@ -1,23 +1,25 @@
 {% extends "layouts/application.html" %}
 
+{% block title %}{{ layout.i18n.t("posts.show.title") }}{% endblock %}
+
 {% block content %}
-<h1>Post</h1>
+<h1>{{ layout.i18n.t("posts.show.title") }}</h1>
 <dl>
-  <dt>Title</dt>
+  <dt>{{ layout.i18n.t("posts.fields.title") }}</dt>
   <dd>{{ post.title }}</dd>
-  <dt>Body</dt>
+  <dt>{{ layout.i18n.t("posts.fields.body") }}</dt>
   <dd>{{ post.body }}</dd>
-  <dt>Published</dt>
+  <dt>{{ layout.i18n.t("posts.fields.published") }}</dt>
   <dd>{{ post.published }}</dd>
 </dl>
 <p>
-  <a href="{{ post.edit_path }}">Edit</a>
-  <a href="{{ back_path }}">Back to posts</a>
+  <a href="{{ post.edit_path }}">{{ layout.i18n.t("posts.index.edit") }}</a>
+  <a href="{{ back_path }}">{{ layout.i18n.t("posts.back") }}</a>
 </p>
-<form action="{{ post.show_path }}" method="post" data-turbo-confirm="Delete this post?">
+<form action="{{ post.show_path }}" method="post" data-turbo-confirm="{{ layout.i18n.t("posts.show.confirm_delete") }}">
   {{ csrf_field|safe }}
   <input type="hidden" name="_method" value="delete">
   <input type="hidden" name="version" value="{{ version }}">
-  <button type="submit">Delete post</button>
+  <button type="submit">{{ layout.i18n.t("posts.show.delete") }}</button>
 </form>
 {% endblock %}

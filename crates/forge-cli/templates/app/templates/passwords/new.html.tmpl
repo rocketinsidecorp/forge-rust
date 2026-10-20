@@ -1,19 +1,22 @@
 {% extends "layouts/application.html" %}
 
+{% block title %}{{ layout.i18n.t("passwords.new.title") }}{% endblock %}
+
 {% block content %}
-<h1>Forgot your password?</h1>
+<h1>{{ layout.i18n.t("passwords.new.title") }}</h1>
+<p>{{ layout.i18n.t("passwords.new.instructions") }}</p>
 {% if let Some(error) = error %}<p class="flash flash-alert" role="alert">{{ error }}</p>{% endif %}
 <form action="/passwords" method="post">
   {{ csrf_field|safe }}
   <div>
-    <label for="password_tenant">Organization</label>
+    <label for="password_tenant">{{ layout.i18n.t("passwords.new.organization") }}</label>
     <input type="text" id="password_tenant" name="tenant" value="{{ tenant }}" required autocomplete="organization" autocapitalize="none" spellcheck="false" maxlength="63">
   </div>
   <div>
-    <label for="password_email">Email</label>
+    <label for="password_email">{{ layout.i18n.t("passwords.new.email") }}</label>
     <input type="email" id="password_email" name="email" value="{{ email }}" required autocomplete="username" maxlength="320">
   </div>
-  <button type="submit">Email reset instructions</button>
+  <button type="submit">{{ layout.i18n.t("passwords.new.submit") }}</button>
 </form>
-<p><a href="/session/new">Back to sign in</a></p>
+<p><a href="/session/new">{{ layout.i18n.t("passwords.new.back") }}</a></p>
 {% endblock %}

@@ -414,6 +414,7 @@ dependencies = [
  "forge-core",
  "forge-db",
  "forge-http",
+ "forge-i18n",
  "forge-mail",
  "forge-security",
  "forge-telemetry",
@@ -456,6 +457,7 @@ name = "forge-config"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "forge-i18n",
  "serde",
  "thiserror",
  "url",
@@ -505,6 +507,16 @@ dependencies = [
  "tokio-util",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "forge-i18n"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tracing",
 ]
 
 [[package]]
@@ -582,6 +594,7 @@ dependencies = [
  "forge-auth",
  "forge-core",
  "forge-http",
+ "forge-i18n",
  "getrandom 0.4.3",
  "serde_json",
  "sha2 0.11.1",

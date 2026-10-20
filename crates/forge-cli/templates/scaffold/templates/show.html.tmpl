@@ -1,18 +1,20 @@
 {% extends "layouts/application.html" %}
 
+{% block title %}{{ layout.i18n.t("%%RESOURCES%%.show.title") }}{% endblock %}
+
 {% block content %}
-<h1>%%LABEL%%</h1>
+<h1>{{ layout.i18n.t("%%RESOURCES%%.show.title") }}</h1>
 <dl>
 %%SHOW_FIELDS%%
 </dl>
 <p>
-  <a href="{{ %%RESOURCE%%.edit_path }}">Edit</a>
-  <a href="{{ back_path }}">Back to %%NOUNS%%</a>
+  <a href="{{ %%RESOURCE%%.edit_path }}">{{ layout.i18n.t("%%RESOURCES%%.index.edit") }}</a>
+  <a href="{{ back_path }}">{{ layout.i18n.t("%%RESOURCES%%.back") }}</a>
 </p>
-<form action="{{ %%RESOURCE%%.show_path }}" method="post" data-turbo-confirm="Delete this %%NOUN%%?">
+<form action="{{ %%RESOURCE%%.show_path }}" method="post" data-turbo-confirm="{{ layout.i18n.t("%%RESOURCES%%.show.confirm_delete") }}">
   {{ csrf_field|safe }}
   <input type="hidden" name="_method" value="delete">
   <input type="hidden" name="version" value="{{ version }}">
-  <button type="submit">Delete %%NOUN%%</button>
+  <button type="submit">{{ layout.i18n.t("%%RESOURCES%%.show.delete") }}</button>
 </form>
 {% endblock %}

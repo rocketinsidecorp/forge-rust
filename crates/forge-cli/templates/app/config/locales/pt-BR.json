@@ -1,0 +1,93 @@
+{
+  "pt-BR": {
+    "layout": {
+      "skip_to_content": "Pular para o conteúdo"
+    },
+    "welcome": {
+      "page_title": "Bem-vindo ao %{app} · Forge Rust",
+      "description": "Um serviço Rust construído com Forge Rust.",
+      "eyebrow": "Seu serviço está no ar",
+      "title": "Bem-vindo ao %{app}",
+      "lede": "Seu serviço Rust está pronto. Substitua esta página de boas-vindas à medida que adicionar as rotas e os recursos de que sua aplicação precisa.",
+      "sign_in": "Entrar",
+      "status": "Ver o status do serviço",
+      "documentation": "Documentação do Forge",
+      "health_endpoints": "Endpoints de saúde do serviço",
+      "logo_alt": "Forge Rust — Framework Rust",
+      "masthead": "Framework Rust",
+      "footer": "Forge Rust · Framework Rust",
+      "tagline": "Feito para você começar rápido"
+    },
+    "number": {
+      "format": {
+        "separator": ",",
+        "delimiter": ".",
+        "precision": 2
+      }
+    },
+    "date": {
+      "formats": {
+        "default": "%d/%m/%Y",
+        "short": "%d de %B",
+        "long": "%d de %B de %Y"
+      },
+      "day_names": [
+        "domingo",
+        "segunda-feira",
+        "terça-feira",
+        "quarta-feira",
+        "quinta-feira",
+        "sexta-feira",
+        "sábado"
+      ],
+      "abbr_day_names": [
+        "dom",
+        "seg",
+        "ter",
+        "qua",
+        "qui",
+        "sex",
+        "sáb"
+      ],
+      "month_names": [
+        null,
+        "janeiro",
+        "fevereiro",
+        "março",
+        "abril",
+        "maio",
+        "junho",
+        "julho",
+        "agosto",
+        "setembro",
+        "outubro",
+        "novembro",
+        "dezembro"
+      ],
+      "abbr_month_names": [
+        null,
+        "jan",
+        "fev",
+        "mar",
+        "abr",
+        "mai",
+        "jun",
+        "jul",
+        "ago",
+        "set",
+        "out",
+        "nov",
+        "dez"
+      ]
+    },
+    "time": {
+      "formats": {
+        "default": "%a, %d de %B de %Y, %H:%M:%S %z",
+        "short": "%d de %B, %H:%M",
+        "long": "%d de %B de %Y, %H:%M"
+      },
+      "am": "",
+      "pm": ""
+    }
+  }
+}

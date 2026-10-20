@@ -21,6 +21,7 @@ runtime = [
     "dep:forge-auth",
     "dep:forge-core",
     "dep:forge-http",
+    "dep:forge-i18n",
     "dep:getrandom",
     "dep:serde_json",
     "dep:sha2",
@@ -36,6 +37,7 @@ cookie = { workspace = true, optional = true }
 forge-auth = { path = "../forge-auth", optional = true }
 forge-core = { path = "../forge-core", optional = true }
 forge-http = { path = "../forge-http", optional = true }
+forge-i18n = { path = "../forge-i18n", optional = true }
 getrandom = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }

@@ -401,7 +401,8 @@ fn fixture_for(world: World, pair_limit: u32) -> Result<Fixture, Box<dyn Error>>
     };
     let config = forge::config::AppConfig::default();
     let mut router = Router::new();
-    let site = app::adapters::http::site(&mut router)?;
+    let translator = app::adapters::http::views::locales::translator(&config)?;
+    let site = app::adapters::http::site(&mut router, translator)?;
     app::adapters::http::routes(&mut router, &site)?;
     let mut composition = forge::Composition::for_testing(&config, &mut router);
     routes(&mut composition, &site, ports)?;
@@ -1385,5 +1386,58 @@ async fn unknown_reset_tokens_are_refused_before_hashing() -> TestResult {
         hashes,
         "no Argon2 work for an unknown token"
     );
+    Ok(())
+}
+
+/// Every page renders in every generated locale (chosen by the `locale`
+/// cookie) without a missing translation, and a failed sign-in answers in
+/// the visitor's language.
+#[tokio::test]
+async fn the_pages_are_translated_in_every_locale() -> TestResult {
+    let fixture = fixture()?;
+    let translator =
+        app::adapters::http::views::locales::translator(&forge::config::AppConfig::default())?;
+    for locale in translator.locales() {
+        let mut browser = Browser::default();
+        browser.cookies.insert("locale".to_owned(), locale.clone());
+        for path in ["/session/new", "/passwords/new"] {
+            let page = browser.get(&fixture.router, path).await?;
+            assert_eq!(page.status(), StatusCode::OK, "{locale} {path}");
+            assert_eq!(
+                header_of(&page, header::CONTENT_LANGUAGE).as_deref(),
+                Some(locale.as_str())
+            );
+            let body = text(&page);
+            assert!(
+                !body.contains("translation missing"),
+                "{locale} {path}: {body}"
+            );
+            assert!(
+                body.contains(&format!("<html lang=\"{locale}\">")),
+                "{body}"
+            );
+        }
+        let failed = browser
+            .post(
+                &fixture.router,
+                "/session",
+                &[
+                    ("tenant", "acme"),
+                    ("email", "nobody@example.com"),
+                    ("password", "not the password"),
+                ],
+            )
+            .await?;
+        let invalid = translator.translate(
+            locale,
+            "sessions.invalid_credentials",
+            &forge::i18n::Args::new(),
+        );
+        let body = text(&failed);
+        assert!(
+            body.contains(&forge::i18n::escape_html(&invalid)),
+            "{locale}: {body}"
+        );
+    }
     Ok(())
 }

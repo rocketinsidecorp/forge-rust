@@ -11,15 +11,25 @@ use std::sync::Arc;
 
 use forge::ComposeError;
 use forge::http::{Method, Request, Response, Router};
+use forge::i18n::Translator;
 
 use self::views::{Site, welcome::WelcomeIndex};
 
+/// Whether the welcome page links to the sign-in pages.
+%%if authentication%%
+const SIGN_IN: bool = true;
+%%end%%
+%%if !authentication%%
+const SIGN_IN: bool = false;
+%%end%%
+
 /// Loads the site and registers the digested assets and the request layers
-/// every HTML page relies on (Content-Security-Policy, CSRF protection with
-/// the `_method` override, flash messages). Every page renders its layout
-/// from the returned site.
-pub fn site(router: &mut Router) -> Result<Arc<Site>, ComposeError> {
-    let site = Arc::new(Site::load()?);
+/// every HTML page relies on (the request's locale, Content-Security-Policy,
+/// CSRF protection with the `_method` override, flash messages). Every page
+/// renders its layout from the returned site; `translator` is
+/// `views::locales::translator(config)`.
+pub fn site(router: &mut Router, translator: Translator) -> Result<Arc<Site>, ComposeError> {
+    let site = Arc::new(Site::load(translator)?);
     site.register(router).map_err(ComposeError::other)?;
     Ok(site)
 }
@@ -37,9 +47,10 @@ pub fn routes(router: &mut Router, site: &Arc<Site>) -> Result<(), ComposeError>
 
 fn index(site: &Site, request: &Request) -> Response {
     forge::web::html(&WelcomeIndex {
-        layout: site.layout(request, "Welcome"),
+        layout: site.layout(request),
         logo: site.logo(),
         application: env!("CARGO_PKG_NAME"),
         version: env!("CARGO_PKG_VERSION"),
+        sign_in: SIGN_IN,
     })
 }

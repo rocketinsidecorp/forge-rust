@@ -14,6 +14,7 @@ fn application(database: Database, views: bool) -> (tempfile::TempDir, PathBuf) 
         database,
         views,
         forge: ForgeSource::Path("../forge/crates/forge".to_owned()),
+        locale: crate::generate::Locale::En,
     };
     let root = create_application(parent.path(), &options)
         .unwrap_or_else(|error| panic!("application: {error}"));
@@ -430,8 +431,88 @@ fn dry_run_lists_the_files_and_writes_nothing() {
     );
 
     assert_eq!(tree(&root), before);
-    assert_eq!(outcome.created.len(), 17);
+    assert_eq!(outcome.created.len(), 18);
+    assert!(
+        outcome
+            .created
+            .contains(&"config/locales/posts.en.json".to_owned())
+    );
     assert!(outcome.wiring.contains("composition.sqlite()?.clone()"));
+}
+
+#[test]
+fn the_default_locale_gets_the_english_text_too() {
+    let parent = tempfile::tempdir().unwrap_or_else(|error| panic!("temporary directory: {error}"));
+    let options = NewApplication {
+        name: "shop".to_owned(),
+        docker: false,
+        ci: false,
+        database: Database::Sqlite3,
+        views: true,
+        forge: ForgeSource::Path("../forge/crates/forge".to_owned()),
+        locale: crate::generate::Locale::PtBr,
+    };
+    let root = create_application(parent.path(), &options)
+        .unwrap_or_else(|error| panic!("application: {error}"));
+    let outcome = ok(&root, &post());
+    let english = fs::read_to_string(root.join("config/locales/posts.en.json"))
+        .unwrap_or_else(|error| panic!("{error}"));
+    let portuguese = fs::read_to_string(root.join("config/locales/posts.pt-BR.json"))
+        .unwrap_or_else(|error| panic!("{error}"));
+    assert!(
+        outcome
+            .created
+            .contains(&"config/locales/posts.pt-BR.json".to_owned())
+    );
+    assert_eq!(
+        portuguese.replacen("\"pt-BR\"", "\"en\"", 1),
+        english,
+        "the same English text under the default locale"
+    );
+    assert!(english.contains("\"created\": \"Post was successfully created.\""));
+    // Every page key the templates use is in the file.
+    let translator = forge_i18n::Translator::load_dir(
+        root.join("config/locales"),
+        forge_i18n::Options::new().default_locale("pt-BR"),
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
+    for page in ["index", "show", "new", "edit", "_form", "not_found"] {
+        let template = fs::read_to_string(root.join(format!("templates/posts/{page}.html")))
+            .unwrap_or_else(|error| panic!("{error}"));
+        for (_, rest) in template
+            .match_indices(".t(\"")
+            .map(|(at, _)| ((), &template[at + 4..]))
+        {
+            let key = rest.split('"').next().unwrap_or_default();
+            assert!(translator.has("pt-BR", key), "{page}: {key}");
+        }
+    }
+}
+
+#[test]
+fn formatting_scopes_are_refused_as_plurals() {
+    let (_parent, root) = application(Database::Sqlite3, true);
+    for plural in ["date", "time", "number"] {
+        let message = refusal(
+            &root,
+            &ScaffoldOptions {
+                plural: Some(plural.to_owned()),
+                ..post()
+            },
+        );
+        assert!(message.contains("formatting scope"), "{plural}: {message}");
+    }
+}
+
+#[test]
+fn applications_without_translations_are_refused_with_instructions() {
+    let (_parent, root) = application(Database::Sqlite3, true);
+    fs::remove_file(root.join(LOCALES_MODULE)).unwrap_or_else(|error| panic!("{error}"));
+    let message = refusal(&root, &post());
+    assert!(
+        message.contains("Applications created before i18n"),
+        "{message}"
+    );
 }
 
 #[test]

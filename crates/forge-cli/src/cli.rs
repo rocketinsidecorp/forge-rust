@@ -3,7 +3,7 @@ use std::time::Duration;
 use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 
 use crate::dev::{parse_debounce, parse_poll_interval};
-use crate::generate::Database;
+use crate::generate::{Database, Locale};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -60,6 +60,17 @@ pub(crate) enum Command {
         /// paths are resolved by Cargo from the new application's directory.
         #[arg(long, value_name = "PATH")]
         forge_path: Option<String>,
+        /// Default locale of the pages: en, es or pt-BR. Writes
+        /// config/locales/en.json and the locale's file (plus the sign-in
+        /// pages' authentication.LOCALE.json).
+        #[arg(
+            long,
+            value_enum,
+            value_name = "LOCALE",
+            default_value_t = Locale::En,
+            conflicts_with = "api"
+        )]
+        locale: Locale,
     },
     /// Generate application artifacts.
     Generate {
@@ -157,6 +168,11 @@ pub(crate) enum Command {
     },
     /// Load the application's seed data by running its `seed` command.
     Seed,
+    /// Translations of config/locales (ADR 0037).
+    I18n {
+        #[command(subcommand)]
+        command: I18nCommand,
+    },
     /// Database lifecycle, like Rails' `db:*` tasks. Every command runs the
     /// application's own subcommand; the CLI never reads the database URL.
     Db {
@@ -167,6 +183,19 @@ pub(crate) enum Command {
 
 const DEFAULT_POLL_INTERVAL_TEXT: &str = "500ms";
 const DEFAULT_DEBOUNCE_TEXT: &str = "300ms";
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum I18nCommand {
+    /// Report the keys and plural forms each locale lacks (compared with the
+    /// other locales and the literal keys of `t("KEY")` in templates and
+    /// Rust code) and the keys nothing uses. Exits 1 when a locale lacks a
+    /// key or a plural form. Reads files only.
+    Check {
+        /// Print a schema-versioned JSON report.
+        #[arg(long)]
+        json: bool,
+    },
+}
 
 /// What `forge migrate` shows instead of migrating.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]

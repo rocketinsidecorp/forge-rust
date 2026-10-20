@@ -100,6 +100,7 @@ pub const KNOWN_KEYS: &[&str] = &[
     "FORGE_STORAGE_MAX_UPLOAD_BYTES",
     "FORGE_STORAGE_LINK_TTL_SECS",
     "FORGE_STREAMS_KEY",
+    I18N_DEFAULT_LOCALE_KEY,
     // MAIL_KEYS and PASSWORD_RESET_URL_KEY, ADR 0035.
     "FORGE_MAIL_URL",
     "FORGE_MAIL_FROM",
@@ -126,6 +127,11 @@ pub const KNOWN_KEYS: &[&str] = &[
     "FORGE_TELEMETRY_METRICS_PUBLIC",
     "FORGE_TELEMETRY_METRICS_INTERVAL",
 ];
+
+/// The locale requests fall back to and missing translations use in
+/// production (ADR 0037), overriding the application's own default (`forge
+/// new --locale`, else `en`).
+pub const I18N_DEFAULT_LOCALE_KEY: &str = "FORGE_I18N_DEFAULT_LOCALE";
 
 /// The reverse proxies whose `X-Forwarded-For` header is believed (ADR 0032):
 /// a comma-separated list of CIDR prefixes or bare addresses. Empty, the
@@ -793,6 +799,19 @@ pub struct AppConfig {
     /// Identity settings (`FORGE_AUTH_PASSWORD_RESET_URL`).
     #[serde(default)]
     pub auth: AuthConfig,
+    /// Translations (`FORGE_I18N_DEFAULT_LOCALE`, ADR 0037).
+    #[serde(default)]
+    pub i18n: I18nConfig,
+}
+
+/// Translation settings.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct I18nConfig {
+    /// The deployment's default locale (`FORGE_I18N_DEFAULT_LOCALE`), spelled
+    /// canonically, such as `en` or `pt-BR`. `None` keeps the application's
+    /// own default. The locale must have a translation file; the translator
+    /// refuses to start otherwise.
+    pub default_locale: Option<String>,
 }
 
 impl AppConfig {
@@ -886,6 +905,11 @@ impl AppConfig {
                 Some(parse_secret_url("FORGE_MIGRATION_DATABASE_URL", value)?);
         }
         apply_services(&lookup, &mut config)?;
+        if let Some(value) = lookup(I18N_DEFAULT_LOCALE_KEY)
+            && !value.is_empty()
+        {
+            config.i18n.default_locale = Some(parse_locale(value)?);
+        }
         telemetry::apply(&lookup, &mut config.telemetry)?;
         mail::apply(&lookup, &mut config.mail, &mut config.auth)?;
         // The format default depends on the environment, so derive it only
@@ -899,6 +923,25 @@ impl AppConfig {
         telemetry::validate(&config.telemetry, config.environment, config.server.bind)?;
         mail::validate(&config.mail, &config.auth, config.environment)?;
         Ok(config)
+    }
+}
+
+/// Validates `FORGE_I18N_DEFAULT_LOCALE`: a locale of the BCP 47 subset
+/// Forge supports, spelled canonically, so the name can never reach the
+/// file system or differ from a translation file's.
+fn parse_locale(value: String) -> Result<String, ConfigError> {
+    match forge_i18n::canonical_locale(&value) {
+        Ok(canonical) if canonical == value => Ok(canonical),
+        Ok(_) => Err(ConfigError::InvalidValue {
+            key: I18N_DEFAULT_LOCALE_KEY,
+            value,
+            expected: "a locale spelled canonically, such as en or pt-BR",
+        }),
+        Err(_) => Err(ConfigError::InvalidValue {
+            key: I18N_DEFAULT_LOCALE_KEY,
+            value: value.chars().take(32).collect(),
+            expected: "a locale such as en or pt-BR (language[-Script][-REGION])",
+        }),
     }
 }
 
@@ -1151,6 +1194,31 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
+
+    #[test]
+    fn i18n_default_locale_is_validated_and_canonical() {
+        let config = AppConfig::from_lookup(|key| {
+            (key == I18N_DEFAULT_LOCALE_KEY).then(|| "pt-BR".to_owned())
+        })
+        .expect("a canonical locale is accepted");
+        assert_eq!(config.i18n.default_locale.as_deref(), Some("pt-BR"));
+        let unset =
+            AppConfig::from_lookup(|key| (key == I18N_DEFAULT_LOCALE_KEY).then(String::new))
+                .expect("an empty value is unset");
+        assert_eq!(unset.i18n.default_locale, None);
+        for (value, expected) in [
+            ("pt-br", "spelled canonically"),
+            ("pt_BR", "language[-Script][-REGION]"),
+            ("../../etc/passwd", "language[-Script][-REGION]"),
+            ("en.json", "language[-Script][-REGION]"),
+        ] {
+            let error = AppConfig::from_lookup(|key| {
+                (key == I18N_DEFAULT_LOCALE_KEY).then(|| value.to_owned())
+            })
+            .expect_err("an invalid locale is refused");
+            assert!(error.to_string().contains(expected), "{value}: {error}");
+        }
+    }
 
     #[test]
     fn mail_keys_are_known_keys() {
@@ -1497,6 +1565,7 @@ mod tests {
             "10",
             "60",
             "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=",
+            "pt-BR",
             "smtps://mailer:secret@smtp.example.com:465",
             "Billing <billing@example.com>",
             "false",

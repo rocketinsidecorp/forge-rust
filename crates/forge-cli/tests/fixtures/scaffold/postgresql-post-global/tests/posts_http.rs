@@ -128,7 +128,11 @@ impl Harness {
     fn new(access: Arc<dyn GlobalAccess>) -> Result<Self, Box<dyn Error>> {
         let repository = Arc::new(InMemoryPosts::default());
         let mut router = Router::new();
-        let site = app::adapters::http::site(&mut router)?;
+        // Development translations: a missing key renders as
+        // `translation missing: LOCALE.KEY`, which the tests reject.
+        let translator =
+            app::adapters::http::views::locales::translator(&forge::config::AppConfig::default())?;
+        let site = app::adapters::http::site(&mut router, translator)?;
         app::adapters::http::posts::routes(
             &mut router,
             &site,
@@ -143,11 +147,15 @@ impl Harness {
         Self::new(Arc::new(AllowAll))
     }
 
+    /// Gets `path`; every page it renders must be completely translated.
     async fn get(&self, path: &str) -> Result<Response, Box<dyn Error>> {
-        Ok(self
+        let response = self
             .router
             .dispatch(request(Method::GET, path, &[], "")?)
-            .await)
+            .await;
+        let body = String::from_utf8_lossy(response.body());
+        assert!(!body.contains("translation missing"), "{path}: {body}");
+        Ok(response)
     }
 
     /// The CSRF token the new-post page issues, as a browser keeps it.

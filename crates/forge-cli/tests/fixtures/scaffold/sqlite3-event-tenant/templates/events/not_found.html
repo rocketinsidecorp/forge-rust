@@ -1,7 +1,9 @@
 {% extends "layouts/application.html" %}
 
+{% block title %}{{ layout.i18n.t("events.not_found.title") }}{% endblock %}
+
 {% block content %}
-<h1>Event not found</h1>
-<p>The event does not exist or was deleted.</p>
-<p><a href="{{ back_path }}">Back to events</a></p>
+<h1>{{ layout.i18n.t("events.not_found.title") }}</h1>
+<p>{{ layout.i18n.t("events.not_found.message") }}</p>
+<p><a href="{{ back_path }}">{{ layout.i18n.t("events.back") }}</a></p>
 {% endblock %}

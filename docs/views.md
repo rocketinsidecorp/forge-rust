@@ -313,6 +313,23 @@ async fn show(_: forge::http::Request) -> forge::http::Response {
 - Templates are compiled into the binary. Editing one triggers an incremental
   rebuild (`cargo run` again); a template error is a build error.
 
+### Translations
+
+Generated pages take their text from `config/locales`
+([i18n](i18n.md), [ADR 0037](adr/0037-internationalization.md)). The
+`Layout` every page receives carries the request's locale as `layout.i18n`:
+
+```html
+{% block title %}{{ layout.i18n.t("products.show.title") }}{% endblock %}
+<p>{{ layout.i18n.t("products.price").with("amount", layout.i18n.number_with_precision(price, 2)) }}</p>
+```
+
+`t(...)` renders HTML (plain keys escaped, `_html` keys as trusted markup
+with escaped arguments) and is never escaped twice; `.text()` gives the text
+for a flash message. `LocaleNegotiation`, which `Site::register` installs
+first, chooses the locale (cookie, `Accept-Language`, default) and adds
+`Content-Language` and `Vary` to the responses that used it.
+
 ## Forms
 
 ### Decoding

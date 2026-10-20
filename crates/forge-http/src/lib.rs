@@ -184,6 +184,17 @@ impl Request {
         self.method = method;
     }
 
+    /// Replaces the request URI before routing.
+    ///
+    /// This exists for [`Middleware`] that rewrites the path the route table
+    /// sees, such as the locale prefix `forge_views::LocaleNegotiation`
+    /// removes (`/pt-BR/posts` is routed as `/posts`). Layers registered
+    /// before it, and the server's own request telemetry, keep seeing the
+    /// original URI.
+    pub fn set_uri(&mut self, uri: Uri) {
+        self.uri = uri;
+    }
+
     /// Creates a new request for testing purposes.
     ///
     /// This constructor is intended for use in tests only.
@@ -1157,6 +1168,36 @@ mod tests {
             rewrite: None,
             answer: None,
         }
+    }
+
+    /// Test layer: removes a `/v2` path prefix before routing.
+    struct StripV2;
+
+    impl Middleware for StripV2 {
+        fn handle<'a>(&'a self, mut request: Request, next: Next<'a>) -> BoxResponseFuture<'a> {
+            if let Some(rest) = request.uri().path().strip_prefix("/v2")
+                && let Ok(uri) = rest.parse::<Uri>()
+            {
+                request.set_uri(uri);
+            }
+            next.run(request)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_layer_can_rewrite_the_path_the_route_table_sees() {
+        let mut router = Router::new();
+        router
+            .route(Method::GET, "/items", |request: Request| async move {
+                Response::new(StatusCode::OK, request.uri().path().to_owned())
+            })
+            .expect("route registers");
+        router.layer(StripV2);
+
+        let response = router.dispatch(request(Method::GET, "/v2/items")).await;
+
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(response.body(), &"/items");
     }
 
     #[tokio::test]

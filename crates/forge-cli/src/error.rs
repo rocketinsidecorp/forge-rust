@@ -77,6 +77,10 @@ pub enum CliError {
     },
     /// The command already printed what is wrong (`forge doctor`).
     Reported,
+    /// `forge i18n check` cannot read the translations.
+    I18n(String),
+    /// `forge i18n check` found a locale without a key or a plural form.
+    TranslationsMissing,
 }
 
 impl fmt::Display for CliError {
@@ -157,6 +161,8 @@ impl fmt::Display for CliError {
                 root.display()
             ),
             Self::Reported => formatter.write_str("checks failed"),
+            Self::I18n(reason) => formatter.write_str(reason),
+            Self::TranslationsMissing => formatter.write_str("translations are missing"),
         }
     }
 }
@@ -187,6 +193,8 @@ impl std::error::Error for CliError {
             | Self::Interrupted
             | Self::TooManyFiles { .. }
             | Self::Reported
+            | Self::I18n(_)
+            | Self::TranslationsMissing
             | Self::CargoFailed { .. } => None,
         }
     }

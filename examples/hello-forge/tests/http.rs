@@ -1,6 +1,6 @@
 //! The HTML stack end to end, without a network: layout, Content-Security-
-//! Policy, CSRF meta tag and cookie, digested Turbo and Stimulus assets, and
-//! CSRF enforcement on form submissions.
+//! Policy, CSRF meta tag and cookie, digested Turbo and Stimulus assets,
+//! CSRF enforcement on form submissions and translations.
 
 use std::error::Error;
 
@@ -20,7 +20,7 @@ struct Probe {
 /// layer protects it like any other route.
 fn router() -> Result<Router, Box<dyn Error>> {
     let mut router = Router::new();
-    let site = app::adapters::http::site(&mut router)?;
+    let site = app::adapters::http::site(&mut router, translator()?)?;
     app::adapters::http::routes(&mut router, &site)?;
     router.route(Method::POST, "/test-form", |request: Request| async move {
         match forge::web::decode_form::<Probe>(&request) {
@@ -29,6 +29,14 @@ fn router() -> Result<Router, Box<dyn Error>> {
         }
     })?;
     Ok(router)
+}
+
+/// The application's translations as development loads them: a missing
+/// translation shows as `translation missing: LOCALE.KEY`.
+fn translator() -> Result<forge::i18n::Translator, Box<dyn Error>> {
+    Ok(app::adapters::http::views::locales::translator(
+        &forge::config::AppConfig::default(),
+    )?)
 }
 
 fn request(
@@ -120,6 +128,9 @@ async fn turbo_and_stimulus_are_served_digested() -> TestResult {
             header_text(&asset, header::CACHE_CONTROL),
             Some("public, max-age=31536000, immutable")
         );
+        // Assets do not depend on the language: they stay cacheable.
+        assert_eq!(header_text(&asset, header::CONTENT_LANGUAGE), None);
+        assert!(asset.headers().get(header::VARY).is_none());
     }
     Ok(())
 }
@@ -196,5 +207,63 @@ async fn form_posts_need_the_csrf_token_of_the_page() -> TestResult {
         .await;
     assert_eq!(accepted.status(), StatusCode::CREATED);
     assert_eq!(body(&accepted)?, "x");
+    Ok(())
+}
+
+/// Every generated locale translates the welcome page completely: the
+/// `Accept-Language` locale is served, named in `Content-Language` and
+/// `<html lang>`, and the response varies on the headers that chose it.
+#[tokio::test]
+async fn every_locale_translates_the_welcome_page() -> TestResult {
+    let router = router()?;
+    let translator = translator()?;
+    for locale in translator.locales() {
+        let response = router
+            .dispatch(request(
+                Method::GET,
+                "/",
+                &[("accept-language", locale.as_str())],
+                "",
+            )?)
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            header_text(&response, header::CONTENT_LANGUAGE),
+            Some(locale.as_str())
+        );
+        let vary: Vec<&str> = response
+            .headers()
+            .get_all(header::VARY)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .collect();
+        assert!(
+            vary.contains(&"Accept-Language") && vary.contains(&"Cookie"),
+            "{vary:?}"
+        );
+        let page = body(&response)?;
+        assert!(!page.contains("translation missing"), "{locale}: {page}");
+        assert!(
+            page.contains(&format!("<html lang=\"{locale}\">")),
+            "{page}"
+        );
+    }
+    // The `locale` cookie beats Accept-Language; unknown locales get the default.
+    let chosen = router
+        .dispatch(request(
+            Method::GET,
+            "/",
+            &[("cookie", "locale=en"), ("accept-language", "xx")],
+            "",
+        )?)
+        .await;
+    assert_eq!(header_text(&chosen, header::CONTENT_LANGUAGE), Some("en"));
+    let fallback = router
+        .dispatch(request(Method::GET, "/", &[("accept-language", "xx")], "")?)
+        .await;
+    assert_eq!(
+        header_text(&fallback, header::CONTENT_LANGUAGE),
+        Some(translator.default_locale())
+    );
     Ok(())
 }

@@ -166,6 +166,7 @@ forge id                                       # print a UUIDv7
 forge new shop                                 # full-stack, PostgreSQL, Docker and CI
 forge new shop -d sqlite3                      # or postgresql, mysql, mariadb, none
 forge new shop --api                           # JSON only, no views
+forge new shop --locale pt-BR                  # pages in Brazilian Portuguese by default (or es; en is the default)
 forge new shop --skip-docker --skip-ci --skip-lockfile
 forge generate migration create_customers      # empty reversible .up.sql/.down.sql pair
 forge generate authentication                  # sign-in pages + setup for an older PostgreSQL app
@@ -177,6 +178,8 @@ forge generate scaffold event name:string starts_at:timestamp --tenant-scoped --
 forge version                                  # the CLI version (also forge --version)
 forge doctor                                   # toolchain, FORGE_* settings, is the database server answering?
 forge doctor --json                            # versioned, secret-free report for scripts and CI
+forge i18n check                               # keys and plural forms each locale lacks; exit 1 when incomplete
+forge i18n check --json                        # the same report as JSON (schema_version 1)
 forge check && forge lint && forge test        # cargo check / clippy -D warnings / test
 forge test --lib orders -- --nocapture         # arguments replace the defaults and go to cargo test
 forge format                                   # cargo fmt --all
@@ -207,7 +210,7 @@ cargo run -- seed                              #   setup, seed: what the forge c
 ```
 
 The commands above that are not `new`, `generate`, `id`, `version`, `doctor`,
-`check`, `lint`, `test`, `format` or `build` run the generated application's own
+`i18n`, `check`, `lint`, `test`, `format` or `build` run the generated application's own
 subcommands: the CLI builds it with `cargo build --locked`, runs the binary it
 produced with your terminal and environment, and reads no database URL itself
 (`forge doctor` only describes it, redacted, and opens a TCP connection to its
@@ -441,6 +444,10 @@ Kubernetes and systemd deployment is covered in
   `x-csrf-token`, host-only cookie, `403` otherwise) with the `_method`
   override, one-shot flash messages, strict form decoding with field errors,
   and a `tests/http.rs` that proves the stack.
+- Translations: the layout, welcome, sign-in and scaffold pages read their
+  text from `config/locales/*.json` (English, plus Spanish or Brazilian
+  Portuguese with `--locale`), with a locale per request and
+  `forge i18n check` ([ADR 0037](docs/adr/0037-internationalization.md)).
 - `forge::App`: the framework owns the Tokio runtime, structured logging (JSON in
   production), SIGTERM/SIGINT graceful shutdown with a drain deadline, and the
   `/health`, `/health/live` and `/health/ready` routes.
@@ -529,6 +536,43 @@ sender.send(&message).await?;
 Credentials go only over verified TLS (or to a loopback relay with
 `FORGE_MAIL_ALLOW_PLAINTEXT=true`); production refuses the file sender and
 previews.
+
+## Translations
+
+Full-stack applications are translated like Rails I18n: JSON files in
+`config/locales`, `%{name}` interpolation, CLDR plural forms, a locale per
+request (the `locale` cookie, `Accept-Language`, then the default) and
+localized numbers and dates; the same files and rules as Forge-Go
+([docs/i18n.md](docs/i18n.md), [ADR 0037](docs/adr/0037-internationalization.md)).
+`forge new` ships the pages in English, Spanish and Brazilian Portuguese:
+
+```sh
+forge new hola --locale es -d none              # en.json + es.json, es is the default locale
+cd hola && cargo run &
+curl -s -H 'Accept-Language: en' http://127.0.0.1:3000/ | grep '<h1>'      # Welcome to hola
+curl -s -H 'Accept-Language: es' http://127.0.0.1:3000/ | grep '<h1>'      # Bienvenido a hola
+curl -s --cookie 'locale=en' -o /dev/null -D - http://127.0.0.1:3000/ | grep -i content-language   # en
+kill %1
+FORGE_I18N_DEFAULT_LOCALE=en cargo run          # a deployment's default (canonical spelling)
+
+cp config/locales/en.json config/locales/fr.json   # add a locale: rename the "en" key to "fr", translate
+forge i18n check                                   # what each locale lacks; exit 1 when incomplete
+forge i18n check --json                            # the same report for CI
+```
+
+In an application with a database (`forge new shop --locale es`), the
+sign-in pages are translated too and every scaffold writes its text:
+
+```sh
+forge generate scaffold post title:string --global   # config/locales/posts.en.json + posts.es.json (English text to translate)
+```
+
+Templates translate with `{{ layout.i18n.t("posts.index.title") }}`
+(`.with("name", value)`, `.count(n)`), `layout.i18n.l(&date, "short")`,
+`layout.i18n.number(n)` and `layout.i18n.locale()`; handlers with
+`site.i18n(&request).t("posts.flash.created").text()`, jobs and mailers with
+`forge::i18n::Translator::translate`. Plain keys are always HTML-escaped;
+only keys ending in `_html` are markup, with their arguments escaped.
 
 ## Rate limiting, caching and file storage
 
@@ -676,6 +720,7 @@ crates/
 ├── forge-db       # repository/transaction contracts, including tenant-scoped ports
 ├── forge-events   # integration events, transactional outbox, dispatcher, consumer inbox
 ├── forge-http     # HTTP server, routing, middleware, form/query decoding, limits
+├── forge-i18n     # translations: JSON catalogs, CLDR plurals, locale matching, number/date formats
 ├── forge-jobs     # durable PostgreSQL jobs, workers, cron schedules
 ├── forge-mail     # email: validated MIME, TLS-enforcing SMTP, file/test senders, previews
 ├── forge-ratelimit # fixed-window limiter: memory and shared stores, fail-closed middleware
@@ -747,6 +792,7 @@ Contribution rules:
 - [CLI reference](docs/cli.md)
 - [Jobs, schedules, outbox and consumers](docs/jobs.md)
 - [Mail: SMTP, templates, previews and reset emails](docs/mail.md)
+- [Internationalization: translations, plurals, locales](docs/i18n.md)
 - [Deployment](docs/deployment.md)
 - [Observability: traces, metrics and logs](docs/observability.md)
 - [Rate limiting](docs/rate-limiting.md), [caching](docs/caching.md) and [file storage](docs/storage.md)

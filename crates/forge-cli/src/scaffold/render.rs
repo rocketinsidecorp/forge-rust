@@ -125,13 +125,15 @@ pub(crate) struct File {
 
 /// Every file of `resource` for `backend`, in a stable order. `migration`
 /// is the version prefix of the migration pair; `access` adds the shared
-/// access-policy module.
+/// access-policy module; `locales` are the locales whose
+/// `config/locales/PLURAL.LOCALE.json` is written with the English text.
 pub(crate) fn files(
     resource: &Resource,
     backend: Backend,
     migration: &str,
     access: bool,
     broadcast: Broadcast,
+    locales: &[String],
 ) -> Vec<File> {
     let renderer = Renderer::new(resource, backend, broadcast.enabled);
     let singular = &resource.singular;
@@ -170,6 +172,12 @@ pub(crate) fn files(
     }
     if broadcast.enabled {
         files.push(renderer.file(format!("templates/{plural}/_row.html"), ROW_PARTIAL));
+    }
+    for locale in locales {
+        files.push(File {
+            path: format!("config/locales/{plural}.{locale}.json"),
+            content: renderer.translations(locale),
+        });
     }
     files.push(renderer.file(format!("tests/{plural}_http.rs"), TESTS_HTTP));
     files.push(renderer.file(format!("tests/{plural}_repository.rs"), TESTS_REPOSITORY));
@@ -1234,12 +1242,109 @@ impl<'a> Renderer<'a> {
 
     // ---------------------------------------------------------- templates
 
+    /// `config/locales/PLURAL.LOCALE.json`: the English text of the pages
+    /// and messages under `locale` (en, or the application's default locale,
+    /// where it is the text to translate). `forge i18n check` lists what
+    /// other locales lack.
+    fn translations(&self, locale: &str) -> String {
+        use serde_json::{Map, Value, json};
+
+        let noun = words(&self.resource.singular);
+        let nouns = words(&self.resource.plural);
+        let label = sentence_case(&self.resource.singular);
+        let labels = sentence_case(&self.resource.plural);
+        let mut fields = Map::new();
+        for field in self.fields() {
+            fields.insert(field.name.clone(), Value::from(sentence_case(&field.name)));
+        }
+        let mut form = Map::new();
+        form.insert("create".to_owned(), json!(format!("Create {noun}")));
+        form.insert("update".to_owned(), json!(format!("Update {noun}")));
+        form.insert(
+            "no_version".to_owned(),
+            json!("The form has no valid version; reload the page."),
+        );
+        if self.has(FieldType::Timestamp) {
+            form.insert("utc".to_owned(), json!("(UTC)"));
+        }
+        if self
+            .fields()
+            .any(|field| field.kind == FieldType::Boolean && field.optional)
+        {
+            form.insert("not_set".to_owned(), json!("Not set"));
+            form.insert("yes".to_owned(), json!("Yes"));
+            form.insert("no".to_owned(), json!("No"));
+        }
+        let scope = json!({
+            "back": format!("Back to {nouns}"),
+            "fields": fields,
+            "form": form,
+            "index": {
+                "title": labels,
+                "new": format!("New {noun}"),
+                "actions": "Actions",
+                "empty": format!("No {nouns} yet."),
+                "next_page": "Next page",
+                "show": "Show",
+                "edit": "Edit",
+            },
+            "show": {
+                "title": label,
+                "delete": format!("Delete {noun}"),
+                "confirm_delete": format!("Delete this {noun}?"),
+            },
+            "new": {"title": format!("New {noun}")},
+            "edit": {
+                "title": format!("Editing {noun}"),
+                "conflict": format!(
+                    "This {noun} was changed by someone else after you opened the form. \
+                     Review your changes and save again to overwrite."
+                ),
+            },
+            "not_found": {
+                "title": format!("{label} not found"),
+                "message": format!("The {noun} does not exist or was deleted."),
+            },
+            "flash": {
+                "created": format!("{label} was successfully created."),
+                "updated": format!("{label} was successfully updated."),
+                "deleted": format!("{label} was successfully deleted."),
+                "stale": format!(
+                    "This {noun} was changed by someone else. Review it and delete it again."
+                ),
+                "no_version": "The delete form has no valid version; reload the page.",
+            },
+        });
+        let mut plural = Map::new();
+        plural.insert(self.resource.plural.clone(), scope);
+        let mut root = Map::new();
+        root.insert(locale.to_owned(), Value::Object(plural));
+        // Serializing a map of strings cannot fail.
+        let text = serde_json::to_string_pretty(&Value::Object(root)).unwrap_or_default();
+        format!("{text}\n")
+    }
+
+    /// `{{ layout.i18n.t("posts.fields.title") }}`.
+    fn field_label(&self, field: &Field, i18n: &str) -> String {
+        format!(
+            "{{{{ {i18n}.t(\"{}.fields.{}\") }}}}",
+            self.resource.plural, field.name
+        )
+    }
+
+    fn text(&self, key: &str) -> String {
+        format!(
+            "{{{{ layout.i18n.t(\"{}.{key}\") }}}}",
+            self.resource.plural
+        )
+    }
+
     fn index_headers(&self) -> String {
         self.fields()
             .map(|field| {
                 format!(
                     "      <th scope=\"col\">{}</th>",
-                    sentence_case(&field.name)
+                    self.field_label(field, "layout.i18n")
                 )
             })
             .collect::<Vec<_>>()
@@ -1259,7 +1364,7 @@ impl<'a> Renderer<'a> {
             .map(|field| {
                 format!(
                     "  <dt>{}</dt>\n  <dd>{{{{ {singular}.{} }}}}</dd>",
-                    sentence_case(&field.name),
+                    self.field_label(field, "layout.i18n"),
                     field.name
                 )
             })
@@ -1273,9 +1378,10 @@ impl<'a> Renderer<'a> {
             .map(|field| {
                 let name = &field.name;
                 let id = format!("{singular}_{name}");
-                let mut label = sentence_case(name);
+                let mut label = self.field_label(field, "layout.i18n");
                 if field.kind == FieldType::Timestamp {
-                    label.push_str(" (UTC)");
+                    label.push(' ');
+                    label.push_str(&self.text("form.utc"));
                 }
                 let input = match (field.kind, field.optional) {
                     (FieldType::String, _) => format!(
@@ -1292,10 +1398,13 @@ impl<'a> Renderer<'a> {
                     ),
                     (FieldType::Boolean, true) => format!(
                         "<select id=\"{id}\" name=\"{name}\">\n      \
-                         <option value=\"\">Not set</option>\n      \
-                         <option value=\"true\"{{% if form.{name} == \"true\" %}} selected{{% endif %}}>Yes</option>\n      \
-                         <option value=\"false\"{{% if form.{name} == \"false\" %}} selected{{% endif %}}>No</option>\n    \
-                         </select>"
+                         <option value=\"\">{}</option>\n      \
+                         <option value=\"true\"{{% if form.{name} == \"true\" %}} selected{{% endif %}}>{}</option>\n      \
+                         <option value=\"false\"{{% if form.{name} == \"false\" %}} selected{{% endif %}}>{}</option>\n    \
+                         </select>",
+                        self.text("form.not_set"),
+                        self.text("form.yes"),
+                        self.text("form.no"),
                     ),
                     (FieldType::Timestamp, _) => format!(
                         "<input type=\"datetime-local\" id=\"{id}\" name=\"{name}\" value=\"{{{{ form.{name} }}}}\" step=\"1\">"
@@ -1307,7 +1416,7 @@ impl<'a> Renderer<'a> {
                 format!(
                     "  <div>\n    <label for=\"{id}\">{label}</label>\n    {input}\n    \
                      {{% if let Some(message) = errors.get(\"{name}\") %}}<p class=\"flash flash-alert\" role=\"alert\">{} {{{{ message }}}}</p>{{% endif %}}\n  </div>",
-                    sentence_case(name)
+                    self.field_label(field, "layout.i18n")
                 )
             })
             .collect::<Vec<_>>()
