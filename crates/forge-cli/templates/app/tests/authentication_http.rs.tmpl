@@ -17,7 +17,11 @@ use forge::auth::{
     PasswordResetTokenDigest, Session, SessionCredentialDigest, SessionId, SessionStore,
     SessionStoreError, ThrottleConfig, UnixTimestamp,
 };
-use forge::http::{HeaderMap, HeaderValue, Method, Request, Response, Router, StatusCode, header};
+use forge::config::TrustedProxy;
+use forge::http::{
+    HeaderMap, HeaderValue, Method, Request, Response, Router, StatusCode, TrustedProxies,
+    X_FORWARDED_FOR, header,
+};
 use forge::security::{PrincipalId, Role};
 use forge::tenancy::{
     AccountStoreError, Membership, MembershipState, MembershipStore, MembershipStoreError,
@@ -406,9 +410,21 @@ fn fixture_with(deliver_fails: bool, pair_limit: u32) -> Result<Fixture, Box<dyn
 #[derive(Clone, Default)]
 struct Browser {
     cookies: HashMap<String, String>,
+    /// The reverse proxy the requests come through and the
+    /// `X-Forwarded-For` it sends; `None` connects from 127.0.0.1 directly.
+    via: Option<(&'static str, &'static str)>,
 }
 
 impl Browser {
+    /// A browser whose requests reach the application from `peer` with
+    /// `X-Forwarded-For: forwarded_for`.
+    fn via(peer: &'static str, forwarded_for: &'static str) -> Self {
+        Self {
+            via: Some((peer, forwarded_for)),
+            ..Self::default()
+        }
+    }
+
     fn keep(&mut self, response: &Response) {
         for value in response.headers().get_all(header::SET_COOKIE) {
             let Ok(value) = value.to_str() else { continue };
@@ -446,12 +462,19 @@ impl Browser {
                 .collect();
             headers.insert(header::COOKIE, HeaderValue::from_str(&cookies.join("; "))?);
         }
+        let peer = match self.via {
+            Some((peer, forwarded_for)) => {
+                headers.insert(X_FORWARDED_FOR, HeaderValue::from_static(forwarded_for));
+                peer
+            }
+            None => "127.0.0.1:4000",
+        };
         Ok(Request::new_for_test(
             method,
             uri.parse()?,
             headers,
             body.to_owned().into(),
-            "127.0.0.1:4000".parse()?,
+            peer.parse()?,
             forge::core::Id::<Request>::new().into_uuid(),
         ))
     }
@@ -681,6 +704,67 @@ async fn attempts_are_throttled_even_with_the_right_password() -> TestResult {
     );
     assert!(browser.cookie("__Host-forge_session").is_none());
     Ok(())
+}
+
+#[tokio::test]
+async fn clients_behind_one_trusted_proxy_have_their_own_sign_in_counters() -> TestResult {
+    let mut fixture = fixture()?;
+    // What the server does for FORGE_HTTP_TRUSTED_PROXIES=172.18.0.0/16.
+    fixture.router.layer(TrustedProxies::new([
+        "172.18.0.0/16".parse::<TrustedProxy>()?
+    ]));
+    let proxy = "172.18.0.2:5000";
+
+    let mut guesser = Browser::via(proxy, "203.0.113.9");
+    for _ in 0..3 {
+        let response = browser_sign_in(&mut guesser, &fixture.router, "wrong password!").await?;
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+    assert_eq!(
+        browser_sign_in(&mut guesser, &fixture.router, PASSWORD)
+            .await?
+            .status(),
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    // Entries the guesser writes left of the proxy's own do not escape its
+    // counter.
+    let mut forging = Browser::via(proxy, "198.51.100.7, 203.0.113.9");
+    assert_eq!(
+        browser_sign_in(&mut forging, &fixture.router, PASSWORD)
+            .await?
+            .status(),
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    // A client that connects directly cannot claim another client's address:
+    // it spends its own (peer) counter.
+    let mut direct = Browser::via("198.51.100.20:4000", "198.51.100.7");
+    for _ in 0..3 {
+        let response = browser_sign_in(&mut direct, &fixture.router, "wrong password!").await?;
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+    assert_eq!(
+        browser_sign_in(&mut direct, &fixture.router, PASSWORD)
+            .await?
+            .status(),
+        StatusCode::TOO_MANY_REQUESTS
+    );
+
+    // The owner behind the same proxy still signs in.
+    let mut owner = Browser::via(proxy, "198.51.100.7");
+    let response = browser_sign_in(&mut owner, &fixture.router, PASSWORD).await?;
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert!(owner.cookie("__Host-forge_session").is_some());
+    Ok(())
+}
+
+async fn browser_sign_in(
+    browser: &mut Browser,
+    router: &Router,
+    password: &str,
+) -> Result<Response, Box<dyn Error>> {
+    browser
+        .sign_in(router, "acme", "ada@example.com", password)
+        .await
 }
 
 #[tokio::test]

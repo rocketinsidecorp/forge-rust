@@ -24,7 +24,7 @@ use forge::{
     App, ComposeError,
     cache::{MemoryCache, MemoryOptions as CacheOptions, fetch, key},
     http::{Method, Request, Response, StatusCode},
-    ratelimit::{Limit, MemoryLimiter, MemoryOptions as LimiterOptions, RateLimit, by_remote_addr},
+    ratelimit::{Limit, MemoryLimiter, MemoryOptions as LimiterOptions, RateLimit, by_client_ip},
     storage::{
         DiskStorage, HandlerOptions, SignOptions, Signer, Storage, StorageHandler, UploadOptions,
         receive,
@@ -46,7 +46,7 @@ fn main() -> ExitCode {
                 limiter,
                 "comments.create",
                 Limit::new(3, Duration::from_secs(60)).map_err(ComposeError::other)?,
-                by_remote_addr,
+                by_client_ip,
             )
             .map_err(ComposeError::other)?;
 

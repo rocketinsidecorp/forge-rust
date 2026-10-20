@@ -197,6 +197,19 @@ transaction with `FORGE_MIGRATION_DATABASE_URL`; keep it idempotent.
 Configuration uses `FORGE_*` environment variables; unknown `FORGE_*` keys are
 rejected at startup. Run `cargo run -- help` for the full list.
 
+Behind a reverse proxy (nginx, Traefik, a load balancer), list its networks in
+`FORGE_HTTP_TRUSTED_PROXIES` so throttles, rate limits and live-update caps
+count each client (`Request::client_ip`) instead of the proxy. Empty, the
+default, trusts nobody; `/0`, IPv4 prefixes shorter than `/8`, IPv6 prefixes
+shorter than `/16` and malformed entries stop startup. Only `X-Forwarded-For`
+from a listed peer is read, from the right; keep the application port
+reachable only through the proxy:
+
+```bash
+export FORGE_HTTP_TRUSTED_PROXIES=172.30.0.0/24,fd00:1::/64   # proxy CIDRs or addresses
+cargo run
+```
+
 %%if docker%%
 ## Container
 

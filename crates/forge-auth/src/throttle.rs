@@ -2,9 +2,10 @@
 //!
 //! Every syntactically valid attempt is counted before credentials are
 //! checked, against three counters: the account (the canonical login the
-//! attempt names, whatever else it names), the network source (the socket
-//! peer address, IPv6 by its /64 prefix; forwarded headers are not trusted)
-//! and the pair of both. The pair has the tight limit, so a guesser is
+//! attempt names, whatever else it names), the network source (the client
+//! address the HTTP server resolved, `Request::client_ip`: the socket peer
+//! unless it is a trusted proxy listed in `FORGE_HTTP_TRUSTED_PROXIES`, ADR
+//! 0032; IPv6 by its /64 prefix) and the pair of both. The pair has the tight limit, so a guesser is
 //! stopped quickly; the account alone has a higher cap, so guessing from
 //! many sources is still bounded while one source cannot lock a known login
 //! out for everyone; the source alone bounds password spraying. Keys are
@@ -44,9 +45,10 @@ impl ThrottleKey {
     /// `scope` separates independent limits (for example `"sign_in"` and
     /// `"password_reset"`); `account` is the canonical identity the attempt
     /// names (such as a [`CanonicalLogin`](crate::CanonicalLogin)), whether
-    /// or not it exists; `source` is the socket peer address. IPv6 sources
-    /// count per /64 prefix (one subscriber's allocation), IPv4-mapped IPv6
-    /// addresses as their IPv4 address.
+    /// or not it exists; `source` is the client address
+    /// (`forge_http::Request::client_ip`), never a header the caller reads
+    /// itself. IPv6 sources count per /64 prefix (one subscriber's
+    /// allocation), IPv4-mapped IPv6 addresses as their IPv4 address.
     #[must_use]
     pub fn new(scope: &str, account: &str, source: Option<IpAddr>) -> Self {
         let account_digest = digest(&[b"account", scope.as_bytes(), account.as_bytes()]);

@@ -5,8 +5,14 @@
 //! internals. This keeps the adapter replaceable and application code stable.
 
 use std::{
-    collections::HashMap, convert::Infallible, fmt, future::Future, net::SocketAddr, pin::Pin,
-    sync::Arc, time::Duration,
+    collections::HashMap,
+    convert::Infallible,
+    fmt,
+    future::Future,
+    net::{IpAddr, SocketAddr},
+    pin::Pin,
+    sync::Arc,
+    time::Duration,
 };
 
 use bytes::Bytes;
@@ -32,12 +38,14 @@ use uuid::Uuid;
 use crate::body::{OutgoingBody, ResponseBody};
 
 mod body;
+mod client_ip;
 mod encoding;
 mod form;
 mod io;
 mod query;
 mod routing;
 
+pub use client_ip::{MAX_FORWARDED_HOPS, TrustedProxies, X_FORWARDED_FOR};
 pub use form::{
     CSRF_FIELD_NAME, FORM_CONTENT_TYPE, FormError, FormErrorKind, MAX_FORM_FIELDS,
     METHOD_FIELD_NAME, RESERVED_FORM_FIELDS,
@@ -69,6 +77,8 @@ pub struct Request {
     body: Bytes,
     path_params: HashMap<String, String>,
     remote_addr: SocketAddr,
+    /// Set only by [`TrustedProxies::apply`].
+    client_ip: Option<IpAddr>,
     request_id: Uuid,
     extensions: Extensions,
 }
@@ -98,10 +108,28 @@ impl Request {
         &self.body
     }
 
-    /// Peer address observed by the TCP listener.
+    /// Peer address observed by the TCP listener. Behind a reverse proxy
+    /// this is the proxy; per-client counters use [`Request::client_ip`].
     #[must_use]
     pub fn remote_addr(&self) -> SocketAddr {
         self.remote_addr
+    }
+
+    /// The client address (ADR 0032): the TCP peer, unless the peer is a
+    /// trusted proxy listed in `FORGE_HTTP_TRUSTED_PROXIES`, in which case it
+    /// is the first untrusted `X-Forwarded-For` entry read from the right
+    /// (see [`TrustedProxies::resolve`]). The [`Server`] resolves it before
+    /// any [`Middleware`] runs; when no resolver ran (a [`Router`] dispatched
+    /// directly) it is the peer, the same as trusting nobody. A client that
+    /// reaches the application directly cannot choose it.
+    ///
+    /// Sign-in and reset throttles, rate limits and the live-update stream
+    /// cap count clients by it. It is a full, canonical address (no zone,
+    /// IPv4-mapped IPv6 as IPv4); counters bucket IPv6 by `/64` themselves.
+    #[must_use]
+    pub fn client_ip(&self) -> IpAddr {
+        self.client_ip
+            .unwrap_or_else(|| self.remote_addr.ip().to_canonical())
     }
 
     /// Server-generated UUIDv7 correlation identifier.
@@ -150,6 +178,7 @@ impl Request {
             body,
             path_params: HashMap::new(),
             remote_addr,
+            client_ip: None,
             request_id,
             extensions: Extensions::new(),
         }
@@ -645,18 +674,25 @@ pub enum RouteError {
 /// HTTP server with bounded requests and owned connection tasks.
 pub struct Server {
     config: ServerConfig,
-    router: Arc<Router>,
+    app: Arc<ServedApp>,
     /// [`MIN_WRITE_STALL_TIMEOUT`]; lowered only by tests.
     min_write_stall: Duration,
 }
 
 impl Server {
     /// Creates a server from validated configuration and a frozen router.
+    ///
+    /// Every request's [`Request::client_ip`] is resolved with
+    /// [`ServerConfig::trusted_proxies`] before the first [`Middleware`]
+    /// runs.
     #[must_use]
     pub fn new(config: ServerConfig, router: Router) -> Self {
         Self {
+            app: Arc::new(ServedApp {
+                trusted_proxies: TrustedProxies::new(config.trusted_proxies.iter().copied()),
+                router,
+            }),
             config,
-            router: Arc::new(router),
             min_write_stall: MIN_WRITE_STALL_TIMEOUT,
         }
     }
@@ -772,7 +808,7 @@ impl Server {
         permit: OwnedSemaphorePermit,
         cancellation: CancellationToken,
     ) {
-        let router = Arc::clone(&self.router);
+        let app = Arc::clone(&self.app);
         let max_body_bytes = self.config.max_body_bytes;
         let request_timeout = self.config.request_timeout;
         let write_stall = write_stall_timeout(request_timeout, self.min_write_stall);
@@ -780,7 +816,7 @@ impl Server {
             serve_connection(
                 stream,
                 remote_addr,
-                router,
+                app,
                 max_body_bytes,
                 request_timeout,
                 write_stall,
@@ -805,10 +841,16 @@ fn log_connection_result(completed: Result<(), JoinError>) {
     }
 }
 
+/// What every connection of a [`Server`] shares.
+struct ServedApp {
+    router: Router,
+    trusted_proxies: TrustedProxies,
+}
+
 async fn serve_connection(
     stream: tokio::net::TcpStream,
     remote_addr: SocketAddr,
-    router: Arc<Router>,
+    app: Arc<ServedApp>,
     max_body_bytes: usize,
     request_timeout: Duration,
     write_stall: Duration,
@@ -818,7 +860,7 @@ async fn serve_connection(
         handle_request(
             request,
             remote_addr,
-            Arc::clone(&router),
+            Arc::clone(&app),
             max_body_bytes,
             request_timeout,
         )
@@ -851,7 +893,7 @@ async fn serve_connection(
 async fn handle_request(
     request: hyper::Request<Incoming>,
     remote_addr: SocketAddr,
-    router: Arc<Router>,
+    app: Arc<ServedApp>,
     max_body_bytes: usize,
     request_timeout: Duration,
 ) -> Result<hyper::Response<OutgoingBody>, Infallible> {
@@ -868,17 +910,20 @@ async fn handle_request(
                 Ok(body) => body,
                 Err(rejection) => return rejection.into_response(),
             };
-            let request = Request {
+            let mut request = Request {
                 method: parts.method,
                 uri: parts.uri,
                 headers: parts.headers,
                 body,
                 path_params: HashMap::new(),
                 remote_addr,
+                client_ip: None,
                 request_id,
                 extensions: Extensions::new(),
             };
-            router.dispatch(request).await
+            // The client address is resolved once, outside every layer.
+            app.trusted_proxies.apply(&mut request);
+            app.router.dispatch(request).await
         };
         let response = match tokio::time::timeout(request_timeout, exchange).await {
             Ok(response) => response,
@@ -978,6 +1023,7 @@ mod tests {
             body: Bytes::new(),
             path_params: HashMap::new(),
             remote_addr: "127.0.0.1:4000".parse().expect("valid test address"),
+            client_ip: None,
             request_id: Uuid::now_v7(),
             extensions: Extensions::new(),
         }
@@ -1440,6 +1486,7 @@ mod tests {
             shutdown_grace: Duration::from_secs(30),
             max_body_bytes: 64,
             max_connections: 16,
+            trusted_proxies: Vec::new(),
         }
     }
 
@@ -1500,6 +1547,68 @@ mod tests {
             received.extend_from_slice(&buffer[..read]);
         }
         String::from_utf8_lossy(&received).into_owned()
+    }
+
+    /// Answers with the client address the first layer saw.
+    struct SeenByFirstLayer;
+
+    impl Middleware for SeenByFirstLayer {
+        fn handle<'a>(&'a self, mut request: Request, next: Next<'a>) -> BoxResponseFuture<'a> {
+            let seen = request.client_ip();
+            request.extensions_mut().insert(seen);
+            next.run(request)
+        }
+    }
+
+    fn client_ip_router() -> Router {
+        let mut router = Router::new();
+        router.layer(SeenByFirstLayer);
+        router
+            .route(Method::GET, "/ip", |request: Request| async move {
+                let seen = request.extensions().get::<IpAddr>().copied();
+                Response::new(
+                    StatusCode::OK,
+                    format!("first-layer={seen:?} handler={}", request.client_ip()),
+                )
+            })
+            .expect("ip route must register");
+        router
+    }
+
+    #[tokio::test]
+    async fn server_resolves_the_client_from_trusted_proxies_only_before_every_layer() {
+        let raw = "GET /ip HTTP/1.1\r\nHost: localhost\r\nX-Forwarded-For: 1.2.3.4, 203.0.113.9\r\nX-Real-IP: 198.51.100.1\r\nConnection: close\r\n\r\n";
+
+        // The test client connects from 127.0.0.1; trusting it believes the
+        // header, and the first layer already sees the resolved client.
+        let mut trusting = test_config(Duration::from_secs(10));
+        trusting.trusted_proxies = vec!["127.0.0.0/8".parse().expect("valid network")];
+        let server = TestServer::start(trusting, client_ip_router()).await;
+        let response = exchange(server.addr, raw).await;
+        assert!(
+            response.contains("first-layer=Some(203.0.113.9) handler=203.0.113.9"),
+            "{response}"
+        );
+        server.stop().await;
+
+        // Negative: the default trusts nobody, so a client that connects
+        // directly cannot choose its address with any forwarding header.
+        let server =
+            TestServer::start(test_config(Duration::from_secs(10)), client_ip_router()).await;
+        let response = exchange(server.addr, raw).await;
+        assert!(
+            response.contains("first-layer=Some(127.0.0.1) handler=127.0.0.1"),
+            "{response}"
+        );
+        server.stop().await;
+
+        // Negative: a trusted network that does not contain the peer.
+        let mut elsewhere = test_config(Duration::from_secs(10));
+        elsewhere.trusted_proxies = vec!["10.0.0.0/8".parse().expect("valid network")];
+        let server = TestServer::start(elsewhere, client_ip_router()).await;
+        let response = exchange(server.addr, raw).await;
+        assert!(response.contains("handler=127.0.0.1"), "{response}");
+        server.stop().await;
     }
 
     #[tokio::test]

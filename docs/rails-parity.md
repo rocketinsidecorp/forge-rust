@@ -20,6 +20,7 @@ the work is finished and waiting for its review; **Planned** means not started.
 | Persistent jobs, cron, outbox | Solid Queue | Done | Done (framework crates; `forge new` wiring planned) |
 | Mailer with previews | Action Mailer | Done | Planned |
 | Rate limiting | `rate_limit` | Done | Done |
+| Client address behind trusted proxies | `request.remote_ip`, `trusted_proxies` | Done (`FORGE_HTTP_TRUSTED_PROXIES`, ADR 0037) | Done (`FORGE_HTTP_TRUSTED_PROXIES`, ADR 0032; `forge deploy` sets it once ported) |
 | Cache | Solid Cache | Done | Done |
 | File storage with signed URLs | Active Storage | Done (disk) | Done (disk) |
 | Import maps, Turbo, Stimulus | Hotwire | In review | Done |

@@ -3,6 +3,7 @@
 - Status: Accepted
 - Date: 2026-10-19
 - Refines: [ADR 0013](0013-persistent-principals-sessions-and-memberships.md), [ADR 0014](0014-argon2-session-cookie-and-csrf.md), [ADR 0023](0023-form-csrf-flash-and-method-override.md), [ADR 0024](0024-scaffold-generator.md)
+- Refined by: [ADR 0032](0032-trusted-proxies-and-client-ip.md) (throttle source is the resolved client address)
 
 ## Context
 

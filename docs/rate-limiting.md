@@ -25,14 +25,14 @@ Forge:
 
 ```rust
 use std::{sync::Arc, time::Duration};
-use forge::ratelimit::{Limit, MemoryLimiter, MemoryOptions, RateLimit, by_remote_addr};
+use forge::ratelimit::{Limit, MemoryLimiter, MemoryOptions, RateLimit, by_client_ip};
 
 let limiter = Arc::new(MemoryLimiter::new(MemoryOptions::from_config(&config.rate_limit))?);
 let create = RateLimit::new(
     limiter,
     "comments.create",                              // scope: what the limit protects
     Limit::new(10, Duration::from_secs(180))?,      // 10 requests per 3 minutes
-    by_remote_addr,
+    by_client_ip,                                   // the client, also behind a trusted proxy
 )?;
 
 // one route:
@@ -71,19 +71,33 @@ through (and logs a warning) for routes where availability matters more.
 The key function (`Fn(&Request) -> String`) result is hashed before it reaches
 a store (no addresses or identifiers at rest).
 
-`by_remote_addr` uses the **TCP peer address** only. IPv4 addresses are used
-whole; IPv6 addresses are reduced to their `/64`, because one subscriber
-controls the whole prefix and could otherwise rotate addresses at will. It
-**never reads `X-Forwarded-For`, `X-Real-IP` or `Forwarded`**: those headers
-are client-controlled unless a proxy overwrites them, and Forge has no
-trusted-proxy policy yet.
+`by_client_ip` keys by `Request::client_ip()`, the client address the HTTP
+server resolved ([ADR 0032](adr/0032-trusted-proxies-and-client-ip.md)): the
+TCP peer, unless the peer is a reverse proxy listed in
+`FORGE_HTTP_TRUSTED_PROXIES`; then it is the first address of
+`X-Forwarded-For`, read from the right, that is not a listed proxy. A client
+that connects directly cannot choose it, and `Forwarded` and `X-Real-IP` are
+never read. `by_remote_addr` is always the TCP peer, whatever the trusted
+proxies. Both use IPv4 addresses whole and reduce IPv6 addresses to their
+`/64`, because one subscriber controls the whole prefix and could otherwise
+rotate addresses at will.
 
-| Deployment | `by_remote_addr` | What to do |
+| Deployment | `by_client_ip` | What to do |
 | --- | --- | --- |
 | Direct (TLS in the application) | the client | nothing |
-| Behind a proxy / load balancer | **the proxy**: every client shares one bucket | key by an authenticated value, or by a header your proxy sets |
+| Behind a proxy / load balancer | **the proxy** until configured: every client shares one bucket | `FORGE_HTTP_TRUSTED_PROXIES=<proxy CIDRs>` |
 
-Key by something the application has authenticated whenever possible:
+```sh
+export FORGE_HTTP_TRUSTED_PROXIES=10.0.0.0/24   # your load balancer's subnet
+```
+
+List only proxy networks and keep the application reachable only through
+them: anything inside a listed network can claim any client address. Empty
+(the default) trusts nobody; `/0` and prefixes broader than IPv4 `/8` or
+IPv6 `/16` stop startup ([deployment](deployment.md#client-addresses-behind-a-proxy)).
+
+Keying by something the application has authenticated is still stronger
+where there is one:
 
 ```rust
 let by_principal = |request: &Request| match request.extensions().get::<Principal>() {
@@ -92,11 +106,9 @@ let by_principal = |request: &Request| match request.extensions().get::<Principa
 };
 ```
 
-If you must key by client address behind a proxy, write the key function
-yourself, read the single header your proxy **overwrites** (not appends), and
-only do so when the proxy is the only network path to the application
-(firewall the container port). A key function that trusts a header the client
-can set lets one client use unlimited keys and bypass the limit entirely.
+Never write a key function that reads a forwarding header yourself: a key
+the client can set lets one client use unlimited keys and bypass the limit
+entirely. `by_client_ip` reads `X-Forwarded-For` only from listed proxies.
 
 ## Stores
 

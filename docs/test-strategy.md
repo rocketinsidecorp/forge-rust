@@ -315,3 +315,25 @@ The SQLite suites always run. PostgreSQL, MySQL and MariaDB suites are
 `#[ignore]`d unless requested with `-- --include-ignored` and
 `FORGE_TEST_DATABASE_URL`, `FORGE_TEST_MYSQL_URL` or `FORGE_TEST_MARIADB_URL`
 (the same convention as `forge-db`).
+
+## Client address tests
+
+The trusted-proxy resolver (ADR 0032) mirrors the Forge-Go ADR 0037 tests:
+
+- **Configuration:** empty by default; masked parsing; the `/8` and `/16`
+  minimums accepted; empty, malformed, zoned, IPv4-mapped, `/0` and too broad
+  entries refused by position without echoing the value, also through
+  `TrustedProxy::new` and deserialization.
+- **Resolver:** the Forge-Go resolution table (untrusted peers, appending
+  proxies, trusted chains over several header lines, malformed entries,
+  zones, IPv4-mapped forms), the 32-hop limit, `X-Real-IP` and `Forwarded`
+  never read, and a deterministic generated property test (no proptest
+  dependency: an xorshift generator over 20 000 chains) asserting the result
+  is always the peer or an entry of the header.
+- **Server and consumers:** a real server resolves before its first layer and
+  ignores headers from untrusted peers; `by_client_ip`, the stream cap and a
+  sign-in throttle over TCP (`crates/forge/tests/client_ip.rs`) give two
+  clients behind one proxy independent counters, keep forged prefixes and
+  direct forgers in their own counters, and group IPv6 by `/64`; the
+  generated `clients_behind_one_trusted_proxy_have_their_own_sign_in_counters`
+  does the same through the real sign-in pages.

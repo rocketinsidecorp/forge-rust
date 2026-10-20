@@ -205,6 +205,31 @@ on `127.0.0.1:3000` only:
 docker compose up --build
 ```
 
+### Client addresses behind a proxy
+
+Sign-in and reset throttles, `forge::ratelimit::by_client_ip` and the
+anonymous live-update stream cap count `Request::client_ip()`: the TCP peer,
+unless the peer is a reverse proxy listed in `FORGE_HTTP_TRUSTED_PROXIES`;
+then it is the first untrusted `X-Forwarded-For` entry read from the right
+([ADR 0032](docs/adr/0032-trusted-proxies-and-client-ip.md)). Empty, the
+default, trusts nobody, so behind a proxy every client shares the proxy's
+budget until you list it. `/0`, IPv4 prefixes shorter than `/8`, IPv6
+prefixes shorter than `/16`, IPv4-mapped prefixes and malformed entries stop
+startup; `Forwarded` and `X-Real-IP` are never read.
+
+```sh
+export FORGE_HTTP_TRUSTED_PROXIES=10.0.0.0/24,fd00:1::/64   # proxy CIDRs or addresses
+cargo run
+docker network create --subnet 172.30.0.0/24 edge   # the proxy joins it too
+docker run --rm --network edge -e FORGE_HTTP_TRUSTED_PROXIES=172.30.0.0/24 shop   # no -p: only the proxy reaches it
+FORGE_HTTP_TRUSTED_PROXIES=0.0.0.0/0 cargo run -- healthcheck   # refused: entry 1 is too broad
+```
+
+List only proxy networks and keep the application port reachable only
+through them: anything inside a listed network can claim any client address.
+nginx, Traefik, Compose and Kubernetes setups are in the
+[deployment guide](docs/deployment.md#client-addresses-behind-a-proxy).
+
 > **Before the first tag:** generated applications depend on `forge` through the
 > Git tag `v<cli version>` (for example `v0.1.0`). Until that tag is pushed, the
 > dependency cannot resolve and `cargo run` fails in a freshly generated app.
@@ -393,7 +418,7 @@ The code behind each call (copy it into your composition root):
 ```rust
 // Rate limit one route (Rails: rate_limit to: 3, within: 1.minute, only: :create)
 let limiter = Arc::new(MemoryLimiter::new(MemoryOptions::from_config(&config.rate_limit))?);
-let limit = RateLimit::new(limiter, "comments.create", Limit::new(3, Duration::from_secs(60))?, by_remote_addr)?;
+let limit = RateLimit::new(limiter, "comments.create", Limit::new(3, Duration::from_secs(60))?, by_client_ip)?;
 router.route(Method::POST, "/comments", limit.wrap(create_comment))?;
 
 // Cache with stampede protection (shared PostgreSQL/MySQL/SQLite stores: docs/caching.md)
@@ -422,6 +447,20 @@ export FORGE_STORAGE_ROOT=/var/lib/shop/storage  # absolute in production
 export FORGE_STORAGE_SIGNING_KEY=$(openssl rand -base64 32 | tr '+/' '-_' | tr -d '=')
 export FORGE_STORAGE_MAX_UPLOAD_BYTES=524288     # must not exceed FORGE_MAX_BODY_BYTES
 export FORGE_STORAGE_LINK_TTL_SECS=900           # default signed link lifetime
+```
+
+Behind a reverse proxy, list it in `FORGE_HTTP_TRUSTED_PROXIES` so
+`by_client_ip`, the sign-in and reset throttles and the live-update stream
+cap count each client instead of the proxy (see
+[client addresses behind a proxy](#client-addresses-behind-a-proxy)). With
+the example above, restarted with `127.0.0.1` playing the proxy:
+
+```sh
+FORGE_HTTP_TRUSTED_PROXIES=127.0.0.1 FORGE_BIND=127.0.0.1:3000 cargo run -p forge --example services --features "ratelimit cache storage"
+# 201 201 201 429 for one client, then 201 for another client behind the same proxy
+for ip in 203.0.113.1 203.0.113.1 203.0.113.1 203.0.113.1 203.0.113.2; do
+  curl -s -o /dev/null -w '%{http_code} ' -X POST -H "X-Forwarded-For: $ip" http://127.0.0.1:3000/comments
+done; echo
 ```
 
 Shared stores need their tables: merge the crate migration into your own with

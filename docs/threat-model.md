@@ -219,7 +219,7 @@ commands, and the framework rules they rely on.
 
 | Threat | Control | Verification |
 | --- | --- | --- |
-| Online password guessing and credential stuffing | Attempts counted before any credential check against the canonical login (whatever organization or letter case is typed), the source (socket peer, IPv6 per /64) and the pair: 5 per login and source, 50 per login, 300 per source in 15 minutes (`MemoryLoginThrottle`); `429` with `Retry-After`; success clears the pair and login counters, not the source; Argon2id | `forge-auth` throttle tests; generated `attempts_are_throttled_even_with_the_right_password`, `letter_case_and_unicode_variants_do_not_get_fresh_guesses` |
+| Online password guessing and credential stuffing | Attempts counted before any credential check against the canonical login (whatever organization or letter case is typed), the source (`Request::client_ip`: the socket peer unless it is a proxy listed in `FORGE_HTTP_TRUSTED_PROXIES`, ADR 0032; IPv6 per /64) and the pair: 5 per login and source, 50 per login, 300 per source in 15 minutes (`MemoryLoginThrottle`); `429` with `Retry-After`; success clears the pair and login counters, not the source; Argon2id | `forge-auth` throttle tests; generated `attempts_are_throttled_even_with_the_right_password`, `letter_case_and_unicode_variants_do_not_get_fresh_guesses`, `clients_behind_one_trusted_proxy_have_their_own_sign_in_counters` |
 | Throttle as a denial of service | One source cannot lock a login out for others (the tight limit is per login and source); a full table evicts the oldest idle counters instead of refusing everyone, and keeps blocking ones | `one_source_cannot_lock_a_login_out_for_other_sources`, `a_full_table_evicts_idle_counters_and_keeps_blocking_ones` |
 | Look-alike (Unicode) logins | `CanonicalLogin` refuses non-ASCII logins at the boundary (storage, lookup, throttle keys); reset links are delivered to the login as stored, never as typed | `forge-auth` login tests; `reset_links_go_to_the_stored_login_and_look_alikes_get_nothing` |
 | Timing oracle on reset requests and sign-in | Reset requests are queued to a bounded lifecycle-owned worker and answered after at least 100 ms; sign-in runs the tenant and membership lookups with random identifiers for malformed or unknown organizations; unknown reset tokens are refused before Argon2id | `reset_requests_take_the_same_minimum_time`, `sign_in_looks_up_a_membership_whatever_the_organization`, `unknown_reset_tokens_are_refused_before_hashing` |
@@ -232,9 +232,10 @@ commands, and the framework rules they rely on.
 | Signed-out browser leaks a protected page | Access policies answer `401`; `SignInRedirect` turns it into a `303` to sign in for HTML clients only; JSON keeps `401` | `forge-views` sign-in redirect tests; `signed_out_browsers_are_sent_to_sign_in_and_api_clients_get_401`; slow scaffold e2e |
 
 Residual risks: throttle counters live in one process (a restart or several
-replicas multiply the budget; a shared store is a follow-up); the source key
-is the socket peer, so clients behind one proxy share a budget and Forge does
-not trust `X-Forwarded-For`; an attacker who controls 50 sources (or /64s)
+replicas multiply the budget; a shared store is a follow-up); behind a
+reverse proxy clients share one source budget until `FORGE_HTTP_TRUSTED_PROXIES`
+lists the proxy, and anything inside a listed network can choose its source
+(see the trusted-proxy review below); an attacker who controls 50 sources (or /64s)
 can still keep one known login throttled for 15 minutes at a time, and one
 with very many sources can fill the table with blocking counters, after
 which new attempts are refused until counters expire; a full reset queue
@@ -285,7 +286,7 @@ same unless a difference is stated.
 
 | Threat | STRIDE | Control | Verification |
 | --- | --- | --- | --- |
-| Limiter key spoofing: a client rotates a forwarded header or address to get a fresh bucket per request | S, D | `by_remote_addr` uses only the TCP peer address, never `X-Forwarded-For`, `X-Real-IP` or `Forwarded`; IPv6 clients are keyed by `/64`. The key function documents that its result must not be client-chosen. **Residual:** behind a reverse proxy every client shares the proxy's bucket until the application keys by an authenticated value or its own proxy-overwritten header; Forge has no trusted-proxy policy yet | spoofed-header test proves the limit holds; `/64` test |
+| Limiter key spoofing: a client rotates a forwarded header or address to get a fresh bucket per request | S, D | `by_client_ip` uses `Request::client_ip` (ADR 0032): `X-Forwarded-For` only from a peer listed in `FORGE_HTTP_TRUSTED_PROXIES`, read from the right; `by_remote_addr` uses only the TCP peer; `X-Real-IP` and `Forwarded` are never read; IPv6 clients are keyed by `/64`. The key function documents that its result must not be client-chosen. **Residual:** behind an unlisted reverse proxy every client shares the proxy's bucket; anything inside a listed network can choose its key | spoofed-header test proves the limit holds; `direct_clients_cannot_choose_their_client_ip_bucket`, `clients_behind_a_trusted_proxy_get_their_own_buckets`; `/64` tests |
 | Limiter memory exhaustion by distinct keys | D | `MemoryLimiter` is bounded by `max_keys` (deadline-ordered expiry, no task); `EvictSoonest` never refuses new clients, `Deny` never drops a counter; counters saturate. Shared stores keep one 64-character-key row per live bucket and prune in bounded batches after every `prune_batch` hits. **Residual:** with `EvictSoonest`, more than `max_keys` distinct keys in one window can reset other clients' counters, so never key it on attacker-choosable per-target values (use `Deny` or a database limiter) | flood test keeps `len == max_keys`; `Deny` keeps counters; sustained-keys pruning test per backend |
 | Limiter bypass or outage when its store fails | D, E | The middleware fails closed (`503`); `fail_open` is an explicit per-route choice; limiter errors are logged server-side, never returned | fail-closed/open test; error text never contains SQL or keys |
 | Personal data in limiter storage | I | Keys are SHA-256 digests of length-prefixed (scope, window, identifier); addresses and e-mail addresses are never stored | key and recording-limiter tests |
@@ -328,7 +329,7 @@ difference is stated.
 | One person (or a proxy's shared address) exhausting the stream slots of everyone signed in behind it | D | `GlobalAccess::authorize` returns the principal it admitted; generated `Readers` serve global channels to `StreamViewer::principal` for signed-in callers, so each person has their own 16 streams, and only anonymous viewers of public resources are counted by address. Tenant channels are always counted by principal (`StreamViewer::member`). Older access modules that return `()` are refused by the scaffold with the change to make | generated `signed_in_viewers_from_one_address_each_have_their_own_stream_limit`; scaffold refusal unit test |
 | Script or field injection through broadcast content or stream targets | T | Targets are `DomId`s (`[A-Za-z][A-Za-z0-9_:-]*`), content comes from auto-escaping Askama views; SSE framing splits every line terminator into its own `data:` field, so a payload cannot end an event or add `id:`/`event:`/comment lines; the source element escapes its URL and the path is restricted | `events_frame_every_line_and_cannot_be_ended_early`, `dom_ids_reject_injection_attempts`, `from_view_escapes_user_data`, path validation test |
 | Request-bound secrets broadcast to everyone | I | Fragments are rendered from views that take no request; generated tests assert broadcasts carry no CSRF token | generated `changes_are_broadcast_to_open_lists` |
-| Memory or connection exhaustion by many or slow subscribers | D | No task per subscriber; bounded per-subscriber queues (64) with slow consumers dropped, never awaited; 10 000 subscribers per process, 1 000 per channel, 1 MiB per message; 16 open streams per principal (generated global channels: the principal `GlobalAccess` admitted; anonymous: per IP, IPv6 per `/64`) and 1 000 per tenant (`429`); the HTTP server ends a connection whose writes make no progress for the request timeout (at least 30 seconds); streams end at 30 minutes and when shutdown begins. **Residual:** anonymous viewers behind a reverse proxy share the proxy's slots until a trusted-proxy resolver is configured (Forge-Go PR #12) | slow-consumer, subscriber-cap, per-principal, per-tenant, IPv6 `/64`, full-broker and stalled-reader (real socket) tests |
+| Memory or connection exhaustion by many or slow subscribers | D | No task per subscriber; bounded per-subscriber queues (64) with slow consumers dropped, never awaited; 10 000 subscribers per process, 1 000 per channel, 1 MiB per message; 16 open streams per principal (generated global channels: the principal `GlobalAccess` admitted; anonymous: per IP, IPv6 per `/64`) and 1 000 per tenant (`429`); the HTTP server ends a connection whose writes make no progress for the request timeout (at least 30 seconds); streams end at 30 minutes and when shutdown begins. Anonymous viewers are counted by `Request::client_ip` (ADR 0032). **Residual:** anonymous viewers behind an unlisted reverse proxy share the proxy's slots | slow-consumer, subscriber-cap, per-principal, per-tenant, IPv6 `/64`, `anonymous_viewers_behind_a_trusted_proxy_are_counted_per_client`, full-broker and stalled-reader (real socket) tests |
 | Open streams holding up shutdown | D | The broker is bound to the shutdown-start signal; streams end before the server drains | real-server drain test with a 60 s grace that finishes at once |
 | Forged or oversized `NOTIFY` payloads | T, D | Notifications are parsed strictly, bounded in chunk count, chunk size, pending messages (64), bytes and age (30 s); malformed or inconsistent ones are logged and ignored; payloads above 7 500 bytes are never sent; messages above 256 KiB are refused. **Residual:** whoever can `NOTIFY` on the database can publish; the database role is the trust boundary | envelope malformed/out-of-order/budget tests, PostgreSQL malformed-notification and oversize tests |
 | LISTEN/NOTIFY emulated insecurely on other backends | T | `Fanout::Postgres` is refused on MySQL, MariaDB and SQLite (`UnsupportedBackend`); they use the in-process broker | `postgres_fanout_is_refused_on_sqlite_not_emulated`, `ensure_fanout_supported` doctest |
@@ -343,6 +344,35 @@ previous-key setting yet, a parity follow-up); `sqlx::PgListener` buffers
 notifications in an unbounded channel and drops with a detached `UNLISTEN`
 task, accepted as bounded in practice (ADR 0031, "Accepted residuals and
 capacity edges").
+
+## Trusted proxies and the client address review
+
+Review date: 2026-10-20
+([ADR 0032](adr/0032-trusted-proxies-and-client-ip.md), port of Forge-Go ADR
+0037). Scope: `FORGE_HTTP_TRUSTED_PROXIES`, the resolver the HTTP server runs
+before every layer, and the counters that read `Request::client_ip`
+(sign-in and reset throttles, `by_client_ip`, the anonymous stream cap).
+
+| Threat | STRIDE | Control | Verification |
+| --- | --- | --- | --- |
+| A client that connects directly forges `X-Forwarded-For`, `X-Real-IP` or `Forwarded` to pick a fresh throttle, limiter or stream key | S, D | The header is read only when the TCP peer is inside a listed network; the default list is empty (trust nobody); `X-Real-IP` and `Forwarded` are never read | `resolves_like_forge_go` (untrusted-peer cases), `trusting_nobody_uses_the_peer`, `other_forwarding_headers_are_never_read`, `server_resolves_the_client_from_trusted_proxies_only_before_every_layer`, `without_trusted_proxies_forwarding_headers_are_ignored`, `direct_clients_cannot_choose_their_client_ip_bucket` |
+| A client behind a trusted proxy prepends entries to escape its counters | S, D | The walk starts at the right (the entry the proxy appended), skips only listed proxies and stops at the first unlisted address; entries to its left are never read | `client-supplied prefix ignored` cases, `clients_behind_a_trusted_proxy_get_independent_sign_in_counters` (TCP), `clients_behind_one_trusted_proxy_have_their_own_sign_in_counters` (generated), `anonymous_viewers_behind_a_trusted_proxy_are_counted_per_client` |
+| Malformed or overlong chains resolve to a chosen value or cost unbounded work | S, D | An empty or non-address entry on the walk (port, brackets, `for=`, non-UTF-8, empty zone) and more than 32 listed hops resolve to the peer; the walk stops at the first untrusted, malformed or 33rd entry | malformed cases, `non_utf8_entries_fall_back_to_the_peer_only_when_reached`, `overlong_trusted_chains_fall_back_to_the_peer`, `the_result_is_always_the_peer_or_an_entry_of_the_header` (20 000 generated chains) |
+| A client rotates through its IPv6 `/64` behind the proxy | S, D | The resolver returns the full canonical address (zone dropped, IPv4-mapped as IPv4); every counter buckets IPv6 by `/64` | `client_ip_keys_group_ipv6_by_64_and_keep_the_peer_key_the_peer`, broadcast and TCP `/64` rotation tests |
+| A trusted-proxy list that trusts clients | S | Empty or malformed entries, `/0`, IPv4 prefixes shorter than `/8`, IPv6 prefixes shorter than `/16`, IPv4-mapped prefixes and zoned addresses stop startup; `TrustedProxy::new` is the only way to make a trusted network, so deserialized and hand-built configurations obey the same rules; errors name the entry position, never its text | `trusted_proxies_reject_invalid_entries_without_echoing_them`, `trusted_proxy_rules_apply_to_programmatic_values`, `trusted_proxies_deserialize_through_the_same_rules`, `unsafe_trusted_proxies_stop_the_configuration_without_echoing_them`, e2e script |
+| A layer overwrites the resolved address | T | The address is a private field of `Request` that only `TrustedProxies::apply` sets; the server applies it before the first layer | `server_resolves_the_client_from_trusted_proxies_only_before_every_layer` |
+
+Residual risks: anything inside a listed network (other containers on the
+same Docker network, accessories, a compromised dependency in one of them,
+host processes through the network's gateway address) can send requests with
+a chosen `X-Forwarded-For` directly to the application and pick its key,
+including spending other clients' per-source budgets; operators must list
+only proxy networks and keep untrusted services off them. An application also
+reachable directly from a listed network trusts that network's headers. A
+proxy that forwards the client's header unchanged lets clients choose their
+address. The minimum prefix lengths stop only obvious mistakes (a `/8` still
+trusts 16 million addresses). Forge-Rust has no `forge deploy` yet, so the
+value is the operator's to set; audit records carry no source digest yet.
 
 ## Review cadence
 

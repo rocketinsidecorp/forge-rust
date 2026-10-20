@@ -4,7 +4,12 @@
 //! receives a validated [`AppConfig`] and never needs to parse ad-hoc strings.
 
 use std::{
-    collections::HashMap, ffi::OsString, fmt, net::SocketAddr, path::PathBuf, str::FromStr,
+    collections::HashMap,
+    ffi::OsString,
+    fmt,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    path::PathBuf,
+    str::FromStr,
     time::Duration,
 };
 
@@ -64,6 +69,7 @@ pub const KNOWN_KEYS: &[&str] = &[
     "FORGE_SHUTDOWN_GRACE_SECS",
     "FORGE_MAX_BODY_BYTES",
     "FORGE_MAX_CONNECTIONS",
+    TRUSTED_PROXIES_KEY,
     "FORGE_LOG",
     "FORGE_LOG_FORMAT",
     "FORGE_DATABASE_URL",
@@ -80,6 +86,11 @@ pub const KNOWN_KEYS: &[&str] = &[
     "FORGE_STORAGE_LINK_TTL_SECS",
     "FORGE_STREAMS_KEY",
 ];
+
+/// The reverse proxies whose `X-Forwarded-For` header is believed (ADR 0032):
+/// a comma-separated list of CIDR prefixes or bare addresses. Empty, the
+/// default, trusts nobody.
+pub const TRUSTED_PROXIES_KEY: &str = "FORGE_HTTP_TRUSTED_PROXIES";
 
 /// The owner password the `setup` command of generated applications reads
 /// when it is not typed at a terminal or piped with `--password-stdin`.
@@ -134,6 +145,13 @@ pub struct ServerConfig {
     pub max_body_bytes: usize,
     /// Maximum number of concurrently open client connections.
     pub max_connections: usize,
+    /// Networks of the reverse proxies whose `X-Forwarded-For` header is
+    /// believed when resolving the client address
+    /// (`FORGE_HTTP_TRUSTED_PROXIES`, ADR 0032). Empty, the default, trusts
+    /// nobody: the client is the TCP peer. Every entry was validated by
+    /// [`TrustedProxy::new`].
+    #[serde(default)]
+    pub trusted_proxies: Vec<TrustedProxy>,
 }
 
 impl Default for ServerConfig {
@@ -146,8 +164,232 @@ impl Default for ServerConfig {
             shutdown_grace: Duration::from_secs(DEFAULT_SHUTDOWN_GRACE_SECS),
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             max_connections: DEFAULT_MAX_CONNECTIONS,
+            trusted_proxies: Vec::new(),
         }
     }
+}
+
+/// Shortest IPv4 prefix a trusted proxy network may have. Shorter prefixes
+/// trust a large part of the address space (two `/1` prefixes cover the
+/// whole IPv4 internet), letting almost any client choose its address.
+pub const MIN_TRUSTED_PREFIX_BITS_V4: u8 = 8;
+/// Shortest IPv6 prefix a trusted proxy network may have.
+pub const MIN_TRUSTED_PREFIX_BITS_V6: u8 = 16;
+
+/// A network of reverse proxies whose `X-Forwarded-For` header is believed
+/// (ADR 0032): a CIDR prefix, or a bare address as a `/32` or `/128`.
+///
+/// A value exists only after [`TrustedProxy::new`] (or parsing, which calls
+/// it) accepted it, so every `TrustedProxy` is safe to trust: never `/0`, no
+/// IPv4 prefix shorter than `/8`, no IPv6 prefix shorter than `/16` and no
+/// IPv4-mapped IPv6 prefix (peers are compared in their IPv4 form, so it
+/// would silently never match; write the IPv4 form). The network address is
+/// stored masked.
+///
+/// ```
+/// use forge_config::TrustedProxy;
+///
+/// let proxy: TrustedProxy = "172.18.5.9/16".parse()?;
+/// assert_eq!(proxy.to_string(), "172.18.0.0/16");
+/// assert!(proxy.contains("172.18.0.2".parse()?));
+/// assert!(proxy.contains("::ffff:172.18.0.2".parse()?));
+/// assert!("0.0.0.0/0".parse::<TrustedProxy>().is_err());
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct TrustedProxy {
+    network: IpAddr,
+    prefix_len: u8,
+}
+
+impl TrustedProxy {
+    /// The network of `address` and the first `prefix_len` bits, or why it
+    /// is not a safe trusted proxy network.
+    ///
+    /// This is the single definition of the rules: parsing
+    /// `FORGE_HTTP_TRUSTED_PROXIES`, deserializing a [`ServerConfig`] and
+    /// the HTTP server's resolver all go through it. The error never contains
+    /// the address.
+    pub fn new(address: IpAddr, prefix_len: u8) -> Result<Self, TrustedProxyError> {
+        let network = match address {
+            IpAddr::V4(address) => {
+                if prefix_len > 32 {
+                    return Err(TrustedProxyError::InvalidPrefix);
+                }
+                if prefix_len < MIN_TRUSTED_PREFIX_BITS_V4 {
+                    return Err(TrustedProxyError::TooBroadV4);
+                }
+                IpAddr::V4(Ipv4Addr::from(u32::from(address) & v4_mask(prefix_len)))
+            }
+            IpAddr::V6(address) => {
+                if prefix_len > 128 {
+                    return Err(TrustedProxyError::InvalidPrefix);
+                }
+                if address.to_ipv4_mapped().is_some() {
+                    return Err(TrustedProxyError::Ipv4Mapped);
+                }
+                if prefix_len < MIN_TRUSTED_PREFIX_BITS_V6 {
+                    return Err(TrustedProxyError::TooBroadV6);
+                }
+                IpAddr::V6(Ipv6Addr::from(u128::from(address) & v6_mask(prefix_len)))
+            }
+        };
+        Ok(Self {
+            network,
+            prefix_len,
+        })
+    }
+
+    /// The masked network address.
+    #[must_use]
+    pub const fn network(&self) -> IpAddr {
+        self.network
+    }
+
+    /// The prefix length in bits.
+    #[must_use]
+    pub const fn prefix_len(&self) -> u8 {
+        self.prefix_len
+    }
+
+    /// Whether `address` is inside this network. IPv4-mapped IPv6 addresses
+    /// are compared in their IPv4 form.
+    #[must_use]
+    pub fn contains(&self, address: IpAddr) -> bool {
+        match (self.network, address.to_canonical()) {
+            (IpAddr::V4(network), IpAddr::V4(address)) => {
+                u32::from(address) & v4_mask(self.prefix_len) == u32::from(network)
+            }
+            (IpAddr::V6(network), IpAddr::V6(address)) => {
+                u128::from(address) & v6_mask(self.prefix_len) == u128::from(network)
+            }
+            _ => false,
+        }
+    }
+}
+
+fn v4_mask(prefix_len: u8) -> u32 {
+    u32::MAX
+        .checked_shl(32 - u32::from(prefix_len))
+        .unwrap_or(0)
+}
+
+fn v6_mask(prefix_len: u8) -> u128 {
+    u128::MAX
+        .checked_shl(128 - u32::from(prefix_len))
+        .unwrap_or(0)
+}
+
+impl fmt::Display for TrustedProxy {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}/{}", self.network, self.prefix_len)
+    }
+}
+
+impl FromStr for TrustedProxy {
+    type Err = TrustedProxyError;
+
+    /// Parses one entry: a CIDR prefix such as `172.18.0.0/16`, or a bare
+    /// address (a `/32` or `/128`). Surrounding whitespace is ignored; zoned
+    /// addresses, ports, brackets and prefix lengths with a sign or a leading
+    /// zero are malformed.
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let value = value.trim();
+        let (address, prefix_len) = match value.split_once('/') {
+            Some((address, bits)) => (address, Some(parse_prefix_len(bits)?)),
+            None => (value, None),
+        };
+        let address: IpAddr = address.parse().map_err(|_| TrustedProxyError::Malformed)?;
+        let prefix_len = prefix_len.unwrap_or(match address {
+            IpAddr::V4(_) => 32,
+            IpAddr::V6(_) => 128,
+        });
+        match Self::new(address, prefix_len) {
+            // A length beyond the address is a parse failure, as in Forge-Go.
+            Err(TrustedProxyError::InvalidPrefix) => Err(TrustedProxyError::Malformed),
+            result => result,
+        }
+    }
+}
+
+/// Decimal prefix length without sign or leading zero, at most 255.
+fn parse_prefix_len(bits: &str) -> Result<u8, TrustedProxyError> {
+    let canonical = !bits.is_empty()
+        && bits.len() <= 3
+        && bits.bytes().all(|byte| byte.is_ascii_digit())
+        && (bits == "0" || !bits.starts_with('0'));
+    if !canonical {
+        return Err(TrustedProxyError::Malformed);
+    }
+    bits.parse().map_err(|_| TrustedProxyError::Malformed)
+}
+
+impl Serialize for TrustedProxy {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for TrustedProxy {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let text = String::deserialize(deserializer)?;
+        text.parse()
+            .map_err(|error| serde::de::Error::custom(format!("trusted proxy {error}")))
+    }
+}
+
+/// Why a trusted proxy entry was refused. The message completes the sentence
+/// "entry N ..." and never contains the entry.
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum TrustedProxyError {
+    /// Not an IP address or CIDR prefix.
+    #[error("is not an IP address or CIDR prefix such as 172.18.0.0/16")]
+    Malformed,
+    /// The prefix length is longer than the address.
+    #[error("is not a valid CIDR prefix")]
+    InvalidPrefix,
+    /// An IPv4-mapped IPv6 prefix or address.
+    #[error("is an IPv4-mapped IPv6 prefix; use the IPv4 form")]
+    Ipv4Mapped,
+    /// An IPv4 prefix shorter than [`MIN_TRUSTED_PREFIX_BITS_V4`].
+    #[error(
+        "is too broad: IPv4 prefixes shorter than /8 trust too many addresses; list the proxy networks instead"
+    )]
+    TooBroadV4,
+    /// An IPv6 prefix shorter than [`MIN_TRUSTED_PREFIX_BITS_V6`].
+    #[error(
+        "is too broad: IPv6 prefixes shorter than /16 trust too many addresses; list the proxy networks instead"
+    )]
+    TooBroadV6,
+}
+
+/// Parses `FORGE_HTTP_TRUSTED_PROXIES`: a comma-separated list of CIDR
+/// prefixes or bare addresses, such as `172.18.0.0/16, fd00:1::/64,
+/// 10.0.0.7`. A blank list trusts nobody. An empty, malformed or unsafe
+/// entry (see [`TrustedProxy::new`]) is an error naming the entry's
+/// position, never its text.
+pub fn parse_trusted_proxies(list: &str) -> Result<Vec<TrustedProxy>, ConfigError> {
+    if list.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    list.split(',')
+        .enumerate()
+        .map(|(index, entry)| {
+            entry
+                .parse()
+                .map_err(|reason| ConfigError::InvalidTrustedProxy {
+                    entry: index + 1,
+                    reason,
+                })
+        })
+        .collect()
 }
 
 /// Log output encoding.
@@ -573,6 +815,9 @@ impl AppConfig {
         if let Some(value) = lookup("FORGE_MAX_CONNECTIONS") {
             config.server.max_connections = parse_positive("FORGE_MAX_CONNECTIONS", &value)?;
         }
+        if let Some(value) = lookup(TRUSTED_PROXIES_KEY) {
+            config.server.trusted_proxies = parse_trusted_proxies(&value)?;
+        }
         if let Some(value) = lookup("FORGE_LOG") {
             let filter = value.trim();
             if filter.is_empty() {
@@ -810,6 +1055,15 @@ pub enum ConfigError {
     UnknownKey {
         /// Rejected variable name.
         key: String,
+    },
+    /// An entry of `FORGE_HTTP_TRUSTED_PROXIES` was refused. Only its
+    /// position is reported: the value is never echoed.
+    #[error("invalid value for FORGE_HTTP_TRUSTED_PROXIES: entry {entry} {reason}")]
+    InvalidTrustedProxy {
+        /// One-based position of the refused entry.
+        entry: usize,
+        /// Why it was refused.
+        reason: TrustedProxyError,
     },
     /// A known key contains a value that is not valid UTF-8.
     #[error("invalid value for {key}: value is not valid UTF-8")]
@@ -1150,6 +1404,7 @@ mod tests {
             "5",
             "10",
             "10",
+            "172.18.0.0/16, fd00:1::/64",
             "debug",
             "json",
             "postgres://runtime:secret@localhost/app",
@@ -1381,5 +1636,150 @@ mod tests {
         .expect("raised body limit allows it");
         load(&[("FORGE_STORAGE_MAX_UPLOAD_BYTES", "2097152")])
             .expect("not checked while storage is unused");
+    }
+
+    fn trusted_proxies(value: &str) -> Result<AppConfig, ConfigError> {
+        AppConfig::from_lookup(|key| (key == TRUSTED_PROXIES_KEY).then(|| value.to_owned()))
+    }
+
+    #[test]
+    fn trusted_proxies_default_to_nobody() {
+        assert!(
+            AppConfig::from_lookup(|_| None)
+                .expect("defaults")
+                .server
+                .trusted_proxies
+                .is_empty()
+        );
+        for blank in ["", "  "] {
+            let config = trusted_proxies(blank).expect("blank trusts nobody");
+            assert!(config.server.trusted_proxies.is_empty(), "{blank:?}");
+        }
+    }
+
+    #[test]
+    fn trusted_proxies_parse_masked_prefixes_and_bare_addresses() {
+        let config = trusted_proxies(" 172.18.5.9/16, fd00:1::/64,10.0.0.7 ,2001:db8::1")
+            .expect("valid list");
+        let parsed: Vec<String> = config
+            .server
+            .trusted_proxies
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(
+            parsed,
+            [
+                "172.18.0.0/16",
+                "fd00:1::/64",
+                "10.0.0.7/32",
+                "2001:db8::1/128"
+            ]
+        );
+    }
+
+    #[test]
+    fn trusted_proxies_accept_the_minimum_prefix_lengths() {
+        let config = trusted_proxies("10.0.0.0/8, fc00::/16").expect("minimum lengths");
+        assert_eq!(config.server.trusted_proxies.len(), 2);
+    }
+
+    #[test]
+    fn trusted_proxies_reject_invalid_entries_without_echoing_them() {
+        for (value, entry) in [
+            ("172.18.0.0/33", 1),
+            ("not-a-network", 1),
+            ("172.18.0.0/16,", 2),
+            ("172.18.0.0/16,,10.0.0.0/8", 2),
+            ("0.0.0.0/0", 1),
+            ("::/0", 1),
+            ("0.0.0.0/1,128.0.0.0/1", 1),
+            ("10.0.0.0/7", 1),
+            ("::/1", 1),
+            ("fc00::/15", 1),
+            ("10.0.0.0/8, 0.0.0.0/0", 2),
+            ("::ffff:10.0.0.0/104", 1),
+            ("::ffff:10.0.0.1", 1),
+            ("fe80::1%eth0", 1),
+            ("fe80::%eth0/64", 1),
+            ("172.18.0.0/16 10.0.0.0/8", 1),
+            ("*", 1),
+            ("10.0.0.0/+8", 1),
+            ("10.0.0.0/08", 1),
+            ("10.0.0.0/", 1),
+            ("10.0.0.1:80", 1),
+            ("[2001:db8::1]", 1),
+        ] {
+            let error = trusted_proxies(value).expect_err(value);
+            assert!(
+                matches!(error, ConfigError::InvalidTrustedProxy { entry: actual, .. } if actual == entry),
+                "{value}: {error:?}"
+            );
+            let message = error.to_string();
+            assert!(message.contains(TRUSTED_PROXIES_KEY), "{message}");
+            assert!(message.contains(&format!("entry {entry} ")), "{message}");
+            assert!(!message.contains(value.trim()), "{value}: {message}");
+            let refused = value.split(',').nth(entry - 1).unwrap_or_default().trim();
+            assert!(
+                refused.len() < 2 || !message.contains(refused),
+                "{value}: {message} echoes {refused}"
+            );
+        }
+    }
+
+    #[test]
+    fn trusted_proxy_rules_apply_to_programmatic_values() {
+        let v4 = |text: &str| text.parse::<IpAddr>().expect("address");
+        for (address, bits, reason) in [
+            ("0.0.0.0", 0, TrustedProxyError::TooBroadV4),
+            ("0.0.0.0", 1, TrustedProxyError::TooBroadV4),
+            ("10.0.0.0", 7, TrustedProxyError::TooBroadV4),
+            ("10.0.0.1", 33, TrustedProxyError::InvalidPrefix),
+            ("::", 0, TrustedProxyError::TooBroadV6),
+            ("::", 1, TrustedProxyError::TooBroadV6),
+            ("fc00::", 15, TrustedProxyError::TooBroadV6),
+            ("fc00::", 129, TrustedProxyError::InvalidPrefix),
+            ("::ffff:10.0.0.0", 104, TrustedProxyError::Ipv4Mapped),
+        ] {
+            assert_eq!(
+                TrustedProxy::new(v4(address), bits),
+                Err(reason),
+                "{address}/{bits}"
+            );
+        }
+        let proxy = TrustedProxy::new(v4("172.18.5.9"), 16).expect("valid");
+        assert_eq!(proxy.network(), v4("172.18.0.0"));
+        assert_eq!(proxy.prefix_len(), 16);
+        assert!(proxy.contains(v4("172.18.255.1")));
+        assert!(proxy.contains(v4("::ffff:172.18.0.2")));
+        assert!(!proxy.contains(v4("172.19.0.1")));
+        assert!(!proxy.contains(v4("fd00::1")));
+        let v6 = TrustedProxy::new(v4("fd00:1::"), 64).expect("valid");
+        assert!(v6.contains(v4("fd00:1::abcd")));
+        assert!(!v6.contains(v4("fd00:2::1")));
+        assert!(!v6.contains(v4("10.0.0.1")));
+    }
+
+    #[test]
+    fn trusted_proxies_deserialize_through_the_same_rules() {
+        let config = AppConfig::from_lookup(|key| {
+            (key == TRUSTED_PROXIES_KEY).then(|| "172.18.0.0/16".to_owned())
+        })
+        .expect("valid");
+        let json = serde_json::to_string(&config.server).expect("serializes");
+        assert!(
+            json.contains(r#""trusted_proxies":["172.18.0.0/16"]"#),
+            "{json}"
+        );
+        let back: ServerConfig = serde_json::from_str(&json).expect("deserializes");
+        assert_eq!(back, config.server);
+        let unsafe_json = json.replace("172.18.0.0/16", "0.0.0.0/0");
+        let error =
+            serde_json::from_str::<ServerConfig>(&unsafe_json).expect_err("unsafe prefix refused");
+        assert!(!error.to_string().contains("0.0.0.0"), "{error}");
+        let without: ServerConfig =
+            serde_json::from_str(&json.replace(r#","trusted_proxies":["172.18.0.0/16"]"#, ""))
+                .expect("older configuration without the field");
+        assert!(without.trusted_proxies.is_empty());
     }
 }

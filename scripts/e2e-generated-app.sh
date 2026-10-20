@@ -458,6 +458,11 @@ env "${env_args[@]}" "$app_bin" healthcheck || fail "healthcheck subcommand"
 if FORGE_BIDN="typo" "$app_bin" healthcheck 2>/dev/null; then
   fail "unknown FORGE_* keys must be rejected"
 fi
+if proxies_error="$(FORGE_HTTP_TRUSTED_PROXIES="10.0.0.0/8,0.0.0.0/0" "$app_bin" healthcheck 2>&1)"; then
+  fail "an unsafe FORGE_HTTP_TRUSTED_PROXIES must be rejected"
+fi
+[[ "$proxies_error" == *"FORGE_HTTP_TRUSTED_PROXIES: entry 2"* && "$proxies_error" != *"0.0.0.0/0"* ]] \
+  || fail "trusted proxy errors must name the entry position without echoing it"
 kill -TERM "$server_pid"
 status=0
 wait "$server_pid" || status=$?
