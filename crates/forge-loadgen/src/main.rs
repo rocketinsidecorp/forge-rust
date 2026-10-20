@@ -90,7 +90,7 @@ fn parse_duration(text: &str) -> Result<Duration, String> {
         total += value * scale;
         rest = &rest[unit_end..];
     }
-    Ok(Duration::from_secs_f64(total))
+    Duration::try_from_secs_f64(total).map_err(|_| format!("duration {text:?} is out of range"))
 }
 
 fn parse(args: &[String], password: String) -> Result<Config, String> {

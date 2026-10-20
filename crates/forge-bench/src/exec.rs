@@ -1,5 +1,7 @@
 //! Driving futures without a runtime.
 
+#![forbid(unsafe_code)]
+
 use std::future::Future;
 use std::pin::pin;
 use std::task::{Context, Poll, Waker};

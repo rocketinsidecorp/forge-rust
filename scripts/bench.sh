@@ -136,18 +136,20 @@ server="$target/release/benchapp"
 echo "creating the database ${database} with the non-superuser roles ${migrator} and ${runtime}" >&2
 # The statements go on stdin (printf is a builtin), so the passwords never
 # appear in psql's arguments, which ps shows.
+# Set first: the cleanup drops the roles IF EXISTS, so a failure between the
+# two CREATE ROLE statements leaks neither.
+created_roles=1
 printf "CREATE ROLE %s LOGIN PASSWORD '%s' NOSUPERUSER NOBYPASSRLS CREATEDB;\nCREATE ROLE %s LOGIN PASSWORD '%s' NOSUPERUSER NOCREATEDB NOBYPASSRLS;\n" \
 	"$migrator" "$migrator_password" "$runtime" "$runtime_password" |
 	psql "$admin" -qAt -v ON_ERROR_STOP=1 >/dev/null
-created_roles=1
 psql "$admin" -qAt -v ON_ERROR_STOP=1 -c "CREATE DATABASE ${database} OWNER ${migrator}" >/dev/null
 created_database=1
 # Same host and port as the admin URL, the new roles and database.
 authority="$(printf '%s' "$admin" | sed -E 's#^[a-z]+://([^@/]*@)?([^/?]+).*$#\2#')"
 admin_on_database="$(printf '%s' "$admin" | sed -E "s#^([a-z]+://[^/?]+)(/[^?]*)?#\\1/${database}#")"
-# The least-privilege setup of the generated compose file (docker/postgres/init.sql):
-# the runtime role may use the schema and, by default privileges, read and
-# write the tables the migration role creates; it owns nothing and cannot
+# Modelled on the generated compose file (docker/postgres/init.sql), but
+# broader (docs/benchmarks.md): the runtime role may use the schema and, by
+# default privileges, read and write the tables the migration role creates; it owns nothing and cannot
 # create anything. Row-level security applies to both (it is forced).
 psql "$admin_on_database" -qAt -v ON_ERROR_STOP=1 >/dev/null <<SQL
 REVOKE CONNECT, TEMPORARY ON DATABASE ${database} FROM PUBLIC;

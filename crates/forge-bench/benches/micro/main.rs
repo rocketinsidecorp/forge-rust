@@ -7,6 +7,8 @@
 //! cargo bench -p forge-bench -- --quick            # each scenario once (what CI and `cargo test` do)
 //! ```
 
+#![forbid(unsafe_code)]
+
 use forge_bench::alloc::Counting;
 use forge_bench::{Options, environment, measure, table};
 

@@ -516,6 +516,8 @@ impl App {
         if let Err(code) = mount_openapi(name, &mut router, &config, &info) {
             return code;
         }
+        // Without `jobs` the slot types are `()`; the bindings keep one code path.
+        #[cfg_attr(not(feature = "jobs"), allow(clippy::let_unit_value))]
         let background = background_for(jobs_slot, database.as_ref(), telemetry.as_ref());
         #[cfg(feature = "jobs")]
         let background = background.filter(|_| run_jobs_in_serve);
@@ -1249,7 +1251,7 @@ fn compose(
     shutdown: &Cancellation,
     telemetry: Option<&Telemetry>,
 ) -> Result<Built, ExitCode> {
-    #[cfg_attr(not(feature = "jobs"), allow(unused_mut))]
+    #[cfg_attr(not(feature = "jobs"), allow(unused_mut, clippy::let_unit_value))]
     let mut jobs = jobs;
     let database = match declared {
         Some((declaration, url)) => match declaration.connect_lazy(url) {

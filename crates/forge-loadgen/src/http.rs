@@ -128,7 +128,11 @@ impl Connection {
     pub fn send(&mut self, request: &Request, keep_body: bool) -> io::Result<Reply> {
         let reused = self.stream.is_some();
         match self.exchange(request, keep_body) {
-            Err(error) if reused && is_stale(&error) => self.exchange(request, keep_body),
+            // Only when no response byte arrived: a request the server may
+            // have processed (a POST that creates a row) is never re-sent.
+            Err(error) if reused && is_stale(&error) && self.buffer.is_empty() => {
+                self.exchange(request, keep_body)
+            }
             other => other,
         }
     }
@@ -157,6 +161,9 @@ impl Connection {
         let Some(stream) = self.stream.as_mut() else {
             return Err(io::Error::new(io::ErrorKind::NotConnected, "no connection"));
         };
+        // Cleared before writing, so a failed write leaves it empty too and
+        // `send` can tell "nothing received" from "failed mid-response".
+        self.buffer.clear();
         stream.write_all(&request.wire)?;
         read_reply(stream, &mut self.buffer, keep_body)
     }
