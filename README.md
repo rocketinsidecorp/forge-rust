@@ -337,6 +337,7 @@ Contribution rules:
 ## Documentation
 
 - [Architecture](docs/architecture.md)
+- [Rails parity (Forge-Go and Forge-Rust)](docs/rails-parity.md)
 - [Architecture Decision Records](docs/adr/README.md)
 - [CLI reference](docs/cli.md)
 - [Deployment](docs/deployment.md)
