@@ -384,19 +384,13 @@ pub(crate) mod tests {
         let signer = signer(&clock);
         let k = key("avatars/a.png");
         let attachment = signed_query(&signer, &k, &SignOptions::default());
-        assert_eq!(
-            signer.verify(&k, Some(&attachment), "").expect("valid"),
-            false
-        );
+        assert!(!signer.verify(&k, Some(&attachment), "").expect("valid"));
         let inline = signed_query(&signer, &k, &SignOptions::default().inline(true));
         assert!(inline.ends_with("&disposition=inline"));
-        assert_eq!(signer.verify(&k, Some(&inline), "").expect("valid"), true);
+        assert!(signer.verify(&k, Some(&inline), "").expect("valid"));
         // An explicit `disposition=attachment` is the same as none.
         let explicit = format!("{attachment}&disposition=attachment");
-        assert_eq!(
-            signer.verify(&k, Some(&explicit), "").expect("valid"),
-            false
-        );
+        assert!(!signer.verify(&k, Some(&explicit), "").expect("valid"));
     }
 
     #[test]

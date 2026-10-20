@@ -356,7 +356,7 @@ async fn invalid_and_expired_links_never_touch_the_store() {
     tampered_sig.replace_range(0..1, if sig.starts_with('A') { "B" } else { "A" });
 
     let uris = [
-        format!("/files/secret/file.txt"),
+        "/files/secret/file.txt".to_owned(),
         format!("{path}?expires={expires}"),
         format!("{path}?sig={sig}"),
         format!("{path}?expires={expires}&sig={tampered_sig}"),
@@ -400,10 +400,11 @@ async fn invalid_and_expired_links_never_touch_the_store() {
     let missing = h.router.dispatch(get("/files/no/such/key.txt")).await;
     let existing = h.router.dispatch(get("/files/secret/file.txt")).await;
     assert_eq!(missing.status(), existing.status());
-    assert_eq!(
-        missing.body().len().abs_diff(existing.body().len()) < 1,
-        true
-    );
+    // Only the per-request id differs: the same code and message either way.
+    for response in [&missing, &existing] {
+        let text = String::from_utf8_lossy(response.body());
+        assert!(text.contains("link_invalid") && text.contains("invalid or tampered link"));
+    }
 }
 
 #[tokio::test]
@@ -911,6 +912,9 @@ async fn the_request_body_cap_applies_before_anything_is_parsed() {
     assert_eq!(u.blobs(), 0);
 }
 
+/// A named upload, the parts it sends and the specific error it must produce (if any).
+type Case = (&'static str, Vec<Part>, Option<fn(&StorageError) -> bool>);
+
 #[tokio::test]
 async fn structural_violations_are_rejected_and_store_nothing() {
     let png = |field| file(field, "a.png", "image/png", PNG);
@@ -918,7 +922,7 @@ async fn structural_violations_are_rejected_and_store_nothing() {
         headers: vec![("Content-Transfer-Encoding", "base64")],
         ..file("avatar", "a.png", "image/png", PNG)
     };
-    let cases: Vec<(&str, Vec<Part>, Option<fn(&StorageError) -> bool>)> = vec![
+    let cases: Vec<Case> = vec![
         ("file in another field", vec![png("other")], None),
         ("too many files", vec![png("avatar"), png("avatar")], None),
         (

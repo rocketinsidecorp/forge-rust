@@ -254,12 +254,14 @@ pub(crate) fn parse(body: &[u8], boundary: &str) -> Result<Vec<Part>, StorageErr
                     }
                 }
                 "content-type" => {
-                    if content_type.replace(value).is_some() {
+                    let repeated = content_type.replace(value).is_some();
+                    if repeated {
                         return Err(invalid("repeated Content-Type in a multipart part"));
                     }
                 }
                 "content-transfer-encoding" => {
-                    if encoding.replace(value).is_some() {
+                    let repeated = encoding.replace(value).is_some();
+                    if repeated {
                         return Err(invalid(
                             "repeated Content-Transfer-Encoding in a multipart part",
                         ));

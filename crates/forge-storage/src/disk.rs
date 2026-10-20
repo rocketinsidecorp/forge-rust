@@ -398,13 +398,13 @@ impl Dirs {
     }
 
     fn prune_temp(&self, older_than: Duration) -> Result<usize, StorageError> {
-        let mut directory = Dir::read_from(&self.tmp).map_err(io_error)?;
+        let directory = Dir::read_from(&self.tmp).map_err(io_error)?;
         let cutoff = SystemTime::now()
             .checked_sub(older_than)
             .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
             .map_or(0, |elapsed| elapsed.as_secs());
         let mut removed = 0;
-        while let Some(entry) = directory.next() {
+        for entry in directory {
             let entry = entry.map_err(io_error)?;
             let name = entry.file_name();
             if name == c"." || name == c".." {

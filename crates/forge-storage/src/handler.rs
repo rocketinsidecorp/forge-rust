@@ -203,7 +203,7 @@ impl StorageHandler {
         let content_type =
             normalize_content_type(&info.content_type).unwrap_or_else(|_| OCTET_STREAM.to_owned());
         let inline = inline_requested
-            && (is_inline_safe(&content_type) || self.inline.iter().any(|t| *t == content_type));
+            && (is_inline_safe(&content_type) || self.inline.contains(&content_type));
 
         let mut response = Response::new(StatusCode::OK, bytes::Bytes::new());
         let headers = response.headers_mut();
