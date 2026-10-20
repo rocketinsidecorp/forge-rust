@@ -316,11 +316,12 @@ Admission review:
 - No new type appears in a public signature except `http::HeaderMap` in
   `OtlpClient::new`, already a public Forge type. Public telemetry contracts
   (`Telemetry`, `Registry`, `Span`, `SpanContext`) are Forge-owned.
-- Graph impact for generated applications: every application (database-free
-  ones included) now links `rustls` with the `ring` provider, which builds C
-  and assembly with `cc` at compile time; the generated Dockerfile's builder
-  image already provides that toolchain and database-enabled applications
-  already compiled it through SQLx.
+- Graph impact for generated applications: `ring` was already in every
+  application's graph before this change (through `forge-core` → `sqlx-core`,
+  database-free applications included), so telemetry adds no C build step;
+  the new build cost is the `flate2` family and `tokio-rustls` (about 15
+  packages). Of the new crates only `crc32fast` has a build script, and it
+  only runs `$RUSTC --version` to emit `cfg` flags.
 - `cargo deny check` was run with these crates in the graph.
 
 ## Features and public API containment

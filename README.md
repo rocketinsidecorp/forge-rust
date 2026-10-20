@@ -249,7 +249,9 @@ curl -s http://127.0.0.1:9464/metrics | grep http_server_request_duration_second
 # Spans in the development log
 FORGE_TELEMETRY_EXPORTER=log cargo run
 
-# Traces, metrics and logs to an OpenTelemetry Collector (OTLP/HTTP, JSON)
+# Traces, metrics and logs to an OpenTelemetry Collector (OTLP/HTTP, JSON).
+# Exported logs carry what stdout shows (request path, client address), so
+# treat the collector like your log store.
 FORGE_TELEMETRY_EXPORTER=otlp FORGE_TELEMETRY_LOGS_EXPORTER=otlp \
 FORGE_TELEMETRY_OTLP_ENDPOINT=http://127.0.0.1:4318 \
 FORGE_TELEMETRY_SERVICE_NAME=shop cargo run
