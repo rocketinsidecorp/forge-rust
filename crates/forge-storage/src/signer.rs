@@ -311,9 +311,11 @@ fn parse_link(query: Option<&str>) -> Option<ParsedLink> {
         return None;
     }
     let expires = expires?;
+    // Canonical decimal only: no leading zeros, so one expiry has one spelling.
     if expires.is_empty()
         || expires.len() > 12
         || !expires.bytes().all(|byte| byte.is_ascii_digit())
+        || (expires.len() > 1 && expires.starts_with('0'))
     {
         return None;
     }
@@ -464,6 +466,11 @@ pub(crate) mod tests {
                 "non-decimal expiry",
                 k.clone(),
                 Some(format!("expires=+{expires}&sig={signature}")),
+            ),
+            (
+                "zero-padded expiry",
+                k.clone(),
+                Some(format!("expires=0{expires}&sig={signature}")),
             ),
             (
                 "hex expiry",

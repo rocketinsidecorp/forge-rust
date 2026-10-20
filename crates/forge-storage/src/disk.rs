@@ -43,7 +43,10 @@ use std::{
     io::{self, Read, Write},
     os::fd::OwnedFd,
     path::Path,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -206,12 +209,14 @@ impl Dirs {
         format!("{}.json", Self::leaf(key))
     }
 
-    fn put(
-        &self,
+    /// Writes the content and metadata of one blob to `tmp/` without publishing
+    /// anything: the first half of a put.
+    fn stage<'a>(
+        &'a self,
         key: &StorageKey,
         body: &[u8],
         options: &PutOptions,
-    ) -> Result<Info, StorageError> {
+    ) -> Result<Staged<'a>, StorageError> {
         if body.len() as u64 > options.max_bytes() {
             return Err(StorageError::TooLarge);
         }
@@ -231,43 +236,126 @@ impl Dirs {
             .map_err(|error| StorageError::Io(io::Error::other(error)))?;
 
         let temp = uuid::Uuid::now_v7().simple().to_string();
-        let temp_meta = format!("{temp}.meta");
-        // Whatever a failure leaves behind goes.
-        let guard = TempFiles {
+        // Whatever a failure leaves behind goes (the guard unlinks on drop).
+        let staged = Staged {
             dirs: self,
-            names: [&temp, &temp_meta],
+            key: key.clone(),
+            temp_meta: format!("{temp}.meta"),
+            backup: format!("{temp}.old"),
+            temp,
+            info: Info {
+                key: key.clone(),
+                size: body.len() as u64,
+                content_type,
+                filename,
+                sha256: Some(digest),
+                modified: SystemTime::now(),
+            },
         };
+        self.write_temp(&staged.temp, body)?;
+        self.write_temp(&staged.temp_meta, &encoded)?;
+        Ok(staged)
+    }
 
-        self.write_temp(&temp, body)?;
-        self.write_temp(&temp_meta, &encoded)?;
-
+    /// Publishes a staged blob: the metadata first, the blob is the commit
+    /// point. The previous metadata is kept aside, so a failed overwrite puts it
+    /// back instead of losing it.
+    fn promote(&self, staged: &Staged<'_>) -> Result<(), StorageError> {
+        let key = &staged.key;
         let blob_dir = self.parent(&self.blobs, key, true).map_err(io_error)?;
         let meta_dir = self.parent(&self.meta, key, true).map_err(io_error)?;
-        // Metadata first: the blob is the commit point.
-        renameat(
-            &self.tmp,
-            temp_meta.as_str(),
+        let meta_leaf = Self::meta_leaf(key);
+        let had_old = match renameat(
             &meta_dir,
-            Self::meta_leaf(key).as_str(),
-        )
-        .map_err(io_error)?;
-        if let Err(error) = renameat(&self.tmp, temp.as_str(), &blob_dir, Self::leaf(key)) {
-            let _ = unlinkat(&meta_dir, Self::meta_leaf(key).as_str(), AtFlags::empty());
+            meta_leaf.as_str(),
+            &self.tmp,
+            staged.backup.as_str(),
+        ) {
+            Ok(()) => true,
+            Err(Errno::NOENT) => false,
+            Err(error) => return Err(io_error(error)),
+        };
+        let restore = || {
+            if had_old {
+                let _ = renameat(
+                    &self.tmp,
+                    staged.backup.as_str(),
+                    &meta_dir,
+                    meta_leaf.as_str(),
+                );
+            }
+        };
+        if let Err(error) = renameat(
+            &self.tmp,
+            staged.temp_meta.as_str(),
+            &meta_dir,
+            meta_leaf.as_str(),
+        ) {
+            restore();
             return Err(io_error(error));
         }
-        drop(guard);
+        if let Err(error) = renameat(&self.tmp, staged.temp.as_str(), &blob_dir, Self::leaf(key)) {
+            // The new metadata describes a blob that never arrived: drop it and
+            // bring the previous record back.
+            let _ = unlinkat(&meta_dir, meta_leaf.as_str(), AtFlags::empty());
+            restore();
+            return Err(io_error(error));
+        }
         for directory in [&blob_dir, &meta_dir] {
             // Best effort: the rename is already atomic; this makes it durable.
             let _ = rustix::fs::fsync(directory);
         }
-        Ok(Info {
-            key: key.clone(),
-            size: body.len() as u64,
-            content_type,
-            filename,
-            sha256: Some(digest),
-            modified: SystemTime::now(),
-        })
+        Ok(())
+    }
+
+    /// Removes a blob and its metadata that were just published (rollback of a
+    /// multi-file commit; the keys are fresh).
+    fn unpublish(&self, key: &StorageKey) {
+        let _ = self.delete(key);
+    }
+
+    fn put(
+        &self,
+        key: &StorageKey,
+        body: &[u8],
+        options: &PutOptions,
+    ) -> Result<Info, StorageError> {
+        let staged = self.stage(key, body, options)?;
+        self.promote(&staged)?;
+        Ok(staged.info.clone())
+    }
+
+    /// Stages every file, then publishes them all, or none: a failure removes
+    /// what was published, and a cancelled request (`cancelled`, set when the
+    /// awaiting future is dropped) discards the staged files before anything is
+    /// published. `before_promote` runs between the two phases.
+    fn put_all(
+        &self,
+        items: &[(StorageKey, Bytes, PutOptions)],
+        cancelled: &AtomicBool,
+        before_promote: &dyn Fn(),
+    ) -> Result<Vec<Info>, StorageError> {
+        let abandoned = || StorageError::Io(io::Error::other("upload cancelled"));
+        let mut staged = Vec::with_capacity(items.len());
+        for (key, body, options) in items {
+            if cancelled.load(Ordering::SeqCst) {
+                return Err(abandoned());
+            }
+            staged.push(self.stage(key, body, options)?);
+        }
+        before_promote();
+        if cancelled.load(Ordering::SeqCst) {
+            return Err(abandoned());
+        }
+        for (index, file) in staged.iter().enumerate() {
+            if let Err(error) = self.promote(file) {
+                for published in &staged[..index] {
+                    self.unpublish(&published.key);
+                }
+                return Err(error);
+            }
+        }
+        Ok(staged.iter().map(|file| file.info.clone()).collect())
     }
 
     fn write_temp(&self, name: &str, content: &[u8]) -> Result<(), StorageError> {
@@ -425,16 +513,35 @@ impl Dirs {
     }
 }
 
-/// Removes the named temporary files when dropped.
-struct TempFiles<'a> {
+/// A blob written to `tmp/` and not yet published. Dropping it removes whatever
+/// is left of its temporary files (after a publish only the backup, if any).
+struct Staged<'a> {
     dirs: &'a Dirs,
-    names: [&'a str; 2],
+    key: StorageKey,
+    temp: String,
+    temp_meta: String,
+    backup: String,
+    info: Info,
 }
 
-impl Drop for TempFiles<'_> {
+impl Drop for Staged<'_> {
     fn drop(&mut self) {
-        for name in self.names {
-            let _ = unlinkat(&self.dirs.tmp, name, AtFlags::empty());
+        for name in [&self.temp, &self.temp_meta, &self.backup] {
+            let _ = unlinkat(&self.dirs.tmp, name.as_str(), AtFlags::empty());
+        }
+    }
+}
+
+/// Raises a flag when dropped while armed: the awaiting future was cancelled.
+struct CancelOnDrop {
+    flag: Arc<AtomicBool>,
+    armed: bool,
+}
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        if self.armed {
+            self.flag.store(true, Ordering::SeqCst);
         }
     }
 }
@@ -468,6 +575,29 @@ impl Storage for DiskStorage {
         run(move || dirs.put(&key, &body, &options)).await
     }
 
+    async fn put_all(
+        &self,
+        items: Vec<(StorageKey, Bytes, PutOptions)>,
+    ) -> Result<Vec<Info>, StorageError> {
+        if items
+            .iter()
+            .any(|(_, body, options)| body.len() as u64 > options.max_bytes())
+        {
+            return Err(StorageError::TooLarge);
+        }
+        // The blocking job outlives a dropped future, so it is told: until the
+        // publish phase starts, a dropped future discards its staged files.
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let mut guard = CancelOnDrop {
+            flag: Arc::clone(&cancelled),
+            armed: true,
+        };
+        let dirs = Arc::clone(&self.inner);
+        let result = run(move || dirs.put_all(&items, &cancelled, &|| {})).await;
+        guard.armed = false;
+        result
+    }
+
     async fn open(&self, key: &StorageKey, max_bytes: u64) -> Result<Blob, StorageError> {
         let (dirs, key) = (Arc::clone(&self.inner), key.clone());
         run(move || dirs.open(&key, max_bytes)).await
@@ -481,5 +611,100 @@ impl Storage for DiskStorage {
     async fn delete(&self, key: &StorageKey) -> Result<(), StorageError> {
         let (dirs, key) = (Arc::clone(&self.inner), key.clone());
         run(move || dirs.delete(&key)).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::AtomicBool;
+
+    use super::*;
+
+    fn key(text: &str) -> StorageKey {
+        StorageKey::parse(text).expect("key")
+    }
+
+    fn items(keys: &[&str]) -> Vec<(StorageKey, Bytes, PutOptions)> {
+        keys.iter()
+            .map(|k| {
+                (
+                    key(k),
+                    Bytes::from_static(b"content"),
+                    PutOptions::new(100).expect("options"),
+                )
+            })
+            .collect()
+    }
+
+    fn file_count(root: &Path, tree: &str) -> usize {
+        fn count(path: &Path) -> usize {
+            std::fs::read_dir(path).map_or(0, |entries| {
+                entries
+                    .map(|entry| entry.expect("entry").path())
+                    .map(|path| if path.is_dir() { count(&path) } else { 1 })
+                    .sum()
+            })
+        }
+        count(&root.join(tree))
+    }
+
+    #[test]
+    fn a_cancellation_before_the_publish_phase_discards_every_staged_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = DiskStorage::open(dir.path().join("root")).expect("open");
+        let cancelled = AtomicBool::new(false);
+        // The future is dropped after the files were staged, before publishing.
+        let result = storage
+            .inner
+            .put_all(&items(&["a", "b", "c"]), &cancelled, &|| {
+                cancelled.store(true, Ordering::SeqCst);
+            });
+        assert!(result.is_err());
+        let root = dir.path().join("root");
+        assert_eq!(file_count(&root, "blobs"), 0, "a blob was published");
+        assert_eq!(file_count(&root, "meta"), 0, "metadata was published");
+        assert_eq!(file_count(&root, "tmp"), 0, "staged files were left behind");
+    }
+
+    #[test]
+    fn without_cancellation_everything_is_published_and_staging_is_empty() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = DiskStorage::open(dir.path().join("root")).expect("open");
+        let infos = storage
+            .inner
+            .put_all(&items(&["a", "b/c"]), &AtomicBool::new(false), &|| {})
+            .expect("put_all");
+        assert_eq!(infos.len(), 2);
+        let root = dir.path().join("root");
+        assert_eq!(file_count(&root, "blobs"), 2);
+        assert_eq!(file_count(&root, "meta"), 2);
+        assert_eq!(file_count(&root, "tmp"), 0);
+    }
+
+    #[test]
+    fn a_failure_while_publishing_removes_what_was_already_published() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = DiskStorage::open(dir.path().join("root")).expect("open");
+        // "d" is a directory (it holds "d/x"), so a blob cannot be renamed onto it.
+        storage
+            .inner
+            .put_all(&items(&["d/x"]), &AtomicBool::new(false), &|| {})
+            .expect("setup");
+        let result = storage
+            .inner
+            .put_all(&items(&["ok", "d"]), &AtomicBool::new(false), &|| {});
+        assert!(result.is_err());
+        let root = dir.path().join("root");
+        assert!(
+            !root.join("blobs/ok").exists(),
+            "the first file was left published"
+        );
+        assert!(!root.join("meta/ok.json").exists());
+        assert!(!root.join("meta/d.json").exists());
+        assert!(
+            root.join("blobs/d/x").exists(),
+            "unrelated blobs are untouched"
+        );
+        assert_eq!(file_count(&root, "tmp"), 0);
     }
 }

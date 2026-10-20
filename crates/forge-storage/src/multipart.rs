@@ -158,8 +158,11 @@ fn decode_extended(value: &str) -> Result<String, StorageError> {
     let mut index = 0;
     while index < bytes.len() {
         if bytes[index] == b'%' {
+            // Exactly two ASCII hex digits: `from_str_radix` alone would accept a
+            // sign ("%+1").
             let hex = bytes
                 .get(index + 1..index + 3)
+                .filter(|pair| pair.iter().all(u8::is_ascii_hexdigit))
                 .and_then(|pair| std::str::from_utf8(pair).ok())
                 .and_then(|pair| u8::from_str_radix(pair, 16).ok())
                 .ok_or_else(|| invalid("malformed filename encoding in a multipart header"))?;
@@ -219,8 +222,14 @@ fn parse_disposition(value: &str) -> Result<Disposition, StorageError> {
     Ok(Disposition { name, filename })
 }
 
-/// Parses `body` into its parts, or fails on the first deviation.
-pub(crate) fn parse(body: &[u8], boundary: &str) -> Result<Vec<Part>, StorageError> {
+/// Parses `body` into at most `max_parts` parts, or fails on the first
+/// deviation (including the part that would exceed the count, before any of
+/// the rest is examined).
+pub(crate) fn parse(
+    body: &[u8],
+    boundary: &str,
+    max_parts: usize,
+) -> Result<Vec<Part>, StorageError> {
     let delimiter = [b"--".as_slice(), boundary.as_bytes()].concat();
     let separator = [b"\r\n".as_slice(), &delimiter].concat();
     let mut parts = Vec::new();
@@ -235,14 +244,27 @@ pub(crate) fn parse(body: &[u8], boundary: &str) -> Result<Vec<Part>, StorageErr
             }
             return Err(invalid("data after the closing multipart delimiter"));
         }
+        if parts.len() >= max_parts {
+            return Err(invalid("too many multipart parts"));
+        }
         position = expect(body, position, b"\r\n")?;
 
         let (headers_end, headers) = parse_headers(body, position)?;
         position = headers_end;
-        let content_end = find(body, position, &separator)
-            .ok_or_else(|| invalid("the multipart body is not terminated"))?;
-        let content = position..content_end;
-        position = content_end + separator.len();
+        let content = if body[position..].starts_with(&delimiter) {
+            // An empty body: the blank line that ends the headers also is the
+            // CRLF of the delimiter. Searching for the next separator from here
+            // would swallow the following part.
+            let empty = position..position;
+            position += delimiter.len();
+            empty
+        } else {
+            let content_end = find(body, position, &separator)
+                .ok_or_else(|| invalid("the multipart body is not terminated"))?;
+            let content = position..content_end;
+            position = content_end + separator.len();
+            content
+        };
 
         let mut disposition = None;
         let (mut content_type, mut encoding) = (None, None::<String>);
@@ -427,7 +449,7 @@ pub(crate) mod tests {
             Spec::file("avatar", "me.png", "image/png", png),
             Spec::file("empty", "", "application/octet-stream", b""),
         ]);
-        let parts = parse(&body, BOUNDARY).expect("parse");
+        let parts = parse(&body, BOUNDARY, 64).expect("parse");
         assert_eq!(parts.len(), 3);
         assert_eq!(parts[0].name, "name");
         assert_eq!(parts[0].filename, None);
@@ -449,7 +471,7 @@ pub(crate) mod tests {
     fn the_closing_delimiter_may_omit_the_trailing_crlf() {
         let mut body = encode(&[Spec::text("a", "1")]);
         body.truncate(body.len() - 2);
-        assert_eq!(parse(&body, BOUNDARY).expect("parse").len(), 1);
+        assert_eq!(parse(&body, BOUNDARY, 64).expect("parse").len(), 1);
     }
 
     #[test]
@@ -457,7 +479,7 @@ pub(crate) mod tests {
         let body = format!(
             "--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"a\\\"b\"; filename=\"x;y.png\"\r\n\r\nz\r\n--{BOUNDARY}\r\nContent-Disposition: form-data; name=f; filename*=UTF-8''%C3%A9.png\r\n\r\nz\r\n--{BOUNDARY}--"
         );
-        let parts = parse(body.as_bytes(), BOUNDARY).expect("parse");
+        let parts = parse(body.as_bytes(), BOUNDARY, 64).expect("parse");
         assert_eq!(parts[0].name, "a\"b");
         assert_eq!(parts[0].filename.as_deref(), Some("x;y.png"));
         assert_eq!(parts[1].filename.as_deref(), Some("é.png"));
@@ -493,12 +515,90 @@ pub(crate) mod tests {
         ];
         for (name, body) in cases {
             assert!(
-                matches!(parse(&body, BOUNDARY), Err(StorageError::InvalidUpload(_))),
+                matches!(
+                    parse(&body, BOUNDARY, 64),
+                    Err(StorageError::InvalidUpload(_))
+                ),
                 "{name}: {:?}",
-                parse(&body, BOUNDARY).map(|p| p.len())
+                parse(&body, BOUNDARY, 64).map(|p| p.len())
             );
         }
-        assert!(parse(&good, BOUNDARY).is_ok());
+        assert!(parse(&good, BOUNDARY, 64).is_ok());
+    }
+
+    #[test]
+    fn an_empty_part_does_not_swallow_the_next_one() {
+        let b = BOUNDARY;
+        // Headers, then directly the next delimiter: the part has no body.
+        let body = format!(
+            "--{b}\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\n--{b}\r\nContent-Disposition: form-data; name=\"b\"\r\n\r\nsecond\r\n--{b}--\r\n"
+        );
+        let parts = parse(body.as_bytes(), BOUNDARY, 64).expect("parse");
+        assert_eq!(parts.len(), 2, "the second part was swallowed");
+        assert_eq!(parts[0].name, "a");
+        assert!(parts[0].content.is_empty());
+        assert_eq!(parts[1].name, "b");
+        assert_eq!(&body.as_bytes()[parts[1].content.clone()], b"second");
+        // The same at the very end of the body.
+        let last =
+            format!("--{b}\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\n--{b}--\r\n");
+        assert_eq!(
+            parse(last.as_bytes(), BOUNDARY, 64).expect("parse").len(),
+            1
+        );
+    }
+
+    #[test]
+    fn the_part_count_is_enforced_while_parsing_not_after() {
+        let b = BOUNDARY;
+        let part = |n: usize| {
+            format!("--{b}\r\nContent-Disposition: form-data; name=\"f{n}\"\r\n\r\nv\r\n")
+        };
+        let valid: String = (0..10).map(part).collect();
+        let body = format!("{valid}--{b}--\r\n");
+        assert_eq!(
+            parse(body.as_bytes(), BOUNDARY, 10).expect("parse").len(),
+            10
+        );
+        let error = parse(body.as_bytes(), BOUNDARY, 9).expect_err("over the count");
+        assert!(
+            error.to_string().contains("too many multipart parts"),
+            "{error}"
+        );
+        // Failing early: garbage after the limit is never reached, so the error
+        // is the count, not the malformed tail.
+        let garbage = format!("{valid}--{b}\r\nnot a header\r\n\r\n");
+        let error = parse(garbage.as_bytes(), BOUNDARY, 10).expect_err("over the count");
+        assert!(
+            error.to_string().contains("too many multipart parts"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn extended_file_names_need_exactly_two_hex_digits() {
+        let b = BOUNDARY;
+        for bad in ["%+1", "%-1", "% 1", "%1", "%", "%zz", "a%2"] {
+            let body = format!(
+                "--{b}\r\nContent-Disposition: form-data; name=f; filename*=UTF-8''{bad}\r\n\r\nz\r\n--{b}--"
+            );
+            assert!(
+                matches!(
+                    parse(body.as_bytes(), BOUNDARY, 4),
+                    Err(StorageError::InvalidUpload(_))
+                ),
+                "{bad}"
+            );
+        }
+        let ok = format!(
+            "--{b}\r\nContent-Disposition: form-data; name=f; filename*=UTF-8''%41%4a\r\n\r\nz\r\n--{b}--"
+        );
+        assert_eq!(
+            parse(ok.as_bytes(), BOUNDARY, 4).expect("parse")[0]
+                .filename
+                .as_deref(),
+            Some("AJ")
+        );
     }
 
     #[test]
@@ -509,7 +609,7 @@ pub(crate) mod tests {
             "--{b}\r\nContent-Disposition: form-data; name=\"a\"\r\n{many}\r\n1\r\n--{b}--"
         );
         assert!(
-            parse(body.as_bytes(), BOUNDARY).is_err(),
+            parse(body.as_bytes(), BOUNDARY, 64).is_err(),
             "too many headers"
         );
         let long = "v".repeat(MAX_HEADER_LINE);
@@ -517,14 +617,14 @@ pub(crate) mod tests {
             "--{b}\r\nContent-Disposition: form-data; name=\"a\"\r\nX-Long: {long}\r\n\r\n1\r\n--{b}--"
         );
         assert!(
-            parse(body.as_bytes(), BOUNDARY).is_err(),
+            parse(body.as_bytes(), BOUNDARY, 64).is_err(),
             "header line too long"
         );
         let name = "n".repeat(MAX_NAME + 1);
         let body =
             format!("--{b}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n1\r\n--{b}--");
         assert!(
-            parse(body.as_bytes(), BOUNDARY).is_err(),
+            parse(body.as_bytes(), BOUNDARY, 64).is_err(),
             "field name too long"
         );
     }
@@ -601,7 +701,7 @@ pub(crate) mod tests {
                 });
             }
             let body = encode(&specs);
-            let parts = parse(&body, BOUNDARY).unwrap_or_else(|e| panic!("round {round}: {e}"));
+            let parts = parse(&body, BOUNDARY, 64).unwrap_or_else(|e| panic!("round {round}: {e}"));
             assert_eq!(parts.len(), specs.len(), "round {round}");
             for (part, spec) in parts.iter().zip(&specs) {
                 assert_eq!(part.name, spec.field);
@@ -623,7 +723,7 @@ pub(crate) mod tests {
                     2 => mutated.insert(at, (next() % 256) as u8),
                     _ => mutated.truncate(at),
                 }
-                if let Ok(parsed) = parse(&mutated, BOUNDARY) {
+                if let Ok(parsed) = parse(&mutated, BOUNDARY, 64) {
                     for part in parsed {
                         assert!(
                             part.content.end <= mutated.len()

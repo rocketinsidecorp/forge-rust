@@ -121,8 +121,10 @@ Files are written from the buffered body without an extra copy; text fields
 | file in another field, more files than `max_files`, empty file, unnamed part, non-identity `Content-Transfer-Encoding`, too many text fields, malformed or non-canonical body | `400 invalid_upload` |
 | no file at all | `StorageError::NoFile` (`400 upload_missing`); use `optional_file(true)` to receive the fields of such a submission |
 
-If a store failure interrupts a multi-file upload, the files already stored by
-the request are deleted.
+A multi-file upload is stored as one unit (`Storage::put_all`): if a store
+failure interrupts it, or the request is cancelled (for example by the request
+timeout) before publishing starts, no file of the request is kept; staged files
+in `tmp/` are removed by the job or by `prune_temp`.
 
 ### How the content type is decided
 

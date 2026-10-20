@@ -85,7 +85,17 @@ file name is metadata, never part of the key.
   adapter (the crate compiles there without it).
 - Blocking file work runs on Tokio's blocking pool and is awaited by the caller;
   it is never detached. Dropping the future abandons the result, not a syscall in
-  flight; `tmp/` pruning covers the leftovers.
+  flight, so a multi-file upload goes through `Storage::put_all`: the disk adapter
+  runs it as one blocking job that first **stages** every file in `tmp/` and only
+  then **publishes** them all (metadata first, blob last). The awaiting future
+  raises a flag when it is dropped; the job checks it before publishing and, if
+  set, discards the staged files, so a request timeout cannot leave the first
+  files of an upload committed. A failure while publishing removes what was
+  already published. Once publishing has started the job completes (the same as a
+  client that times out after the server committed). A crash leaves at most staged
+  files in `tmp/`, which `prune_temp` removes.
+- A single `put` keeps the previous metadata aside while it replaces it, so a
+  failed overwrite restores the existing record instead of deleting it.
 - Disk storage is for one host (or hosts sharing a volume with working
   `rename`/`fsync`, not NFS).
 
@@ -97,7 +107,7 @@ custom cryptography). The computed MAC is compared with `subtle`'s constant-time
 equality against **every** configured key (no early exit), and the signature is
 checked **before** the store is consulted. A link carries `expires` (unix
 seconds), `sig` (unpadded base64url) and optionally `disposition=inline`.
-Parsing is strict: exactly one `expires` (decimal) and one `sig` (canonical
+Parsing is strict: exactly one `expires` (canonical decimal, no leading zeros) and one `sig` (canonical
 43-character signature), at most one `disposition`, no percent-decoding: there
 is no second spelling of a valid link. `ExpiredLink` is only returned for an
 *authentic* expired link, so expiry cannot be used to learn anything about
@@ -166,8 +176,11 @@ existing keys). Responses:
   except that types that must carry a signature (images, audio, video, fonts,
   PDF, archives) and text types (which need text content) are refused when the
   content does not match;
-- everything is validated before the first `put`; if a `put` then fails, the
-  files already stored by the request are removed;
+- the part count is bounded while parsing (`max_files + max_fields`) and an empty
+  part cannot swallow the next one;
+- everything is validated before anything is stored; the files are then stored by
+  `put_all` as one unit (all or none, also when the request is cancelled; see
+  the disk adapter);
 - keys are UUIDv7 under an optional validated prefix; the file name is sanitized
   (no directories, control or bidirectional characters, quotes, leading dots) and
   kept only as metadata.

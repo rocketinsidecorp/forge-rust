@@ -1293,3 +1293,115 @@ async fn end_to_end_upload_then_signed_download_through_the_router() {
         "a path leaked: {body}"
     );
 }
+
+/// A store whose writes are slow, so a request timeout lands mid-upload.
+#[tokio::test]
+async fn a_cancelled_upload_leaves_no_committed_blob_behind() {
+    let u = uploads();
+    let options = UploadOptions::new("avatar", &["image/png"], 8 << 20)
+        .expect("options")
+        .max_files(6);
+    // Six large files: staging them takes much longer than the timeout.
+    let big = [PNG, &vec![7_u8; 6 << 20]].concat();
+    let parts: Vec<Part> = (0..6)
+        .map(|_| file("avatar", "a.png", "image/png", &big))
+        .collect();
+    let request = upload_request(multipart(&parts));
+    let outcome = tokio::time::timeout(
+        Duration::from_millis(1),
+        receive(&request, &u.store, &options),
+    )
+    .await;
+    assert!(
+        outcome.is_err(),
+        "the upload was expected to be cut off by the timeout"
+    );
+    // Give the blocking job time to notice the cancellation and clean up.
+    tokio::time::sleep(Duration::from_millis(3000)).await;
+    assert_eq!(
+        u.blobs(),
+        0,
+        "a cancelled upload left files behind (blobs, metadata or staging)"
+    );
+}
+
+/// A failed overwrite must not destroy the record of the blob that is still there.
+#[tokio::test]
+async fn a_failed_overwrite_keeps_the_previous_metadata() {
+    let u = uploads();
+    let root = u.dir.path().join("root");
+    // `blobs/a` is a directory, so a blob named "a" can never be stored; its
+    // metadata file exists from an earlier life.
+    u.store
+        .put(
+            &key("a/b"),
+            Bytes::from_static(b"x"),
+            PutOptions::new(10).expect("o"),
+        )
+        .await
+        .expect("setup");
+    let record = r#"{"content_type":"text/plain","sha256":"00","size":1}"#;
+    std::fs::write(root.join("meta/a.json"), record).expect("record");
+    let result = u
+        .store
+        .put(
+            &key("a"),
+            Bytes::from_static(b"new"),
+            PutOptions::new(10).expect("o"),
+        )
+        .await;
+    assert!(result.is_err());
+    assert_eq!(
+        std::fs::read_to_string(root.join("meta/a.json")).expect("kept"),
+        record
+    );
+    assert_eq!(std::fs::read_dir(root.join("tmp")).expect("tmp").count(), 0);
+}
+
+#[tokio::test]
+async fn an_empty_text_field_does_not_swallow_the_file_after_it() {
+    let u = uploads();
+    let mut body = Vec::new();
+    body.extend_from_slice(
+        format!("--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"note\"\r\n\r\n").as_bytes(),
+    );
+    body.extend_from_slice(format!("--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"avatar\"; filename=\"a.png\"\r\nContent-Type: image/png\r\n\r\n").as_bytes());
+    body.extend_from_slice(PNG);
+    body.extend_from_slice(format!("\r\n--{BOUNDARY}--\r\n").as_bytes());
+    let got = receive(
+        &upload_request(Bytes::from(body)),
+        &u.store,
+        &default_options(),
+    )
+    .await
+    .expect("receive");
+    assert_eq!(
+        got.files.len(),
+        1,
+        "the file after an empty part was swallowed"
+    );
+    assert_eq!(got.fields["note"], vec![""]);
+}
+
+#[tokio::test]
+async fn too_many_parts_are_refused_before_the_rest_is_examined() {
+    let u = uploads();
+    let options = default_options().text_fields(2, 100);
+    // max parts = 1 file + 2 fields = 3; send four, then garbage.
+    let mut body = multipart(&[
+        text("a", "1"),
+        text("b", "2"),
+        text("c", "3"),
+        text("d", "4"),
+    ])
+    .to_vec();
+    body.truncate(body.len() - format!("--{BOUNDARY}--\r\n").len());
+    body.extend_from_slice(format!("--{BOUNDARY}\r\nbroken").as_bytes());
+    let error = receive(&upload_request(Bytes::from(body)), &u.store, &options)
+        .await
+        .expect_err("too many");
+    assert!(
+        error.to_string().contains("too many multipart parts"),
+        "{error}"
+    );
+}

@@ -335,6 +335,36 @@ pub trait Storage: Send + Sync {
         options: PutOptions,
     ) -> Result<Info, StorageError>;
 
+    /// Stores several blobs as one unit: every blob is stored, or none.
+    ///
+    /// This is what [`receive`] uses, so a failure half way (or a cancelled
+    /// request) cannot leave the first files of an upload committed. The
+    /// provided implementation stores one by one and deletes what it stored
+    /// when a later `put` fails; it is **not** safe against the future being
+    /// dropped, so an adapter whose writes outlive a dropped future (the disk
+    /// adapter's blocking jobs do) overrides it with an implementation that
+    /// publishes nothing once the caller is gone.
+    async fn put_all(
+        &self,
+        items: Vec<(StorageKey, Bytes, PutOptions)>,
+    ) -> Result<Vec<Info>, StorageError> {
+        let mut stored: Vec<Info> = Vec::with_capacity(items.len());
+        for (key, body, options) in items {
+            match self.put(&key, body, options).await {
+                Ok(info) => stored.push(info),
+                Err(error) => {
+                    for info in &stored {
+                        if let Err(delete_error) = self.delete(&info.key).await {
+                            tracing::warn!(error = %delete_error, "could not remove a file of a rejected upload");
+                        }
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        Ok(stored)
+    }
+
     /// Reads the content of `key`, failing with [`StorageError::TooLarge`] when
     /// it is longer than `max_bytes` (so serving a blob has a memory bound).
     async fn open(&self, key: &StorageKey, max_bytes: u64) -> Result<Blob, StorageError>;

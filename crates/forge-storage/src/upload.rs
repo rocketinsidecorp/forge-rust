@@ -194,7 +194,7 @@ pub async fn receive(
     if body.len() as u64 > options.body_limit() {
         return Err(StorageError::TooLarge);
     }
-    let parts = multipart::parse(body, &boundary)?;
+    let parts = multipart::parse(body, &boundary, options.max_files + options.max_fields)?;
 
     // Validate everything that does not need the store before storing a byte.
     let allowed: HashSet<&str> = options.allowed_types.iter().map(String::as_str).collect();
@@ -250,19 +250,17 @@ pub async fn receive(
         };
     }
 
+    // One unit: all files are stored or none, even if this future is dropped
+    // half way (the request timeout), so no blob is orphaned.
+    let mut items = Vec::with_capacity(files.len());
     for (range, filename, content_type) in files {
         let key = StorageKey::unique(options.prefix.as_deref())?;
         let put = PutOptions::new(options.max_file_bytes)?
             .content_type(content_type)
             .filename(sanitize_filename(&filename));
-        match store.put(&key, body.slice(range), put).await {
-            Ok(info) => received.files.push(info),
-            Err(error) => {
-                cleanup(store, &received.files).await;
-                return Err(error);
-            }
-        }
+        items.push((key, body.slice(range), put));
     }
+    received.files = store.put_all(items).await?;
     Ok(received)
 }
 
@@ -349,16 +347,6 @@ fn has_signature(content_type: &str) -> bool {
                 | "text/html"
                 | "text/xml"
         )
-}
-
-/// Removes files stored by a rejected upload. Failures are logged without the
-/// key; a leftover blob has an unguessable key and is garbage, not exposure.
-async fn cleanup(store: &dyn Storage, files: &[Info]) {
-    for file in files {
-        if let Err(error) = store.delete(&file.key).await {
-            tracing::warn!(%error, "could not remove a file of a rejected upload");
-        }
-    }
 }
 
 #[cfg(test)]
