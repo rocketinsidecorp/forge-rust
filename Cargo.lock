@@ -851,6 +851,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "forge-proxy"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "bytes",
+ "getrandom 0.4.3",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "ring",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-rustls",
+ "tokio-util",
+ "url",
+ "webpki-roots",
+]
+
+[[package]]
 name = "forge-ratelimit"
 version = "0.1.0"
 dependencies = [

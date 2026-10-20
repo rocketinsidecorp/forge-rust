@@ -18,6 +18,7 @@ members = [
     "crates/forge-macros",
     "crates/forge-mail",
     "crates/forge-openapi",
+    "crates/forge-proxy",
     "crates/forge-ratelimit",
     "crates/forge-security",
     "crates/forge-storage",
