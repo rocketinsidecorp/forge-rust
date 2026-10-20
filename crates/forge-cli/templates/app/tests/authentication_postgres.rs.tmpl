@@ -1,7 +1,10 @@
 //! `setup` and the PostgreSQL authentication adapters against a real
 //! database migrated with the application's migrations
 //! (`forge::db::testing::TestDatabase`): one owner only, also under
-//! concurrency; reset tokens that work once, expire and revoke sessions.
+//! concurrency; reset tokens that work once, expire and revoke sessions;
+//! two-factor codes, backup codes and sign-in challenges that work once,
+//! expire, die with a password change and fail closed on a wrong key or a
+//! tampered seed.
 //!
 //! PostgreSQL tests need `FORGE_TEST_DATABASE_URL` (a role that may create
 //! databases) and are ignored by default:
@@ -11,11 +14,12 @@ use std::error::Error;
 
 use app::bootstrap::setup;
 use app::infrastructure::accounts::{
-    OWNER_ROLE, OwnerAccount, PgPasswordResetStore, PgTenantDirectory, SetupError, provision_owner,
+    OWNER_ROLE, OwnerAccount, PgMfaStore, PgPasswordResetStore, PgTenantDirectory, SetupError,
+    provision_owner,
 };
 use app::infrastructure::auth::{PostgresPasswordCredentialStore, PostgresSessionStore};
 use app::infrastructure::security::{
-    Argon2idPasswordHasher, authenticate_password, issue_persisted_session,
+    Argon2idPasswordHasher, authenticate_password, issue_persisted_session, verify_password,
 };
 use forge::CommandContext;
 use forge::auth::{
@@ -25,6 +29,12 @@ use forge::db::testing::TestDatabase;
 use forge::tenancy::{
     PasswordResetGrant, PasswordResetStore as _, TenantDirectory as _, TenantSlug,
 };
+
+use std::net::{IpAddr, Ipv4Addr};
+use std::sync::Arc;
+
+use forge::auth::{Aes256GcmSecretCipher, MemoryLoginThrottle, MfaChallengeBinding};
+use forge::tenancy::{MfaChange, MfaError, MfaService, mfa_throttle_config};
 
 type TestResult = Result<(), Box<dyn Error>>;
 
@@ -301,6 +311,280 @@ async fn reset_tokens_work_once_expire_and_revoke_every_session() -> TestResult 
         stored, 2,
         "the redeemed and the outstanding token are used up"
     );
+    database.cleanup().await?;
+    Ok(())
+}
+
+/// Two-factor authentication over the PostgreSQL store, with `key`.
+fn mfa(pool: &sqlx::PgPool, key: [u8; 32]) -> Result<MfaService, Box<dyn Error>> {
+    Ok(MfaService::new(
+        Arc::new(PgMfaStore::new(pool.clone())),
+        Some(Arc::new(Aes256GcmSecretCipher::new(&key)?)),
+        Arc::new(MemoryLoginThrottle::new(mfa_throttle_config())?),
+    ))
+}
+
+fn after(now: UnixTimestamp, seconds: u64) -> UnixTimestamp {
+    UnixTimestamp::from_secs(now.as_secs() + seconds)
+}
+
+fn binding() -> MfaChallengeBinding {
+    MfaChallengeBinding::from_bytes([1; 32])
+}
+
+fn source() -> Option<IpAddr> {
+    Some(IpAddr::V4(Ipv4Addr::LOCALHOST))
+}
+
+#[tokio::test]
+#[ignore = "needs FORGE_TEST_DATABASE_URL"]
+async fn two_factor_codes_and_challenges_work_once_and_fail_closed() -> TestResult {
+    let database = TestDatabase::<sqlx::Postgres>::create(&MIGRATOR).await?;
+    let pool = database.database().pool().clone();
+    let now = now()?;
+    let owner = provision_owner(
+        &pool,
+        &OwnerAccount {
+            tenant: TenantSlug::new("acme")?,
+            organization: "Acme".to_owned(),
+            login: CanonicalLogin::parse("owner@example.com")?,
+            password_hash: Argon2idPasswordHasher.hash(PASSWORD.as_bytes()).await?,
+            now,
+        },
+    )
+    .await?;
+    let principal = owner.principal_id;
+    let service = mfa(&pool, [7; 32])?;
+    let sessions = PostgresSessionStore::new(pool.clone());
+    let before = issue_persisted_session(&sessions, principal, now, after(now, 3_600)).await?;
+
+    // Enrollment: pending until confirmed, then a factor with ten codes.
+    let enrollment = service
+        .begin(
+            principal,
+            MfaChange::Enrollment,
+            "shop",
+            "owner@example.com",
+            now,
+        )
+        .await?;
+    assert_eq!(service.status(principal).await?, None);
+    let codes = service
+        .confirm(
+            principal,
+            MfaChange::Enrollment,
+            &enrollment.secret.code_at(now),
+            now,
+        )
+        .await?;
+    assert_eq!(
+        service
+            .status(principal)
+            .await?
+            .map(|status| status.remaining_backup_codes),
+        Some(10)
+    );
+    let session = sessions
+        .find_by_credential(&before.secrets.bearer_digest)
+        .await?
+        .ok_or("kept as history")?;
+    assert!(
+        session.revoked_at().is_some(),
+        "enrolling signs out everywhere"
+    );
+    // Only ciphertext and digests are stored.
+    let stored: Vec<u8> = sqlx::query_scalar("SELECT secret_ciphertext FROM forge_totp_factors")
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(stored.len(), 12 + 20 + 16, "nonce, sealed seed and tag");
+    assert!(
+        !String::from_utf8_lossy(&stored).contains(&enrollment.secret.base32()),
+        "never the seed in clear"
+    );
+
+    let credentials = PostgresPasswordCredentialStore::new(pool.clone());
+    let verified = verify_password(
+        &credentials,
+        &Argon2idPasswordHasher,
+        "owner@example.com",
+        PASSWORD.as_bytes(),
+    )
+    .await?;
+    let challenge = |at: UnixTimestamp| {
+        let service = service.clone();
+        async move {
+            service
+                .issue_challenge(
+                    principal,
+                    owner.tenant_id,
+                    verified.version,
+                    binding(),
+                    after(at, 3_600),
+                    at,
+                )
+                .await
+        }
+    };
+
+    // The confirmation's period is used up; the next one signs in, once,
+    // even when two requests race.
+    let first = challenge(now).await?;
+    let replay = service
+        .complete(
+            first.token.expose(),
+            &binding(),
+            &enrollment.secret.code_at(now),
+            source(),
+            now,
+        )
+        .await;
+    assert_eq!(
+        replay.err().map(|rejection| rejection.error),
+        Some(MfaError::InvalidCode)
+    );
+    let next = after(now, 30);
+    let code = enrollment.secret.code_at(next);
+    let bound = binding();
+    let (one, two) = tokio::join!(
+        service.complete(first.token.expose(), &bound, &code, source(), next),
+        service.complete(first.token.expose(), &bound, &code, source(), next),
+    );
+    assert_eq!(
+        usize::from(one.is_ok()) + usize::from(two.is_ok()),
+        1,
+        "{one:?} {two:?}"
+    );
+    let second = challenge(next).await?;
+    let replayed = service
+        .complete(second.token.expose(), &binding(), &code, source(), next)
+        .await;
+    assert_eq!(
+        replayed.err().map(|rejection| rejection.error),
+        Some(MfaError::InvalidCode)
+    );
+    // Another browser session's binding.
+    let foreign = service
+        .complete(
+            second.token.expose(),
+            &MfaChallengeBinding::from_bytes([2; 32]),
+            &enrollment.secret.code_at(after(now, 60)),
+            source(),
+            after(now, 60),
+        )
+        .await;
+    assert_eq!(
+        foreign.err().map(|rejection| rejection.error),
+        Some(MfaError::InvalidCode)
+    );
+    // Expired.
+    let late = after(next, forge::tenancy::MFA_CHALLENGE_LIFETIME_SECS);
+    let expired = service
+        .complete(
+            second.token.expose(),
+            &binding(),
+            &enrollment.secret.code_at(late),
+            source(),
+            late,
+        )
+        .await;
+    assert_eq!(
+        expired.err().map(|rejection| rejection.error),
+        Some(MfaError::ChallengeExpired)
+    );
+
+    // A backup code works once.
+    let third = challenge(after(now, 60)).await?;
+    let signed_in = service
+        .complete(
+            third.token.expose(),
+            &binding(),
+            codes[0].expose(),
+            source(),
+            after(now, 60),
+        )
+        .await
+        .map_err(|rejection| rejection.error)?;
+    assert_eq!(signed_in.tenant_id, owner.tenant_id);
+    let fourth = challenge(after(now, 60)).await?;
+    let reused = service
+        .complete(
+            fourth.token.expose(),
+            &binding(),
+            codes[0].expose(),
+            source(),
+            after(now, 60),
+        )
+        .await;
+    assert_eq!(
+        reused.err().map(|rejection| rejection.error),
+        Some(MfaError::InvalidCode)
+    );
+
+    // A password change voids the pending challenge.
+    sqlx::query("UPDATE forge_principals SET version = version + 1 WHERE id = $1")
+        .bind(principal.into_uuid())
+        .execute(&pool)
+        .await?;
+    let stale = service
+        .complete(
+            fourth.token.expose(),
+            &binding(),
+            &enrollment.secret.code_at(after(now, 90)),
+            source(),
+            after(now, 90),
+        )
+        .await;
+    assert_eq!(
+        stale.err().map(|rejection| rejection.error),
+        Some(MfaError::ChallengeExpired)
+    );
+    assert_eq!(
+        challenge(after(now, 90)).await.err(),
+        Some(MfaError::NotEnabled)
+    );
+
+    // A wrong key and a tampered seed fail closed.
+    let wrong_key = mfa(&pool, [8; 32])?;
+    assert_eq!(
+        wrong_key
+            .verify_second_factor(
+                principal,
+                &enrollment.secret.code_at(after(now, 120)),
+                after(now, 120)
+            )
+            .await,
+        Err(MfaError::Mechanism)
+    );
+    sqlx::query(
+        "UPDATE forge_totp_factors
+         SET secret_ciphertext = set_byte(secret_ciphertext, 20, get_byte(secret_ciphertext, 20) # 1)",
+    )
+    .execute(&pool)
+    .await?;
+    assert_eq!(
+        service
+            .verify_second_factor(
+                principal,
+                &enrollment.secret.code_at(after(now, 120)),
+                after(now, 120)
+            )
+            .await,
+        Err(MfaError::Mechanism)
+    );
+
+    // Disabling removes the factor and its codes and signs out everywhere.
+    let last = issue_persisted_session(&sessions, principal, now, after(now, 3_600)).await?;
+    service.disable(principal, after(now, 150)).await?;
+    assert_eq!(service.status(principal).await?, None);
+    let remaining: i64 = sqlx::query_scalar("SELECT count(*) FROM forge_mfa_backup_codes")
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(remaining, 0);
+    let session = sessions
+        .find_by_credential(&last.secrets.bearer_digest)
+        .await?
+        .ok_or("kept as history")?;
+    assert!(session.revoked_at().is_some());
     database.cleanup().await?;
     Ok(())
 }

@@ -1,0 +1,11 @@
+<div>
+  <label>{{ layout.i18n.t("mfa.show.password") }}
+    <input type="password" name="password" required autocomplete="current-password" maxlength="1024">
+  </label>
+</div>
+<div>
+  <label>{{ layout.i18n.t("mfa.show.code") }}
+    <input type="text" name="code" required maxlength="32" inputmode="numeric" autocomplete="one-time-code" autocapitalize="none" spellcheck="false">
+  </label>
+  <p class="muted">{{ layout.i18n.t("mfa.show.code_hint") }}</p>
+</div>

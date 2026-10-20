@@ -105,6 +105,11 @@ services:
 %%if database%%
       FORGE_DATABASE_URL: %%DATABASE_RUNTIME_URL_CONTAINER%%
 %%end%%
+%%if authentication%%
+      # Two-factor authentication (ADR 0040): export a key before
+      # `docker compose up`; empty leaves it off.
+      FORGE_AUTH_MFA_KEY: ${FORGE_AUTH_MFA_KEY:-}
+%%end%%
 %%if sqlite%%
     volumes:
       - sqlite-data:/data

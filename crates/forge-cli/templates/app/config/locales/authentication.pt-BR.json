@@ -11,10 +11,19 @@
         "forgot_password": "Esqueceu sua senha?",
         "already_signed_in": "Você já entrou. Entre novamente para trocar de conta, ou saia."
       },
+      "mfa": {
+        "title": "Autenticação em dois fatores",
+        "code": "Código",
+        "code_hint": "O código de 6 dígitos do seu aplicativo autenticador, ou um dos seus códigos de backup.",
+        "submit": "Verificar",
+        "start_over": "Recomeçar"
+      },
       "sign_out": "Sair",
       "signed_in": "Você entrou.",
       "signed_out": "Você saiu.",
-      "invalid_credentials": "Essa organização, e-mail e senha não correspondem a uma conta."
+      "invalid_credentials": "Essa organização, e-mail e senha não correspondem a uma conta.",
+      "expired": "Sua entrada expirou. Entre novamente.",
+      "invalid_code": "Esse código não funcionou. Digite o código atual do seu aplicativo autenticador, ou um código de backup."
     },
     "passwords": {
       "new": {
@@ -40,6 +49,53 @@
         "invalid": "A nova senha não é válida"
       }
     },
+    "mfa": {
+      "show": {
+        "title": "Autenticação em dois fatores",
+        "enabled": "A autenticação em dois fatores está ativada.",
+        "disabled": "A autenticação em dois fatores está desativada. Ative-a para exigir um código de um aplicativo autenticador a cada entrada.",
+        "unavailable": "A autenticação em dois fatores não está disponível: FORGE_AUTH_MFA_KEY não está configurada.",
+        "remaining": {
+          "one": "Resta %{count} código de backup.",
+          "other": "Restam %{count} códigos de backup."
+        },
+        "password": "Senha atual",
+        "code": "Código atual",
+        "code_hint": "Do seu aplicativo autenticador, ou um dos seus códigos de backup.",
+        "enable": "Ativar a autenticação em dois fatores",
+        "rotate_title": "Substituir seu autenticador",
+        "rotate": "Substituir o autenticador",
+        "backup_codes_title": "Códigos de backup",
+        "regenerate": "Criar novos códigos de backup",
+        "disable_title": "Desativar",
+        "disable": "Desativar a autenticação em dois fatores",
+        "back": "Voltar à autenticação em dois fatores"
+      },
+      "new": {
+        "title": "Configure seu aplicativo autenticador",
+        "rotate_title": "Configure seu novo autenticador",
+        "instructions": "Adicione esta conta ao seu aplicativo autenticador pelo link, ou digite a chave nele. Depois digite o código de 6 dígitos que ele mostra.",
+        "link": "Abrir no seu aplicativo autenticador",
+        "key": "Chave",
+        "expires": "Esta configuração expira em 10 minutos.",
+        "code": "Código",
+        "submit": "Ativar",
+        "rotate_submit": "Substituir"
+      },
+      "backup_codes": {
+        "title": "Seus códigos de backup",
+        "instructions": "Cada código faz você entrar uma vez quando não puder usar seu aplicativo autenticador. Guarde-os em um lugar seguro: eles só são mostrados agora.",
+        "signed_out": "Você saiu de todas as sessões. Entre com sua senha e um código.",
+        "sign_in": "Entrar novamente"
+      },
+      "disabled": "A autenticação em dois fatores está desativada. Entre novamente.",
+      "errors": {
+        "step_up": "Essa senha ou esse código não funcionou.",
+        "invalid_code": "Esse código não funcionou. Digite o código atual do seu aplicativo autenticador.",
+        "expired": "Essa configuração expirou. Comece de novo.",
+        "changed": "A autenticação em dois fatores mudou enquanto isso. Confira as configurações e tente novamente."
+      }
+    },
     "throttled": {
       "sign_in": {
         "one": "Muitas tentativas de entrada. Tente novamente em um minuto.",
@@ -48,6 +104,10 @@
       "reset": {
         "one": "Muitas tentativas de redefinição. Tente novamente em um minuto.",
         "other": "Muitas tentativas de redefinição. Tente novamente em %{count} minutos."
+      },
+      "code": {
+        "one": "Muitas tentativas de código. Tente novamente em um minuto.",
+        "other": "Muitas tentativas de código. Tente novamente em %{count} minutos."
       }
     }
   }

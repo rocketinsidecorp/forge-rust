@@ -381,6 +381,13 @@ fn the_app_settings_are_valid_framework_configuration() {
                 let value = value
                     .as_str()
                     .unwrap_or_else(|| panic!("{key} = {value} is not a string"));
+                // `${NAME:-}` passes an exported secret through; Compose
+                // interpolates it to empty when it is not exported.
+                let value = if value == format!("${{{key}:-}}") {
+                    ""
+                } else {
+                    value
+                };
                 variables.insert(key.clone(), value.to_owned());
             }
         }

@@ -37,6 +37,8 @@ uuid.workspace = true
 rustix = { workspace = true, features = ["process"] }
 
 [dev-dependencies]
+# tests/scaffold.rs computes the TOTP codes of a generated app's two-factor flow.
+forge-auth = { path = "../forge-auth" }
 # tests/scaffold.rs provisions a PostgreSQL database for migrate/rollback.
 forge-db = { path = "../forge-db", features = ["postgres", "testing"] }
 tempfile.workspace = true

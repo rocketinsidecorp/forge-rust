@@ -11,10 +11,19 @@
         "forgot_password": "Forgot your password?",
         "already_signed_in": "You are signed in. Sign in again to switch accounts, or sign out."
       },
+      "mfa": {
+        "title": "Two-factor authentication",
+        "code": "Code",
+        "code_hint": "The 6-digit code from your authenticator app, or one of your backup codes.",
+        "submit": "Verify",
+        "start_over": "Start over"
+      },
       "sign_out": "Sign out",
       "signed_in": "Signed in.",
       "signed_out": "Signed out.",
-      "invalid_credentials": "That organization, email and password do not match an account."
+      "invalid_credentials": "That organization, email and password do not match an account.",
+      "expired": "Your sign-in expired. Sign in again.",
+      "invalid_code": "That code did not work. Enter the current code from your authenticator app, or a backup code."
     },
     "passwords": {
       "new": {
@@ -40,6 +49,53 @@
         "invalid": "New password is not a valid password"
       }
     },
+    "mfa": {
+      "show": {
+        "title": "Two-factor authentication",
+        "enabled": "Two-factor authentication is on.",
+        "disabled": "Two-factor authentication is off. Turn it on to require a code from an authenticator app at every sign-in.",
+        "unavailable": "Two-factor authentication is not available: FORGE_AUTH_MFA_KEY is not configured.",
+        "remaining": {
+          "one": "%{count} backup code left.",
+          "other": "%{count} backup codes left."
+        },
+        "password": "Current password",
+        "code": "Current code",
+        "code_hint": "From your authenticator app, or one of your backup codes.",
+        "enable": "Turn on two-factor authentication",
+        "rotate_title": "Replace your authenticator",
+        "rotate": "Replace authenticator",
+        "backup_codes_title": "Backup codes",
+        "regenerate": "Create new backup codes",
+        "disable_title": "Turn off",
+        "disable": "Turn off two-factor authentication",
+        "back": "Back to two-factor authentication"
+      },
+      "new": {
+        "title": "Set up your authenticator app",
+        "rotate_title": "Set up your new authenticator",
+        "instructions": "Add this account to your authenticator app with the link, or type the key into it. Then enter the 6-digit code it shows.",
+        "link": "Open in your authenticator app",
+        "key": "Key",
+        "expires": "This setup expires in 10 minutes.",
+        "code": "Code",
+        "submit": "Turn on",
+        "rotate_submit": "Replace"
+      },
+      "backup_codes": {
+        "title": "Your backup codes",
+        "instructions": "Each code signs you in once when you cannot use your authenticator app. Store them somewhere safe: they are shown only now.",
+        "signed_out": "You were signed out everywhere. Sign in with your password and a code.",
+        "sign_in": "Sign in again"
+      },
+      "disabled": "Two-factor authentication is off. Sign in again.",
+      "errors": {
+        "step_up": "That password or code did not work.",
+        "invalid_code": "That code did not work. Enter the current code from your authenticator app.",
+        "expired": "That setup expired. Start again.",
+        "changed": "Two-factor authentication changed meanwhile. Check the settings and try again."
+      }
+    },
     "throttled": {
       "sign_in": {
         "one": "Too many sign-in attempts. Try again in a minute.",
@@ -48,6 +104,10 @@
       "reset": {
         "one": "Too many reset attempts. Try again in a minute.",
         "other": "Too many reset attempts. Try again in %{count} minutes."
+      },
+      "code": {
+        "one": "Too many code attempts. Try again in a minute.",
+        "other": "Too many code attempts. Try again in %{count} minutes."
       }
     }
   }

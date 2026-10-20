@@ -1,4 +1,4 @@
-//! The sign-in, sign-out and password-reset pages end to end through the
+//! The sign-in, sign-out, password-reset and two-factor pages end to end through the
 //! application's router, without a network or database: the identity ports
 //! are in-memory fakes that follow the PostgreSQL adapters' contracts, and
 //! the password hasher is a fast stand-in for Argon2id.
@@ -23,10 +23,11 @@ use forge::http::{
     X_FORWARDED_FOR, header,
 };
 use forge::security::{PrincipalId, Role};
+use forge::tenancy::testing::MemoryMfaStore;
 use forge::tenancy::{
     AccountStoreError, Membership, MembershipState, MembershipStore, MembershipStoreError,
-    MembershipStoreErrorKind, PasswordResetGrant, PasswordResetStore, RedeemedPasswordReset,
-    TenantDirectory, TenantId, TenantSlug,
+    MembershipStoreErrorKind, MfaService, PasswordResetGrant, PasswordResetStore,
+    RedeemedPasswordReset, TenantDirectory, TenantId, TenantSlug, mfa_throttle_config,
 };
 
 use app::adapters::http::authentication::{AuthenticationPorts, RESET_RESPONSE_TIME, routes};
@@ -113,6 +114,27 @@ impl PasswordCredentialStore for World {
         lock(&self.accounts)
             .iter()
             .find(|account| fold(&account.login) == fold(login))
+            .map(|account| {
+                let version = PasswordCredentialVersion::new(account.version)
+                    .ok_or(PasswordCredentialStoreError::CorruptRecord)?;
+                Ok(PasswordCredential::new(
+                    account.principal,
+                    account.hash.clone(),
+                    account.disabled,
+                    version,
+                )
+                .with_login(account.login.clone()))
+            })
+            .transpose()
+    }
+
+    async fn find_by_principal(
+        &self,
+        principal: PrincipalId,
+    ) -> Result<Option<PasswordCredential>, PasswordCredentialStoreError> {
+        lock(&self.accounts)
+            .iter()
+            .find(|account| account.principal == principal)
             .map(|account| {
                 let version = PasswordCredentialVersion::new(account.version)
                     .ok_or(PasswordCredentialStoreError::CorruptRecord)?;
@@ -352,8 +374,9 @@ fn fixture_with(deliver_fails: bool, pair_limit: u32) -> Result<Fixture, Box<dyn
     )
 }
 
-fn fixture_for(world: World, pair_limit: u32) -> Result<Fixture, Box<dyn Error>> {
-    let world = Arc::new(world);
+/// `acme` with the active owner Ada and the disabled Eve; `globex`, where
+/// Ada has no membership. Returns Ada.
+fn seed(world: &World) -> Result<PrincipalId, Box<dyn Error>> {
     let acme = TenantId::new();
     lock(&world.tenants).insert("acme".to_owned(), acme);
     lock(&world.tenants).insert("globex".to_owned(), TenantId::new());
@@ -377,6 +400,62 @@ fn fixture_for(world: World, pair_limit: u32) -> Result<Fixture, Box<dyn Error>>
             vec![Role::new("owner")?],
         ));
     }
+    Ok(ada)
+}
+
+/// The `FORGE_AUTH_MFA_KEY` of the tests.
+const MFA_KEY: [u8; 32] = [7; 32];
+
+/// Two-factor authentication over an in-memory store that revokes the
+/// world's sessions as the PostgreSQL adapter does.
+fn mfa_service(
+    world: &Arc<World>,
+    key: Option<[u8; 32]>,
+    store: Option<Arc<MemoryMfaStore>>,
+) -> Result<MfaService, Box<dyn Error>> {
+    let sessions = Arc::clone(world);
+    let store = store.unwrap_or_else(|| {
+        Arc::new(
+            MemoryMfaStore::new().with_session_revoker(Arc::new(move |principal, now| {
+                for (session, _, _) in lock(&sessions.sessions).iter_mut() {
+                    if session.principal_id() == principal {
+                        let _ = session.revoke(now);
+                    }
+                }
+            })),
+        )
+    });
+    let cipher = match key {
+        Some(key) => Some(Arc::new(forge::auth::Aes256GcmSecretCipher::new(&key)?)
+            as Arc<dyn forge::auth::SecretCipher>),
+        None => None,
+    };
+    Ok(MfaService::new(
+        store,
+        cipher,
+        Arc::new(MemoryLoginThrottle::new(mfa_throttle_config())?),
+    ))
+}
+
+fn fixture_for(world: World, pair_limit: u32) -> Result<Fixture, Box<dyn Error>> {
+    fixture_with_mfa(Arc::new(world), pair_limit, Some(MFA_KEY), None)
+}
+
+fn fixture_with_mfa(
+    world: Arc<World>,
+    pair_limit: u32,
+    mfa_key: Option<[u8; 32]>,
+    mfa_store: Option<Arc<MemoryMfaStore>>,
+) -> Result<Fixture, Box<dyn Error>> {
+    // A world served before (a second router over the same accounts) keeps them.
+    let seeded = lock(&world.accounts)
+        .iter()
+        .find(|account| account.login == "ada@example.com")
+        .map(|account| account.principal);
+    let ada = match seeded {
+        Some(ada) => ada,
+        None => seed(&world)?,
+    };
 
     let throttle = || -> Result<Arc<MemoryLoginThrottle>, Box<dyn Error>> {
         Ok(Arc::new(MemoryLoginThrottle::new(ThrottleConfig {
@@ -398,6 +477,7 @@ fn fixture_for(world: World, pair_limit: u32) -> Result<Fixture, Box<dyn Error>>
         audit: world.clone(),
         sign_in_throttle: throttle()?,
         reset_throttle: throttle()?,
+        mfa: mfa_service(&world, mfa_key, mfa_store)?,
     };
     let config = forge::config::AppConfig::default();
     let mut router = Router::new();
@@ -1439,5 +1519,391 @@ async fn the_pages_are_translated_in_every_locale() -> TestResult {
             "{locale}: {body}"
         );
     }
+    Ok(())
+}
+
+/// The current TOTP period.
+fn period() -> Result<u64, Box<dyn Error>> {
+    Ok(std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs()
+        / forge::auth::TOTP_PERIOD_SECS)
+}
+
+/// The code of the period `offset` periods from now.
+fn totp(key: &str, offset: u64) -> Result<String, Box<dyn Error>> {
+    Ok(forge::auth::TotpSecret::from_base32(key)?.code(period()? + offset))
+}
+
+/// A six-digit code that is wrong in every accepted period.
+fn wrong_totp(key: &str) -> Result<String, Box<dyn Error>> {
+    let secret = forge::auth::TotpSecret::from_base32(key)?;
+    let now = period()?;
+    let taken: Vec<String> = (now.saturating_sub(2)..=now + 3)
+        .map(|counter| secret.code(counter))
+        .collect();
+    Ok((0..10)
+        .map(|digit| digit.to_string().repeat(6))
+        .find(|candidate| !taken.contains(candidate))
+        .unwrap_or_default())
+}
+
+/// The text of `<code id="mfa_key">` on the setup page.
+fn mfa_key_of(page: &Response) -> Result<String, Box<dyn Error>> {
+    let body = text(page);
+    let key = body
+        .split("<code id=\"mfa_key\">")
+        .nth(1)
+        .and_then(|rest| rest.split("</code>").next())
+        .ok_or("the setup page shows the key")?;
+    Ok(key.replace(' ', ""))
+}
+
+/// The backup codes listed on the backup-codes page.
+fn backup_codes_of(page: &Response) -> Vec<String> {
+    text(page)
+        .split("<li><code>")
+        .skip(1)
+        .filter_map(|rest| rest.split("</code>").next())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Signs Ada in and turns two-factor on; returns the key and backup codes.
+/// Every session of Ada ends with it.
+async fn enroll_ada(fixture: &Fixture) -> Result<(String, Vec<String>), Box<dyn Error>> {
+    let mut browser = Browser::default();
+    browser
+        .sign_in(&fixture.router, "acme", "ada@example.com", PASSWORD)
+        .await?;
+    let page = browser
+        .post(&fixture.router, "/mfa", &[("password", PASSWORD)])
+        .await?;
+    assert_eq!(page.status(), StatusCode::OK, "{}", text(&page));
+    assert_eq!(
+        header_of(&page, header::CACHE_CONTROL).as_deref(),
+        Some("no-store")
+    );
+    let key = mfa_key_of(&page)?;
+    assert!(text(&page).contains("otpauth://totp/"));
+    let confirmed = browser
+        .post(
+            &fixture.router,
+            "/mfa/confirm",
+            &[("code", &totp(&key, 0)?)],
+        )
+        .await?;
+    assert_eq!(confirmed.status(), StatusCode::OK, "{}", text(&confirmed));
+    assert!(browser.cookie("__Host-forge_session").is_none());
+    let codes = backup_codes_of(&confirmed);
+    assert_eq!(codes.len(), 10);
+    Ok((key, codes))
+}
+
+/// Signs in with the password: the answer of an account with a factor.
+async fn password_step(
+    fixture: &Fixture,
+    browser: &mut Browser,
+) -> Result<Response, Box<dyn Error>> {
+    let response = browser
+        .sign_in(&fixture.router, "acme", "ada@example.com", PASSWORD)
+        .await?;
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        header_of(&response, header::LOCATION).as_deref(),
+        Some("/session/mfa")
+    );
+    assert!(browser.cookie("__Host-forge_session").is_none());
+    assert!(browser.cookie("__Host-forge_mfa").is_some());
+    Ok(response)
+}
+
+#[tokio::test]
+async fn two_factor_sign_in_takes_a_code_once_and_a_backup_code_once() -> TestResult {
+    let fixture = fixture()?;
+    let (key, codes) = enroll_ada(&fixture).await?;
+    assert!(audited(
+        &fixture.world,
+        "auth.mfa.enrollment_started",
+        AuditOutcome::Succeeded
+    ));
+    assert!(audited(
+        &fixture.world,
+        "auth.mfa.enabled",
+        AuditOutcome::Succeeded
+    ));
+    assert_eq!(live_sessions(&fixture.world, fixture.ada), 0);
+
+    // The password alone issues no session, only the challenge.
+    let mut browser = Browser::default();
+    password_step(&fixture, &mut browser).await?;
+    let form = browser.get(&fixture.router, "/session/mfa").await?;
+    assert_eq!(form.status(), StatusCode::OK);
+    assert!(text(&form).contains("autocomplete=\"one-time-code\""));
+    assert_eq!(live_sessions(&fixture.world, fixture.ada), 0);
+
+    let wrong = browser
+        .post(
+            &fixture.router,
+            "/session/mfa",
+            &[("code", &wrong_totp(&key)?)],
+        )
+        .await?;
+    assert_eq!(wrong.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(text(&wrong).contains("That code did not work."));
+    assert!(audited(
+        &fixture.world,
+        "auth.mfa.challenge_failed",
+        AuditOutcome::Denied
+    ));
+    // The confirmation's code was recorded: replaying it fails.
+    let replayed = browser
+        .post(
+            &fixture.router,
+            "/session/mfa",
+            &[("code", &totp(&key, 0)?)],
+        )
+        .await?;
+    assert_eq!(replayed.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    let code = totp(&key, 1)?;
+    let signed_in = browser
+        .post(&fixture.router, "/session/mfa", &[("code", &code)])
+        .await?;
+    assert_eq!(
+        signed_in.status(),
+        StatusCode::SEE_OTHER,
+        "{}",
+        text(&signed_in)
+    );
+    assert_eq!(
+        header_of(&signed_in, header::LOCATION).as_deref(),
+        Some("/")
+    );
+    assert!(browser.cookie("__Host-forge_session").is_some());
+    assert!(browser.cookie("__Host-forge_mfa").is_none());
+    assert_eq!(live_sessions(&fixture.world, fixture.ada), 1);
+    assert!(audited(
+        &fixture.world,
+        "auth.mfa.challenge_succeeded",
+        AuditOutcome::Succeeded
+    ));
+
+    // The same code in a new sign-in is a replay.
+    let mut again = Browser::default();
+    password_step(&fixture, &mut again).await?;
+    let replay = again
+        .post(&fixture.router, "/session/mfa", &[("code", &code)])
+        .await?;
+    assert_eq!(replay.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    // A backup code signs in once.
+    let backup = again
+        .post(&fixture.router, "/session/mfa", &[("code", &codes[0])])
+        .await?;
+    assert_eq!(backup.status(), StatusCode::SEE_OTHER, "{}", text(&backup));
+    assert!(audited(
+        &fixture.world,
+        "auth.mfa.backup_code_used",
+        AuditOutcome::Succeeded
+    ));
+    let settings = again.get(&fixture.router, "/mfa").await?;
+    assert!(
+        text(&settings).contains("9 backup codes left."),
+        "{}",
+        text(&settings)
+    );
+    let mut third = Browser::default();
+    password_step(&fixture, &mut third).await?;
+    let reused = third
+        .post(&fixture.router, "/session/mfa", &[("code", &codes[0])])
+        .await?;
+    assert_eq!(reused.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_challenge_cookie_carried_to_another_browser_is_refused() -> TestResult {
+    let fixture = fixture()?;
+    let (key, _) = enroll_ada(&fixture).await?;
+    let mut owner = Browser::default();
+    password_step(&fixture, &mut owner).await?;
+    let mut thief = Browser::default();
+    thief.get(&fixture.router, "/session/new").await?;
+    let stolen = owner.cookie("__Host-forge_mfa").ok_or("challenge cookie")?;
+    thief.cookies.insert("__Host-forge_mfa".to_owned(), stolen);
+    let refused = thief
+        .post(
+            &fixture.router,
+            "/session/mfa",
+            &[("code", &totp(&key, 1)?)],
+        )
+        .await?;
+    assert_eq!(refused.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(thief.cookie("__Host-forge_session").is_none());
+    // Without a challenge cookie the page sends the browser to sign in.
+    let mut stranger = Browser::default();
+    stranger.get(&fixture.router, "/session/new").await?;
+    let missing = stranger
+        .post(&fixture.router, "/session/mfa", &[("code", "123456")])
+        .await?;
+    assert_eq!(missing.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        header_of(&missing, header::LOCATION).as_deref(),
+        Some("/session/new")
+    );
+    // Without the CSRF token: forbidden.
+    let mut no_token = owner.clone();
+    no_token.cookies.remove("__Host-forge_csrf");
+    let response = fixture
+        .router
+        .dispatch(no_token.request(Method::POST, "/session/mfa", "code=123456")?)
+        .await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    Ok(())
+}
+
+#[tokio::test]
+async fn second_factor_attempts_are_throttled() -> TestResult {
+    let fixture = fixture()?;
+    let (key, _) = enroll_ada(&fixture).await?;
+    let mut browser = Browser::default();
+    password_step(&fixture, &mut browser).await?;
+    let wrong = wrong_totp(&key)?;
+    for _ in 0..5 {
+        let response = browser
+            .post(&fixture.router, "/session/mfa", &[("code", &wrong)])
+            .await?;
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+    let throttled = browser
+        .post(
+            &fixture.router,
+            "/session/mfa",
+            &[("code", &totp(&key, 1)?)],
+        )
+        .await?;
+    assert_eq!(throttled.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(header_of(&throttled, header::RETRY_AFTER).is_some());
+    assert!(text(&throttled).contains("Too many code attempts."));
+    assert!(browser.cookie("__Host-forge_session").is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn changing_the_factor_needs_the_password_and_a_current_code() -> TestResult {
+    let fixture = fixture()?;
+    // Turning it on needs the password.
+    let mut browser = Browser::default();
+    browser
+        .sign_in(&fixture.router, "acme", "ada@example.com", PASSWORD)
+        .await?;
+    let refused = browser
+        .post(&fixture.router, "/mfa", &[("password", "not the password")])
+        .await?;
+    assert_eq!(refused.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(audited(
+        &fixture.world,
+        "auth.mfa.enrollment_started",
+        AuditOutcome::Denied
+    ));
+    // Signed-out browsers are sent to sign in.
+    let signed_out = Browser::default().get(&fixture.router, "/mfa").await?;
+    assert_eq!(signed_out.status(), StatusCode::SEE_OTHER);
+
+    let (key, codes) = enroll_ada(&fixture).await?;
+    let mut browser = Browser::default();
+    password_step(&fixture, &mut browser).await?;
+    browser
+        .post(&fixture.router, "/session/mfa", &[("code", &codes[0])])
+        .await?;
+    // Turning it off without a code, or with a wrong one, is refused.
+    for code in ["", wrong_totp(&key)?.as_str(), codes[0].as_str()] {
+        let refused = browser
+            .post(
+                &fixture.router,
+                "/mfa",
+                &[
+                    ("_method", "delete"),
+                    ("password", PASSWORD),
+                    ("code", code),
+                ],
+            )
+            .await?;
+        assert_eq!(refused.status(), StatusCode::UNPROCESSABLE_ENTITY, "{code}");
+    }
+    let wrong_password = browser
+        .post(
+            &fixture.router,
+            "/mfa",
+            &[
+                ("_method", "delete"),
+                ("password", "not the password"),
+                ("code", &codes[1]),
+            ],
+        )
+        .await?;
+    assert_eq!(wrong_password.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(audited(
+        &fixture.world,
+        "auth.mfa.disabled",
+        AuditOutcome::Denied
+    ));
+    let on = browser.get(&fixture.router, "/mfa").await?;
+    assert!(text(&on).contains("Two-factor authentication is on."));
+
+    let disabled = browser
+        .post(
+            &fixture.router,
+            "/mfa",
+            &[
+                ("_method", "delete"),
+                ("password", PASSWORD),
+                ("code", &totp(&key, 1)?),
+            ],
+        )
+        .await?;
+    assert_eq!(
+        disabled.status(),
+        StatusCode::SEE_OTHER,
+        "{}",
+        text(&disabled)
+    );
+    assert!(audited(
+        &fixture.world,
+        "auth.mfa.disabled",
+        AuditOutcome::Succeeded
+    ));
+    assert_eq!(live_sessions(&fixture.world, fixture.ada), 0);
+    // The password alone signs in again.
+    let mut plain = Browser::default();
+    let response = plain
+        .sign_in(&fixture.router, "acme", "ada@example.com", PASSWORD)
+        .await?;
+    assert_eq!(header_of(&response, header::LOCATION).as_deref(), Some("/"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn without_the_key_an_enrolled_account_cannot_sign_in() -> TestResult {
+    let world = Arc::new(World::default());
+    let store = Arc::new(MemoryMfaStore::new());
+    let enrolled = fixture_with_mfa(
+        Arc::clone(&world),
+        10,
+        Some(MFA_KEY),
+        Some(Arc::clone(&store)),
+    )?;
+    enroll_ada(&enrolled).await?;
+    // The same accounts and factors, served without FORGE_AUTH_MFA_KEY.
+    let fixture = fixture_with_mfa(world, 10, None, Some(store))?;
+    let mut browser = Browser::default();
+    let response = browser
+        .sign_in(&fixture.router, "acme", "ada@example.com", PASSWORD)
+        .await?;
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(browser.cookie("__Host-forge_session").is_none());
+    let settings = Browser::default().get(&fixture.router, "/mfa").await?;
+    assert_eq!(settings.status(), StatusCode::SEE_OTHER);
     Ok(())
 }

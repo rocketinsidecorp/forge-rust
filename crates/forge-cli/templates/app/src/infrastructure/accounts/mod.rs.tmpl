@@ -1,21 +1,32 @@
 //! PostgreSQL persistence of browser authentication (ADR 0026): the tenant
-//! directory used at sign-in, one-time password reset tokens, and the first
-//! tenant and owner created by `setup`.
+//! directory used at sign-in, one-time password reset tokens, TOTP
+//! multi-factor authentication (ADR 0040) and the first tenant and owner
+//! created by `setup`.
 //!
 //! Reset tokens are stored only as SHA-256 digests. Redeeming one changes the
 //! password, revokes every session of the account and uses up its other reset
 //! tokens in a single transaction.
+//!
+//! TOTP seeds are stored only as AES-256-GCM ciphertext (the key,
+//! `FORGE_AUTH_MFA_KEY`, never reaches the database) beside their digest;
+//! backup codes and sign-in challenges only as SHA-256 digests. Every change
+//! of a factor, a backup code or a challenge is one transaction that locks
+//! the rows it reads, so a code is accepted once even under concurrency.
 
 use async_trait::async_trait;
 use forge::audit::{AuditAction, AuditActor, AuditEvent, AuditOutcome};
-use forge::auth::{CanonicalLogin, PasswordHash, PasswordResetTokenDigest, UnixTimestamp};
+use forge::auth::{
+    CanonicalLogin, MfaBackupCodeDigest, MfaChallengeBinding, MfaChallengeDigest, PasswordHash,
+    PasswordResetTokenDigest, SealedTotpSecret, TotpSecretDigest, UnixTimestamp,
+};
 use forge::core::Id;
 use forge::security::PrincipalId;
 use forge::tenancy::{
-    AccountStoreError, PasswordResetGrant, PasswordResetStore, RedeemedPasswordReset,
+    AccountStoreError, ActiveTotp, MfaChallengeGrant, MfaChallengeRecord, MfaChange, MfaStatus,
+    MfaStore, PasswordResetGrant, PasswordResetStore, PendingTotp, RedeemedPasswordReset,
     TenantDirectory, TenantId, TenantSlug,
 };
-use sqlx::{PgPool, types::Uuid};
+use sqlx::{PgPool, Postgres, Transaction, types::Uuid};
 
 /// The role `setup` gives the first member of the first tenant. Generated
 /// access policies grant it every permission of the resources they protect.
@@ -197,6 +208,650 @@ impl PasswordResetStore for PgPasswordResetStore {
             tenant_id: TenantId::from_uuid(tenant_id).map_err(|_| AccountStoreError::Corrupt)?,
         }))
     }
+}
+
+/// Marker of backup code record identifiers.
+#[derive(Debug)]
+pub enum MfaBackupCodeMarker {}
+
+/// Marker of sign-in challenge record identifiers.
+#[derive(Debug)]
+pub enum MfaChallengeMarker {}
+
+/// TOTP factors, pending seeds, backup codes and sign-in challenges
+/// (Forge-Go's `auth/postgres` MFA repository).
+#[derive(Clone, Debug)]
+pub struct PgMfaStore {
+    pool: PgPool,
+}
+
+impl PgMfaStore {
+    /// Creates a store using the least-privilege runtime pool.
+    #[must_use]
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+/// The tables of a challenge query: the challenge, its account, the factor
+/// it was issued for and the account's membership of its tenant.
+macro_rules! challenge_tables {
+    () => {
+        " FROM forge_mfa_challenges AS challenge
+          JOIN forge_principals AS principal ON principal.id = challenge.principal_id
+          JOIN forge_totp_factors AS factor
+            ON factor.principal_id = challenge.principal_id
+           AND factor.secret_digest = challenge.factor_secret_digest
+          JOIN forge_tenant_memberships AS membership
+            ON membership.principal_id = challenge.principal_id
+           AND membership.tenant_id = challenge.tenant_id "
+    };
+}
+
+/// A live challenge ($1 its digest, $2 now): unconsumed and unexpired, its
+/// account enabled with the credential version the password step verified
+/// and its membership of the tenant active.
+macro_rules! live_challenge {
+    () => {
+        " WHERE challenge.token_digest = $1
+            AND challenge.consumed_at IS NULL
+            AND challenge.expires_at > to_timestamp($2::double precision)
+            AND challenge.session_expires_at > to_timestamp($2::double precision)
+            AND principal.disabled_at IS NULL
+            AND principal.version = challenge.credential_version
+            AND membership.state = 'active' "
+    };
+}
+
+#[async_trait]
+impl MfaStore for PgMfaStore {
+    async fn status(&self, principal: PrincipalId) -> Result<Option<MfaStatus>, AccountStoreError> {
+        let remaining = sqlx::query_scalar::<_, i64>(
+            "SELECT (
+                SELECT count(*) FROM forge_mfa_backup_codes AS code
+                WHERE code.principal_id = factor.principal_id
+                  AND code.consumed_at IS NULL
+             )
+             FROM forge_totp_factors AS factor
+             WHERE factor.principal_id = $1",
+        )
+        .bind(principal.into_uuid())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(classify)?;
+        remaining
+            .map(|count| {
+                u32::try_from(count)
+                    .map(|remaining_backup_codes| MfaStatus {
+                        remaining_backup_codes,
+                    })
+                    .map_err(|_| AccountStoreError::Corrupt)
+            })
+            .transpose()
+    }
+
+    async fn begin(
+        &self,
+        principal: PrincipalId,
+        change: MfaChange,
+        pending: &PendingTotp,
+    ) -> Result<bool, AccountStoreError> {
+        let mut transaction = self.pool.begin().await.map_err(classify)?;
+        let Some(enabled) = lock_account(&mut transaction, principal).await? else {
+            return Ok(false);
+        };
+        if enabled != (change == MfaChange::Rotation) {
+            return Ok(false);
+        }
+        sqlx::query(
+            "INSERT INTO forge_totp_enrollments (
+                principal_id, secret_digest, secret_ciphertext, expires_at
+             ) VALUES ($1, $2, $3, to_timestamp($4::double precision))
+             ON CONFLICT (principal_id) DO UPDATE
+             SET secret_digest = EXCLUDED.secret_digest,
+                 secret_ciphertext = EXCLUDED.secret_ciphertext,
+                 expires_at = EXCLUDED.expires_at,
+                 created_at = clock_timestamp()",
+        )
+        .bind(principal.into_uuid())
+        .bind(pending.sealed.digest().as_bytes().as_slice())
+        .bind(pending.sealed.ciphertext())
+        .bind(seconds(pending.expires_at)?)
+        .execute(&mut *transaction)
+        .await
+        .map_err(classify)?;
+        transaction.commit().await.map_err(classify)?;
+        Ok(true)
+    }
+
+    async fn pending(
+        &self,
+        principal: PrincipalId,
+        now: UnixTimestamp,
+    ) -> Result<Option<PendingTotp>, AccountStoreError> {
+        let row = sqlx::query_as::<_, (Vec<u8>, Vec<u8>, i64)>(
+            "SELECT pending.secret_digest, pending.secret_ciphertext,
+                    EXTRACT(EPOCH FROM pending.expires_at)::bigint
+             FROM forge_totp_enrollments AS pending
+             JOIN forge_principals AS principal ON principal.id = pending.principal_id
+             WHERE pending.principal_id = $1
+               AND pending.expires_at > to_timestamp($2::double precision)
+               AND principal.disabled_at IS NULL",
+        )
+        .bind(principal.into_uuid())
+        .bind(seconds(now)?)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(classify)?;
+        row.map(|(digest, ciphertext, expires_at)| {
+            Ok(PendingTotp {
+                sealed: sealed(ciphertext, digest)?,
+                expires_at: timestamp(expires_at)?,
+            })
+        })
+        .transpose()
+    }
+
+    async fn activate(
+        &self,
+        principal: PrincipalId,
+        change: MfaChange,
+        digest: &TotpSecretDigest,
+        counter: u64,
+        backup_codes: &[MfaBackupCodeDigest],
+        now: UnixTimestamp,
+    ) -> Result<bool, AccountStoreError> {
+        let counter = i64::try_from(counter).map_err(|_| AccountStoreError::Corrupt)?;
+        let at = seconds(now)?;
+        let mut transaction = self.pool.begin().await.map_err(classify)?;
+        let Some(enabled) = lock_account(&mut transaction, principal).await? else {
+            return Ok(false);
+        };
+        if enabled != (change == MfaChange::Rotation) {
+            return Ok(false);
+        }
+        let Some(ciphertext) = sqlx::query_scalar::<_, Vec<u8>>(
+            "SELECT secret_ciphertext
+             FROM forge_totp_enrollments
+             WHERE principal_id = $1
+               AND secret_digest = $2
+               AND expires_at > to_timestamp($3::double precision)
+             FOR UPDATE",
+        )
+        .bind(principal.into_uuid())
+        .bind(digest.as_bytes().as_slice())
+        .bind(at)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(classify)?
+        else {
+            return Ok(false);
+        };
+
+        let installed = match change {
+            MfaChange::Enrollment => sqlx::query(
+                "INSERT INTO forge_totp_factors (
+                    principal_id, secret_digest, secret_ciphertext, last_counter
+                 ) VALUES ($1, $2, $3, $4)",
+            ),
+            MfaChange::Rotation => sqlx::query(
+                "UPDATE forge_totp_factors
+                 SET secret_digest = $2,
+                     secret_ciphertext = $3,
+                     last_counter = $4,
+                     updated_at = clock_timestamp()
+                 WHERE principal_id = $1",
+            ),
+        }
+        .bind(principal.into_uuid())
+        .bind(digest.as_bytes().as_slice())
+        .bind(ciphertext)
+        .bind(counter)
+        .execute(&mut *transaction)
+        .await
+        .map_err(classify)?;
+        if installed.rows_affected() != 1 {
+            return Err(AccountStoreError::Conflict);
+        }
+        store_backup_codes(&mut transaction, principal, backup_codes).await?;
+        sqlx::query("DELETE FROM forge_totp_enrollments WHERE principal_id = $1")
+            .bind(principal.into_uuid())
+            .execute(&mut *transaction)
+            .await
+            .map_err(classify)?;
+        sign_out_everywhere(&mut transaction, principal, at).await?;
+        transaction.commit().await.map_err(classify)?;
+        Ok(true)
+    }
+
+    async fn disable(
+        &self,
+        principal: PrincipalId,
+        now: UnixTimestamp,
+    ) -> Result<bool, AccountStoreError> {
+        let mut transaction = self.pool.begin().await.map_err(classify)?;
+        if lock_account(&mut transaction, principal).await? != Some(true) {
+            return Ok(false);
+        }
+        for statement in [
+            "DELETE FROM forge_mfa_backup_codes WHERE principal_id = $1",
+            "DELETE FROM forge_totp_enrollments WHERE principal_id = $1",
+            "DELETE FROM forge_totp_factors WHERE principal_id = $1",
+        ] {
+            sqlx::query(statement)
+                .bind(principal.into_uuid())
+                .execute(&mut *transaction)
+                .await
+                .map_err(classify)?;
+        }
+        sign_out_everywhere(&mut transaction, principal, seconds(now)?).await?;
+        transaction.commit().await.map_err(classify)?;
+        Ok(true)
+    }
+
+    async fn active(
+        &self,
+        principal: PrincipalId,
+    ) -> Result<Option<ActiveTotp>, AccountStoreError> {
+        let row = sqlx::query_as::<_, (Vec<u8>, Vec<u8>, i64)>(
+            "SELECT factor.secret_digest, factor.secret_ciphertext, factor.last_counter
+             FROM forge_totp_factors AS factor
+             JOIN forge_principals AS principal ON principal.id = factor.principal_id
+             WHERE factor.principal_id = $1
+               AND principal.disabled_at IS NULL",
+        )
+        .bind(principal.into_uuid())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(classify)?;
+        row.map(|(digest, ciphertext, last_counter)| {
+            Ok(ActiveTotp {
+                sealed: sealed(ciphertext, digest)?,
+                last_counter: counter_from(last_counter)?,
+            })
+        })
+        .transpose()
+    }
+
+    async fn use_totp_counter(
+        &self,
+        principal: PrincipalId,
+        digest: &TotpSecretDigest,
+        counter: u64,
+    ) -> Result<bool, AccountStoreError> {
+        // One statement: of two concurrent uses of a code, one updates.
+        let updated = sqlx::query(
+            "UPDATE forge_totp_factors
+             SET last_counter = $3, updated_at = clock_timestamp()
+             WHERE principal_id = $1
+               AND secret_digest = $2
+               AND last_counter < $3",
+        )
+        .bind(principal.into_uuid())
+        .bind(digest.as_bytes().as_slice())
+        .bind(i64::try_from(counter).map_err(|_| AccountStoreError::Corrupt)?)
+        .execute(&self.pool)
+        .await
+        .map_err(classify)?;
+        Ok(updated.rows_affected() == 1)
+    }
+
+    async fn use_backup_code(
+        &self,
+        principal: PrincipalId,
+        code: &MfaBackupCodeDigest,
+        now: UnixTimestamp,
+    ) -> Result<bool, AccountStoreError> {
+        let used = sqlx::query(
+            "UPDATE forge_mfa_backup_codes AS code
+             SET consumed_at = to_timestamp($3::double precision)
+             WHERE code.principal_id = $1
+               AND code.code_digest = $2
+               AND code.consumed_at IS NULL
+               AND EXISTS (
+                   SELECT 1 FROM forge_totp_factors AS factor
+                   WHERE factor.principal_id = code.principal_id
+               )",
+        )
+        .bind(principal.into_uuid())
+        .bind(code.as_bytes().as_slice())
+        .bind(seconds(now)?)
+        .execute(&self.pool)
+        .await
+        .map_err(classify)?;
+        Ok(used.rows_affected() == 1)
+    }
+
+    async fn replace_backup_codes(
+        &self,
+        principal: PrincipalId,
+        backup_codes: &[MfaBackupCodeDigest],
+        _now: UnixTimestamp,
+    ) -> Result<bool, AccountStoreError> {
+        let mut transaction = self.pool.begin().await.map_err(classify)?;
+        if lock_account(&mut transaction, principal).await? != Some(true) {
+            return Ok(false);
+        }
+        store_backup_codes(&mut transaction, principal, backup_codes).await?;
+        transaction.commit().await.map_err(classify)?;
+        Ok(true)
+    }
+
+    async fn create_challenge(&self, grant: &MfaChallengeGrant) -> Result<bool, AccountStoreError> {
+        let version = i64::try_from(grant.credential_version.get())
+            .map_err(|_| AccountStoreError::Corrupt)?;
+        let mut transaction = self.pool.begin().await.map_err(classify)?;
+        let factor = sqlx::query_scalar::<_, Vec<u8>>(
+            "SELECT factor.secret_digest
+             FROM forge_totp_factors AS factor
+             JOIN forge_principals AS principal ON principal.id = factor.principal_id
+             WHERE factor.principal_id = $1
+               AND principal.disabled_at IS NULL
+               AND principal.version = $2
+             FOR UPDATE OF factor",
+        )
+        .bind(grant.principal_id.into_uuid())
+        .bind(version)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(classify)?;
+        let Some(factor) = factor else {
+            return Ok(false);
+        };
+        // One pending challenge per account: a new sign-in voids the last.
+        sqlx::query(
+            "UPDATE forge_mfa_challenges
+             SET consumed_at = clock_timestamp()
+             WHERE principal_id = $1
+               AND consumed_at IS NULL",
+        )
+        .bind(grant.principal_id.into_uuid())
+        .execute(&mut *transaction)
+        .await
+        .map_err(classify)?;
+        sqlx::query(
+            "INSERT INTO forge_mfa_challenges (
+                id, token_digest, principal_id, tenant_id, credential_version,
+                factor_secret_digest, binding_digest, expires_at, session_expires_at
+             ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7,
+                to_timestamp($8::double precision),
+                to_timestamp($9::double precision)
+             )",
+        )
+        .bind(Id::<MfaChallengeMarker>::new().into_uuid())
+        .bind(grant.digest.as_bytes().as_slice())
+        .bind(grant.principal_id.into_uuid())
+        .bind(grant.tenant_id.into_uuid())
+        .bind(version)
+        .bind(factor)
+        .bind(grant.binding.as_bytes().as_slice())
+        .bind(seconds(grant.expires_at)?)
+        .bind(seconds(grant.session_expires_at)?)
+        .execute(&mut *transaction)
+        .await
+        .map_err(classify)?;
+        transaction.commit().await.map_err(classify)?;
+        Ok(true)
+    }
+
+    async fn challenge(
+        &self,
+        digest: &MfaChallengeDigest,
+        now: UnixTimestamp,
+    ) -> Result<Option<MfaChallengeRecord>, AccountStoreError> {
+        type Row = (Uuid, Uuid, Vec<u8>, Vec<u8>, Vec<u8>, i64, i64, i64);
+        let row = sqlx::query_as::<_, Row>(concat!(
+            "SELECT challenge.principal_id, challenge.tenant_id, challenge.binding_digest,
+                    factor.secret_digest, factor.secret_ciphertext, factor.last_counter,
+                    EXTRACT(EPOCH FROM challenge.expires_at)::bigint,
+                    EXTRACT(EPOCH FROM challenge.session_expires_at)::bigint",
+            challenge_tables!(),
+            live_challenge!(),
+        ))
+        .bind(digest.as_bytes().as_slice())
+        .bind(seconds(now)?)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(classify)?;
+        row.map(
+            |(principal, tenant, binding, factor, ciphertext, last, expires, session)| {
+                Ok(MfaChallengeRecord {
+                    principal_id: PrincipalId::from_uuid(principal)
+                        .map_err(|_| AccountStoreError::Corrupt)?,
+                    tenant_id: TenantId::from_uuid(tenant)
+                        .map_err(|_| AccountStoreError::Corrupt)?,
+                    binding: MfaChallengeBinding::from_bytes(digest32(binding)?),
+                    factor: ActiveTotp {
+                        sealed: sealed(ciphertext, factor)?,
+                        last_counter: counter_from(last)?,
+                    },
+                    expires_at: timestamp(expires)?,
+                    session_expires_at: timestamp(session)?,
+                })
+            },
+        )
+        .transpose()
+    }
+
+    async fn consume_challenge_with_totp(
+        &self,
+        digest: &MfaChallengeDigest,
+        factor: &TotpSecretDigest,
+        counter: u64,
+        now: UnixTimestamp,
+    ) -> Result<bool, AccountStoreError> {
+        let counter = i64::try_from(counter).map_err(|_| AccountStoreError::Corrupt)?;
+        let mut transaction = self.pool.begin().await.map_err(classify)?;
+        let row = sqlx::query_as::<_, (Uuid, Uuid, i64)>(concat!(
+            "SELECT challenge.id, challenge.principal_id, factor.last_counter",
+            challenge_tables!(),
+            live_challenge!(),
+            "AND challenge.factor_secret_digest = $3
+             FOR UPDATE OF challenge, factor",
+        ))
+        .bind(digest.as_bytes().as_slice())
+        .bind(seconds(now)?)
+        .bind(factor.as_bytes().as_slice())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(classify)?;
+        let Some((challenge, principal, last_counter)) = row else {
+            return Ok(false);
+        };
+        if counter <= last_counter {
+            return Ok(false);
+        }
+        let advanced = sqlx::query(
+            "UPDATE forge_totp_factors
+             SET last_counter = $3, updated_at = clock_timestamp()
+             WHERE principal_id = $1
+               AND secret_digest = $2
+               AND last_counter < $3",
+        )
+        .bind(principal)
+        .bind(factor.as_bytes().as_slice())
+        .bind(counter)
+        .execute(&mut *transaction)
+        .await
+        .map_err(classify)?;
+        if advanced.rows_affected() != 1 {
+            return Ok(false);
+        }
+        consume_challenge(&mut transaction, challenge, seconds(now)?).await?;
+        transaction.commit().await.map_err(classify)?;
+        Ok(true)
+    }
+
+    async fn consume_challenge_with_backup_code(
+        &self,
+        digest: &MfaChallengeDigest,
+        code: &MfaBackupCodeDigest,
+        now: UnixTimestamp,
+    ) -> Result<bool, AccountStoreError> {
+        let at = seconds(now)?;
+        let mut transaction = self.pool.begin().await.map_err(classify)?;
+        let row = sqlx::query_as::<_, (Uuid, Uuid)>(concat!(
+            "SELECT challenge.id, code.id",
+            challenge_tables!(),
+            "JOIN forge_mfa_backup_codes AS code
+               ON code.principal_id = challenge.principal_id
+              AND code.code_digest = $3
+              AND code.consumed_at IS NULL",
+            live_challenge!(),
+            "FOR UPDATE OF challenge, code",
+        ))
+        .bind(digest.as_bytes().as_slice())
+        .bind(at)
+        .bind(code.as_bytes().as_slice())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(classify)?;
+        let Some((challenge, code)) = row else {
+            return Ok(false);
+        };
+        let used = sqlx::query(
+            "UPDATE forge_mfa_backup_codes
+             SET consumed_at = to_timestamp($2::double precision)
+             WHERE id = $1
+               AND consumed_at IS NULL",
+        )
+        .bind(code)
+        .bind(at)
+        .execute(&mut *transaction)
+        .await
+        .map_err(classify)?;
+        if used.rows_affected() != 1 {
+            return Ok(false);
+        }
+        consume_challenge(&mut transaction, challenge, at).await?;
+        transaction.commit().await.map_err(classify)?;
+        Ok(true)
+    }
+}
+
+/// Locks an enabled account's row; `Some(has a factor)`, or `None` when the
+/// account is missing or disabled.
+async fn lock_account(
+    transaction: &mut Transaction<'_, Postgres>,
+    principal: PrincipalId,
+) -> Result<Option<bool>, AccountStoreError> {
+    let enabled = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (
+            SELECT 1 FROM forge_totp_factors WHERE principal_id = principal.id
+         )
+         FROM forge_principals AS principal
+         WHERE principal.id = $1
+           AND principal.disabled_at IS NULL
+         FOR UPDATE OF principal",
+    )
+    .bind(principal.into_uuid())
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(classify)?;
+    Ok(enabled)
+}
+
+/// Replaces the account's backup codes with `codes`.
+async fn store_backup_codes(
+    transaction: &mut Transaction<'_, Postgres>,
+    principal: PrincipalId,
+    codes: &[MfaBackupCodeDigest],
+) -> Result<(), AccountStoreError> {
+    sqlx::query("DELETE FROM forge_mfa_backup_codes WHERE principal_id = $1")
+        .bind(principal.into_uuid())
+        .execute(&mut **transaction)
+        .await
+        .map_err(classify)?;
+    for code in codes {
+        sqlx::query(
+            "INSERT INTO forge_mfa_backup_codes (id, principal_id, code_digest)
+             VALUES ($1, $2, $3)",
+        )
+        .bind(Id::<MfaBackupCodeMarker>::new().into_uuid())
+        .bind(principal.into_uuid())
+        .bind(code.as_bytes().as_slice())
+        .execute(&mut **transaction)
+        .await
+        .map_err(classify)?;
+    }
+    Ok(())
+}
+
+/// Revokes every session of the account and voids its pending challenges.
+async fn sign_out_everywhere(
+    transaction: &mut Transaction<'_, Postgres>,
+    principal: PrincipalId,
+    at: i64,
+) -> Result<(), AccountStoreError> {
+    for statement in [
+        "UPDATE forge_sessions
+         SET revoked_at = GREATEST(issued_at, to_timestamp($2::double precision))
+         WHERE principal_id = $1
+           AND revoked_at IS NULL",
+        "UPDATE forge_mfa_challenges
+         SET consumed_at = to_timestamp($2::double precision)
+         WHERE principal_id = $1
+           AND consumed_at IS NULL",
+    ] {
+        sqlx::query(statement)
+            .bind(principal.into_uuid())
+            .bind(at)
+            .execute(&mut **transaction)
+            .await
+            .map_err(classify)?;
+    }
+    Ok(())
+}
+
+async fn consume_challenge(
+    transaction: &mut Transaction<'_, Postgres>,
+    challenge: Uuid,
+    at: i64,
+) -> Result<(), AccountStoreError> {
+    let consumed = sqlx::query(
+        "UPDATE forge_mfa_challenges
+         SET consumed_at = to_timestamp($2::double precision)
+         WHERE id = $1
+           AND consumed_at IS NULL",
+    )
+    .bind(challenge)
+    .bind(at)
+    .execute(&mut **transaction)
+    .await
+    .map_err(classify)?;
+    if consumed.rows_affected() == 1 {
+        Ok(())
+    } else {
+        Err(AccountStoreError::Conflict)
+    }
+}
+
+fn digest32(bytes: Vec<u8>) -> Result<[u8; 32], AccountStoreError> {
+    <[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| AccountStoreError::Corrupt)
+}
+
+fn sealed(ciphertext: Vec<u8>, digest: Vec<u8>) -> Result<SealedTotpSecret, AccountStoreError> {
+    Ok(SealedTotpSecret::new(
+        ciphertext,
+        TotpSecretDigest::from_bytes(digest32(digest)?),
+    ))
+}
+
+/// The persisted last counter: -1 before the first accepted code.
+fn counter_from(value: i64) -> Result<Option<u64>, AccountStoreError> {
+    match value {
+        -1 => Ok(None),
+        _ => u64::try_from(value)
+            .map(Some)
+            .map_err(|_| AccountStoreError::Corrupt),
+    }
+}
+
+fn timestamp(value: i64) -> Result<UnixTimestamp, AccountStoreError> {
+    u64::try_from(value)
+        .map(UnixTimestamp::from_secs)
+        .map_err(|_| AccountStoreError::Corrupt)
 }
 
 /// The first tenant and its owner, as `setup` creates them.

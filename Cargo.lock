@@ -628,6 +628,7 @@ name = "forge-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "forge-auth",
  "forge-config",
  "forge-db",
  "forge-i18n",

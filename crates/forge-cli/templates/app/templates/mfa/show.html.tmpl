@@ -1,0 +1,42 @@
+{% extends "layouts/application.html" %}
+
+{% block title %}{{ layout.i18n.t("mfa.show.title") }}{% endblock %}
+
+{% block content %}
+<h1>{{ layout.i18n.t("mfa.show.title") }}</h1>
+{% if let Some(error) = error %}<p class="flash flash-alert" role="alert">{{ error }}</p>{% endif %}
+{% if !configured %}
+<p>{{ layout.i18n.t("mfa.show.unavailable") }}</p>
+{% else if enabled %}
+<p>{{ layout.i18n.t("mfa.show.enabled") }} {{ remaining }}</p>
+<h2>{{ layout.i18n.t("mfa.show.rotate_title") }}</h2>
+<form action="/mfa/rotation" method="post">
+  {{ csrf_field|safe }}
+  {% include "mfa/_step_up.html" %}
+  <button type="submit">{{ layout.i18n.t("mfa.show.rotate") }}</button>
+</form>
+<h2>{{ layout.i18n.t("mfa.show.backup_codes_title") }}</h2>
+<form action="/mfa/backup_codes" method="post">
+  {{ csrf_field|safe }}
+  {% include "mfa/_step_up.html" %}
+  <button type="submit">{{ layout.i18n.t("mfa.show.regenerate") }}</button>
+</form>
+<h2>{{ layout.i18n.t("mfa.show.disable_title") }}</h2>
+<form action="/mfa" method="post">
+  {{ csrf_field|safe }}
+  <input type="hidden" name="_method" value="delete">
+  {% include "mfa/_step_up.html" %}
+  <button type="submit">{{ layout.i18n.t("mfa.show.disable") }}</button>
+</form>
+{% else %}
+<p>{{ layout.i18n.t("mfa.show.disabled") }}</p>
+<form action="/mfa" method="post">
+  {{ csrf_field|safe }}
+  <div>
+    <label for="mfa_enable_password">{{ layout.i18n.t("mfa.show.password") }}</label>
+    <input type="password" id="mfa_enable_password" name="password" required autocomplete="current-password" maxlength="1024">
+  </div>
+  <button type="submit">{{ layout.i18n.t("mfa.show.enable") }}</button>
+</form>
+{% endif %}
+{% endblock %}
