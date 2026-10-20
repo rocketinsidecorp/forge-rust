@@ -12,7 +12,10 @@
 //! session signs in, uses the tenant-scoped scaffold pages and signs out
 //! against the running server (with `FORGE_TEST_MYSQL_URL` the MySQL
 //! repository tests run too). A PostgreSQL application stripped of its
-//! sign-in pages regains them with `forge generate authentication`.
+//! sign-in pages regains them with `forge generate authentication`, and
+//! another PostgreSQL application runs its whole lifecycle through the `forge`
+//! CLI: `doctor`, `db prepare|status|reset|drop`, `migrate`, `rollback` and
+//! `setup`, against a database the CLI itself creates.
 //!
 //! These tests build whole applications and resolve dependencies with
 //! `cargo generate-lockfile`, so they are ignored by default:
@@ -905,4 +908,286 @@ fn postgresql_application_regains_its_sign_in_pages_with_generate_authentication
     ] {
         assert!(tests.contains(test), "{test}\n{tests}");
     }
+}
+
+/// Removes the lifecycle test's database, also when an assertion panics.
+struct DropDatabase {
+    admin: String,
+    name: String,
+}
+
+impl Drop for DropDatabase {
+    fn drop(&mut self) {
+        let admin = self.admin.clone();
+        let statement = format!("DROP DATABASE IF EXISTS \"{}\" WITH (FORCE)", self.name);
+        let outcome = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| error.to_string())?;
+            runtime.block_on(async {
+                use forge_db::sqlx::{Connection as _, Executor as _};
+
+                let mut connection = forge_db::sqlx::PgConnection::connect(&admin)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                connection
+                    .execute(forge_db::sqlx::AssertSqlSafe(statement))
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
+            })
+        })
+        .join();
+        if !matches!(outcome, Ok(Ok(()))) {
+            eprintln!("could not drop the lifecycle test database {}", self.name);
+        }
+    }
+}
+
+/// Whether `url`'s database exists, asked of the server directly.
+fn database_exists(admin: &str, name: &str) -> bool {
+    let admin = admin.to_owned();
+    let name = name.to_owned();
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap_or_else(|error| panic!("{error}"));
+        runtime.block_on(async {
+            use forge_db::sqlx::Connection as _;
+
+            let mut connection = forge_db::sqlx::PgConnection::connect(&admin)
+                .await
+                .unwrap_or_else(|error| panic!("admin connection: {error}"));
+            forge_db::sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = $1)",
+            )
+            .bind(name)
+            .fetch_one(&mut connection)
+            .await
+            .unwrap_or_else(|error| panic!("{error}"))
+        })
+    })
+    .join()
+    .unwrap_or_else(|_| panic!("database_exists thread panicked"))
+}
+
+#[test]
+#[ignore = "slow: builds generated applications; run with --ignored"]
+fn postgresql_application_runs_its_lifecycle_through_the_forge_cli() {
+    let Ok(admin) = std::env::var("FORGE_TEST_DATABASE_URL") else {
+        eprintln!("FORGE_TEST_DATABASE_URL is not set: the forge CLI lifecycle test is skipped");
+        return;
+    };
+    let forge = env!("CARGO_BIN_EXE_forge");
+    let parent = tempfile::tempdir().unwrap_or_else(|error| panic!("{error}"));
+    let forge_path = workspace().join("crates/forge");
+    let forge_path = forge_path.to_string_lossy();
+    run(
+        parent.path(),
+        forge,
+        &[
+            "new",
+            "lifecycle",
+            "--skip-docker",
+            "--skip-ci",
+            "--skip-lockfile",
+            "--forge-path",
+            &forge_path,
+        ],
+        &[],
+    );
+    let root = parent.path().join("lifecycle");
+    run(&root, "cargo", &["generate-lockfile", "--quiet"], &[]);
+
+    // A database that does not exist yet: the CLI creates it. The server and
+    // credentials are the test server's; only the name differs.
+    let name = format!("forge_lifecycle_{}", uuid_simple());
+    let base = admin
+        .rsplit_once('/')
+        .map(|(base, _)| base.to_owned())
+        .unwrap_or_else(|| panic!("FORGE_TEST_DATABASE_URL has a database name"));
+    let url = format!("{base}/{name}");
+    let _cleanup = DropDatabase {
+        admin: admin.clone(),
+        name: name.clone(),
+    };
+    // Less debug information keeps the build of the application small.
+    let environment = [
+        ("FORGE_DATABASE_URL", url.as_str()),
+        ("FORGE_MIGRATION_DATABASE_URL", url.as_str()),
+        ("CARGO_PROFILE_DEV_DEBUG", "0"),
+    ];
+    let output = |output: &Output| {
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    };
+
+    // doctor sees the server, never prints the credentials.
+    let doctor = run(&root, forge, &["doctor"], &environment);
+    let text = output(&doctor);
+    assert!(text.contains("configuration: ok"), "{text}");
+    assert!(
+        text.contains(&format!("database: postgres database \"{name}\" on ")),
+        "{text}"
+    );
+    assert!(text.contains("the server accepts connections"), "{text}");
+    assert!(
+        !text.contains(&admin) && !text.contains("postgres:postgres"),
+        "{text}"
+    );
+
+    // Nothing to inspect yet: the database is missing.
+    let missing = run_unchecked(&root, forge, &["db", "status"], &environment, None);
+    assert!(!missing.status.success(), "{}", output(&missing));
+
+    // prepare = create + migrate + seed for a missing database.
+    let prepared = run(&root, forge, &["db", "prepare"], &environment);
+    let text = output(&prepared);
+    assert!(text.contains("created postgres database"), "{text}");
+    assert!(text.contains("Seed data loaded."), "{text}");
+    assert!(database_exists(&admin, &name));
+    let status = run(&root, forge, &["db", "status"], &environment);
+    let listing = String::from_utf8_lossy(&status.stdout).into_owned();
+    assert!(listing.contains("applied   1_forge_audit"), "{listing}");
+    assert!(
+        listing.contains("applied   3_forge_authentication"),
+        "{listing}"
+    );
+    assert!(!listing.contains("pending"), "{listing}");
+
+    // Prepared again, the database exists: it only migrates.
+    let again = run(&root, forge, &["db", "prepare"], &environment);
+    let text = output(&again);
+    assert!(!text.contains("created postgres database"), "{text}");
+    assert!(text.contains("no pending migrations"), "{text}");
+
+    // A new migration shows as pending, applies, and rolls back.
+    run(
+        &root,
+        forge,
+        &["generate", "migration", "create customers"],
+        &[],
+    );
+    let customers = std::fs::read_dir(root.join("migrations"))
+        .unwrap_or_else(|error| panic!("{error}"))
+        .map(|entry| entry.unwrap_or_else(|error| panic!("{error}")).path())
+        .filter(|path| path.to_string_lossy().contains("_create_customers."))
+        .collect::<Vec<_>>();
+    for path in &customers {
+        let sql = if path.to_string_lossy().ends_with(".up.sql") {
+            "CREATE TABLE customers (id UUID PRIMARY KEY);\n"
+        } else {
+            "DROP TABLE customers;\n"
+        };
+        std::fs::write(path, sql).unwrap_or_else(|error| panic!("{error}"));
+    }
+    // The migrations are embedded at compile time: forge rebuilds the application.
+    let pending = run(&root, forge, &["migrate", "status"], &environment);
+    let listing = String::from_utf8_lossy(&pending.stdout).into_owned();
+    assert!(
+        listing.contains("pending   ") && listing.contains("_create_customers"),
+        "{listing}"
+    );
+    let migrated = run(&root, forge, &["migrate"], &environment);
+    assert!(
+        output(&migrated).contains("applied migration"),
+        "{}",
+        output(&migrated)
+    );
+    let listing = run(&root, forge, &["db", "status"], &environment);
+    assert!(!String::from_utf8_lossy(&listing.stdout).contains("pending"));
+    let rolled = run(&root, forge, &["rollback"], &environment);
+    assert!(
+        output(&rolled).contains("reverted migration"),
+        "{}",
+        output(&rolled)
+    );
+    let listing = run(&root, forge, &["db", "status"], &environment);
+    assert!(String::from_utf8_lossy(&listing.stdout).contains("pending"));
+    run(&root, forge, &["migrate"], &environment);
+
+    // setup creates the owner (the password only on standard input), once.
+    let setup = [
+        "setup",
+        "--tenant",
+        "acme",
+        "--email",
+        "owner@example.com",
+        "--organization",
+        "Acme Inc",
+        "--password-stdin",
+    ];
+    let created = run_unchecked(
+        &root,
+        forge,
+        &setup,
+        &environment,
+        Some(&format!("{OWNER_PASSWORD}\n")),
+    );
+    let text = output(&created);
+    assert!(created.status.success(), "{text}");
+    assert!(text.contains("Created tenant acme"), "{text}");
+    assert!(!text.contains(OWNER_PASSWORD));
+    let twice = run_unchecked(
+        &root,
+        forge,
+        &setup,
+        &environment,
+        Some(&format!("{OWNER_PASSWORD}\n")),
+    );
+    assert!(!twice.status.success(), "{}", output(&twice));
+
+    // Production refuses before touching anything.
+    let mut production = environment.to_vec();
+    production.push(("FORGE_ENV", "production"));
+    for arguments in [&["db", "drop"][..], &["db", "reset"], &["db", "rollback"]] {
+        let refused = run_unchecked(&root, forge, arguments, &production, None);
+        assert_eq!(refused.status.code(), Some(1), "{arguments:?}");
+        let text = output(&refused);
+        assert!(
+            text.contains("refusing to ") && text.contains("FORGE_ENV is production"),
+            "{arguments:?}: {text}"
+        );
+    }
+    assert!(
+        database_exists(&admin, &name),
+        "the database is still there"
+    );
+    run(&root, forge, &["db", "status"], &environment);
+
+    // reset drops and rebuilds: the owner is gone, so setup works again.
+    let reset = run(&root, forge, &["db", "reset"], &environment);
+    let text = output(&reset);
+    assert!(text.contains("dropped postgres database"), "{text}");
+    assert!(text.contains("created postgres database"), "{text}");
+    let recreated = run_unchecked(
+        &root,
+        forge,
+        &setup,
+        &environment,
+        Some(&format!("{OWNER_PASSWORD}\n")),
+    );
+    assert!(recreated.status.success(), "{}", output(&recreated));
+
+    // drop removes the database; dropping again says there is none.
+    let dropped = run(&root, forge, &["db", "drop"], &environment);
+    assert!(output(&dropped).contains("dropped postgres database"));
+    assert!(!database_exists(&admin, &name));
+    let nothing = run(&root, forge, &["db", "drop"], &environment);
+    assert!(
+        output(&nothing).contains("does not exist"),
+        "{}",
+        output(&nothing)
+    );
+}
+
+/// A UUIDv7 without hyphens, for unique database names.
+fn uuid_simple() -> String {
+    let id = run(Path::new("."), env!("CARGO_BIN_EXE_forge"), &["id"], &[]);
+    String::from_utf8_lossy(&id.stdout).trim().replace('-', "")
 }
