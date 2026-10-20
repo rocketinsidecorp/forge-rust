@@ -85,6 +85,7 @@ echo the endpoint or a header value. Durations use Go's syntax (`10s`,
 | HTTP server (every request) | `GET /users/{id}` (server; `GET` when no route matched) | `http.request.method`, `http.route`, `http.response.status_code`, `url.scheme`, `network.protocol.version`, `error.type` for 5xx |
 | Job attempts (`forge::jobs`) | `process <queue>` (consumer, new trace) | `messaging.system`, `messaging.operation.type`, `messaging.destination.name`, `messaging.message.id` (job id), `forge.job.kind`, `forge.job.attempt`, `forge.job.outcome` |
 | Outbox deliveries (`forge::events`) | `process outbox` (consumer, new trace) | `messaging.message.id` (event id), `forge.event.type`, `forge.event.version`, `forge.outbox.attempt`, `forge.outbox.outcome` |
+| Mail deliveries (`forge::mail::Instrumented::send_in`, docs/mail.md) | `mail send` (client, only inside a traced operation) | `error.type` (the error code) on failure |
 
 Span limits: 64 attributes, string values cut at 1024 bytes. Errors are
 recorded as `error.type` only (a status code or an outcome such as
@@ -119,6 +120,7 @@ trace IDs.
 | `http.server.active_requests` (`http_server_active_requests`) | gauge | `http_request_method` |
 | `forge.queue.job.duration` (`forge_queue_job_duration_seconds`) | histogram | `messaging_destination_name`, `forge_job_kind`, `forge_job_outcome` |
 | `forge.outbox.dispatch.duration` (`forge_outbox_dispatch_duration_seconds`) | histogram | `forge_event_type`, `forge_outbox_outcome` |
+| `forge.mail.send.duration` (`forge_mail_send_duration_seconds`) | histogram | `forge_mail_outcome` (`sent` or the error code, such as `mail_unavailable`) |
 | `db.client.connection.count` (`db_client_connection_count`) | gauge | `db_system_name`, `db_client_connection_pool_name`, `db_client_connection_state` (`idle`, `used`) |
 | `db.client.connection.max` (`db_client_connection_max`) | gauge | `db_system_name`, `db_client_connection_pool_name` |
 | `process.memory.usage` (`process_memory_usage_bytes`) | gauge | |
@@ -459,7 +461,6 @@ has no such counter:
 - `forge.scheduler.job.duration`: Forge-Rust's cron schedules enqueue
   durable jobs (ADR 0025) instead of running functions in process, so
   scheduled work is measured by `forge.queue.job.duration`.
-- `forge.mail.send.duration`: Forge-Rust has no mailer yet.
 - `go.goroutine.count`, `go.memory.heap.alloc`, `go.memory.heap.inuse`,
   `go.memory.total`, `go.memory.gc.goal`, `go.memory.allocated`,
   `go.gc.cycles`, `go.gc.pause.duration`, `go.processor.limit`: Rust has no

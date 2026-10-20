@@ -64,6 +64,8 @@ struct World {
     hashes: Mutex<u32>,
     membership_lookups: Mutex<u32>,
     deliver_fails: bool,
+    /// Delivers through the real mail adapter instead of recording tokens.
+    mailer: Option<forge::mail::PasswordResetMailer>,
 }
 
 /// PostgreSQL's `lower()` under common collations folds `İ` to `i` (no
@@ -307,6 +309,9 @@ impl PasswordResetNotifier for World {
         if self.deliver_fails {
             return Err(PasswordResetDeliveryError::NotConfigured);
         }
+        if let Some(mailer) = &self.mailer {
+            return mailer.deliver(delivery).await;
+        }
         lock(&self.deliveries).push((
             delivery.login().to_owned(),
             delivery.token().expose().to_owned(),
@@ -338,10 +343,17 @@ fn fixture() -> Result<Fixture, Box<dyn Error>> {
 }
 
 fn fixture_with(deliver_fails: bool, pair_limit: u32) -> Result<Fixture, Box<dyn Error>> {
-    let world = Arc::new(World {
-        deliver_fails,
-        ..World::default()
-    });
+    fixture_for(
+        World {
+            deliver_fails,
+            ..World::default()
+        },
+        pair_limit,
+    )
+}
+
+fn fixture_for(world: World, pair_limit: u32) -> Result<Fixture, Box<dyn Error>> {
+    let world = Arc::new(world);
     let acme = TenantId::new();
     lock(&world.tenants).insert("acme".to_owned(), acme);
     lock(&world.tenants).insert("globex".to_owned(), TenantId::new());
@@ -985,6 +997,71 @@ async fn reset_requests_answer_the_same_whether_or_not_the_account_exists() -> T
         );
         assert_eq!(lock(&fixture.world.resets).len(), 1);
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn reset_emails_carry_a_working_link_through_the_mailer() -> TestResult {
+    // The reset notifier `src/bootstrap/mod.rs` wires when FORGE_MAIL_URL is
+    // set, over the in-memory test sender instead of SMTP.
+    let outbox = Arc::new(forge::mail::testing::Recorder::new());
+    let emails = forge::mail::PasswordResetEmails::new(
+        forge::mail::Address::new("Shop", "no-reply@example.com")?,
+        "Shop",
+        "https://shop.example.com/passwords/edit",
+    )?;
+    let fixture = fixture_for(
+        World {
+            mailer: Some(forge::mail::PasswordResetMailer::new(
+                emails,
+                outbox.clone(),
+            )),
+            ..World::default()
+        },
+        10,
+    )?;
+    reset_request(&fixture, "acme", "nobody@example.com").await?;
+    assert!(outbox.is_empty(), "unknown accounts get no email");
+    reset_request(&fixture, "acme", "ada@example.com").await?;
+
+    let email = outbox.last().ok_or("one email")?;
+    assert_eq!(email.recipients, ["ada@example.com"]);
+    assert_eq!(email.message.subject, "Reset your Shop password");
+    let prefix = "https://shop.example.com/passwords/edit?token=";
+    let start = email.message.text.find(prefix).ok_or("a reset link")? + prefix.len();
+    let token: String = email.message.text[start..]
+        .chars()
+        .take_while(char::is_ascii_hexdigit)
+        .collect();
+    assert_eq!(token.len(), 64);
+
+    let mut browser = Browser::default();
+    browser
+        .get(&fixture.router, &format!("/passwords/edit?token={token}"))
+        .await?;
+    let changed = browser
+        .post(
+            &fixture.router,
+            "/passwords",
+            &[
+                ("_method", "patch"),
+                ("token", &token),
+                ("password", "a brand new secret"),
+                ("password_confirmation", "a brand new secret"),
+            ],
+        )
+        .await?;
+    assert_eq!(changed.status(), StatusCode::SEE_OTHER);
+    let mut ada = Browser::default();
+    let signed_in = ada
+        .sign_in(
+            &fixture.router,
+            "acme",
+            "ada@example.com",
+            "a brand new secret",
+        )
+        .await?;
+    assert_eq!(signed_in.status(), StatusCode::SEE_OTHER);
     Ok(())
 }
 

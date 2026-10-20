@@ -523,6 +523,7 @@ dependencies = [
  "forge-events",
  "forge-http",
  "forge-jobs",
+ "forge-mail",
  "forge-ratelimit",
  "forge-security",
  "forge-storage",
@@ -733,6 +734,32 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "forge-mail"
+version = "0.1.0"
+dependencies = [
+ "askama",
+ "async-trait",
+ "base64",
+ "forge-auth",
+ "forge-config",
+ "forge-http",
+ "forge-mail",
+ "forge-telemetry",
+ "getrandom 0.4.3",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+ "webpki-roots",
 ]
 
 [[package]]

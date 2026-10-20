@@ -59,6 +59,12 @@ pub use forge_http as http;
 /// Durable jobs, workers and cron schedules (feature `jobs`, ADR 0025).
 #[cfg(feature = "jobs")]
 pub use forge_jobs as jobs;
+/// Email: the `Sender` port, the SMTP, development file and test senders,
+/// askama templates, browser previews and the password reset mailer
+/// (feature `mail`, enabled by `views`, ADR 0035). Application code depends
+/// on `Sender`; bootstrap selects the sender with `from_config`.
+#[cfg(feature = "mail")]
+pub use forge_mail as mail;
 /// Fixed-window rate limiting and its HTTP middleware (feature `ratelimit`,
 /// ADR 0027).
 #[cfg(feature = "ratelimit")]

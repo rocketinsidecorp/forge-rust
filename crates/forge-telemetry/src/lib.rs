@@ -26,6 +26,7 @@ pub mod context;
 pub mod http;
 pub mod jobs;
 pub mod logs;
+pub mod mail;
 pub mod metrics;
 pub mod otlp;
 pub mod pool;

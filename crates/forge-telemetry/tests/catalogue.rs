@@ -78,6 +78,13 @@ const SHARED: &[Shared] = &[
         "db_client_connection_max",
     ),
     (
+        "forge.mail.send.duration",
+        MetricKind::Histogram,
+        "s",
+        &["forge.mail.outcome"],
+        "forge_mail_send_duration_seconds",
+    ),
+    (
         "forge.telemetry.spans.dropped",
         MetricKind::Counter,
         "{span}",
@@ -113,7 +120,6 @@ const NOT_PORTED: &[&str] = &[
     "http.client.request.duration",
     "db.client.operation.duration",
     "forge.scheduler.job.duration",
-    "forge.mail.send.duration",
     "forge.db.pool.waits",
     "forge.db.pool.wait.duration",
     "go.goroutine.count",
@@ -147,6 +153,7 @@ fn every_instrument() -> (Telemetry, forge_telemetry::pool::PoolObservation) {
     telemetry.http_server().expect("http");
     telemetry.jobs().expect("jobs");
     telemetry.outbox().expect("outbox");
+    telemetry.mail().expect("mail");
     let pool = telemetry
         .observe_pool("postgresql", "default", PoolStats::default)
         .expect("pool");

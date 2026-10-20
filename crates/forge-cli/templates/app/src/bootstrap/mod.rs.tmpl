@@ -58,9 +58,32 @@ fn compose(composition: &mut forge::Composition<'_>) -> Result<(), forge::Compos
     crate::adapters::http::routes(composition.router(), &site)?;
 %%if authentication%%
     // Sign-in, sign-out and password-reset pages (ADR 0026), with the
-    // PostgreSQL identity stores, Argon2id, per-process attempt throttles and
-    // a reset notifier that delivers nothing until a mailer adapter replaces
-    // it. Signed-out browsers asking for a protected page are sent to sign in.
+    // PostgreSQL identity stores, Argon2id and per-process attempt throttles.
+    // Reset links are emailed (ADR 0035) once FORGE_MAIL_URL, FORGE_MAIL_FROM
+    // and FORGE_AUTH_PASSWORD_RESET_URL are set; without FORGE_MAIL_URL the
+    // notifier fails closed and delivers nothing, and FORGE_MAIL_URL without
+    // the reset URL stops start-up. Signed-out browsers asking for a
+    // protected page are sent to sign in.
+    let notifier = forge::mail::password_reset_notifier(
+        composition.config(),
+        env!("CARGO_PKG_NAME"),
+        composition.telemetry(),
+    )
+    .map_err(forge::ComposeError::other)?;
+    // FORGE_MAIL_PREVIEW=true (development and test only) shows the reset
+    // email at /_mail without sending it.
+    if composition.config().mail.preview {
+        let preview = forge::mail::PasswordResetEmails::for_preview(
+            composition.config(),
+            env!("CARGO_PKG_NAME"),
+        )
+        .map_err(forge::ComposeError::other)?
+        .preview();
+        let previews =
+            forge::mail::PreviewHandler::new(composition.config(), "/_mail", vec![preview])
+                .map_err(forge::ComposeError::other)?;
+        composition.router().layer(previews);
+    }
     let pool = composition.postgres()?.pool().clone();
     let throttle = || {
         forge::auth::MemoryLoginThrottle::new(forge::auth::ThrottleConfig::default())
@@ -84,7 +107,7 @@ fn compose(composition: &mut forge::Composition<'_>) -> Result<(), forge::Compos
         resets: std::sync::Arc::new(crate::infrastructure::accounts::PgPasswordResetStore::new(
             pool.clone(),
         )),
-        notifier: std::sync::Arc::new(forge::auth::UndeliverablePasswordResets),
+        notifier,
         audit: std::sync::Arc::new(crate::infrastructure::audit::PgAuditSink::new(pool)),
         sign_in_throttle: throttle()?,
         reset_throttle: throttle()?,

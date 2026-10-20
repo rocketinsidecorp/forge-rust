@@ -27,7 +27,7 @@ results.
 | 0 | Architecture, ADRs, threat model, dependency and test policy | Done |
 | 1 | Runtime, CLI, configuration, HTTP, graceful shutdown, health, Docker | Implemented, unreleased |
 | 2 | PostgreSQL, migrations, transaction contracts, repositories | Behavior implemented; CI runner gate still blocked |
-| 3 | Authentication, authorization, tenancy, RLS, audit | Implemented for PostgreSQL (sign-in pages, setup, RBAC, RLS, audit); MFA, reset delivery and other backends pending |
+| 3 | Authentication, authorization, tenancy, RLS, audit | Implemented for PostgreSQL (sign-in pages, setup, RBAC, RLS, audit, reset emails through the mailer of [ADR 0035](docs/adr/0035-mail.md)); MFA and other backends pending |
 | 4 | PostgreSQL jobs, cron scheduler, outbox, idempotent consumers | Library implemented and tested (`forge` features `jobs`, `events`); `forge new` wiring pending |
 | 5 | Traces, metrics, correlated logs (OTLP, Prometheus) | Implemented ([ADR 0033](docs/adr/0033-telemetry.md)); generated local Grafana, Prometheus, Tempo and Loki stack ([ADR 0034](docs/adr/0034-local-observability-stack.md)) |
 | 6+ | OpenAPI, AI, hardening | Design only |
@@ -68,8 +68,9 @@ sign-out and password-reset pages (`/session/new`, `/passwords/new`), the
 `src/bootstrap/seeds.rs` in one transaction). The organization field is the
 tenant slug; every failure shows the same message; attempts are throttled;
 signing in issues a fresh session and CSRF token. Password-reset links are
-not delivered until a mailer adapter replaces the fail-closed default
-notifier; the page answers the same either way. An older PostgreSQL
+emailed once `FORGE_MAIL_URL`, `FORGE_MAIL_FROM` and
+`FORGE_AUTH_PASSWORD_RESET_URL` are set (see [Email](#email)); until then
+nothing is delivered and the page answers the same either way. An older PostgreSQL
 application gets the same files with `forge generate authentication`
 ([ADR 0026](docs/adr/0026-authentication-pages-and-setup.md),
 [docs/cli.md](docs/cli.md#forge-generate-authentication)).
@@ -449,6 +450,51 @@ Kubernetes and systemd deployment is covered in
   with `rust-toolchain.toml` (skip all of them with `--skip-docker`), plus `.github/workflows/ci.yml` and `.github/dependabot.yml`
   (skip with `--skip-ci`).
 
+## Email
+
+`forge::mail` (feature `mail`, on in every full-stack application) is the
+counterpart of Action Mailer: validated messages, a TLS-enforcing SMTP
+sender, a development `.eml` sender, an in-memory test recorder, askama
+templates and browser previews ([ADR 0035](docs/adr/0035-mail.md),
+[docs/mail.md](docs/mail.md)). Generated PostgreSQL applications email
+password-reset links with it:
+
+```sh
+# development: write each email to tmp/mail/*.eml instead of sending it
+export FORGE_MAIL_URL=file:tmp/mail
+export FORGE_MAIL_FROM="Shop <no-reply@example.com>"
+export FORGE_AUTH_PASSWORD_RESET_URL=http://localhost:3000/passwords/edit
+cargo run
+# request a reset at http://127.0.0.1:3000/passwords/new?tenant=acme, then
+ls -t tmp/mail | head -1
+
+# preview the reset email in the browser, nothing sent (development and test only)
+FORGE_MAIL_PREVIEW=true cargo run
+# open http://127.0.0.1:3000/_mail
+
+# production: STARTTLS (smtp://, 587) or implicit TLS (smtps://, 465), always verified
+export FORGE_MAIL_URL='smtps://user:password@smtp.example.com:465'
+export FORGE_MAIL_FROM="Shop <no-reply@example.com>"
+export FORGE_AUTH_PASSWORD_RESET_URL=https://shop.example.com/passwords/edit
+```
+
+Send your own email through the port:
+
+```rust
+use forge::mail::{Address, Message, Sender};
+
+let sender = forge::mail::from_config(composition.config())?;      // Arc<dyn Sender>
+let message = Message::new(forge::mail::default_from(composition.config())?)
+    .to(Address::new("Ada", "ada@example.org")?)
+    .subject("Your receipt")
+    .text("Thanks for your order.");
+sender.send(&message).await?;
+```
+
+Credentials go only over verified TLS (or to a loopback relay with
+`FORGE_MAIL_ALLOW_PLAINTEXT=true`); production refuses the file sender and
+previews.
+
 ## Rate limiting, caching and file storage
 
 Three platform services ship as facade features: `ratelimit`
@@ -596,6 +642,7 @@ crates/
 ├── forge-events   # integration events, transactional outbox, dispatcher, consumer inbox
 ├── forge-http     # HTTP server, routing, middleware, form/query decoding, limits
 ├── forge-jobs     # durable PostgreSQL jobs, workers, cron schedules
+├── forge-mail     # email: validated MIME, TLS-enforcing SMTP, file/test senders, previews
 ├── forge-ratelimit # fixed-window limiter: memory and shared stores, fail-closed middleware
 ├── forge-security # deny-by-default RBAC roles, permissions and grants
 ├── forge-storage  # file storage: disk adapter, signed links, strict uploads
@@ -664,6 +711,7 @@ Contribution rules:
 - [Architecture Decision Records](docs/adr/README.md)
 - [CLI reference](docs/cli.md)
 - [Jobs, schedules, outbox and consumers](docs/jobs.md)
+- [Mail: SMTP, templates, previews and reset emails](docs/mail.md)
 - [Deployment](docs/deployment.md)
 - [Observability: traces, metrics and logs](docs/observability.md)
 - [Rate limiting](docs/rate-limiting.md), [caching](docs/caching.md) and [file storage](docs/storage.md)

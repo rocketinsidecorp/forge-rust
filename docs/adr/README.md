@@ -34,6 +34,7 @@ does not mean implementation exists.
 | [0032](0032-trusted-proxies-and-client-ip.md) | Trusted proxies and the client address: `FORGE_HTTP_TRUSTED_PROXIES`, right-to-left `X-Forwarded-For`, `Request::client_ip` | Accepted |
 | [0033](0033-telemetry.md) | Forge-owned telemetry over OpenTelemetry protocols: `FORGE_TELEMETRY_*`, W3C propagation, OTLP/HTTP JSON, Prometheus listener, correlated log export | Accepted |
 | [0034](0034-local-observability-stack.md) | Preconfigured local observability stack: `compose.observability.yaml` with the Collector, Prometheus, Tempo, Loki and Grafana | Accepted |
+| [0035](0035-mail.md) | Mail: validated MIME, a Forge-owned TLS-enforcing SMTP client, development and test senders, askama templates, previews, password reset emails | Accepted |
 
 New ADRs use the next four-digit number. A changed decision receives a new ADR
 that marks the prior record `Superseded`; accepted records are not rewritten to

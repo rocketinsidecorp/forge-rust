@@ -271,6 +271,14 @@ Environment:
   FORGE_STORAGE_MAX_UPLOAD_BYTES largest uploaded file (default: 524288)
   FORGE_STORAGE_LINK_TTL_SECS default signed link lifetime (default: 900)
   FORGE_STREAMS_KEY           base64 of 32+ bytes signing live-update stream names; required in production when streams are served
+  FORGE_MAIL_URL              smtp://user:pass@host:587 (STARTTLS), smtps://user:pass@host:465 (implicit TLS)
+                              or file:tmp/mail (development .eml files; refused in production) (default: mail off)
+  FORGE_MAIL_FROM             default sender, App <app@example.com>; required with FORGE_MAIL_URL
+  FORGE_MAIL_ALLOW_PLAINTEXT  true continues without STARTTLS; credentials still go only over TLS or to loopback
+  FORGE_MAIL_TIMEOUT          one delivery attempt, at most 10m (default: 30s)
+  FORGE_MAIL_PREVIEW          true serves mail previews (development and test only; default: false)
+  FORGE_MAIL_TLS_CA_FILE      PEM roots trusted in addition to the Mozilla roots (private relays)
+  FORGE_AUTH_PASSWORD_RESET_URL public URL of /passwords/edit for reset emails (https; http only on localhost)
   FORGE_TELEMETRY_ENABLED     false installs no tracing, metrics or log export (default: true)
   FORGE_TELEMETRY_SERVICE_NAME    service.name (default: the application name)
   FORGE_TELEMETRY_SERVICE_VERSION service.version (default: the application version)
