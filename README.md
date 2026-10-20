@@ -634,6 +634,23 @@ let stored = cipher.attribute("people", "ssn").seal(&id.to_string(), &ssn)?;  //
 let ssn: String = cipher.attribute("people", "ssn").open(&id.to_string(), &stored)?;
 ```
 
+To rotate a data key, make the new key active, re-encrypt each column and
+remove the old key only when a count of rows not on the active key is 0
+([docs/encryption.md](docs/encryption.md#rotating-keys)). PostgreSQL tenant
+tables (row-level security) rotate once per tenant; an unscoped run on them is
+refused:
+
+```rust
+use forge::encryption::{RotateOptions, SqlColumn, postgres::EncryptedColumn};
+let column = EncryptedColumn::new(db.clone(), SqlColumn::new("people", "ssn")?)?.tenant(tenant_id);
+let report = cipher.reencrypt(&column, RotateOptions::default(), &cancellation).await?;
+```
+
+```sql
+SELECT count(*) FROM people  -- per tenant (set_config('forge.tenant_id', ...)); must be 0
+ WHERE ssn IS NOT NULL AND substr(ssn, 1, length('fg1.2026-10.')) <> 'fg1.2026-10.';
+```
+
 ## Translations
 
 Full-stack applications are translated like Rails I18n: JSON files in

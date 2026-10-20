@@ -712,6 +712,8 @@ dependencies = [
  "forge-core",
  "forge-db",
  "forge-encryption",
+ "forge-jobs",
+ "forge-tenancy",
  "getrandom 0.4.3",
  "ring",
  "serde",

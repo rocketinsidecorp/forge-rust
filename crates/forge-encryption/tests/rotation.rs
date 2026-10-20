@@ -398,3 +398,196 @@ sql_rotation!(
     "SELECT id, ssn, ssn_idx FROM people WHERE ssn IS NOT NULL ORDER BY id";
     #[ignore = "needs FORGE_TEST_MYSQL_URL"]
 );
+
+/// Row-level security: the generated tenant tables (`ENABLE` and `FORCE ROW
+/// LEVEL SECURITY` on `forge.tenant_id`) hide every row from an unscoped
+/// NOBYPASSRLS role, so an unscoped rotation must be refused instead of
+/// reporting an empty success; a tenant-scoped one rotates that tenant only,
+/// and the count of rows not on the active key proves completion.
+mod postgres_row_level_security {
+    use super::*;
+    use forge_db::PgDatabase;
+    use forge_encryption::SqlColumn;
+    use forge_encryption::postgres::EncryptedColumn;
+    use forge_jobs::testing::RlsTestDatabase;
+    use forge_tenancy::TenantId;
+    use sqlx::AssertSqlSafe;
+    use uuid::Uuid;
+
+    const ROWS_PER_TENANT: u32 = 5;
+    const STALE: &str = "SELECT count(*) FROM people \
+                         WHERE ssn IS NOT NULL AND substr(ssn, 1, length($1)) <> $1";
+
+    /// Rows of `people` not sealed with the active key, as `database` sees
+    /// them, optionally inside one tenant's scope.
+    async fn stale(database: &PgDatabase, tenant: Option<TenantId>, active: &str) -> i64 {
+        let mut transaction = database.begin().await.expect("begin");
+        if let Some(tenant) = tenant {
+            transaction.set_tenant(tenant).await.expect("scope");
+        }
+        let count = sqlx::query_scalar(STALE)
+            .bind(format!("fg1.{active}."))
+            .fetch_one(transaction.connection())
+            .await
+            .expect("count");
+        transaction.rollback().await.expect("rollback");
+        count
+    }
+
+    async fn values(database: &PgDatabase, tenant: TenantId) -> Vec<(Uuid, String)> {
+        sqlx::query_as("SELECT id, ssn FROM people WHERE tenant_id = $1 ORDER BY id")
+            .bind(tenant.into_uuid())
+            .fetch_all(database.pool())
+            .await
+            .expect("values")
+    }
+
+    fn column(database: &PgDatabase) -> EncryptedColumn {
+        let spec = SqlColumn::new(TABLE, COLUMN)
+            .unwrap()
+            .with_index_column("ssn_idx")
+            .unwrap();
+        EncryptedColumn::new(database.clone(), spec).unwrap()
+    }
+
+    #[tokio::test]
+    #[ignore = "needs FORGE_TEST_DATABASE_URL"]
+    async fn tenant_tables_rotate_per_tenant_and_refuse_unscoped_runs() {
+        let db = RlsTestDatabase::create(&[]).await.expect("database");
+        let runtime_role = db.runtime_role().to_owned();
+        for statement in [
+            "CREATE TABLE people (id uuid PRIMARY KEY, tenant_id uuid NOT NULL, \
+             ssn text, ssn_idx text)"
+                .to_owned(),
+            "ALTER TABLE people ENABLE ROW LEVEL SECURITY".to_owned(),
+            "ALTER TABLE people FORCE ROW LEVEL SECURITY".to_owned(),
+            "CREATE POLICY people_tenant_isolation ON people \
+             USING (tenant_id = NULLIF(current_setting('forge.tenant_id', true), '')::uuid) \
+             WITH CHECK (tenant_id = NULLIF(current_setting('forge.tenant_id', true), '')::uuid)"
+                .to_owned(),
+            format!("GRANT SELECT, INSERT, UPDATE ON people TO \"{runtime_role}\""),
+        ] {
+            sqlx::query(AssertSqlSafe(statement))
+                .execute(db.migrator().pool())
+                .await
+                .expect("schema");
+        }
+        let (old_ring, rotating_ring, new_only) = rings();
+        let old = Cipher::new(&old_ring).unwrap();
+        let (first, second) = (TenantId::new(), TenantId::new());
+        for tenant in [first, second] {
+            for n in 0..ROWS_PER_TENANT {
+                let id = Uuid::now_v7();
+                let sealed = old
+                    .attribute(TABLE, COLUMN)
+                    .seal(&id.to_string(), &format!("ssn-{n}"))
+                    .unwrap();
+                // The superuser bypasses row-level security.
+                sqlx::query("INSERT INTO people (id, tenant_id, ssn) VALUES ($1, $2, $3)")
+                    .bind(id)
+                    .bind(tenant.into_uuid())
+                    .bind(sealed)
+                    .execute(db.admin().pool())
+                    .await
+                    .expect("seed");
+            }
+        }
+        let rotating = Cipher::new(&rotating_ring).unwrap();
+        let active = rotating.active_key_id().to_owned();
+        let all_rows = i64::from(2 * ROWS_PER_TENANT);
+        assert_eq!(stale(db.admin(), None, &active).await, all_rows);
+        // What the old adapter scanned: the runtime role sees no row at all.
+        assert_eq!(stale(db.runtime(), None, &active).await, 0);
+
+        // 1. Without a tenant scope the rotation is refused, for the runtime
+        //    role and for the owner (FORCE binds it too), before any write.
+        for database in [db.runtime(), db.migrator()] {
+            let error = rotating
+                .reencrypt(
+                    &column(database),
+                    RotateOptions::default(),
+                    &Cancellation::new(),
+                )
+                .await
+                .expect_err("unscoped rotation of a tenant table");
+            let ReencryptFailure::Page { source, .. } = &error.failure else {
+                panic!("unexpected failure {error}");
+            };
+            let configuration = source
+                .downcast_ref::<EncryptionError>()
+                .expect("an encryption error");
+            assert!(
+                matches!(configuration, EncryptionError::Configuration(message)
+                    if message.contains("row-level security") && message.contains(".tenant(")),
+                "{configuration}"
+            );
+            assert_eq!(error.report, Default::default());
+        }
+        assert_eq!(stale(db.admin(), None, &active).await, all_rows);
+
+        // 2. Scoped to the first tenant: its rows rotate, the second
+        //    tenant's rows are untouched.
+        let before = values(db.admin(), second).await;
+        let report = rotating
+            .reencrypt(
+                &column(db.runtime()).tenant(first),
+                RotateOptions {
+                    batch_size: 2,
+                    blind_index: true,
+                    ..RotateOptions::default()
+                },
+                &Cancellation::new(),
+            )
+            .await
+            .expect("rotate the first tenant");
+        let rows = u64::from(ROWS_PER_TENANT);
+        assert_eq!(
+            (
+                report.scanned,
+                report.rotated,
+                report.reindexed,
+                report.conflicts
+            ),
+            (rows, rows, rows, 0)
+        );
+        assert_eq!(values(db.admin(), second).await, before);
+
+        // 3. The count of rows not on the active key proves completion, per
+        //    tenant or as a role that sees every row; `scanned` never does.
+        assert_eq!(stale(db.runtime(), Some(first), &active).await, 0);
+        assert_eq!(
+            stale(db.runtime(), Some(second), &active).await,
+            i64::from(ROWS_PER_TENANT)
+        );
+        assert_eq!(
+            stale(db.admin(), None, &active).await,
+            i64::from(ROWS_PER_TENANT)
+        );
+        let report = rotating
+            .reencrypt(
+                &column(db.runtime()).tenant(second),
+                RotateOptions::default(),
+                &Cancellation::new(),
+            )
+            .await
+            .expect("rotate the second tenant");
+        assert_eq!((report.scanned, report.rotated), (rows, rows));
+        for tenant in [first, second] {
+            assert_eq!(stale(db.runtime(), Some(tenant), &active).await, 0);
+        }
+        assert_eq!(stale(db.admin(), None, &active).await, 0);
+
+        // Only now may the old key go: the new key alone reads every row.
+        let new_cipher = Cipher::new(&new_only).unwrap();
+        for tenant in [first, second] {
+            for (id, sealed) in values(db.admin(), tenant).await {
+                let plain: String = new_cipher
+                    .attribute(TABLE, COLUMN)
+                    .open(&id.to_string(), &sealed)
+                    .unwrap();
+                assert!(plain.starts_with("ssn-"));
+            }
+        }
+        db.cleanup().await.expect("cleanup");
+    }
+}

@@ -157,8 +157,10 @@ impl fmt::Debug for Key {
 /// remain usable for decryption only. Immutable; identifiers are unique.
 #[derive(Clone)]
 pub struct KeyRing {
-    /// The active key first.
-    keys: Vec<Key>,
+    /// The key used for new ciphertexts.
+    active: Key,
+    /// Decryption-only keys, in the order given.
+    previous: Vec<Key>,
 }
 
 impl KeyRing {
@@ -167,51 +169,69 @@ impl KeyRing {
         active: Key,
         previous: impl IntoIterator<Item = Key>,
     ) -> Result<Self, EncryptionError> {
-        let mut keys = vec![active];
+        let mut ring = Self {
+            active,
+            previous: Vec::new(),
+        };
         for key in previous {
-            if keys.iter().any(|existing| existing.id == key.id) {
+            if ring.keys().any(|existing| existing.id == key.id) {
                 return Err(EncryptionError::InvalidKey(format!(
                     "duplicate key identifier {:?}",
                     key.id
                 )));
             }
-            keys.push(key);
+            ring.previous.push(key);
         }
-        Ok(Self { keys })
+        Ok(ring)
     }
 
     /// A ring from an active identifier and a map of identifier to canonical
     /// text keys, the shape stored in credentials. Previous keys are ordered
     /// by identifier.
+    ///
+    /// Errors never echo an identifier or the active value: one swapped with
+    /// a key by mistake would otherwise print the key. They name a key by
+    /// its position among the identifiers in sorted order, and the active
+    /// value by its length.
     pub fn parse(active: &str, keys: &BTreeMap<String, String>) -> Result<Self, EncryptionError> {
-        let Some(active_text) = keys.get(active) else {
-            return Err(EncryptionError::InvalidKey(format!(
-                "active key {active:?} is not among the keys"
-            )));
+        let missing = || {
+            EncryptionError::InvalidKey(format!(
+                "the active identifier ({} characters) is not among the {} keys",
+                active.chars().count(),
+                keys.len()
+            ))
         };
-        let parse = |id: &str, text: &str| {
-            let material = parse_key(text).map_err(|error| match error {
-                EncryptionError::InvalidKey(reason) => {
-                    EncryptionError::InvalidKey(format!("key {id:?}: {reason}"))
-                }
-                other => other,
-            })?;
-            Key::new(id, material)
+        if !keys.contains_key(active) {
+            return Err(missing());
+        }
+        let parse = |position: usize, id: &str, text: &str| {
+            parse_key(text)
+                .and_then(|material| Key::new(id, material))
+                .map_err(|error| match error {
+                    EncryptionError::InvalidKey(reason) => {
+                        EncryptionError::InvalidKey(format!("key #{}: {reason}", position + 1))
+                    }
+                    other => other,
+                })
         };
-        let active_key = parse(active, active_text)?;
-        let previous = keys
-            .iter()
-            .filter(|(id, _)| id.as_str() != active)
-            .map(|(id, text)| parse(id, text))
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut active_key = None;
+        let mut previous = Vec::with_capacity(keys.len().saturating_sub(1));
+        for (position, (id, text)) in keys.iter().enumerate() {
+            let key = parse(position, id, text)?;
+            if id.as_str() == active {
+                active_key = Some(key);
+            } else {
+                previous.push(key);
+            }
+        }
+        let active_key = active_key.ok_or_else(missing)?;
         Self::new(active_key, previous)
     }
 
     /// The key used for new ciphertexts.
     #[must_use]
     pub fn active(&self) -> &Key {
-        // `new` always stores the active key first.
-        &self.keys[0]
+        &self.active
     }
 
     /// The identifier of the active key.
@@ -223,12 +243,12 @@ impl KeyRing {
     /// Every identifier, the active one first.
     #[must_use]
     pub fn ids(&self) -> Vec<&str> {
-        self.keys.iter().map(Key::id).collect()
+        self.keys().map(Key::id).collect()
     }
 
     /// Every key, the active one first.
     pub fn keys(&self) -> impl Iterator<Item = &Key> {
-        self.keys.iter()
+        std::iter::once(&self.active).chain(&self.previous)
     }
 }
 
@@ -309,6 +329,29 @@ mod tests {
         broken.insert("d".to_owned(), "secret-looking-text".to_owned());
         let error = KeyRing::parse("c", &broken).expect_err("bad key");
         assert!(!error.to_string().contains("secret-looking-text"));
+    }
+
+    #[test]
+    fn parse_errors_never_echo_a_key_swapped_with_an_identifier() {
+        let key = encode_key(&generate_key().expect("random")).to_string();
+        let other = encode_key(&generate_key().expect("random")).to_string();
+        // The key text pasted as the active identifier and as a map key.
+        let swapped: BTreeMap<String, String> = [
+            (key.clone(), "2026-10".to_owned()),
+            ("2025-03".to_owned(), other.clone()),
+        ]
+        .into();
+        for (active, keys) in [(key.as_str(), &swapped), ("2026-10", &swapped)] {
+            let error = KeyRing::parse(active, keys).expect_err("refused");
+            let text = format!("{error} {error:?}");
+            assert!(!text.contains(&key), "{text}");
+            assert!(!text.contains(&other), "{text}");
+        }
+        // The key text pasted as the active identifier only.
+        let ids: BTreeMap<String, String> = [("2025-03".to_owned(), other)].into();
+        let error = KeyRing::parse(&key, &ids).expect_err("refused");
+        assert!(!error.to_string().contains(&key), "{error}");
+        assert!(error.to_string().contains("43 characters"), "{error}");
     }
 
     #[test]

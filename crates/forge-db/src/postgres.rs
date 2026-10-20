@@ -3,6 +3,7 @@
 use std::str::FromStr as _;
 
 use forge_config::{DatabaseScheme, database_url, is_loopback_host};
+use forge_tenancy::TenantId;
 use sqlx::Postgres;
 
 use crate::{Backend, DbError, DbTransaction, backend::sealed::Hooks};
@@ -72,6 +73,20 @@ impl DbTransaction<Postgres> {
     pub async fn advisory_xact_lock(&mut self, key: i64) -> Result<(), DbError> {
         sqlx::query("SELECT pg_advisory_xact_lock($1)")
             .bind(key)
+            .execute(self.connection())
+            .await?;
+        Ok(())
+    }
+
+    /// Installs `tenant` as this transaction's `forge.tenant_id` setting
+    /// (`set_config(..., true)`, ADR 0011), the value the generated
+    /// row-level security policies compare with. The setting is
+    /// transaction-local, so it never leaks to the next user of the pooled
+    /// connection. Call it before the first tenant-scoped statement.
+    /// PostgreSQL only.
+    pub async fn set_tenant(&mut self, tenant: TenantId) -> Result<(), DbError> {
+        sqlx::query("SELECT set_config('forge.tenant_id', $1, true)")
+            .bind(tenant.to_string())
             .execute(self.connection())
             .await?;
         Ok(())

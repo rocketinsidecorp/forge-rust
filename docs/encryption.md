@@ -155,9 +155,60 @@ deterministic encryption mode.
    the value read. A row that cannot be decrypted stops the run with its id:
    investigate, do not skip.
 
-3. When a second run reports `rotated == 0` and `conflicts == 0`, remove the
-   old key from the credentials and deploy. A value still sealed with a
-   removed key fails with `EncryptionError::UnknownKey`.
+   **Tenant tables on PostgreSQL.** Generated tenant tables use `ENABLE` and
+   `FORCE ROW LEVEL SECURITY` with policies on `forge.tenant_id`, and both
+   generated roles are `NOBYPASSRLS`: without a tenant scope they see no row
+   at all. Rotate such a table once per tenant:
+
+   ```rust
+   // Every tenant, read by a role that sees them all.
+   let tenant_ids: Vec<forge::tenancy::TenantId> = load_tenant_ids().await?;
+   for tenant_id in tenant_ids {
+       let column = EncryptedColumn::new(database.clone(), SqlColumn::new("people", "ssn")?)?
+           .tenant(tenant_id); // every page and update: set_config('forge.tenant_id', ..., true)
+       let report = cipher.reencrypt(&column, RotateOptions::default(), &cancellation).await?;
+       tracing::info!(%tenant_id, rotated = report.rotated, conflicts = report.conflicts, "rotated");
+   }
+   ```
+
+   Without `.tenant(..)` the PostgreSQL `EncryptedColumn` checks the catalog
+   before every page (`pg_class.relrowsecurity`/`relforcerowsecurity`, the
+   table owner, `pg_roles.rolsuper`/`rolbypassrls` of `current_user`) and fails
+   with `EncryptionError::Configuration` when the policies apply to the
+   connected role, instead of seeing no row and reporting an empty success.
+   A role that bypasses row-level security (a superuser, a `BYPASSRLS` role,
+   or the owner of a table without `FORCE`) may rotate the whole table
+   unscoped. A tenant scope only narrows what the policies narrow: on a table
+   without row-level security it visits every row.
+
+   MySQL, MariaDB and SQLite have no row-level security. Their tenant
+   isolation is the application's `TenantContext` predicates, which a rotation
+   does not apply: `mysql::EncryptedColumn` and `sqlite::EncryptedColumn` have
+   no tenant scope and visit every row of the table.
+
+3. Prove that nothing is left on the old key, then remove it. Run, for every
+   encrypted column, a count of the rows not sealed with the active key
+   (values start with `fg1.<key id>.`):
+
+   ```sql
+   -- PostgreSQL tenant table, as the runtime role: once per tenant
+   BEGIN;
+   SELECT set_config('forge.tenant_id', '<tenant uuid>', true);
+   SELECT count(*) FROM people
+    WHERE ssn IS NOT NULL AND substr(ssn, 1, length('fg1.2026-10.')) <> 'fg1.2026-10.';
+   COMMIT;
+   ```
+
+   or once without `set_config` as a role that sees every row (superuser,
+   `BYPASSRLS`; on MySQL, MariaDB and SQLite any role that reads the table).
+   Every count must be `0`. Compare a prefix rather than `NOT LIKE
+   'fg1.2026_10.%'`: `_` is a `LIKE` wildcard and key ids may contain it.
+
+   A report never proves completion: `scanned == 0`, `rotated == 0` and
+   `conflicts == 0` are exactly what a role that cannot see the rows reports.
+   Only when every count is `0` remove the old key from the credentials and
+   deploy. A value still sealed with a removed key fails with
+   `EncryptionError::UnknownKey` and cannot be read again without that key.
 
 Rotate before about 2^32 values have been encrypted under one key (random
 96-bit nonces; NIST SP 800-38D), and on any suspicion of exposure.
@@ -186,3 +237,7 @@ Rotate before about 2^32 values have been encrypted under one key (random
 - `reencrypt` takes a `forge_core::Cancellation` and returns the report inside
   the error (`ReencryptError::report`) instead of a context and a report beside
   the error.
+- The PostgreSQL rewriter has a tenant scope (`EncryptedColumn::tenant`) and
+  refuses an unscoped run on a table whose row-level security applies to the
+  connected role. Forge-Go's SQL rewriter has neither yet and adopts both, with
+  the same completion count, in a follow-up.

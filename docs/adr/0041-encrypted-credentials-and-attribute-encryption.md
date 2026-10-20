@@ -29,7 +29,11 @@ hexagonal rings, secrets redacted and zeroized.
    `ring`; key rings; `Cipher`; blind indexes; typed `Attribute` values;
    resumable re-encryption behind the `Rewriter` port with SQLx
    `EncryptedColumn` adapters for PostgreSQL, MySQL/MariaDB and SQLite (behind
-   the backend features). `forge-credentials` (`forge::credentials`): the file
+   the backend features). The PostgreSQL adapter rotates row-level-security
+   tables per tenant (`.tenant(id)`, `set_config('forge.tenant_id', id, true)`
+   in every page and update transaction) and refuses an unscoped run when the
+   policies apply to the connected role; completion is proven by a count of
+   rows not on the active key, never by a report. `forge-credentials` (`forge::credentials`): the file
    format, key loading, atomic writes, `init` and the redacted `Store`. The
    `forge` facade re-exports both; the CLI uses `forge-credentials` directly.
 2. **Byte-compatible formats.** The credentials file is Forge-Go's JSON

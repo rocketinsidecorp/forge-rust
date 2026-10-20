@@ -182,15 +182,47 @@ fn valid_identifier(name: &str) -> bool {
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'_')
 }
 
-/// The SQLx [`Rewriter`](crate::Rewriter) of one backend.
+/// What the catalog says about one table and the role running a rotation.
+#[cfg(feature = "postgres")]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct RowSecurity {
+    /// `pg_class.relrowsecurity`: `ENABLE ROW LEVEL SECURITY`.
+    enabled: bool,
+    /// `pg_class.relforcerowsecurity`: `FORCE ROW LEVEL SECURITY`, which
+    /// also binds the table owner.
+    forced: bool,
+    /// `current_user` has the privileges of the table's owner.
+    owner: bool,
+    /// `pg_roles.rolsuper` of `current_user`.
+    superuser: bool,
+    /// `pg_roles.rolbypassrls` of `current_user`.
+    bypass: bool,
+}
+
+#[cfg(feature = "postgres")]
+impl RowSecurity {
+    /// Whether the policies filter the rows this role sees: superusers and
+    /// `BYPASSRLS` roles never see them applied, owners only when forced.
+    const fn applies(self) -> bool {
+        self.enabled && !self.superuser && !self.bypass && (self.forced || !self.owner)
+    }
+}
+
+/// The SQLx [`Rewriter`](crate::Rewriter) of one backend. `$field`s are the
+/// backend's own state (the PostgreSQL tenant scope); `$extra` adds its
+/// items, among them `begin(&self, check)`, which opens the transaction every
+/// page read (`check == true`) and compare-and-set update runs in.
 #[cfg(any(feature = "postgres", feature = "mysql", feature = "sqlite"))]
 macro_rules! encrypted_column {
-    ($module:ident, $feature:literal, $database:ty, $style:expr, $doc:literal) => {
+    (
+        $module:ident, $feature:literal, $database:ty, $style:expr, $doc:literal,
+        { $($field:ident: $field_type:ty = $field_init:expr),* }, { $($extra:item)* }
+    ) => {
         #[cfg(feature = $feature)]
         #[doc = $doc]
         pub mod $module {
             use async_trait::async_trait;
-            use forge_db::Database;
+            use forge_db::{Database, DbTransaction};
             use sqlx::{AssertSqlSafe, Row as _};
             use uuid::Uuid;
 
@@ -202,6 +234,7 @@ macro_rules! encrypted_column {
             pub struct EncryptedColumn {
                 db: Database<$database>,
                 spec: SqlColumn,
+                $($field: $field_type,)*
             }
 
             impl EncryptedColumn {
@@ -211,7 +244,11 @@ macro_rules! encrypted_column {
                     spec: SqlColumn,
                 ) -> Result<Self, EncryptionError> {
                     spec.validate()?;
-                    Ok(Self { db, spec })
+                    Ok(Self {
+                        db,
+                        spec,
+                        $($field: $field_init,)*
+                    })
                 }
 
                 fn bind_id<'q>(
@@ -240,6 +277,8 @@ macro_rules! encrypted_column {
                 }
             }
 
+            $($extra)*
+
             #[async_trait]
             impl Rewriter for EncryptedColumn {
                 fn table(&self) -> &str {
@@ -260,7 +299,9 @@ macro_rules! encrypted_column {
                     if let Some(after) = after {
                         query = self.bind_id(query, after)?;
                     }
-                    let rows = query.fetch_all(self.db.pool()).await?;
+                    let mut transaction: DbTransaction<$database> = self.begin(true).await?;
+                    let rows = query.fetch_all(transaction.connection()).await?;
+                    transaction.commit().await?;
                     rows.iter()
                         .map(|row| {
                             let id = match self.spec.id_type {
@@ -285,7 +326,9 @@ macro_rules! encrypted_column {
                     let query = self
                         .bind_id(query, &update.id)?
                         .bind(update.old_sealed.clone());
-                    let result = query.execute(self.db.pool()).await?;
+                    let mut transaction: DbTransaction<$database> = self.begin(false).await?;
+                    let result = query.execute(transaction.connection()).await?;
+                    transaction.commit().await?;
                     Ok(result.rows_affected() > 0)
                 }
             }
@@ -299,7 +342,80 @@ encrypted_column!(
     "postgres",
     sqlx::Postgres,
     super::Placeholders::Dollar,
-    "PostgreSQL re-encryption adapter (`uuid`, text or `bigint` keys)."
+    "PostgreSQL re-encryption adapter (`uuid`, text or `bigint` keys).\n\n\
+     A table under row-level security (the generated tenant tables: `ENABLE` and \
+     `FORCE ROW LEVEL SECURITY` on `forge.tenant_id`) is rotated one tenant at a \
+     time with [`EncryptedColumn::tenant`](crate::postgres::EncryptedColumn::tenant). \
+     Without a tenant scope every page first checks the catalog and fails with \
+     [`EncryptionError::Configuration`](crate::EncryptionError::Configuration) \
+     when the policies apply to the connected role, instead of seeing no row and \
+     reporting an empty, successful rotation.",
+    { scope: Option<forge_tenancy::TenantId> = None },
+    {
+        impl EncryptedColumn {
+            /// Scopes every page read and compare-and-set update to `tenant`:
+            /// each runs in a transaction that first installs it as
+            /// `forge.tenant_id` ([`DbTransaction::set_tenant`]), so the
+            /// table's row-level security policies show and accept that
+            /// tenant's rows only. Rotate a tenant table once per tenant.
+            #[must_use]
+            pub fn tenant(mut self, tenant: forge_tenancy::TenantId) -> Self {
+                self.scope = Some(tenant);
+                self
+            }
+
+            async fn begin(&self, check: bool) -> Result<DbTransaction<sqlx::Postgres>, BoxError> {
+                let mut transaction = self.db.begin().await?;
+                match self.scope {
+                    Some(tenant) => transaction.set_tenant(tenant).await?,
+                    None if check => self.refuse_row_security(&mut transaction).await?,
+                    None => {}
+                }
+                Ok(transaction)
+            }
+
+            /// Fails closed when row-level security would hide rows from an
+            /// unscoped rotation.
+            async fn refuse_row_security(
+                &self,
+                transaction: &mut DbTransaction<sqlx::Postgres>,
+            ) -> Result<(), BoxError> {
+                let state: Option<(bool, bool, bool, bool, bool)> = sqlx::query_as(
+                    "SELECT c.relrowsecurity, c.relforcerowsecurity, \
+                     pg_has_role(current_user, c.relowner, 'USAGE'), r.rolsuper, r.rolbypassrls \
+                     FROM pg_class c JOIN pg_roles r ON r.rolname = current_user \
+                     WHERE c.oid = to_regclass($1)",
+                )
+                .bind(self.spec.table())
+                .fetch_optional(transaction.connection())
+                .await?;
+                let table = self.spec.table();
+                let Some((enabled, forced, owner, superuser, bypass)) = state else {
+                    return Err(EncryptionError::Configuration(format!(
+                        "table {table} does not exist on the search path"
+                    ))
+                    .into());
+                };
+                let security = super::RowSecurity {
+                    enabled,
+                    forced,
+                    owner,
+                    superuser,
+                    bypass,
+                };
+                if security.applies() {
+                    return Err(EncryptionError::Configuration(format!(
+                        "table {table} has row-level security for this database role, \
+                         which sees no row without a tenant scope: rotate it once per \
+                         tenant with EncryptedColumn::new(..)?.tenant(tenant_id), or as a \
+                         role that bypasses row-level security (see docs/encryption.md)"
+                    ))
+                    .into());
+                }
+                Ok(())
+            }
+        }
+    }
 );
 #[cfg(feature = "mysql")]
 encrypted_column!(
@@ -307,7 +423,18 @@ encrypted_column!(
     "mysql",
     sqlx::MySql,
     super::Placeholders::Question,
-    "MySQL and MariaDB re-encryption adapter (`BINARY(16)` UUID, text or `BIGINT` keys)."
+    "MySQL and MariaDB re-encryption adapter (`BINARY(16)` UUID, text or `BIGINT` keys).\n\n\
+     MySQL and MariaDB have no row-level security: tenant isolation lives in \
+     the application's `TenantContext` predicates, which a rotation does not \
+     apply, so it visits every row of the table.",
+    {},
+    {
+        impl EncryptedColumn {
+            async fn begin(&self, _check: bool) -> Result<DbTransaction<sqlx::MySql>, BoxError> {
+                Ok(self.db.begin().await?)
+            }
+        }
+    }
 );
 #[cfg(feature = "sqlite")]
 encrypted_column!(
@@ -315,7 +442,18 @@ encrypted_column!(
     "sqlite",
     sqlx::Sqlite,
     super::Placeholders::Question,
-    "SQLite re-encryption adapter (`BLOB` UUID, text or `INTEGER` keys)."
+    "SQLite re-encryption adapter (`BLOB` UUID, text or `INTEGER` keys).\n\n\
+     SQLite has no row-level security: tenant isolation lives in the \
+     application's `TenantContext` predicates, which a rotation does not \
+     apply, so it visits every row of the table.",
+    {},
+    {
+        impl EncryptedColumn {
+            async fn begin(&self, _check: bool) -> Result<DbTransaction<sqlx::Sqlite>, BoxError> {
+                Ok(self.db.begin().await?)
+            }
+        }
+    }
 );
 
 #[cfg(test)]
@@ -347,6 +485,43 @@ mod tests {
         );
         let plain = SqlColumn::new("people", "ssn").expect("spec");
         assert!(plain.replace_sql(true, Placeholders::Dollar).is_err());
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn row_security_applies_only_to_roles_it_binds() {
+        let tenant_table = RowSecurity {
+            enabled: true,
+            forced: true,
+            ..RowSecurity::default()
+        };
+        assert!(tenant_table.applies(), "the generated runtime role");
+        assert!(
+            RowSecurity {
+                owner: true,
+                ..tenant_table
+            }
+            .applies(),
+            "FORCE binds the owner"
+        );
+        for exempt in [
+            RowSecurity::default(),
+            RowSecurity {
+                superuser: true,
+                ..tenant_table
+            },
+            RowSecurity {
+                bypass: true,
+                ..tenant_table
+            },
+            RowSecurity {
+                forced: false,
+                owner: true,
+                ..tenant_table
+            },
+        ] {
+            assert!(!exempt.applies(), "{exempt:?}");
+        }
     }
 
     #[test]

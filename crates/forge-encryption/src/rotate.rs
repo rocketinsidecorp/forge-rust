@@ -91,7 +91,9 @@ pub struct RotateOptions {
 /// [`RotateOptions::after`].
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Report {
-    /// Rows visited.
+    /// Rows visited: the rows this connection can see. `0` never proves a
+    /// column is done (row-level security can hide every row); count the
+    /// rows not on the active key instead.
     pub scanned: u64,
     /// Rows moved to the active key.
     pub rotated: u64,

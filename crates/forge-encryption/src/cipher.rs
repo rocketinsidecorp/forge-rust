@@ -9,7 +9,7 @@ use ring::hmac;
 use zeroize::Zeroizing;
 
 use crate::aead::{NONCE_SIZE, TAG_SIZE};
-use crate::{Aead, EncryptionError, KeyRing, associated_data, derive_key, valid_key_id};
+use crate::{Aead, EncryptionError, Key, KeyRing, associated_data, derive_key, valid_key_id};
 
 /// The largest attribute plaintext.
 pub const MAX_PLAINTEXT_BYTES: usize = 1 << 20;
@@ -66,37 +66,41 @@ struct KeySet {
 /// Encrypts and decrypts attribute values with a key ring: it writes with the
 /// active key and reads with any. Immutable and safe for concurrent use.
 pub struct Cipher {
-    /// The active key first, in ring order.
-    sets: Vec<KeySet>,
+    /// The key set used for new ciphertexts.
+    active: KeySet,
+    /// Decryption-only key sets, in ring order.
+    previous: Vec<KeySet>,
 }
 
 impl Cipher {
     /// Derives the encryption and blind-index subkeys of every ring key with
     /// HKDF-SHA256.
     pub fn new(ring: &KeyRing) -> Result<Self, EncryptionError> {
-        let sets = ring
-            .keys()
-            .map(|key| {
-                let aead_key = derive_key(key.material(), PURPOSE_ATTRIBUTES)?;
-                let index_key = derive_key(key.material(), PURPOSE_BLIND_INDEX)?;
-                Ok(KeySet {
-                    id: key.id().to_owned(),
-                    aead: Aead::new(&aead_key)?,
-                    index: hmac::Key::new(hmac::HMAC_SHA256, index_key.expose()),
-                })
+        let derive = |key: &Key| {
+            let aead_key = derive_key(key.material(), PURPOSE_ATTRIBUTES)?;
+            let index_key = derive_key(key.material(), PURPOSE_BLIND_INDEX)?;
+            Ok::<_, EncryptionError>(KeySet {
+                id: key.id().to_owned(),
+                aead: Aead::new(&aead_key)?,
+                index: hmac::Key::new(hmac::HMAC_SHA256, index_key.expose()),
             })
-            .collect::<Result<Vec<_>, EncryptionError>>()?;
-        if sets.is_empty() {
-            return Err(EncryptionError::InvalidKey(
-                "the key ring is empty".to_owned(),
-            ));
-        }
-        Ok(Self { sets })
+        };
+        let active = derive(ring.active())?;
+        let previous = ring
+            .keys()
+            .skip(1)
+            .map(derive)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self { active, previous })
     }
 
     fn active(&self) -> &KeySet {
-        // `new` refuses an empty ring.
-        &self.sets[0]
+        &self.active
+    }
+
+    /// Every key set, the active one first.
+    fn sets(&self) -> impl Iterator<Item = &KeySet> {
+        std::iter::once(&self.active).chain(&self.previous)
     }
 
     /// The identifier used for new ciphertexts.
@@ -143,8 +147,7 @@ impl Cipher {
             .decode(payload)
             .map_err(|_| EncryptionError::Malformed)?;
         let set = self
-            .sets
-            .iter()
+            .sets()
             .find(|set| set.id == key_id)
             .ok_or_else(|| EncryptionError::UnknownKey(key_id.to_owned()))?;
         Ok((set, sealed))
@@ -198,8 +201,7 @@ impl Cipher {
         column: &str,
         plaintext: &[u8],
     ) -> Result<Vec<String>, EncryptionError> {
-        self.sets
-            .iter()
+        self.sets()
             .map(|set| blind_index(set, table, column, plaintext))
             .collect()
     }
@@ -231,11 +233,7 @@ impl fmt::Debug for Cipher {
             .debug_struct("Cipher")
             .field(
                 "key_ids",
-                &self
-                    .sets
-                    .iter()
-                    .map(|set| set.id.as_str())
-                    .collect::<Vec<_>>(),
+                &self.sets().map(|set| set.id.as_str()).collect::<Vec<_>>(),
             )
             .finish_non_exhaustive()
     }
