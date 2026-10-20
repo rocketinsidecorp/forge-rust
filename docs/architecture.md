@@ -119,8 +119,9 @@ forge/
 │   ├── forge-tenancy       # tenant context and RLS integration
 │   ├── forge-jobs          # job contracts, PostgreSQL adapter, workers, cron (Phase 4)
 │   ├── forge-events        # events, outbox, dispatcher, consumer inbox (Phase 4)
-│   ├── forge-cache         # cache port and adapters
-│   ├── forge-storage       # object storage port and adapters
+│   ├── forge-cache         # cache port and adapters (implemented, ADR 0028)
+│   ├── forge-ratelimit     # fixed-window limiter, stores, HTTP middleware (ADR 0027)
+│   ├── forge-storage       # storage port, disk adapter, signed links, uploads (ADR 0029)
 │   ├── forge-telemetry     # OpenTelemetry lifecycle and context
 │   ├── forge-openapi       # contract/schema projection
 │   ├── forge-ai            # provider and controlled execution ports
@@ -314,6 +315,30 @@ preserve append-only semantics. Cryptographic integrity chaining, immutable
 external sinks, retention enforcement and privileged reader workflows remain
 separate controls. See
 [ADR 0012](adr/0012-structured-append-only-audit-evidence.md).
+
+### Rate limiting, cache and file storage
+
+Three platform services sit at the HTTP/infrastructure edge, behind features of
+the facade (`ratelimit`, `cache`, `storage`) and with PostgreSQL, MySQL/MariaDB
+and SQLite stores that share `forge-db`'s pruning pacing and migration
+composition:
+
+- `forge-ratelimit` counts fixed-window hits per SHA-256 key: a bounded memory
+  limiter with no background task, shared stores using one atomic statement per
+  hit, and a `Middleware`/handler wrapper that answers `429` with `Retry-After`
+  and fails closed (`503`) when the limiter fails. It never trusts forwarded
+  headers; the application chooses the client key. See
+  [ADR 0027](adr/0027-rate-limiting.md) and [rate limiting](rate-limiting.md).
+- `forge-cache` is a bounded key/value cache (memory LRU, or shared tables addressed by
+  key hash) whose `fetch` collapses concurrent misses per process and survives a
+  cancelled leader; tenant data is keyed from an authorized `TenantContext`. See
+  [ADR 0028](adr/0028-cache.md) and [caching](caching.md).
+- `forge-storage` keeps blobs under `StorageKey`s that cannot express traversal,
+  on a disk adapter that resolves every path with `openat` and `O_NOFOLLOW`,
+  serves them through HMAC-signed expiring links as sandboxed downloads (inline
+  only for raster images), and accepts uploads through a strict bounded
+  multipart parser with a mandatory allow-list on the sniffed type. See
+  [ADR 0029](adr/0029-file-storage.md) and [storage](storage.md).
 
 ### Jobs and events
 

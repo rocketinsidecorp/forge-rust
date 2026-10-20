@@ -189,3 +189,12 @@ migrations and the same assertions pass on both:
 - duplicate-key messages name `table.index` on MySQL 8 and `index` on MariaDB;
   both yield the index name;
 - deadlock (`1213`) and lock wait timeout (`1205`) are identical.
+
+## Migrations shipped by Forge crates
+
+`forge-ratelimit` and `forge-cache` embed reversible migrations per backend
+(`forge_ratelimit::postgres::MIGRATIONS`, `forge_cache::sqlite::MIGRATIONS`, ...)
+with timestamp versions (`20261019000000`, `20261019000100`). They share the
+application's `_sqlx_migrations` table, so merge them with the application's own
+and declare the result: `forge::db::combine_migrations(&[&APP, &forge::cache::postgres::MIGRATIONS])`
+returns one `Migrator` for `App::postgres(..)`; duplicate versions are refused.

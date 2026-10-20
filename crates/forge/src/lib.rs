@@ -38,6 +38,10 @@ mod worker;
 
 pub use forge_audit as audit;
 pub use forge_auth as auth;
+/// Application cache with per-process stampede protection (feature `cache`,
+/// ADR 0028).
+#[cfg(feature = "cache")]
+pub use forge_cache as cache;
 pub use forge_config as config;
 pub use forge_core as core;
 pub use forge_db as db;
@@ -49,7 +53,14 @@ pub use forge_http as http;
 /// Durable jobs, workers and cron schedules (feature `jobs`, ADR 0025).
 #[cfg(feature = "jobs")]
 pub use forge_jobs as jobs;
+/// Fixed-window rate limiting and its HTTP middleware (feature `ratelimit`,
+/// ADR 0027).
+#[cfg(feature = "ratelimit")]
+pub use forge_ratelimit as ratelimit;
 pub use forge_security as security;
+/// File storage, signed links and strict uploads (feature `storage`, ADR 0029).
+#[cfg(feature = "storage")]
+pub use forge_storage as storage;
 pub use forge_tenancy as tenancy;
 /// Server-rendered views: HTML responses, CSRF protection, flash messages,
 /// digested assets, the import map and the Content-Security-Policy (feature

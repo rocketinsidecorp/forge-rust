@@ -204,6 +204,48 @@ serde_json type appears in a stable domain/application contract: handlers see
 `Job`, `JobContext`, `JobError`, `Timestamp` and Forge ids; SQLx types appear
 only in the PostgreSQL adapter functions that take a `forge_db::DbTransaction`.
 
+## Rate limiting, cache and storage dependency decision
+
+[ADR 0027](adr/0027-rate-limiting.md), [0028](adr/0028-cache.md) and
+[0029](adr/0029-file-storage.md) add three workspace crates and **no new
+package to `Cargo.lock`**: every third-party crate they name was already
+resolved. Newly declared direct dependencies:
+
+| Crate | Version | Used by | Purpose | Feature policy |
+| --- | --- | --- | --- | --- |
+| `hmac` | `0.13.0` | `forge-storage` | HMAC-SHA256 of signed links | defaults disabled; same RustCrypto `digest` 0.11 as `sha2` 0.11 |
+| `base64` | `0.22.1` | `forge-config`, `forge-storage` | canonical unpadded base64url of the signing key and signatures | defaults disabled; `alloc` only |
+| `rustix` | `1.1.5` | `forge-storage` (Unix) | safe `openat`/`mkdirat`/`renameat`/`unlinkat` so every path component is opened with `O_NOFOLLOW` | defaults disabled; `fs`, `std` |
+| `sha2`, `subtle`, `bytes`, `uuid`, `async-trait`, `serde`, `serde_json`, `thiserror`, `tokio`, `tracing`, `sqlx` | as admitted | the three crates | digests, constant-time compare, buffers, UUIDv7, contracts | unchanged workspace entries; `sqlx` adds only `macros` (embedded migrations) |
+
+Admission review:
+
+- `hmac` (RustCrypto, MIT OR Apache-2.0) was already in the graph through
+  `sqlx-postgres`; it has no build script, proc macro, native code or `unsafe` of
+  its own, and no RustSec advisories. It only appears in `forge-storage`'s
+  private signing code; no `hmac` type is in a public signature. Replacement:
+  any audited HMAC-SHA256.
+- `base64` (MIT OR Apache-2.0, `#![forbid(unsafe_code)]`) was already in the
+  graph through `sqlx-core`. The URL-safe no-padding engine rejects padding,
+  non-alphabet bytes and non-canonical trailing bits, which is what makes the
+  signing key and the signature have exactly one spelling.
+- `rustix` (Bytecode Alliance, Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR
+  MIT) was already in the graph through `tempfile`. It contains `unsafe`
+  internally to issue syscalls; Forge code stays `forbid(unsafe_code)` and uses
+  its safe API. It replaces `cap-std` (not admitted) for race-free,
+  symlink-refusing path traversal; a canonicalize-and-compare in `std` would
+  have a check-then-use window. Linux/macOS/BSD only; the adapter is
+  `cfg(unix)`. It does not appear in public Forge signatures.
+- **Multipart parsing and content sniffing are not outsourced.** `multer`,
+  `infer` and `mime_guess` were evaluated and not admitted: they would add
+  `mime`, `encoding_rs`, `spin` and a `futures` stream surface to a hostile-input
+  path that needs security-owner review, for a streaming capability Forge cannot
+  use because `forge-http` buffers bodies. Forge's own parser and sniffer are
+  small, `forbid(unsafe_code)`, bounded, and covered by exhaustive negative,
+  differential and mutation tests (ADR 0029).
+- The supply-chain gate (`cargo deny check`) is unchanged and was run with these
+  crates in the graph.
+
 ## Features and public API containment
 
 - Set `default-features = false` when defaults add unused protocols, native

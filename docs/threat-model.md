@@ -275,6 +275,43 @@ a job runs, so revocation does not cancel already enqueued work; dead-job
 error messages are visible across tenants to operators; there are no
 per-tenant quotas or rate limits on enqueueing yet.
 
+## Rate limiting, cache and file storage review
+
+Review date: 2026-10-19 ([ADR 0027](adr/0027-rate-limiting.md),
+[ADR 0028](adr/0028-cache.md), [ADR 0029](adr/0029-file-storage.md); guides:
+[rate limiting](rate-limiting.md), [caching](caching.md), [storage](storage.md)).
+Ported from the reviewed Forge-Go design; the controls and negative tests are the
+same unless a difference is stated.
+
+| Threat | STRIDE | Control | Verification |
+| --- | --- | --- | --- |
+| Limiter key spoofing: a client rotates a forwarded header or address to get a fresh bucket per request | S, D | `by_remote_addr` uses only the TCP peer address, never `X-Forwarded-For`, `X-Real-IP` or `Forwarded`; IPv6 clients are keyed by `/64`. The key function documents that its result must not be client-chosen. **Residual:** behind a reverse proxy every client shares the proxy's bucket until the application keys by an authenticated value or its own proxy-overwritten header; Forge has no trusted-proxy policy yet | spoofed-header test proves the limit holds; `/64` test |
+| Limiter memory exhaustion by distinct keys | D | `MemoryLimiter` is bounded by `max_keys` (deadline-ordered expiry, no task); `EvictSoonest` never refuses new clients, `Deny` never drops a counter; counters saturate. Shared stores keep one 64-character-key row per live bucket and prune in bounded batches after every `prune_batch` hits. **Residual:** with `EvictSoonest`, more than `max_keys` distinct keys in one window can reset other clients' counters, so never key it on attacker-choosable per-target values (use `Deny` or a database limiter) | flood test keeps `len == max_keys`; `Deny` keeps counters; sustained-keys pruning test per backend |
+| Limiter bypass or outage when its store fails | D, E | The middleware fails closed (`503`); `fail_open` is an explicit per-route choice; limiter errors are logged server-side, never returned | fail-closed/open test; error text never contains SQL or keys |
+| Personal data in limiter storage | I | Keys are SHA-256 digests of length-prefixed (scope, window, identifier); addresses and e-mail addresses are never stored | key and recording-limiter tests |
+| Concurrent hits over-admitted | E | One atomic statement per hit (MySQL: upsert and read in one transaction) | 160 concurrent hits allow exactly `N` on every store |
+| Unbounded or stale cache growth | D | Entries, value size, key size and ttl are bounded; memory also by bytes; database stores prune expired entries and evict the oldest writes in bounded batches. **Residual:** the database entry bound is soft but tight (about `prune_batch` per writing process) | entry-bound, bounded-prune and sustained-write tests per backend |
+| Cache poisoning through attacker-influenced keys or values | T, E | Keys built with `key` (length-prefixed parts and namespace); an undecodable entry is a miss; values are copied. **Residual (application):** whoever can write the table can poison every replica; per-user data must carry the user in the key | key-collision matrix, JSON-miss tests |
+| Cross-tenant cache reads | I, E | `tenant_key` derives the key from an authorized `TenantContext`, never a bare id | distinct tenants/same principal tests |
+| Secrets or identifiers leaked through the cache | I | Rows hold `SHA-256(key)`; keys and values are never logged and errors never contain them | log-capture test; hashed-key test per backend |
+| Thundering herd on a cold key | D | `fetch` collapses concurrent misses in a process; a dropped or panicking leader never fails waiters, who take over. Across replicas the herd is not collapsed (documented) | 24 concurrent misses compute once; cancelled/panicking leader tests |
+| Upload abuse: oversized bodies, many files or fields | D | `receive` caps the body, bounds files, text-field count (every repetition counts) and bytes, and header sizes; the server body limit bounds buffering and `FORGE_STORAGE_MAX_UPLOAD_BYTES` cannot exceed it. **Residual:** bodies are buffered (up to `FORGE_MAX_BODY_BYTES`) until `forge-http` streams; disk space is not metered per user | oversized, body-cap, repeated-field (1500 values) and header-budget tests |
+| Hostile multipart framing: smuggled parts, re-encoded content, duplicate headers, preamble/epilogue tricks | T, S | A strict parser: no preamble/epilogue/padding/folding, one disposition, identity encodings only, bounded headers and names | rejection table, differential and mutation tests |
+| Hostile file content: HTML, SVG or script uploaded as an image; polyglots | T, E | A mandatory allow-list decided on the type **sniffed from the bytes**, not the label; labels that need a signature must match it; text labels need text content. Served as downloads (`attachment`, `nosniff`, sandboxing CSP) except raster images explicitly requested inline. **Residual:** the sniffer reads 512 bytes, so a valid image with appended active content is still an image to a browser; use a separate origin for user files and do not widen `inline_types`; no malware scanning | disguised-type table, polyglot, inline tests |
+| Path traversal and symlink escape in the disk adapter | T, I, E | `StorageKey` makes `..`, hidden files, separators, drive letters and escapes unrepresentable; every component is opened with `openat` and `O_NOFOLLOW` against descriptors opened at startup, so there is no check-then-use window | traversal-key, planted-symlink (file, directory, metadata), replaced-directory and startup-link tests |
+| Partial or torn files after a crash or concurrent overwrite | T | Temp file, `fsync`, `rename`; a failed or oversized write leaves the old blob; orphaned temp files are bounded by `prune_temp` | concurrent-overwrite test never observes a torn write |
+| Client-chosen file name used as a path or header | T | Keys are UUIDv7; the name is sanitized and encoded (RFC 5987 for non-ASCII); invalid header values are dropped | sanitizer table; header-injection test through stored metadata |
+| Signed link tampering or forgery | S, T, E | HMAC-SHA256 over key, expiry, disposition and binding with a 32-byte-minimum key, constant-time comparison against every key; strict parameter parsing with no second spelling | other key, extended expiry, added inline, duplicate and malformed parameters, percent-encoding, short/padded signature tests |
+| Signed link replay: a leaked or forwarded link works until it expires | I | A link is a bearer capability. Default 15 minutes, maximum 7 days; `Cache-Control: private` for at most the remaining lifetime; `binding` ties a link to a principal; rotating the key revokes all links. **Residual:** within its lifetime an unbound link works for anyone who holds it, and links are logged like any URL | binding and rotation tests |
+| Existence oracle for stored keys | I | Signature, expiry and binding are checked before the store is consulted; unsigned and forged requests get the same `403` whether the key exists or not | store-call counter stays zero for every invalid form |
+| Missing or weak signing key | S, E | No default key; configuration requires canonical base64url of 32 to 1024 bytes and, in production, a key whenever storage is configured; the key is redacted and never echoed | config and signer tests |
+| Stored XSS from served files | T, I | Active content never renders on the application origin: every response is `nosniff` with `default-src 'none'; sandbox` | active-content table |
+
+Residual risks beyond the rows above: the disk adapter assumes a trusted volume
+(an attacker with write access can still delete or corrupt blobs, though not
+escape the root); `MemoryLimiter` and `MemoryCache` state is per process;
+byte-range serving is not available.
+
 ## Review cadence
 
 Update this model when adding a trust boundary, privileged capability, protocol,

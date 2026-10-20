@@ -336,6 +336,70 @@ Kubernetes and systemd deployment is covered in
   with `rust-toolchain.toml` (skip all four with `--skip-docker`), plus `.github/workflows/ci.yml` and `.github/dependabot.yml`
   (skip with `--skip-ci`).
 
+## Rate limiting, caching and file storage
+
+Three platform services ship as facade features: `ratelimit`
+([docs/rate-limiting.md](docs/rate-limiting.md)), `cache`
+([docs/caching.md](docs/caching.md)) and `storage`
+([docs/storage.md](docs/storage.md)). Enable them in an application's
+`Cargo.toml` (plus the database backend feature you use for shared stores):
+
+```toml
+forge = { version = "0.1", features = ["ratelimit", "cache", "storage"] }
+```
+
+The runnable example `crates/forge/examples/services.rs` uses all three. From a
+checkout of this repository:
+
+```sh
+export FORGE_STORAGE_ROOT=/tmp/forge-services-storage
+export FORGE_STORAGE_SIGNING_KEY=$(openssl rand -base64 32 | tr '+/' '-_' | tr -d '=')
+FORGE_BIND=127.0.0.1:3000 cargo run -p forge --example services --features "ratelimit cache storage"
+```
+
+In another terminal:
+
+```sh
+# Rate limiting: the fourth POST within a minute is 429 with Retry-After
+for i in 1 2 3 4; do curl -s -i -X POST http://127.0.0.1:3000/comments | head -1; done
+
+# Cache: computed once, then served from the cache
+curl -s http://127.0.0.1:3000/price/sku-1; curl -s http://127.0.0.1:3000/price/sku-1
+
+# Storage: upload a PNG, get a signed inline link, fetch it
+URL=$(curl -s -F avatar=@picture.png http://127.0.0.1:3000/avatars)
+curl -s -i "http://127.0.0.1:3000$URL"          # nosniff, sandbox CSP, Content-Disposition: inline
+curl -s -i -F "avatar=@page.html;type=image/png" http://127.0.0.1:3000/avatars | head -1   # 415: the bytes decide
+```
+
+The code behind each call (copy it into your composition root):
+
+```rust
+// Rate limit one route (Rails: rate_limit to: 3, within: 1.minute, only: :create)
+let limiter = Arc::new(MemoryLimiter::new(MemoryOptions::from_config(&config.rate_limit))?);
+let limit = RateLimit::new(limiter, "comments.create", Limit::new(3, Duration::from_secs(60))?, by_remote_addr)?;
+router.route(Method::POST, "/comments", limit.wrap(create_comment))?;
+
+// Cache with stampede protection (shared PostgreSQL/MySQL/SQLite stores: docs/caching.md)
+let cache = Arc::new(MemoryCache::new(MemoryOptions::from_config(&config.cache))?);
+let price = fetch(cache.as_ref(), &key("price", &[sku]), Some(Duration::from_secs(600)), || async { catalog.price(sku).await }).await?;
+
+// Signed, sandboxed file serving and strict uploads
+let store: Arc<dyn Storage> = Arc::new(DiskStorage::from_config(&config.storage)?);
+let signer = Arc::new(Signer::from_config(&config.storage)?);
+router.layer(StorageHandler::new(store.clone(), signer.clone(), HandlerOptions::default())?);
+let options = UploadOptions::new("avatar", &["image/png", "image/jpeg"], config.storage.max_upload_bytes)?;
+let received = receive(&request, store.as_ref(), &options).await?;
+let url = signer.url("/files", &received.files[0].key, &SignOptions::default().inline(true))?;
+```
+
+Shared stores need their tables: merge the crate migration into your own with
+`forge::db::combine_migrations(&[&APP_MIGRATIONS, &forge::cache::postgres::MIGRATIONS, &forge::ratelimit::postgres::MIGRATIONS])`
+and run `cargo run -- migrate`. Limits and keys are configured with
+`FORGE_RATE_LIMIT_MAX_KEYS`, `FORGE_CACHE_*` and `FORGE_STORAGE_*`
+([deployment guide](docs/deployment.md)); in `production` a storage root must be
+absolute and `FORGE_STORAGE_SIGNING_KEY` is required.
+
 ## Workspace layout
 
 ```text
@@ -343,13 +407,16 @@ crates/
 ├── forge          # facade: forge::App and framework-owned re-exports
 ├── forge-audit    # immutable security audit events and append-only sink contract
 ├── forge-auth     # sessions, sign-in throttling, password policy, reset tokens
+├── forge-cache    # application cache: memory and shared stores, single-flight fetch
 ├── forge-core     # lifecycle, errors, UUIDv7 identifiers
 ├── forge-config   # typed FORGE_* configuration and secret redaction
 ├── forge-db       # repository/transaction contracts, including tenant-scoped ports
 ├── forge-events   # integration events, transactional outbox, dispatcher, consumer inbox
 ├── forge-http     # HTTP server, routing, middleware, form/query decoding, limits
 ├── forge-jobs     # durable PostgreSQL jobs, workers, cron schedules
+├── forge-ratelimit # fixed-window limiter: memory and shared stores, fail-closed middleware
 ├── forge-security # deny-by-default RBAC roles, permissions and grants
+├── forge-storage  # file storage: disk adapter, signed links, strict uploads
 ├── forge-tenancy  # membership and explicit authorized TenantContext
 ├── forge-views    # server-rendered views: HTML, CSRF, flash, assets, import map, CSP
 └── forge-cli      # the `forge` executable and application generator
@@ -415,6 +482,7 @@ Contribution rules:
 - [CLI reference](docs/cli.md)
 - [Jobs, schedules, outbox and consumers](docs/jobs.md)
 - [Deployment](docs/deployment.md)
+- [Rate limiting](docs/rate-limiting.md), [caching](docs/caching.md) and [file storage](docs/storage.md)
 - [Threat model](docs/threat-model.md)
 - [Dependency policy](docs/dependency-policy.md)
 - [Test strategy](docs/test-strategy.md)

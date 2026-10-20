@@ -26,6 +26,9 @@ does not mean implementation exists.
 | [0024](0024-scaffold-generator.md) | `forge generate scaffold`: printed wiring and deny-by-default access | Accepted |
 | [0025](0025-durable-jobs-scheduler-and-outbox.md) | Durable PostgreSQL jobs, cron schedules, transactional outbox and idempotent consumers | Accepted |
 | [0026](0026-authentication-pages-and-setup.md) | Authentication pages, sign-in redirects, first-owner setup and seeds | Accepted |
+| [0027](0027-rate-limiting.md) | Fixed-window rate limiting: bounded memory limiter, shared stores, fail-closed middleware | Accepted |
+| [0028](0028-cache.md) | Application cache: bounded memory and shared stores, single-flight `fetch`, hashed keys | Accepted |
+| [0029](0029-file-storage.md) | File storage: restricted keys, `openat` disk adapter, signed links, strict uploads | Accepted |
 
 New ADRs use the next four-digit number. A changed decision receives a new ADR
 that marks the prior record `Superseded`; accepted records are not rewritten to
