@@ -22,6 +22,8 @@ serde = { version = "1", features = ["derive"] }
 forge-views = { path = "../../crates/forge-views", default-features = false, features = ["build"] }
 
 [dev-dependencies]
+# tests/openapi.rs reads the served OpenAPI document.
+serde_json = "1"
 tokio = { version = "1.53.1", features = ["macros", "rt"] }
 
 [lints.rust]

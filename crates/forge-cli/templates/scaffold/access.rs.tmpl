@@ -52,16 +52,17 @@ pub enum AccessDenied {
 }
 
 impl AccessDenied {
-    /// The generic response for this refusal.
+    /// The generic `text/plain` response for this refusal, as the OpenAPI
+    /// document declares it.
     #[must_use]
     pub fn response(self) -> Response {
         match self {
             Self::Unauthenticated => {
-                Response::new(StatusCode::UNAUTHORIZED, "authentication required")
+                Response::text(StatusCode::UNAUTHORIZED, "authentication required")
             }
-            Self::Forbidden => Response::new(StatusCode::FORBIDDEN, "forbidden"),
+            Self::Forbidden => Response::text(StatusCode::FORBIDDEN, "forbidden"),
             Self::Unavailable => {
-                Response::new(StatusCode::SERVICE_UNAVAILABLE, "service unavailable")
+                Response::text(StatusCode::SERVICE_UNAVAILABLE, "service unavailable")
             }
         }
     }

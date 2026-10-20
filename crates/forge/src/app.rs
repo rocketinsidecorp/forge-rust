@@ -14,11 +14,12 @@ use std::{
 
 use forge_config::{AppConfig, ConfigError, Environment, SecretString};
 use forge_core::Cancellation;
-use forge_http::{RouteError, Router, Server, ServerError};
+use forge_http::{Method, OPENAPI_PATH, RouteError, Router, Server, ServerError};
+use forge_openapi::Info;
 use forge_telemetry::{MetricError, Telemetry, pool::PoolObservation};
 use thiserror::Error;
 use tokio::{net::TcpListener, time::Instant};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 #[cfg(feature = "jobs")]
 use crate::{
@@ -26,7 +27,7 @@ use crate::{
     cli::JobsCommand,
 };
 use crate::{
-    cli::{self, Command, DbCommand},
+    cli::{self, Command, DbCommand, OpenApiOutput},
     command::{CommandContext, CommandError, RegisteredCommand},
     compose::{ComposeError, ComposeHook, Composition},
     database::{DatabaseHandle, Declaration, MigrationCommand, UrlPurpose, register_health},
@@ -75,6 +76,7 @@ pub struct App {
     declarations: Vec<Declaration>,
     compose_hooks: Vec<ComposeHook>,
     commands: Vec<RegisteredCommand>,
+    api_info: Option<Info>,
     #[cfg(feature = "jobs")]
     jobs: Option<JobsDeclaration>,
 }
@@ -122,9 +124,25 @@ impl App {
             declarations: Vec::new(),
             compose_hooks: Vec::new(),
             commands: Vec::new(),
+            api_info: None,
             #[cfg(feature = "jobs")]
             jobs: None,
         }
+    }
+
+    /// Sets the title, version and description of the application's OpenAPI
+    /// document (ADR 0039); they default to the application's name and
+    /// [`App::version`].
+    #[must_use]
+    pub fn api_info(mut self, info: Info) -> Self {
+        self.api_info = Some(info);
+        self
+    }
+
+    fn openapi_info(&self) -> Info {
+        self.api_info
+            .clone()
+            .unwrap_or_else(|| Info::new(self.name, self.version))
     }
 
     /// Sets the version reported in logs and `--version` output, typically
@@ -341,6 +359,9 @@ impl App {
             Ok(Command::Db(command)) => {
                 self.checked(|app| app.run_db_command(command, load_config))
             }
+            Ok(Command::OpenApi(output)) => {
+                self.checked(|app| app.run_openapi_command(&output, load_config))
+            }
             Ok(Command::Version) => write_stdout(&format!("{} {}\n", self.name, self.version)),
             Ok(Command::Help) => write_stdout(&cli::usage(self.name, &self.summaries())),
             #[cfg(feature = "jobs")]
@@ -404,6 +425,7 @@ impl App {
     }
 
     fn serve(self, load_config: impl FnOnce() -> Result<AppConfig, ConfigError>) -> ExitCode {
+        let info = self.openapi_info();
         let Self {
             name,
             version,
@@ -413,6 +435,7 @@ impl App {
             mut declarations,
             compose_hooks,
             commands: _,
+            api_info: _,
             #[cfg(feature = "jobs")]
             jobs,
         } = self;
@@ -480,7 +503,7 @@ impl App {
             )
         };
         let Built {
-            router,
+            mut router,
             database,
             workers,
             jobs: jobs_slot,
@@ -489,6 +512,9 @@ impl App {
             Ok(built) => built,
             Err(code) => return code,
         };
+        if let Err(code) = mount_openapi(name, &mut router, &config, &info) {
+            return code;
+        }
         let background = background_for(jobs_slot, database.as_ref(), telemetry.as_ref());
         #[cfg(feature = "jobs")]
         let background = background.filter(|_| run_jobs_in_serve);
@@ -657,6 +683,94 @@ impl App {
 }
 
 impl App {
+    /// `openapi [--output FILE | --check FILE]`: composes the application
+    /// without listening and prints its OpenAPI document (logs go to
+    /// standard error), writes it to FILE, or exits 1 when FILE differs.
+    /// It needs the configuration `serve` needs; database pools connect
+    /// lazily, so no database has to be running unless a composition hook
+    /// queries one.
+    fn run_openapi_command(
+        self,
+        output: &OpenApiOutput,
+        load_config: impl FnOnce() -> Result<AppConfig, ConfigError>,
+    ) -> ExitCode {
+        let info = self.openapi_info();
+        let Self {
+            name,
+            registrations,
+            mut declarations,
+            compose_hooks,
+            #[cfg(feature = "jobs")]
+            jobs,
+            ..
+        } = self;
+        #[cfg(feature = "jobs")]
+        let (jobs_slot, _) = jobs_for_serve(jobs);
+        #[cfg(not(feature = "jobs"))]
+        let jobs_slot: JobsSlot = ();
+        let declaration = declarations.pop();
+        let config = match load_config() {
+            Ok(config) => config,
+            Err(error) => return config_error(&error),
+        };
+        if let Err(error) = logging::init_stderr(&config.log) {
+            return config_error(&error);
+        }
+        let url = match declaration
+            .as_ref()
+            .map(|declaration| declaration.validate(&config.database, UrlPurpose::Runtime))
+            .transpose()
+        {
+            Ok(url) => url,
+            Err(error) => return config_error(&error),
+        };
+        let runtime = match tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                write_stderr(&format!(
+                    "openapi: failed to start async runtime: {}\n",
+                    ErrorChain(&error)
+                ));
+                return ExitCode::FAILURE;
+            }
+        };
+        let shutdown = Cancellation::new();
+        let composed = {
+            let _guard = runtime.enter();
+            compose(
+                name,
+                &config,
+                registrations,
+                compose_hooks,
+                declaration.zip(url),
+                jobs_slot,
+                &shutdown,
+                None,
+            )
+        };
+        let built = match composed {
+            Ok(built) => built,
+            Err(code) => return code,
+        };
+        let document = built.router.openapi(&info);
+        shutdown.cancel();
+        if let Some(database) = built.database {
+            runtime.block_on(database.close());
+        }
+        runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
+        let document = match document {
+            Ok(document) => document,
+            Err(error) => {
+                write_stderr(&format!("{error}\n"));
+                return ExitCode::FAILURE;
+            }
+        };
+        write_openapi(&document, output)
+    }
+
     /// Runs the application command at `index` with `arguments`.
     fn run_application_command(
         mut self,
@@ -986,6 +1100,102 @@ async fn watch_signal(
         () = shutdown.cancelled() => {}
     }
     shutdown.cancel();
+}
+
+/// Serves the OpenAPI document at `GET /openapi.json` when
+/// `FORGE_OPENAPI_ENABLED` allows it (development and test by default),
+/// unless the application registered that route itself. The document is
+/// built now, from the finished route table, so an inaccurate description
+/// stops startup rather than failing a request.
+fn mount_openapi(
+    name: &'static str,
+    router: &mut Router,
+    config: &AppConfig,
+    info: &Info,
+) -> Result<(), ExitCode> {
+    if !config.serves_openapi() {
+        return Ok(());
+    }
+    if router.has_route(&Method::GET, OPENAPI_PATH) {
+        info!(
+            app = name,
+            path = OPENAPI_PATH,
+            "the application serves its own OpenAPI route; Forge's document is not mounted there"
+        );
+        return Ok(());
+    }
+    let document = router.openapi(info).map_err(|failure| {
+        error!(app = name, error = %failure, "the OpenAPI document cannot be built");
+        ExitCode::FAILURE
+    })?;
+    router.serve_openapi(&document).map_err(|failure| {
+        error!(app = name, error = %failure, "failed to mount the OpenAPI document");
+        ExitCode::FAILURE
+    })?;
+    if config.environment == Environment::Production {
+        warn!(
+            app = name,
+            path = OPENAPI_PATH,
+            "serving the OpenAPI document, which lists every documented route; \
+             FORGE_OPENAPI_ENABLED=true enabled it"
+        );
+    }
+    Ok(())
+}
+
+/// Prints the document, writes it to a file, or compares it with one, and
+/// lists the undescribed routes on standard error.
+fn write_openapi(document: &forge_openapi::Document, output: &OpenApiOutput) -> ExitCode {
+    let undocumented = document.undocumented();
+    if !undocumented.is_empty() {
+        write_stderr(&format!(
+            "openapi: {} routes are not described (forge::openapi::describe or typed): {}\n",
+            undocumented.len(),
+            undocumented.join(", ")
+        ));
+    }
+    match output {
+        OpenApiOutput::Stdout => {
+            let mut stdout = io::stdout().lock();
+            if let Err(error) = stdout
+                .write_all(document.json())
+                .and_then(|()| stdout.flush())
+            {
+                write_stderr(&format!("openapi: {error}\n"));
+                return ExitCode::FAILURE;
+            }
+            ExitCode::SUCCESS
+        }
+        OpenApiOutput::Output(file) => {
+            if let Err(error) = std::fs::write(file, document.json()) {
+                write_stderr(&format!("openapi: write {}: {error}\n", file.display()));
+                return ExitCode::FAILURE;
+            }
+            write_stderr(&format!(
+                "openapi: wrote {} ({} paths)\n",
+                file.display(),
+                document.paths().len()
+            ));
+            ExitCode::SUCCESS
+        }
+        OpenApiOutput::Check(file) => match std::fs::read(file) {
+            Err(error) => {
+                write_stderr(&format!("openapi: read {}: {error}\n", file.display()));
+                ExitCode::FAILURE
+            }
+            Ok(committed) if committed != document.json() => {
+                write_stderr(&format!(
+                    "openapi: {file} is out of date; run forge openapi --output {file}\n",
+                    file = file.display()
+                ));
+                ExitCode::FAILURE
+            }
+            Ok(_) => {
+                write_stderr(&format!("openapi: {} is up to date\n", file.display()));
+                ExitCode::SUCCESS
+            }
+        },
+    }
 }
 
 /// What composition built.
@@ -1331,6 +1541,93 @@ mod tests {
 
     fn args(values: &[&str]) -> Vec<OsString> {
         values.iter().map(OsString::from).collect()
+    }
+
+    fn described_app() -> App {
+        App::new("demo").version("1.2.3").routes(|router| {
+            router.route(Method::GET, "/plain", |_| async {
+                Response::empty(StatusCode::OK)
+            })?;
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn the_openapi_command_writes_and_checks_the_document() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let file = directory.path().join("openapi.json");
+        let path = file.to_string_lossy().into_owned();
+
+        let code = described_app().run_with(args(&["openapi", "--output", &path]), no_config);
+        assert_eq!(code, ExitCode::SUCCESS);
+        let written = std::fs::read_to_string(&file).expect("written");
+        let document: serde_json::Value = serde_json::from_str(&written).expect("JSON");
+        assert_eq!(document["info"]["title"], "demo");
+        assert_eq!(document["info"]["version"], "1.2.3");
+        assert!(document["paths"]["/health/live"]["get"].is_object());
+        assert!(document["paths"].get("/plain").is_none(), "undescribed");
+
+        let check = |app: App| app.run_with(args(&["openapi", "--check", &path]), no_config);
+        assert_eq!(check(described_app()), ExitCode::SUCCESS);
+        let renamed = described_app().api_info(Info::new("renamed", "1.2.3"));
+        assert_eq!(check(renamed), ExitCode::FAILURE, "stale");
+        assert_eq!(
+            described_app().run_with(args(&["openapi", "--yaml"]), no_config),
+            ExitCode::from(EXIT_USAGE)
+        );
+    }
+
+    fn served(config: &AppConfig, own: bool) -> Result<Router, ExitCode> {
+        let mut router = build_router(Vec::new(), None).expect("routes");
+        if own {
+            router
+                .route(Method::GET, OPENAPI_PATH, |_| async {
+                    Response::new(StatusCode::OK, "mine")
+                })
+                .expect("route");
+        }
+        mount_openapi("demo", &mut router, config, &Info::new("demo", "1"))?;
+        Ok(router)
+    }
+
+    #[test]
+    fn the_document_is_served_where_the_configuration_allows_it() {
+        let development = config_with(&[]).expect("config");
+        let router = served(&development, false).expect("mounted");
+        assert!(router.has_route(&Method::GET, OPENAPI_PATH));
+        let production = config_with(&[("FORGE_ENV", "production")]).expect("config");
+        let router = served(&production, false).expect("not mounted");
+        assert!(!router.has_route(&Method::GET, OPENAPI_PATH));
+        let enabled = config_with(&[
+            ("FORGE_ENV", "production"),
+            ("FORGE_OPENAPI_ENABLED", "true"),
+        ])
+        .expect("config");
+        assert!(
+            served(&enabled, false)
+                .expect("mounted")
+                .has_route(&Method::GET, OPENAPI_PATH)
+        );
+        // The application's own route wins.
+        assert!(served(&development, true).is_ok());
+    }
+
+    #[test]
+    fn an_inaccurate_description_stops_startup() {
+        let mut router = Router::new();
+        router
+            .route(
+                Method::GET,
+                "/x",
+                forge_http::describe(
+                    |_| async { Response::empty(StatusCode::OK) },
+                    forge_openapi::Operation::new(),
+                ),
+            )
+            .expect("route");
+        let config = config_with(&[]).expect("config");
+        let result = mount_openapi("demo", &mut router, &config, &Info::new("demo", "1"));
+        assert_eq!(result, Err(ExitCode::FAILURE));
     }
 
     #[test]

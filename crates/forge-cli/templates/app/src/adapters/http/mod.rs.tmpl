@@ -1,5 +1,8 @@
 //! HTTP adapter. Handlers stay thin: decode the request, call a use case and
-//! map the result to a response.
+//! map the result to a response. JSON endpoints describe themselves in the
+//! OpenAPI document (see `status`).
+
+pub mod status;
 
 use forge::http::{Method, Request, Response, RouteError, Router, StatusCode};
 use serde::Serialize;
@@ -8,6 +11,7 @@ use serde::Serialize;
 /// and `/health/ready` itself.
 pub fn routes(router: &mut Router) -> Result<(), RouteError> {
     router.route(Method::GET, "/", index)?;
+    status::routes(router)?;
     Ok(())
 }
 

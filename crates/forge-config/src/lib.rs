@@ -101,6 +101,7 @@ pub const KNOWN_KEYS: &[&str] = &[
     "FORGE_STORAGE_LINK_TTL_SECS",
     "FORGE_STREAMS_KEY",
     I18N_DEFAULT_LOCALE_KEY,
+    OPENAPI_ENABLED_KEY,
     // MAIL_KEYS and PASSWORD_RESET_URL_KEY, ADR 0035.
     "FORGE_MAIL_URL",
     "FORGE_MAIL_FROM",
@@ -127,6 +128,11 @@ pub const KNOWN_KEYS: &[&str] = &[
     "FORGE_TELEMETRY_METRICS_PUBLIC",
     "FORGE_TELEMETRY_METRICS_INTERVAL",
 ];
+
+/// Whether `GET /openapi.json` is served (ADR 0039): unset serves it in
+/// development and test only, `true` everywhere (with a startup warning in
+/// production), `false` never.
+pub const OPENAPI_ENABLED_KEY: &str = "FORGE_OPENAPI_ENABLED";
 
 /// The locale requests fall back to and missing translations use in
 /// production (ADR 0037), overriding the application's own default (`forge
@@ -802,6 +808,18 @@ pub struct AppConfig {
     /// Translations (`FORGE_I18N_DEFAULT_LOCALE`, ADR 0037).
     #[serde(default)]
     pub i18n: I18nConfig,
+    /// The OpenAPI document route (`FORGE_OPENAPI_ENABLED`, ADR 0039).
+    #[serde(default)]
+    pub openapi: OpenApiConfig,
+}
+
+/// The `GET /openapi.json` route.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct OpenApiConfig {
+    /// `FORGE_OPENAPI_ENABLED`. `None` (unset) serves the document in
+    /// development and test only: it lists every documented route, internal
+    /// ones included, so production publishes it only when this is `true`.
+    pub enabled: Option<bool>,
 }
 
 /// Translation settings.
@@ -815,6 +833,16 @@ pub struct I18nConfig {
 }
 
 impl AppConfig {
+    /// Whether the application serves its OpenAPI document at
+    /// `GET /openapi.json`.
+    #[must_use]
+    pub fn serves_openapi(&self) -> bool {
+        self.openapi.enabled.unwrap_or(matches!(
+            self.environment,
+            Environment::Development | Environment::Test
+        ))
+    }
+
     /// Loads configuration from process environment variables.
     ///
     /// Supported keys are listed in [`KNOWN_KEYS`]. Loading fails closed: any
@@ -909,6 +937,9 @@ impl AppConfig {
             && !value.is_empty()
         {
             config.i18n.default_locale = Some(parse_locale(value)?);
+        }
+        if let Some(value) = lookup(OPENAPI_ENABLED_KEY) {
+            config.openapi.enabled = Some(telemetry::parse_bool(OPENAPI_ENABLED_KEY, &value)?);
         }
         telemetry::apply(&lookup, &mut config.telemetry)?;
         mail::apply(&lookup, &mut config.mail, &mut config.auth)?;
@@ -1541,6 +1572,32 @@ mod tests {
     }
 
     #[test]
+    fn openapi_is_served_in_development_and_test_unless_configured() {
+        let load = |vars: &[(&str, &str)]| {
+            AppConfig::from_lookup(|key| {
+                vars.iter()
+                    .find(|(name, _)| *name == key)
+                    .map(|(_, value)| (*value).to_owned())
+            })
+        };
+        for (vars, served) in [
+            (&[][..], true),
+            (&[("FORGE_ENV", "test")][..], true),
+            (&[("FORGE_ENV", "production")][..], false),
+            (
+                &[("FORGE_ENV", "production"), (OPENAPI_ENABLED_KEY, "true")][..],
+                true,
+            ),
+            (&[(OPENAPI_ENABLED_KEY, "false")][..], false),
+        ] {
+            let config = load(vars).expect("valid");
+            assert_eq!(config.serves_openapi(), served, "{vars:?}");
+        }
+        let error = load(&[(OPENAPI_ENABLED_KEY, "yes")]).expect_err("not a boolean");
+        assert!(error.to_string().contains(OPENAPI_ENABLED_KEY), "{error}");
+    }
+
+    #[test]
     fn every_known_key_is_accepted() {
         let values = [
             "production",
@@ -1566,6 +1623,7 @@ mod tests {
             "60",
             "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=",
             "pt-BR",
+            "true",
             "smtps://mailer:secret@smtp.example.com:465",
             "Billing <billing@example.com>",
             "false",

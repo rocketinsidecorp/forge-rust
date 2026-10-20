@@ -5,6 +5,7 @@
 %%if authentication%%
 pub mod authentication;
 %%end%%
+pub mod status;
 pub mod views;
 
 use std::sync::Arc;
@@ -42,6 +43,7 @@ pub fn routes(router: &mut Router, site: &Arc<Site>) -> Result<(), ComposeError>
         let site = Arc::clone(&index_site);
         async move { index(&site, &request) }
     })?;
+    status::routes(router)?;
     Ok(())
 }
 

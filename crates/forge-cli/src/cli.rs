@@ -176,6 +176,17 @@ pub(crate) enum Command {
     },
     /// Load the application's seed data by running its `seed` command.
     Seed,
+    /// Print the application's OpenAPI 3.1 document by running its `openapi`
+    /// command (ADR 0039): it composes the application without listening,
+    /// so it needs the configuration `serve` needs.
+    Openapi {
+        /// Write the document to FILE instead of standard output.
+        #[arg(long, value_name = "FILE", conflicts_with = "check")]
+        output: Option<std::path::PathBuf>,
+        /// Exit 1 when FILE differs from the document (for CI).
+        #[arg(long, value_name = "FILE")]
+        check: Option<std::path::PathBuf>,
+    },
     /// Translations of config/locales (ADR 0037).
     I18n {
         #[command(subcommand)]

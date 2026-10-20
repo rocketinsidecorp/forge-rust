@@ -5,6 +5,10 @@
 //! | --- | --- | --- | --- |
 %%ROUTE_TABLE%%
 //!
+//! Every route is described in the OpenAPI document (`GET /openapi.json`,
+//! `forge openapi`, ADR 0039) by [`operation`]: change the response type
+//! there when an action answers something else.
+//!
 //! Replace [`%%TYPE%%Body`] and the handler bodies with your own. Actions
 //! that change data (create, update, destroy) belong to `forge generate
 //! scaffold`, which also generates the model they change.
@@ -16,6 +20,7 @@ use std::sync::Arc;
 %%end%%
 use forge::ComposeError;
 use forge::http::{Method, Request, Response, Router, StatusCode};
+use forge::openapi::{OpenApiSchema, Operation, describe};
 %%if guarded%%
 use forge::security::Permission;
 %%end%%
@@ -37,7 +42,7 @@ pub const READ_PERMISSION: &str = "%%NAME%%:read";
 %%end%%
 
 /// The JSON document every action answers with.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, OpenApiSchema)]
 pub struct %%TYPE%%Body {
     pub controller: &'static str,
     pub action: &'static str,
@@ -63,12 +68,13 @@ pub fn routes(router: &mut Router, access: Arc<dyn GlobalAccess>) -> Result<(), 
     Ok(())
 }
 
-/// Routes `GET path` to `handler`. The controller is read-only: no other
-/// method is routed.
+/// Routes `GET path` to `handler`, described as `action`. The controller is
+/// read-only: no other method is routed.
 fn route<H, F>(
     router: &mut Router,
     state: &Arc<%%TYPE%%Controller>,
     path: &str,
+    action: &str,
     handler: H,
 ) -> Result<(), ComposeError>
 where
@@ -76,9 +82,14 @@ where
     F: Future<Output = Response> + Send + 'static,
 {
     let state = Arc::clone(state);
-    router.route(Method::GET, path, move |request: Request| {
-        handler(Arc::clone(&state), request)
-    })?;
+    router.route(
+        Method::GET,
+        path,
+        describe(
+            move |request: Request| handler(Arc::clone(&state), request),
+            operation(action),
+        ),
+    )?;
     Ok(())
 }
 
@@ -100,6 +111,22 @@ pub fn routes(router: &mut Router) -> Result<(), ComposeError> {
     Ok(())
 }
 %%end%%
+
+/// How `action` is described in the OpenAPI document.
+fn operation(action: &str) -> Operation {
+    Operation::new()
+        .summary(format!("%%NAME%% {action}"))
+        .tag("%%NAME%%")
+%%if guarded%%
+        // The access policy's refusals: 401, 403 (implied by the
+        // permission) and 503 when it cannot decide.
+        .permission(READ_PERMISSION)
+        .response(
+            forge::openapi::Response::text(503).description("The access policy is unavailable"),
+        )
+%%end%%
+        .json::<%%TYPE%%Body>(200)
+}
 
 /// `200 OK` with `body` as JSON.
 fn respond(body: &%%TYPE%%Body) -> Response {

@@ -241,6 +241,18 @@ fn execute(
             lifecycle(current_dir, |app| app.setup(&arguments))
         }
         Command::Seed => lifecycle(current_dir, |app| app.seed()),
+        Command::Openapi { output, check } => {
+            // The application runs in the project root: a relative FILE
+            // means the one next to where forge was run.
+            let mut arguments = Vec::new();
+            for (flag, file) in [("--output", output), ("--check", check)] {
+                if let Some(file) = file {
+                    arguments.push(flag.to_owned());
+                    arguments.push(current_dir.join(file).to_string_lossy().into_owned());
+                }
+            }
+            lifecycle(current_dir, |app| app.openapi(&arguments))
+        }
         Command::Db { command } => {
             let command = match command {
                 DbCommand::Create => Db::Create,

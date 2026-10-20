@@ -33,14 +33,18 @@ tokio = { version = "1.53.1", features = ["rt", "time"] }
 [build-dependencies]
 # Only the asset embedding helper used by build.rs: no HTTP or template graph.
 forge-views = %%FORGE_VIEWS_BUILD_DEPENDENCY%%
+%%end%%
 
 [dev-dependencies]
+%%if views%%
 %%if database%%
 # `forge::db::testing::TestDatabase` for repository integration tests.
 forge = %%FORGE_TEST_DEPENDENCY%%
 %%end%%
-tokio = { version = "1.53.1", features = ["macros", "rt"] }
 %%end%%
+# tests/openapi.rs reads the served OpenAPI document.
+serde_json = "1"
+tokio = { version = "1.53.1", features = ["macros", "rt"] }
 
 [lints.rust]
 unsafe_code = "forbid"

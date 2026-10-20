@@ -30,7 +30,8 @@ results.
 | 3 | Authentication, authorization, tenancy, RLS, audit | Implemented for PostgreSQL (sign-in pages, setup, RBAC, RLS, audit, reset emails through the mailer of [ADR 0035](docs/adr/0035-mail.md)); MFA and other backends pending |
 | 4 | PostgreSQL jobs, cron scheduler, outbox, idempotent consumers | Library implemented and tested (`forge` features `jobs`, `events`); `forge new` wiring pending |
 | 5 | Traces, metrics, correlated logs (OTLP, Prometheus) | Implemented ([ADR 0033](docs/adr/0033-telemetry.md)); generated local Grafana, Prometheus, Tempo and Loki stack ([ADR 0034](docs/adr/0034-local-observability-stack.md)) |
-| 6+ | OpenAPI, AI, hardening | Design only |
+| 6 | OpenAPI from typed routes | Implemented ([ADR 0039](docs/adr/0039-openapi-from-typed-routes.md)); code generation and AI pending |
+| 7+ | AI, hardening | Design only |
 
 See the [delivery sequence](docs/architecture.md#delivery-sequence-and-exit-criteria).
 
@@ -213,9 +214,11 @@ forge db rollback --steps 1                    # guarded like drop
 forge db reset                                 # drop + setup: a clean development database
 forge db drop                                  # refused when FORGE_ENV=production or the server is remote
 FORGE_ALLOW_DESTRUCTIVE=true forge db drop --force-production --yes   # the only way in production
+forge openapi                                  # the OpenAPI 3.1 document of the JSON routes
+forge openapi --output openapi.json            # write it; --check openapi.json exits 1 when stale (CI)
 cargo run -- healthcheck                       # application binary: serve, healthcheck, version, help,
 cargo run -- migrate                           #   migrate [status], rollback [--steps N], db create|exists|drop,
-cargo run -- seed                              #   setup, seed: what the forge commands above run
+cargo run -- seed                              #   setup, seed, openapi: what the forge commands above run
 ```
 
 The commands above that are not `new`, `generate`, `id`, `version`, `doctor`,
@@ -470,7 +473,10 @@ Kubernetes and systemd deployment is covered in
 - `forge::App`: the framework owns the Tokio runtime, structured logging (JSON in
   production), SIGTERM/SIGINT graceful shutdown with a drain deadline, and the
   `/health`, `/health/live` and `/health/ready` routes.
-- Binary subcommands: `serve` (default), `healthcheck`, `migrate`,
+- An OpenAPI 3.1 document of the JSON routes (`GET /v1/status` and the
+  health routes) at `/openapi.json` in development and test, and a
+  `tests/openapi.rs` contract test ([ADR 0039](docs/adr/0039-openapi-from-typed-routes.md)).
+- Binary subcommands: `serve` (default), `healthcheck`, `openapi`, `migrate`,
   `rollback`, `seed` (database applications), `setup` (full-stack
   PostgreSQL), `jobs` (applications that declare `App::jobs`), `version`,
   `help`.
@@ -705,6 +711,51 @@ Limits and keys are configured with
 ([deployment guide](docs/deployment.md)); in `production` a storage root must be
 absolute and `FORGE_STORAGE_SIGNING_KEY` is required.
 
+## OpenAPI
+
+JSON routes describe themselves in an OpenAPI 3.1 document built from their
+Rust types ([guide](docs/openapi.md), [ADR 0039](docs/adr/0039-openapi-from-typed-routes.md)):
+derive `OpenApiSchema` next to `Serialize`, serve the route with
+`forge::openapi::typed` (the description comes from the handler's types) or
+attach an `Operation` with `forge::openapi::describe`. Every generated
+application serves `GET /v1/status` this way and tests every JSON response
+against the document.
+
+```sh
+forge new shop && cd shop && forge dev
+curl http://127.0.0.1:3000/v1/status
+curl http://127.0.0.1:3000/openapi.json            # development and test only, by default
+forge openapi                                      # print the document
+forge openapi --output openapi.json                # write it, to commit and diff
+forge openapi --check openapi.json                 # exit 1 when the committed file is stale (CI)
+forge generate controller status_checks index --api   # described JSON actions, contract-tested
+FORGE_ENV=production FORGE_OPENAPI_ENABLED=true ./target/release/shop   # serve it in production too
+```
+
+```rust
+#[derive(serde::Serialize, forge::openapi::OpenApiSchema)]
+pub struct StatusResponse {
+    pub service: &'static str,
+    pub status: &'static str,
+}
+
+router.route(
+    Method::GET,
+    "/v1/status",
+    forge::openapi::typed(
+        StatusCode::OK,
+        forge::openapi::Operation::new().summary("Service status").tag("status"),
+        |_request, forge::openapi::NoBody| async {
+            Ok::<_, forge::core::ForgeError>(StatusResponse { service: "shop", status: "ok" })
+        },
+    ),
+)?;
+```
+
+The document lists every described route with its permission, so it is not
+served in production unless `FORGE_OPENAPI_ENABLED=true` (`false` never
+serves it). An inaccurate description stops startup.
+
 ## Live updates
 
 Like Rails' `turbo_stream_from` with Action Cable, pages update when someone
@@ -757,7 +808,9 @@ crates/
 ├── forge-http     # HTTP server, routing, middleware, form/query decoding, limits
 ├── forge-i18n     # translations: JSON catalogs, CLDR plurals, locale matching, number/date formats
 ├── forge-jobs     # durable PostgreSQL jobs, workers, cron schedules
+├── forge-macros   # #[derive(OpenApiSchema)] from serde attributes
 ├── forge-mail     # email: validated MIME, TLS-enforcing SMTP, file/test senders, previews
+├── forge-openapi  # OpenAPI 3.1 documents from typed routes, contract validation
 ├── forge-ratelimit # fixed-window limiter: memory and shared stores, fail-closed middleware
 ├── forge-security # deny-by-default RBAC roles, permissions and grants
 ├── forge-storage  # file storage: disk adapter, signed links, strict uploads
@@ -828,6 +881,7 @@ Contribution rules:
 - [Jobs, schedules, outbox and consumers](docs/jobs.md)
 - [Mail: SMTP, templates, previews and reset emails](docs/mail.md)
 - [Internationalization: translations, plurals, locales](docs/i18n.md)
+- [OpenAPI from typed routes](docs/openapi.md)
 - [Deployment](docs/deployment.md)
 - [Observability: traces, metrics and logs](docs/observability.md)
 - [Rate limiting](docs/rate-limiting.md), [caching](docs/caching.md) and [file storage](docs/storage.md)

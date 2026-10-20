@@ -525,6 +525,7 @@ dependencies = [
  "forge-i18n",
  "forge-jobs",
  "forge-mail",
+ "forge-openapi",
  "forge-ratelimit",
  "forge-security",
  "forge-storage",
@@ -703,6 +704,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "forge-config",
+ "forge-openapi",
  "forge-telemetry",
  "http",
  "http-body-util",
@@ -755,6 +757,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "forge-macros"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "forge-mail"
 version = "0.1.0"
 dependencies = [
@@ -778,6 +789,16 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "webpki-roots",
+]
+
+[[package]]
+name = "forge-openapi"
+version = "0.1.0"
+dependencies = [
+ "forge-core",
+ "forge-macros",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

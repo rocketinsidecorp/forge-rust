@@ -120,6 +120,21 @@ Only its parser/builder and `Secure`, `HttpOnly`, `SameSite`, `Path`
 attributes are required.
 
 
+## OpenAPI dependency decision
+
+[ADR 0039](adr/0039-openapi-from-typed-routes.md) adds two workspace crates,
+`forge-openapi` (the document core: `forge-core`, `serde_json`) and
+`forge-macros` (the `OpenApiSchema` derive), and **no new third-party
+package**. `forge-macros` depends directly on `syn` 2 (features
+`clone-impls`, `derive`, `parsing`, `printing`, `proc-macro`, all already
+enabled in the graph), `quote` and `proc-macro2`, which `serde_derive`,
+`thiserror-impl`, `sqlx-macros` and `tracing-attributes` already bring in at
+the locked versions. It is a proc macro: it runs at compile time, reads only
+the item it derives for, has no build script, performs no I/O or network
+access and contains no `unsafe`. `utoipa` and `schemars` were considered and
+not admitted (ADR 0039 records why); none of these types appears in a Forge
+API (`Schema` is a `serde_json::Value`).
+
 ## Server-rendered views dependency decision
 
 The form CSRF/flash slice ([ADR 0023](adr/0023-form-csrf-flash-and-method-override.md))

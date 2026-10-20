@@ -285,6 +285,7 @@ const TEMPLATES: &[Template] = &[
     template!(Group::Always, "src/application/mod.rs" => "src/application/mod.rs.tmpl"),
     template!(Group::Always, "src/adapters/mod.rs" => "src/adapters/mod.rs.tmpl"),
     template!(Group::Api, "src/adapters/http/mod.rs" => "src/adapters/http/mod.rs.tmpl"),
+    template!(Group::Always, "src/adapters/http/status.rs" => "src/adapters/http/status.rs.tmpl"),
     template!(Group::Views, "src/adapters/http/mod.rs" => "src/adapters/http/mod_views.rs.tmpl"),
     template!(
         Group::Views,
@@ -316,6 +317,7 @@ const TEMPLATES: &[Template] = &[
     template!(Group::Always, "src/infrastructure/mod.rs" => "src/infrastructure/mod.rs.tmpl"),
     template!(Group::Always, "src/bootstrap/mod.rs" => "src/bootstrap/mod.rs.tmpl"),
     template!(Group::Always, "tests/architecture.rs" => "tests/architecture.rs.tmpl"),
+    template!(Group::Always, "tests/openapi.rs" => "tests/openapi.rs.tmpl"),
     template!(Group::BuildScript, "build.rs" => "build.rs.tmpl"),
     template!(Group::Database, ".gitattributes" => "gitattributes.tmpl"),
     template!(Group::Database, "migrations/.gitkeep" => "migrations/gitkeep.tmpl"),
@@ -1980,15 +1982,13 @@ mod tests {
             assert!(!root.join("templates").exists());
             assert!(!root.join("assets").exists());
             let manifest = read(&root, "Cargo.toml");
-            for needle in [
-                "askama",
-                "forge-views",
-                "views",
-                "[build-dependencies]",
-                "[dev-dependencies]",
-            ] {
+            for needle in ["askama", "forge-views", "views", "[build-dependencies]"] {
                 assert!(!manifest.contains(needle), "{database:?}: {needle}");
             }
+            // tests/openapi.rs runs in every application.
+            assert!(manifest.contains("[dev-dependencies]\n# tests/openapi.rs"));
+            assert!(root.join("tests/openapi.rs").exists());
+            assert!(read(&root, "src/adapters/http/status.rs").contains("typed("));
             assert!(
                 read(&root, "src/bootstrap/mod.rs")
                     .contains(".routes(crate::adapters::http::routes)")

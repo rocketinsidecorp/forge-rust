@@ -12,7 +12,10 @@ use forge_config::{DatabaseConfig, DatabaseScheme, Environment, SecretString};
 use forge_db::DbError;
 #[cfg(any(feature = "postgres", feature = "mysql", feature = "sqlite"))]
 use forge_db::Migrator;
-use forge_http::{HeaderValue, Method, Response, RouteError, Router, StatusCode, header};
+use forge_http::{
+    HeaderValue, Method, Response, RouteError, Router, StatusCode, describe, header,
+    health_operation,
+};
 use thiserror::Error;
 use tracing::warn;
 
@@ -338,17 +341,34 @@ pub(crate) fn register_health(
         router.standard_health_routes()?;
         return Ok(());
     };
-    router.route(Method::GET, "/health", |_| async {
-        json(StatusCode::OK, r#"{"status":"ok"}"#)
-    })?;
-    router.route(Method::GET, "/health/live", |_| async {
-        json(StatusCode::OK, r#"{"status":"live"}"#)
-    })?;
+    router.route(
+        Method::GET,
+        "/health",
+        describe(
+            |_| async { json(StatusCode::OK, r#"{"status":"ok"}"#) },
+            health_operation("/health", false),
+        ),
+    )?;
+    router.route(
+        Method::GET,
+        "/health/live",
+        describe(
+            |_| async { json(StatusCode::OK, r#"{"status":"live"}"#) },
+            health_operation("/health/live", false),
+        ),
+    )?;
     let database = Arc::new(database);
-    router.route(Method::GET, "/health/ready", move |_| {
-        let database = Arc::clone(&database);
-        async move { readiness(&database).await }
-    })?;
+    router.route(
+        Method::GET,
+        "/health/ready",
+        describe(
+            move |_| {
+                let database = Arc::clone(&database);
+                async move { readiness(&database).await }
+            },
+            health_operation("/health/ready", true),
+        ),
+    )?;
     Ok(())
 }
 

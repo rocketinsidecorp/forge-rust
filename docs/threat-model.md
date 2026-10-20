@@ -495,6 +495,27 @@ which cannot mark it, and a shared cache can serve it across languages until
 the handler marks it. Live-update fragments render in
 the default locale for every subscriber.
 
+## OpenAPI review
+
+Review date: 2026-10-20 ([ADR 0039](adr/0039-openapi-from-typed-routes.md),
+port of Forge-Go ADR 0043). Scope: `forge-openapi`, `forge-macros`, the
+`forge-http` descriptions, `CheckResponses` and `/openapi.json`, the
+`openapi` command, `FORGE_OPENAPI_ENABLED`. Guide: [OpenAPI](openapi.md).
+
+| Threat | STRIDE | Control | Verification |
+| --- | --- | --- | --- |
+| Reconnaissance: the document lists every described route, internal and admin ones included, with the permission each requires | I | `GET /openapi.json` is served only in development and test unless `FORGE_OPENAPI_ENABLED=true`, which logs a startup warning in production; `false` never serves it; the variable is a strict boolean in `KNOWN_KEYS` | `openapi_is_served_in_development_and_test_unless_configured`, `the_document_is_served_where_the_configuration_allows_it` |
+| An application's own `/openapi.json` (a hand-written or filtered document) silently replaced | T | Forge mounts its document only when no `GET /openapi.json` route exists and logs that it did not | `the_document_is_served_where_the_configuration_allows_it` |
+| A wrong description misleads clients or reviewers (a field that is not written, a missing error) | T, R | Typed handlers derive request and success from their types; the derive follows serde's attributes and refuses at compile time those it cannot describe; inaccurate operations are build errors that stop startup; generated tests check every JSON response with `CheckResponses` | `shapes_it_cannot_describe_are_compile_errors`, `inaccurate_descriptions_are_build_errors`, `an_inaccurate_description_stops_startup`, generated `json_responses_match_the_document` |
+| Secrets in the document (examples, descriptions) | I | The document holds only what code declares: types, names, and `doc`/`example` strings an author writes; no configuration value, credential or request data is ever included | review rule: never put a credential or real customer data in `example` |
+| Resource exhaustion when serving or validating | D | The document is built once at startup and served as fixed bytes; the contract validator is test-only, bounds recursion depth at 256 and only follows references inside the document | `responses_are_checked_against_the_document` |
+| Supply chain of the derive | T | `forge-macros` uses only `syn`, `quote`, `proc-macro2`, already locked for `serde_derive`; it runs at compile time with no I/O, no network and no build script | `cargo deny check`, [dependency policy](dependency-policy.md#openapi-dependency-decision) |
+
+Residual risks: `describe` descriptions are claims about a handler and can
+still be wrong where tests do not exercise a response; enabling the
+document in production publishes the API surface, which is a deliberate
+operator decision.
+
 ## Review cadence
 
 Update this model when adding a trust boundary, privileged capability, protocol,

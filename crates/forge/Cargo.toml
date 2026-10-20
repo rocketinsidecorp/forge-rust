@@ -17,6 +17,7 @@ forge-core = { path = "../forge-core" }
 forge-db = { path = "../forge-db" }
 forge-events = { path = "../forge-events", optional = true }
 forge-http = { path = "../forge-http" }
+forge-openapi = { path = "../forge-openapi" }
 forge-i18n = { path = "../forge-i18n", optional = true }
 forge-jobs = { path = "../forge-jobs", optional = true }
 forge-mail = { path = "../forge-mail", optional = true }

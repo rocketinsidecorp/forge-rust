@@ -1,0 +1,41 @@
+//! `GET /v1/status`, a JSON endpoint described in the OpenAPI document by
+//! its own types (ADR 0039): `forge::openapi::typed` decodes the request,
+//! calls the handler and writes its result, so the description cannot
+//! drift from the code. `GET /openapi.json` (development and test, or
+//! `FORGE_OPENAPI_ENABLED=true`) and `forge openapi` show it.
+
+use forge::core::ForgeError;
+use forge::http::{Method, Request, RouteError, Router, StatusCode};
+use forge::openapi::{NoBody, OpenApiSchema, Operation, typed};
+use serde::Serialize;
+
+/// The body of `GET /v1/status`.
+#[derive(Debug, Serialize, OpenApiSchema)]
+pub struct StatusResponse {
+    #[openapi(example = "%%APP_NAME%%")]
+    pub service: &'static str,
+    #[openapi(example = "ok")]
+    pub status: &'static str,
+}
+
+/// Registers the JSON routes. Describe your own with `typed`, or attach an
+/// `Operation` to an ordinary handler with `forge::openapi::describe`.
+pub fn routes(router: &mut Router) -> Result<(), RouteError> {
+    router.route(
+        Method::GET,
+        "/v1/status",
+        typed(
+            StatusCode::OK,
+            Operation::new().summary("Service status").tag("status"),
+            status,
+        ),
+    )?;
+    Ok(())
+}
+
+async fn status(_request: Request, _body: NoBody) -> Result<StatusResponse, ForgeError> {
+    Ok(StatusResponse {
+        service: env!("CARGO_PKG_NAME"),
+        status: "ok",
+    })
+}

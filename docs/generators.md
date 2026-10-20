@@ -105,7 +105,9 @@ src/adapters/http/access.rs                   shared access policy, when missing
 
 The pages extend the application layout (CSRF meta tag, flash, translations)
 and show a title and text you replace; `--api` handlers answer a small JSON
-document (`NAMEBody`). Controllers are wired in `fn compose`, so they need a
+document (`NAMEBody`) and are described in the OpenAPI document by
+`operation` (summary `NAME ACTION`, tag `NAME`, the permission and the access
+policy's `503`; [OpenAPI](openapi.md)). Controllers are wired in `fn compose`, so they need a
 full-stack application.
 
 `routes` mounts every route behind a guard:
@@ -120,7 +122,8 @@ full-stack application.
 
 Generated tests check that every action answers, that only `GET` is routed,
 that the guard is asked for `NAME:read` once per route, and that `DenyAll`
-refuses every action.
+refuses every action. With `--api` every response in those tests is also
+checked against the OpenAPI document (`CheckResponses`).
 
 ## Mailer
 
