@@ -46,7 +46,6 @@ use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-mod gate;
 mod memory;
 mod middleware;
 #[cfg(feature = "mysql")]
@@ -60,7 +59,8 @@ mod store;
 #[cfg(feature = "testing")]
 pub mod testing;
 
-pub use gate::{MAX_PRUNE_ROUNDS, PruneGate};
+#[cfg(any(feature = "mysql", feature = "postgres", feature = "sqlite"))]
+pub use forge_db::{MAX_PRUNE_ROUNDS, PruneGate};
 pub use memory::{MemoryLimiter, MemoryOptions, WhenFull};
 pub use middleware::{KeyFn, RateLimit, RateLimited, by_remote_addr, join};
 #[cfg(any(feature = "mysql", feature = "postgres", feature = "sqlite"))]
@@ -184,7 +184,7 @@ pub trait Limiter: Send + Sync {
 ///
 /// Each call removes at most [`MAX_PRUNE_ROUNDS`] bounded batches and returns
 /// how many buckets it removed; call it periodically if inline pruning is
-/// disabled (the stores also prune opportunistically, see [`PruneGate`]).
+/// disabled (the stores also prune opportunistically after hits).
 #[async_trait]
 pub trait Pruner: Send + Sync {
     /// Removes expired buckets and returns how many.

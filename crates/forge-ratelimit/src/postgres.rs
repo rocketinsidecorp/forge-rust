@@ -3,12 +3,11 @@
 //! agree and a hit can neither be lost nor counted twice.
 
 use async_trait::async_trait;
-use forge_db::PgDatabase;
+use forge_db::{MAX_PRUNE_ROUNDS, PgDatabase, PruneGate};
 use sqlx::{Row, migrate::Migrator};
 
 use crate::{
-    Decision, Limit, LimitError, Limiter, MAX_PRUNE_ROUNDS, PruneGate, Pruner, StoreOptions,
-    check_key,
+    Decision, Limit, LimitError, Limiter, Pruner, StoreOptions, check_key,
     store::{decide, store_error, window_micros},
 };
 

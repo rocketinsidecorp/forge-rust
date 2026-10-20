@@ -1,14 +1,16 @@
+//! Pacing of inline pruning for database-backed caches and limiters.
+
 use std::{
     sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant},
 };
 
 /// Bounds how many batches one prune removes, so a call is bounded work (at
-/// most `MAX_PRUNE_ROUNDS x batch` rows) yet keeps up with a sustained stream
-/// of new keys.
+/// most `MAX_PRUNE_ROUNDS x batch` rows per kind) yet keeps up with a sustained
+/// stream of new keys.
 pub const MAX_PRUNE_ROUNDS: u32 = 20;
 
-/// Decides when a store prunes inline after a hit: when the prune interval has
+/// Decides when a store prunes inline after a write or hit: when the prune interval has
 /// passed, or when `batch` hits have happened since the last prune, whichever
 /// comes first, so expired buckets cannot pile up faster than they are
 /// removed. Cheap (two atomics) and lock-free; the stores own one each.

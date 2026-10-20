@@ -32,6 +32,7 @@ mod backend;
 mod database;
 mod error;
 mod migrate;
+mod prune;
 
 pub use backend::{Backend, RowsAffected};
 #[cfg(feature = "mysql")]
@@ -45,6 +46,7 @@ pub use error::DbError;
 pub use migrate::combine_migrations;
 #[cfg(feature = "postgres")]
 pub use postgres::advisory_key;
+pub use prune::{MAX_PRUNE_ROUNDS, PruneGate};
 /// The SQLx version Forge builds on, for macros such as `sqlx::migrate!`.
 pub use sqlx;
 /// Embedded or filesystem migrations, produced by `sqlx::migrate!()`.

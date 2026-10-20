@@ -5,12 +5,11 @@
 //! (`UTC_TIMESTAMP`), so replicas with skewed clocks agree.
 
 use async_trait::async_trait;
-use forge_db::{DbError, MySqlDatabase};
+use forge_db::{DbError, MAX_PRUNE_ROUNDS, MySqlDatabase, PruneGate};
 use sqlx::{Row, migrate::Migrator};
 
 use crate::{
-    Decision, Limit, LimitError, Limiter, MAX_PRUNE_ROUNDS, PruneGate, Pruner, StoreOptions,
-    check_key,
+    Decision, Limit, LimitError, Limiter, Pruner, StoreOptions, check_key,
     store::{decide, store_error, window_micros},
 };
 

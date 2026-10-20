@@ -93,7 +93,7 @@ batches of `prune_batch` (default 500) rows per call, `FOR UPDATE SKIP LOCKED`
 on PostgreSQL so replicas do not block each other. `allow` also prunes inline,
 **after every `prune_batch` hits or every `prune_interval` (default one minute),
 whichever comes first**, after the hit has been decided and ignoring errors
-(`PruneGate`: two atomics, no lock). A time-only trigger was rejected: it let a
+(`forge_db::PruneGate`: two atomics, no lock, shared with the cache). A time-only trigger was rejected: it let a
 stream of distinct keys pile up expired rows between prunes. No task is ever
 started; a scheduler can call `prune` for an explicit cadence. Live buckets
 are bounded by the distinct keys seen within one window; a database limiter has

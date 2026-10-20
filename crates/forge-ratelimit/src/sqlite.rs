@@ -6,12 +6,11 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use forge_db::SqliteDatabase;
+use forge_db::{MAX_PRUNE_ROUNDS, PruneGate, SqliteDatabase};
 use sqlx::{Row, migrate::Migrator};
 
 use crate::{
-    Decision, Limit, LimitError, Limiter, MAX_PRUNE_ROUNDS, PruneGate, Pruner, StoreOptions,
-    check_key,
+    Decision, Limit, LimitError, Limiter, Pruner, StoreOptions, check_key,
     store::{decide, store_error, window_micros},
 };
 
