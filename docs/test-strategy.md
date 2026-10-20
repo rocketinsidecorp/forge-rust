@@ -100,6 +100,14 @@ at-least-once duplicate delivery, idempotent consumers, retry jitter within boun
 attempt ceilings, dead letters, scheduled-time semantics, worker crash/reclaim,
 heartbeat expiry, cancellation, concurrency keys, fairness, and saturation.
 
+Phase 4 implementation: `forge-jobs` and `forge-events` run their PostgreSQL
+suites as a per-test non-superuser, non-owner runtime role
+(`forge_jobs::testing::RlsTestDatabase`); they are `#[ignore]`d unless
+`FORGE_TEST_DATABASE_URL` is set and `--include-ignored` is passed. The cron
+evaluator is checked against a minute-by-minute oracle on generated
+expressions and against arbitrary input that must never panic. Concurrency
+keys, per-tenant fairness and saturation tests remain open.
+
 ### Telemetry
 
 Capture an in-memory/export test sink and assert trace linkage across HTTP,
@@ -146,6 +154,22 @@ CSRF/flash/method-override layers with an in-memory port (CSRF refusal, `422`,
 `303`, `404`, `409`, the `DenyAll` default) and the repository against
 `TestDatabase` (optimistic locking, cursor pages, cross-tenant isolation and,
 on PostgreSQL, RLS with a role that cannot bypass it).
+
+The generated sign-in pages ([ADR 0026](adr/0026-authentication-pages-and-setup.md))
+ship `tests/authentication_http.rs` (the pages through the real CSRF and
+flash layers with in-memory ports: success with fresh session and CSRF
+token, one uniform failure for every wrong field, throttling with
+`Retry-After`, CSRF refusals, open-redirect return paths, sign-out, session
+fixation, reset non-enumeration, single-use and expired reset links, sessions
+revoked on reset, the sign-in redirect) and `tests/authentication_postgres.rs`
+(`setup` refusing password arguments and short passwords, creating one owner
+and refusing afterwards, concurrent `setup` runs creating exactly one tenant,
+and reset redemption against PostgreSQL). With `FORGE_TEST_DATABASE_URL` the
+slow scaffold test also runs `setup` and `seed` and drives a browser session
+over HTTP against the running server: sign-in redirect, sign-in, tenant
+scaffold pages, sign-out, revoked session; a second slow test restores the
+pages with `forge generate authentication`. `forge-cli` unit tests check that
+the generator's files are byte-identical to `forge new`'s and its refusals.
 
 Phase 1 additionally builds every generated application's multi-stage Dockerfile,
 inspects the final image for non-root identity and forbidden build contents, starts
@@ -226,3 +250,38 @@ is reported as passed only when the recorded command exits successfully.
 
 See [architecture](architecture.md), [performance targets](performance-targets.md),
 and [dependency policy](dependency-policy.md).
+
+## Rate limiting, cache and storage tests
+
+Each of `forge-ratelimit`, `forge-cache` and `forge-storage` ships its
+conformance suite behind a `testing` feature so a new store passes the same
+guarantees, plus negative tests that mirror the Forge-Go reviews:
+
+- **Rate limiting:** the limit and remaining count, independent keys, window
+  reset, retry-after, 160 concurrent hits allowing exactly the limit, invalid
+  keys, pruning of expired buckets only; bounded memory under a flood of distinct
+  keys (`EvictSoonest`, `Deny`); `429` with `Retry-After`, HTML for browsers,
+  `503` when the limiter fails and only `fail_open` lets requests through;
+  spoofed `X-Forwarded-For`/`X-Real-IP`/`Forwarded` buying no fresh bucket; IPv6
+  `/64` keying; database pruning bounded per call and under 1500 hits of new,
+  instantly expiring keys.
+- **Cache:** the store contract (copies, binary and empty values, expiry,
+  overwrite, default ttl, invalid keys/values/ttls, entry bound), 24 concurrent
+  misses computing once, a cancelled or panicking leader never failing its
+  waiters, errors never cached, store outages degrading to a miss without logging
+  keys or values, length-prefixed key collisions (namespace included), tenant
+  keys, undecodable JSON as a miss, keys stored only as hashes, and the entry bound
+  after 2000 writes of new keys.
+- **Storage:** key traversal impossible by construction, symlinks planted below
+  and in place of storage directories, a symlinked metadata file, atomic writes
+  and `tmp/` hygiene, 0600/0750, tampered/expired/duplicated/percent-encoded/
+  forged/bound/rotated signatures with the store never reached, active content and
+  polyglots served as sandboxed downloads, header injection through stored
+  metadata, disguised types refused on the sniffed bytes, the body cap, the
+  repeated text-field budget, cleanup after a store failure, and a strict
+  multipart parser table plus a differential/mutation test.
+
+The SQLite suites always run. PostgreSQL, MySQL and MariaDB suites are
+`#[ignore]`d unless requested with `-- --include-ignored` and
+`FORGE_TEST_DATABASE_URL`, `FORGE_TEST_MYSQL_URL` or `FORGE_TEST_MARIADB_URL`
+(the same convention as `forge-db`).

@@ -3,6 +3,7 @@
 - Status: Accepted
 - Date: 2026-10-19
 - Refines: [ADR 0022](0022-server-rendered-views.md) (decision 7), [ADR 0021](0021-selectable-database-backends.md), [ADR 0010](0010-session-and-tenant-authorization-context.md)
+- Refined by: [ADR 0026](0026-authentication-pages-and-setup.md) (printed tenant policy grants the `owner` role; signed-out browsers redirected to sign in)
 
 ## Context
 

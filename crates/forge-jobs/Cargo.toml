@@ -1,0 +1,39 @@
+[package]
+name = "forge-jobs"
+publish = false
+description = "Durable PostgreSQL jobs, workers and cron schedules for Forge applications"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+forge-config = { path = "../forge-config" }
+forge-core = { path = "../forge-core", features = ["postgres"] }
+forge-db = { path = "../forge-db", features = ["postgres"] }
+forge-security = { path = "../forge-security" }
+forge-tenancy = { path = "../forge-tenancy" }
+getrandom.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx = { workspace = true, features = ["postgres"] }
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[features]
+# `testing::RlsTestDatabase`: an isolated PostgreSQL database with separate
+# migrator and runtime roles, for integration tests.
+testing = ["forge-db/testing"]
+
+[dev-dependencies]
+forge-auth = { path = "../forge-auth" }
+# Integration tests (tests/) use the `testing` fixture.
+forge-jobs = { path = ".", features = ["testing"] }
+forge-db = { path = "../forge-db", features = ["postgres", "testing"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,31 @@
+[package]
+name = "forge-events"
+publish = false
+description = "Versioned integration events, a transactional PostgreSQL outbox and idempotent consumers for Forge applications"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+forge-core = { path = "../forge-core", features = ["postgres"] }
+forge-db = { path = "../forge-db", features = ["postgres"] }
+forge-jobs = { path = "../forge-jobs" }
+forge-tenancy = { path = "../forge-tenancy" }
+serde.workspace = true
+serde_json.workspace = true
+sqlx = { workspace = true, features = ["postgres"] }
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+forge-auth = { path = "../forge-auth" }
+forge-jobs = { path = "../forge-jobs", features = ["testing"] }
+forge-security = { path = "../forge-security" }
+
+[lints]
+workspace = true

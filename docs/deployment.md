@@ -127,7 +127,17 @@ from env files, Kubernetes manifests and unit files.
 | `FORGE_LOG` | `info` | `tracing` filter directive, for example `info,shop=debug`. |
 | `FORGE_LOG_FORMAT` | `json` in production, `text` otherwise | `json` or `text`. |
 | `FORGE_DATABASE_URL` | none | Least-privilege PostgreSQL runtime connection URL. Treated as a secret and redacted from ordinary diagnostics. |
-| `FORGE_MIGRATION_DATABASE_URL` | none | PostgreSQL schema-owner/migration URL used only by `migrate` and `rollback`. Treated as a secret and redacted. |
+| `FORGE_MIGRATION_DATABASE_URL` | none | PostgreSQL schema-owner/migration URL used only by `migrate`, `rollback` and application commands such as `setup` and `seed`. Treated as a secret and redacted. |
+| `FORGE_SETUP_PASSWORD` | none | Owner password read only by `setup` when it is neither typed nor piped with `--password-stdin`. Never set it for the serving process. |
+| `FORGE_RATE_LIMIT_MAX_KEYS` | `100000` | Live buckets of the in-memory rate limiter, `1` to `10000000` ([rate limiting](rate-limiting.md)). |
+| `FORGE_CACHE_MAX_ENTRIES` | `10000` | Entry bound of every cache ([caching](caching.md)). |
+| `FORGE_CACHE_MAX_BYTES` | `67108864` | Memory bound of the in-memory cache; at least `FORGE_CACHE_MAX_VALUE_BYTES` plus `4096`. |
+| `FORGE_CACHE_MAX_VALUE_BYTES` | `1048576` | Largest cached value, at most `8388608`. |
+| `FORGE_CACHE_DEFAULT_TTL_SECS` | `3600` | Time to live of cache writes that pass none, `1` to `31536000`. |
+| `FORGE_STORAGE_ROOT` | none | Directory of the disk storage adapter; storage is unused when unset. In `production` it must be an absolute path on a persistent volume ([storage](storage.md)). |
+| `FORGE_STORAGE_SIGNING_KEY` | none | HMAC key of signed links: unpadded base64url of 32 to 1024 random bytes. Redacted. **Required in `production` whenever `FORGE_STORAGE_ROOT` is set**; there is no default key. |
+| `FORGE_STORAGE_MAX_UPLOAD_BYTES` | `524288` | Largest uploaded file, at most `1073741824`; when storage is configured it must not exceed `FORGE_MAX_BODY_BYTES`. |
+| `FORGE_STORAGE_LINK_TTL_SECS` | `900` | Default lifetime of signed links, `1` to `604800`. |
 
 Logs go to standard output, and the platform (Docker, Kubernetes, journald)
 collects them. The HTTP layer also enforces a header-read timeout and adds

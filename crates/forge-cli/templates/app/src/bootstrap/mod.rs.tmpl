@@ -6,8 +6,19 @@
 //! The database backend is declared once below. Forge owns the connection pool,
 //! runs the embedded migrations (`migrate`, `rollback`) and reports database
 //! readiness. SQLx is confined to this outer composition/infrastructure boundary.
+//! The `seed` command (and `setup`, with the sign-in pages) runs with the
+//! migration credential, `FORGE_MIGRATION_DATABASE_URL`.
 %%end%%
 
+%%if database%%
+pub mod seeds;
+%%end%%
+%%if authentication%%
+pub mod setup;
+%%end%%
+%%if database%%
+
+%%end%%
 use std::process::ExitCode;
 
 /// Runs the command selected on the command line (serve by default).
@@ -29,6 +40,12 @@ pub fn run() -> ExitCode {
 %%if !views%%
         .routes(crate::adapters::http::routes)
 %%end%%
+%%if authentication%%
+        .command("setup", setup::SUMMARY, setup::run)
+%%end%%
+%%if database%%
+        .command("seed", seeds::SUMMARY, seeds::run)
+%%end%%
         .run()
 }
 %%if views%%
@@ -39,6 +56,41 @@ pub fn run() -> ExitCode {
 fn compose(composition: &mut forge::Composition<'_>) -> Result<(), forge::ComposeError> {
     let site = crate::adapters::http::site(composition.router())?;
     crate::adapters::http::routes(composition.router(), &site)?;
+%%if authentication%%
+    // Sign-in, sign-out and password-reset pages (ADR 0026), with the
+    // PostgreSQL identity stores, Argon2id, per-process attempt throttles and
+    // a reset notifier that delivers nothing until a mailer adapter replaces
+    // it. Signed-out browsers asking for a protected page are sent to sign in.
+    let pool = composition.postgres()?.pool().clone();
+    let throttle = || {
+        forge::auth::MemoryLoginThrottle::new(forge::auth::ThrottleConfig::default())
+            .map(std::sync::Arc::new)
+            .map_err(forge::ComposeError::other)
+    };
+    let ports = crate::adapters::http::authentication::AuthenticationPorts {
+        credentials: std::sync::Arc::new(
+            crate::infrastructure::auth::PostgresPasswordCredentialStore::new(pool.clone()),
+        ),
+        hasher: std::sync::Arc::new(crate::infrastructure::security::Argon2idPasswordHasher),
+        sessions: std::sync::Arc::new(crate::infrastructure::auth::PostgresSessionStore::new(
+            pool.clone(),
+        )),
+        memberships: std::sync::Arc::new(crate::infrastructure::tenancy::PgMembershipStore::new(
+            pool.clone(),
+        )),
+        tenants: std::sync::Arc::new(crate::infrastructure::accounts::PgTenantDirectory::new(
+            pool.clone(),
+        )),
+        resets: std::sync::Arc::new(crate::infrastructure::accounts::PgPasswordResetStore::new(
+            pool.clone(),
+        )),
+        notifier: std::sync::Arc::new(forge::auth::UndeliverablePasswordResets),
+        audit: std::sync::Arc::new(crate::infrastructure::audit::PgAuditSink::new(pool)),
+        sign_in_throttle: throttle()?,
+        reset_throttle: throttle()?,
+    };
+    crate::adapters::http::authentication::routes(composition, &site, ports)?;
+%%end%%
     Ok(())
 }
 %%end%%

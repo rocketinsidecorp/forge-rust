@@ -1,0 +1,19 @@
+{% extends "layouts/application.html" %}
+
+{% block content %}
+<h1>Forgot your password?</h1>
+{% if let Some(error) = error %}<p class="flash flash-alert" role="alert">{{ error }}</p>{% endif %}
+<form action="/passwords" method="post">
+  {{ csrf_field|safe }}
+  <div>
+    <label for="password_tenant">Organization</label>
+    <input type="text" id="password_tenant" name="tenant" value="{{ tenant }}" required autocomplete="organization" autocapitalize="none" spellcheck="false" maxlength="63">
+  </div>
+  <div>
+    <label for="password_email">Email</label>
+    <input type="email" id="password_email" name="email" value="{{ email }}" required autocomplete="username" maxlength="320">
+  </div>
+  <button type="submit">Email reset instructions</button>
+</form>
+<p><a href="/session/new">Back to sign in</a></p>
+{% endblock %}

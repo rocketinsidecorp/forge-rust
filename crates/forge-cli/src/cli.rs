@@ -79,6 +79,16 @@ pub(crate) enum Command {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum GenerateCommand {
+    /// Add sign-in, sign-out and password-reset pages and the `setup`
+    /// command to a full-stack PostgreSQL application (like `rails generate
+    /// authentication`; `forge new` already includes them). Writes only new
+    /// files and prints the wiring to add by hand.
+    Authentication {
+        /// List the files that would be created and the wiring, without
+        /// writing anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Create a reversible SQL migration in migrations/.
     Migration {
         /// Human-readable migration name.

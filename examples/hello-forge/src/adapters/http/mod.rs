@@ -35,6 +35,7 @@ pub fn routes(router: &mut Router, site: &Arc<Site>) -> Result<(), ComposeError>
 fn index(site: &Site, request: &Request) -> Response {
     forge::web::html(&WelcomeIndex {
         layout: site.layout(request, "Welcome"),
+        logo: site.logo(),
         application: env!("CARGO_PKG_NAME"),
         version: env!("CARGO_PKG_VERSION"),
     })

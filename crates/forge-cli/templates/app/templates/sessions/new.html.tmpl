@@ -1,0 +1,28 @@
+{% extends "layouts/application.html" %}
+
+{% block content %}
+<h1>Sign in</h1>
+{% if signed_in %}
+<p>You are signed in. Sign in again to switch accounts, or sign out.</p>
+{% include "sessions/_sign_out.html" %}
+{% endif %}
+{% if let Some(error) = error %}<p class="flash flash-alert" role="alert">{{ error }}</p>{% endif %}
+<form action="/session" method="post">
+  {{ csrf_field|safe }}
+  {% if !return_to.is_empty() %}<input type="hidden" name="return_to" value="{{ return_to }}">{% endif %}
+  <div>
+    <label for="session_tenant">Organization</label>
+    <input type="text" id="session_tenant" name="tenant" value="{{ tenant }}" required autocomplete="organization" autocapitalize="none" spellcheck="false" maxlength="63">
+  </div>
+  <div>
+    <label for="session_email">Email</label>
+    <input type="email" id="session_email" name="email" value="{{ email }}" required autocomplete="username" maxlength="320">
+  </div>
+  <div>
+    <label for="session_password">Password</label>
+    <input type="password" id="session_password" name="password" required autocomplete="current-password" maxlength="1024">
+  </div>
+  <button type="submit">Sign in</button>
+</form>
+<p><a href="/passwords/new">Forgot your password?</a></p>
+{% endblock %}

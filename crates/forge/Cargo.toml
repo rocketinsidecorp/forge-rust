@@ -14,7 +14,12 @@ forge-auth = { path = "../forge-auth" }
 forge-config = { path = "../forge-config" }
 forge-core = { path = "../forge-core" }
 forge-db = { path = "../forge-db" }
+forge-events = { path = "../forge-events", optional = true }
 forge-http = { path = "../forge-http" }
+forge-jobs = { path = "../forge-jobs", optional = true }
+forge-cache = { path = "../forge-cache", optional = true }
+forge-ratelimit = { path = "../forge-ratelimit", optional = true }
+forge-storage = { path = "../forge-storage", optional = true }
 forge-security = { path = "../forge-security" }
 forge-tenancy = { path = "../forge-tenancy" }
 forge-views = { path = "../forge-views", optional = true, default-features = false, features = ["runtime"] }
@@ -24,20 +29,41 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+# Turning terminal echo off while `setup` reads a password (ADR 0026).
+rustix = { version = "1.1.5", default-features = false, features = ["std", "termios"] }
+
 [features]
 default = ["postgres"]
 # Database backends, additive: enable the ones the application declares.
-postgres = ["forge-db/postgres"]
+postgres = ["forge-db/postgres", "forge-ratelimit?/postgres", "forge-cache?/postgres"]
 # MySQL 8.4+ and MariaDB 11.4+.
-mysql = ["forge-db/mysql"]
-sqlite = ["forge-db/sqlite"]
+mysql = ["forge-db/mysql", "forge-ratelimit?/mysql", "forge-cache?/mysql"]
+sqlite = ["forge-db/sqlite", "forge-ratelimit?/sqlite", "forge-cache?/sqlite"]
 # `Composition::for_testing` and `forge::db::testing::TestDatabase`.
-testing = ["forge-db/testing"]
+testing = ["forge-db/testing", "forge-jobs?/testing"]
 # Server-rendered views (ADR 0022): `forge::views` and `forge::web::html`.
 views = ["dep:forge-views"]
+# Durable PostgreSQL jobs, workers and cron schedules (ADR 0025):
+# `forge::jobs`, `App::jobs` and the `jobs` subcommands.
+jobs = ["postgres", "dep:forge-jobs"]
+# Transactional outbox and idempotent consumers (ADR 0025): `forge::events`
+# and `App::events`.
+events = ["jobs", "dep:forge-events"]
+# Rate limiting (ADR 0027), application cache (ADR 0028) and file storage
+# (ADR 0029). The database stores follow the backend features above.
+ratelimit = ["dep:forge-ratelimit"]
+cache = ["dep:forge-cache"]
+storage = ["dep:forge-storage"]
+
+[[example]]
+name = "services"
+required-features = ["ratelimit", "cache", "storage"]
 
 [dev-dependencies]
+async-trait.workspace = true
 bytes.workspace = true
+forge-db = { path = "../forge-db", features = ["testing"] }
 sqlx = { workspace = true, features = ["macros"] }
 tempfile.workspace = true
 serde_json.workspace = true

@@ -172,11 +172,13 @@ UPDATE, or DELETE them, and a database trigger rejects audit-row mutation. This
 does not claim tamper-evident cryptographic integrity or immutable external
 storage.
 
-Remaining Phase 3 threat-model controls are not claimed complete: per-account and
-per-origin credential throttling, turnkey HTTP login/logout/tenant-selection
-composition, audit integrity chaining/retention and privileged reader workflows,
-and administrative cross-tenant role separation still require implementation and
-abuse tests.
+Per-account and per-source credential throttling and the HTTP
+sign-in/sign-out/password-reset composition are now generated
+([browser authentication review](#browser-authentication-review)). Remaining
+Phase 3 threat-model controls are not claimed complete: a shared (multi-process)
+throttle, password-reset delivery, MFA, audit integrity chaining/retention and
+privileged reader workflows, and administrative cross-tenant role separation
+still require implementation and abuse tests.
 
 ## Server-rendered views review
 
@@ -205,8 +207,110 @@ refuse legitimate requests behind `Host`-rewriting proxies for browsers without
 Fetch Metadata; `__Host-` cookies require HTTPS outside `localhost`; a full-stack
 router requires the token on JSON endpoints too (no reviewed exemption mechanism
 yet); multipart forms are not parsed and must send the header. Login-time
-binding of the form token to the session (ADR 0023) remains application code
-until the authentication routes slice.
+binding of the form token to the session (ADR 0023) is done by the generated
+sign-in page (below).
+
+## Browser authentication review
+
+Review date: 2026-10-19
+([ADR 0026](adr/0026-authentication-pages-and-setup.md)). Scope: the
+generated sign-in, sign-out and password-reset pages, the `setup` and `seed`
+commands, and the framework rules they rely on.
+
+| Threat | Control | Verification |
+| --- | --- | --- |
+| Online password guessing and credential stuffing | Attempts counted before any credential check against the canonical login (whatever organization or letter case is typed), the source (socket peer, IPv6 per /64) and the pair: 5 per login and source, 50 per login, 300 per source in 15 minutes (`MemoryLoginThrottle`); `429` with `Retry-After`; success clears the pair and login counters, not the source; Argon2id | `forge-auth` throttle tests; generated `attempts_are_throttled_even_with_the_right_password`, `letter_case_and_unicode_variants_do_not_get_fresh_guesses` |
+| Throttle as a denial of service | One source cannot lock a login out for others (the tight limit is per login and source); a full table evicts the oldest idle counters instead of refusing everyone, and keeps blocking ones | `one_source_cannot_lock_a_login_out_for_other_sources`, `a_full_table_evicts_idle_counters_and_keeps_blocking_ones` |
+| Look-alike (Unicode) logins | `CanonicalLogin` refuses non-ASCII logins at the boundary (storage, lookup, throttle keys); reset links are delivered to the login as stored, never as typed | `forge-auth` login tests; `reset_links_go_to_the_stored_login_and_look_alikes_get_nothing` |
+| Timing oracle on reset requests and sign-in | Reset requests are queued to a bounded lifecycle-owned worker and answered after at least 100 ms; sign-in runs the tenant and membership lookups with random identifiers for malformed or unknown organizations; unknown reset tokens are refused before Argon2id | `reset_requests_take_the_same_minimum_time`, `sign_in_looks_up_a_membership_whatever_the_organization`, `unknown_reset_tokens_are_refused_before_hashing` |
+| Account and tenant enumeration | One `422` message for a wrong organization, email or password, a disabled account or an inactive membership; unknown logins still cost one Argon2id hash; reset requests answer the same `303` and flash whether or not the account exists or the link was delivered | `every_wrong_field_gets_the_same_answer`, `reset_requests_answer_the_same_whether_or_not_the_account_exists` |
+| Login CSRF and forged sign-out | Handlers refuse (`403`) unless `CsrfProtection` verified the request (`csrf_verified`); the sign-in form's token is issued before any session; sign-out also checks the session-bound CSRF token (ADR 0014) | `sign_in_without_the_csrf_token_is_forbidden`, `signing_out_needs_the_csrf_token_and_revokes_the_session` |
+| Session fixation and token planting | Sign-in issues a new server-side session and a new CSRF token in fresh cookies and revokes the session the browser held; sign-out and reset clear the session cookie and rotate the CSRF token | `signing_in_issues_a_fresh_session_and_csrf_token_and_returns_to_the_page`, `signing_in_again_revokes_the_previous_session` |
+| Open redirect through `return_to` | `return_path` accepts only local paths (single leading `/`, visible ASCII, no backslash, at most 2048 bytes) when rendering, posting and redirecting; `see_other` re-checks | `forge-views` return-path tests; `return_paths_off_the_site_are_ignored` |
+| Reset token theft or replay | 256-bit CSPRNG token, SHA-256 digest persisted, single use (row lock, every outstanding token of the account used up), 15-minute expiry, bound to principal and tenant membership, never logged or in `Debug`; reset pages `no-store` and `Referrer-Policy: no-referrer`; every session revoked on reset | `forge-auth` token tests; `a_reset_link_works_once_changes_the_password_and_revokes_sessions`; PostgreSQL `reset_tokens_work_once_expire_and_revoke_every_session` |
+| Takeover through `setup` | Runs only with the migration credential, one transaction under an advisory lock, refuses once any tenant exists; password never an argument (`--password-stdin`, `FORGE_SETUP_PASSWORD` or an echo-off prompt), at least 12 characters, never printed; audited | `setup_creates_one_owner_who_can_sign_in_and_refuses_afterwards`, `concurrent_setups_create_exactly_one_tenant`, `setup_refuses_password_arguments_and_short_passwords_before_touching_a_database` |
+| Signed-out browser leaks a protected page | Access policies answer `401`; `SignInRedirect` turns it into a `303` to sign in for HTML clients only; JSON keeps `401` | `forge-views` sign-in redirect tests; `signed_out_browsers_are_sent_to_sign_in_and_api_clients_get_401`; slow scaffold e2e |
+
+Residual risks: throttle counters live in one process (a restart or several
+replicas multiply the budget; a shared store is a follow-up); the source key
+is the socket peer, so clients behind one proxy share a budget and Forge does
+not trust `X-Forwarded-For`; an attacker who controls 50 sources (or /64s)
+can still keep one known login throttled for 15 minutes at a time, and one
+with very many sources can fill the table with blocking counters, after
+which new attempts are refused until counters expire; a full reset queue
+drops requests (logged), so a flood can delay legitimate resets; the reset
+worker's database load still depends on whether accounts exist, observable
+only through server load; sign-in still does slightly more work (session
+issuance) when it succeeds; until a mailer adapter replaces
+`UndeliverablePasswordResets`, reset links are not delivered and the failure is
+only logged; MFA is not implemented; a session lasts 24 hours without
+idle expiry.
+
+## Phase 4 review: jobs, schedules and the outbox
+
+Review date: 2026-10-19 ([ADR 0025](adr/0025-durable-jobs-scheduler-and-outbox.md),
+[jobs guide](jobs.md)).
+
+| Threat | Control | Verification |
+| --- | --- | --- |
+| Secrets or personal data in payloads leak through logs, errors or operator output | Payloads are JSON in the database only; logs carry job/event id, name, queue and attempt, never payloads; panic messages and decode errors are not recorded, and a process-wide panic hook installed once by the job runtime withholds the message of panics raised inside job attempts and outbox publications from stderr (other panics reach the previous hook unchanged); operator commands never print payloads; envelope `Debug` omits the payload; documentation requires references instead of secrets | `forge-jobs`/`forge-events` unit tests (sanitized errors, payload-free `Debug`); panic test asserts the stored message is generic; `tests/panic_redaction.rs` asserts attempt panics never reach the previous hook |
+| Log forging through handler error messages | Stored/logged messages truncated to 1024 bytes and control characters replaced | `job` and dispatcher sanitizer tests |
+| Cross-tenant job or event access | `tenant_id` + RLS policy identical to ADR 0011 (malformed scope fails closed); runtime role has only `SELECT, INSERT`; tenant jobs require an authorized `TenantContext` at enqueue and a matching transaction scope (tenant and principal); the worker reinstalls the job's scope for the handler; idempotency keys are unique per tenant | `row_level_security_isolates_tenants_and_workers_restore_the_scope`, `tenant_events_are_isolated_by_row_level_security` (non-superuser, non-owner runtime role) |
+| Cross-tenant reads and changes through the worker path | Cross-tenant operations exist only as `SECURITY DEFINER` functions with fixed semantics (`EXECUTE` revoked from `PUBLIC`, `search_path` pinned with `pg_temp` last, argument bounds checked). They **are** cross-tenant reads: `forge_jobs_claim` and `forge_outbox_claim` return full payloads of every tenant, and `stats`/`dead` return other tenants' metadata and error messages. Mitigations: every one of them except the lease-fenced `forge_jobs_complete` refuses to run in a transaction carrying `forge.tenant_id` (a request-serving scope); with `forge.worker_role` they are granted only to a separate worker/operator role, and the request-serving runtime role keeps only `forge_jobs_complete` | `schema_reverts_cleanly_and_grants_least_privilege` (grants, denied writes/DDL, pinned search paths); `worker_functions_refuse_tenant_scope_and_can_be_split_from_the_runtime_role`; `dispatcher_functions_refuse_tenant_scope_and_can_be_split_from_the_runtime_role` |
+| Stale or partitioned worker double-completes a reclaimed job | Fenced lease tokens on every transition; lease renewal cancels attempts that lost their lease; `complete_in` commits completion with effects | `expired_leases_are_reclaimed_and_stale_workers_are_fenced_out`, `transactional_completion_is_fenced_and_rolls_back`, `stale_dispatchers_are_fenced_out` |
+| Poison jobs (crash, hang, panic, malformed payload) | Per-attempt timeout; panic isolation per task; lease-expiry reclaim counts the attempt; attempt ceiling then `dead`; undecodable payload or invalid stored scope fails permanently | timeout/panic and lease-expiry dead-letter tests |
+| Queue flooding / resource exhaustion | Bounded per-queue concurrency (≤ 256) and claim batches; payload ≤ 256 KiB; no in-memory queues; bounded pruning batches; idempotency keys for deduplication | registration/settings tests; pruning test |
+| Duplicate side effects from at-least-once delivery | Inbox `(consumer, event_id)` recorded in the effect transaction; concurrent duplicates serialize on the row | `concurrent_duplicate_deliveries_record_one_first_delivery`, end-to-end ledger test |
+| Duplicate cron firing across replicas | Conditional upsert of `last_tick_at` plus per-tick idempotency key, in one transaction | `two_schedulers_fire_each_tick_exactly_once` |
+
+Residual risks: whichever role runs the workers (the runtime role unless
+`forge.worker_role` names a separate one) can read every tenant's payloads
+through the claim functions and claim, retry or discard any job or event; in
+the default single-role setup that is the request-serving process, so
+deployments with strict isolation needs should run `jobs work` with a
+separate worker role and `WorkerMode::Dedicated`. The tenant-scope refusal is
+defense in depth against application bugs, not against a compromised process
+(which can simply omit the setting). Tenant membership is not re-checked when
+a job runs, so revocation does not cancel already enqueued work; dead-job
+error messages are visible across tenants to operators; there are no
+per-tenant quotas or rate limits on enqueueing yet.
+
+## Rate limiting, cache and file storage review
+
+Review date: 2026-10-19 ([ADR 0027](adr/0027-rate-limiting.md),
+[ADR 0028](adr/0028-cache.md), [ADR 0029](adr/0029-file-storage.md); guides:
+[rate limiting](rate-limiting.md), [caching](caching.md), [storage](storage.md)).
+Ported from the reviewed Forge-Go design; the controls and negative tests are the
+same unless a difference is stated.
+
+| Threat | STRIDE | Control | Verification |
+| --- | --- | --- | --- |
+| Limiter key spoofing: a client rotates a forwarded header or address to get a fresh bucket per request | S, D | `by_remote_addr` uses only the TCP peer address, never `X-Forwarded-For`, `X-Real-IP` or `Forwarded`; IPv6 clients are keyed by `/64`. The key function documents that its result must not be client-chosen. **Residual:** behind a reverse proxy every client shares the proxy's bucket until the application keys by an authenticated value or its own proxy-overwritten header; Forge has no trusted-proxy policy yet | spoofed-header test proves the limit holds; `/64` test |
+| Limiter memory exhaustion by distinct keys | D | `MemoryLimiter` is bounded by `max_keys` (deadline-ordered expiry, no task); `EvictSoonest` never refuses new clients, `Deny` never drops a counter; counters saturate. Shared stores keep one 64-character-key row per live bucket and prune in bounded batches after every `prune_batch` hits. **Residual:** with `EvictSoonest`, more than `max_keys` distinct keys in one window can reset other clients' counters, so never key it on attacker-choosable per-target values (use `Deny` or a database limiter) | flood test keeps `len == max_keys`; `Deny` keeps counters; sustained-keys pruning test per backend |
+| Limiter bypass or outage when its store fails | D, E | The middleware fails closed (`503`); `fail_open` is an explicit per-route choice; limiter errors are logged server-side, never returned | fail-closed/open test; error text never contains SQL or keys |
+| Personal data in limiter storage | I | Keys are SHA-256 digests of length-prefixed (scope, window, identifier); addresses and e-mail addresses are never stored | key and recording-limiter tests |
+| Concurrent hits over-admitted | E | One atomic statement per hit (MySQL: upsert and read in one transaction) | 160 concurrent hits allow exactly `N` on every store |
+| Unbounded or stale cache growth | D | Entries, value size, key size and ttl are bounded; memory also by bytes; database stores prune expired entries and evict the oldest writes in bounded batches. **Residual:** the database entry bound is soft but tight (about `prune_batch` per writing process) | entry-bound, bounded-prune and sustained-write tests per backend |
+| Cache poisoning through attacker-influenced keys or values | T, E | Keys built with `key` (length-prefixed parts and namespace); an undecodable entry is a miss; values are copied. **Residual (application):** whoever can write the table can poison every replica; per-user data must carry the user in the key | key-collision matrix, JSON-miss tests |
+| Cross-tenant cache reads | I, E | `tenant_key` derives the key from an authorized `TenantContext`, never a bare id | distinct tenants/same principal tests |
+| Secrets or identifiers leaked through the cache | I | Rows hold `SHA-256(key)`; keys and values are never logged and errors never contain them | log-capture test; hashed-key test per backend |
+| Thundering herd on a cold key | D | `fetch` collapses concurrent misses in a process; a dropped or panicking leader never fails waiters, who take over. Across replicas the herd is not collapsed (documented) | 24 concurrent misses compute once; cancelled/panicking leader tests |
+| Upload abuse: oversized bodies, many files or fields | D | `receive` caps the body, bounds files, text-field count (every repetition counts) and bytes, and header sizes; the server body limit bounds buffering and `FORGE_STORAGE_MAX_UPLOAD_BYTES` cannot exceed it. **Residual:** bodies are buffered (up to `FORGE_MAX_BODY_BYTES`) until `forge-http` streams; disk space is not metered per user | oversized, body-cap, repeated-field (1500 values) and header-budget tests |
+| Hostile multipart framing: smuggled parts, re-encoded content, duplicate headers, preamble/epilogue tricks | T, S | A strict parser: no preamble/epilogue/padding/folding, one disposition, identity encodings only, bounded headers and names | rejection table, differential and mutation tests |
+| Hostile file content: HTML, SVG or script uploaded as an image; polyglots | T, E | A mandatory allow-list decided on the type **sniffed from the bytes**, not the label; labels that need a signature must match it; text labels need text content. Served as downloads (`attachment`, `nosniff`, sandboxing CSP) except raster images explicitly requested inline. **Residual:** the sniffer reads 512 bytes, so a valid image with appended active content is still an image to a browser; use a separate origin for user files and do not widen `inline_types`; no malware scanning | disguised-type table, polyglot, inline tests |
+| Path traversal and symlink escape in the disk adapter | T, I, E | `StorageKey` makes `..`, hidden files, separators, drive letters and escapes unrepresentable; every component is opened with `openat` and `O_NOFOLLOW` against descriptors opened at startup, so there is no check-then-use window | traversal-key, planted-symlink (file, directory, metadata), replaced-directory and startup-link tests |
+| Partial or torn files after a crash or concurrent overwrite | T | Temp file, `fsync`, `rename`; a failed or oversized write leaves the old blob; orphaned temp files are bounded by `prune_temp`; a multi-file upload is staged then published as one unit, so a cancelled request leaves no committed blob and a failed overwrite keeps the previous metadata | concurrent-overwrite test never observes a torn write; cancelled-upload and failed-overwrite tests |
+| Client-chosen file name used as a path or header | T | Keys are UUIDv7; the name is sanitized and encoded (RFC 5987 for non-ASCII); invalid header values are dropped | sanitizer table; header-injection test through stored metadata |
+| Signed link tampering or forgery | S, T, E | HMAC-SHA256 over key, expiry, disposition and binding with a 32-byte-minimum key, constant-time comparison against every key; strict parameter parsing with no second spelling | other key, extended expiry, added inline, duplicate and malformed parameters, percent-encoding, short/padded signature tests |
+| Signed link replay: a leaked or forwarded link works until it expires | I | A link is a bearer capability. Default 15 minutes, maximum 7 days; `Cache-Control: private` for at most the remaining lifetime; `binding` ties a link to a principal; rotating the key revokes all links. **Residual:** within its lifetime an unbound link works for anyone who holds it, and links are logged like any URL | binding and rotation tests |
+| Existence oracle for stored keys | I | Signature, expiry and binding are checked before the store is consulted; unsigned and forged requests get the same `403` whether the key exists or not | store-call counter stays zero for every invalid form |
+| Missing or weak signing key | S, E | No default key; configuration requires canonical base64url of 32 to 1024 bytes and, in production, a key whenever storage is configured; the key is redacted and never echoed | config and signer tests |
+| Stored XSS from served files | T, I | Active content never renders on the application origin: every response is `nosniff` with `default-src 'none'; sandbox` | active-content table |
+
+Residual risks beyond the rows above: the disk adapter assumes a trusted volume
+(an attacker with write access can still delete or corrupt blobs, though not
+escape the root); `MemoryLimiter` and `MemoryCache` state is per process;
+byte-range serving is not available.
 
 ## Review cadence
 

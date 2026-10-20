@@ -173,6 +173,8 @@ After validation, review version-control status and the final diff. Never state 
 - security impact reviewed;
 - generated examples/docs match implementation;
 - README.md carries copyable commands to create, run and use every user-facing feature (owner decision, 2026-10-19);
+- feature parity: every user-facing capability also exists in the sibling framework (forge-go) with the same commands, names and style, or a tracked follow-up says when (owner decision, 2026-10-20);
+- the pull request passed the Claude Code Review (`@claude review`) with no unresolved blocking findings before merging to main, including a check for malicious or exfiltrating code: unexpected network calls, access to credentials, wallets or crypto keys, obfuscated code, build scripts/proc macros and new dependencies (owner decision, 2026-10-20);
 - targeted tests pass;
 - relevant workspace gates pass;
 - build passes when applicable;

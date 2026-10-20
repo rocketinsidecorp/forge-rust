@@ -118,7 +118,9 @@ impl ContentSecurityPolicy {
 
 /// As a request layer, the policy is applied to every response that does not
 /// already carry a `Content-Security-Policy` (an SVG asset keeps its own
-/// sandboxing policy), so no HTML page can be served without it:
+/// sandboxing policy), so no HTML page can be served without it. A
+/// `Referrer-Policy` the handler set is kept (for example `no-referrer` on a
+/// page whose URL carries a password reset token):
 ///
 /// ```
 /// let mut router = forge_http::Router::new();
@@ -132,7 +134,13 @@ impl Middleware for ContentSecurityPolicy {
                 .headers()
                 .contains_key(header::CONTENT_SECURITY_POLICY)
             {
+                let referrer = response.headers().get(header::REFERRER_POLICY).cloned();
                 self.apply(&mut response);
+                if let Some(referrer) = referrer {
+                    response
+                        .headers_mut()
+                        .insert(header::REFERRER_POLICY, referrer);
+                }
             }
             response
         })
@@ -250,9 +258,21 @@ mod tests {
             })
             .expect("route");
 
+        router
+            .route(Method::GET, "/reset", |_| async {
+                let mut response = Response::empty(StatusCode::OK);
+                response.headers_mut().insert(
+                    header::REFERRER_POLICY,
+                    HeaderValue::from_static("no-referrer"),
+                );
+                response
+            })
+            .expect("route");
+
         let page = router.dispatch(get("/page")).await;
         let missing = router.dispatch(get("/missing")).await;
         let svg = router.dispatch(get("/image.svg")).await;
+        let reset = router.dispatch(get("/reset")).await;
 
         let strict = ContentSecurityPolicy::strict().header_value();
         assert_eq!(
@@ -267,6 +287,16 @@ mod tests {
             header_of(&svg, "content-security-policy"),
             Some("default-src 'none'; sandbox")
         );
+        assert_eq!(
+            header_of(&page, "referrer-policy"),
+            Some("strict-origin-when-cross-origin")
+        );
+        // A stricter policy chosen by the handler is kept.
+        assert_eq!(
+            header_of(&reset, "content-security-policy"),
+            Some(strict.as_str())
+        );
+        assert_eq!(header_of(&reset, "referrer-policy"), Some("no-referrer"));
     }
 
     #[test]

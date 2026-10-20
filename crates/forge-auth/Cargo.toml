@@ -12,7 +12,12 @@ repository.workspace = true
 async-trait.workspace = true
 forge-core = { path = "../forge-core" }
 forge-security = { path = "../forge-security" }
+getrandom.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
 
 [lints]
 workspace = true

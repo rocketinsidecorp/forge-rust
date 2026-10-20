@@ -149,6 +149,9 @@ enum Group {
     Api,
     /// Applications with a database or views.
     BuildScript,
+    /// Full-stack PostgreSQL applications: sign-in pages and `setup`
+    /// (ADR 0026). Also the files of `forge generate authentication`.
+    Authentication,
 }
 
 struct Template {
@@ -156,6 +159,20 @@ struct Template {
     content: &'static str,
     group: Group,
 }
+
+/// A binary file (an image) that `forge new` copies byte for byte: it is not
+/// rendered, so it takes no variables or conditionals.
+struct BinaryFile {
+    path: &'static str,
+    content: &'static [u8],
+    group: Group,
+}
+
+const BINARY_FILES: &[BinaryFile] = &[BinaryFile {
+    path: "assets/forge-rust-logo.png",
+    content: include_bytes!("../templates/app/assets/forge-rust-logo.png"),
+    group: Group::Views,
+}];
 
 macro_rules! template {
     ($group:expr, $path:literal => $source:literal) => {
@@ -225,6 +242,52 @@ const TEMPLATES: &[Template] = &[
         "migrations/00000000000000000002_forge_identity.down.sql" => "migrations/00000000000000000002_forge_identity.down.sql.tmpl"
     ),
     template!(
+        Group::Authentication,
+        "migrations/00000000000000000003_forge_authentication.up.sql" => "migrations/00000000000000000003_forge_authentication.up.sql.tmpl"
+    ),
+    template!(
+        Group::Authentication,
+        "migrations/00000000000000000003_forge_authentication.down.sql" => "migrations/00000000000000000003_forge_authentication.down.sql.tmpl"
+    ),
+    template!(
+        Group::Authentication,
+        "src/infrastructure/accounts/mod.rs" => "src/infrastructure/accounts/mod.rs.tmpl"
+    ),
+    template!(
+        Group::Authentication,
+        "src/adapters/http/authentication.rs" => "src/adapters/http/authentication.rs.tmpl"
+    ),
+    template!(
+        Group::Authentication,
+        "src/adapters/http/views/authentication.rs" => "src/adapters/http/views/authentication.rs.tmpl"
+    ),
+    template!(
+        Group::Authentication,
+        "templates/sessions/new.html" => "templates/sessions/new.html.tmpl"
+    ),
+    template!(
+        Group::Authentication,
+        "templates/sessions/_sign_out.html" => "templates/sessions/_sign_out.html.tmpl"
+    ),
+    template!(
+        Group::Authentication,
+        "templates/passwords/new.html" => "templates/passwords/new.html.tmpl"
+    ),
+    template!(
+        Group::Authentication,
+        "templates/passwords/edit.html" => "templates/passwords/edit.html.tmpl"
+    ),
+    template!(Group::Authentication, "src/bootstrap/setup.rs" => "src/bootstrap/setup.rs.tmpl"),
+    template!(
+        Group::Authentication,
+        "tests/authentication_http.rs" => "tests/authentication_http.rs.tmpl"
+    ),
+    template!(
+        Group::Authentication,
+        "tests/authentication_postgres.rs" => "tests/authentication_postgres.rs.tmpl"
+    ),
+    template!(Group::Database, "src/bootstrap/seeds.rs" => "src/bootstrap/seeds.rs.tmpl"),
+    template!(
         Group::Postgres,
         "src/infrastructure/audit/mod.rs" => "src/infrastructure/audit/mod.rs.tmpl"
     ),
@@ -256,6 +319,41 @@ const TEMPLATES: &[Template] = &[
     template!(Group::Ci, ".github/workflows/ci.yml" => "github/workflows/ci.yml.tmpl"),
     template!(Group::Ci, ".github/dependabot.yml" => "github/dependabot.yml.tmpl"),
 ];
+
+/// The files of the sign-in pages and `setup` (ADR 0026), exactly as
+/// `forge new` writes them for a full-stack PostgreSQL application.
+pub(crate) fn authentication_files() -> Vec<(&'static str, String)> {
+    TEMPLATES
+        .iter()
+        .filter(|template| template.group == Group::Authentication)
+        .map(|template| {
+            (
+                template.path,
+                render(template.content, &[], AUTHENTICATION_CONDITIONS),
+            )
+        })
+        .collect()
+}
+
+/// The statements `forge new` puts at the end of `compose` to wire the
+/// sign-in pages, from the comment that introduces them to the call of
+/// `authentication::routes`.
+pub(crate) fn authentication_compose_statements() -> Option<String> {
+    let bootstrap = TEMPLATES
+        .iter()
+        .find(|template| template.path == "src/bootstrap/mod.rs")?;
+    let rendered = render(bootstrap.content, &[], AUTHENTICATION_CONDITIONS);
+    let start = rendered.find("    // Sign-in, sign-out")?;
+    let call = "crate::adapters::http::authentication::routes(composition, &site, ports)?;\n";
+    let end = start + rendered[start..].find(call)? + call.len();
+    Some(rendered[start..end].to_owned())
+}
+
+const AUTHENTICATION_CONDITIONS: Conditions = Conditions {
+    docker: false,
+    database: Database::Postgresql,
+    views: true,
+};
 
 /// Modules that exist to make each ring's responsibilities discoverable.
 /// Each is a documented, empty module until a feature needs it.
@@ -595,20 +693,21 @@ fn write_application(
         ),
     ];
 
+    let enabled = |group: Group| match group {
+        Group::Always => true,
+        Group::Docker => options.docker,
+        Group::Ci => options.ci,
+        Group::Database => options.database.is_enabled(),
+        Group::Postgres => options.database == Database::Postgresql,
+        Group::PostgresDocker => options.database == Database::Postgresql && options.docker,
+        Group::Sqlite => options.database == Database::Sqlite3,
+        Group::Views => options.views,
+        Group::Api => !options.views,
+        Group::BuildScript => options.views || options.database.is_enabled(),
+        Group::Authentication => options.database == Database::Postgresql && options.views,
+    };
     for template in TEMPLATES {
-        let enabled = match template.group {
-            Group::Always => true,
-            Group::Docker => options.docker,
-            Group::Ci => options.ci,
-            Group::Database => options.database.is_enabled(),
-            Group::Postgres => options.database == Database::Postgresql,
-            Group::PostgresDocker => options.database == Database::Postgresql && options.docker,
-            Group::Sqlite => options.database == Database::Sqlite3,
-            Group::Views => options.views,
-            Group::Api => !options.views,
-            Group::BuildScript => options.views || options.database.is_enabled(),
-        };
-        if enabled {
+        if enabled(template.group) {
             let content = render(
                 template.content,
                 &variables,
@@ -619,6 +718,11 @@ fn write_application(
                 },
             );
             write_file(&root.join(template.path), &content)?;
+        }
+    }
+    for file in BINARY_FILES {
+        if enabled(file.group) {
+            write_file(&root.join(file.path), file.content)?;
         }
     }
 
@@ -633,7 +737,7 @@ fn write_application(
         }
         write_file(
             &root.join(directory).join("mod.rs"),
-            &format!("//! {description}\n"),
+            format!("//! {description}\n"),
         )?;
     }
 
@@ -703,7 +807,8 @@ struct Conditions {
 /// Substitutes template variables and evaluates nested capability conditionals.
 ///
 /// `%%if name%%` / `%%if !name%%` ... `%%end%%` blocks nest. Known names are
-/// `docker`, `views` (full-stack, not `--api`), `database` (any backend),
+/// `docker`, `views` (full-stack, not `--api`), `authentication` (full-stack
+/// PostgreSQL: sign-in pages and `setup`), `database` (any backend),
 /// `postgresql`, `mysql`, `mariadb`, `mysql_family` (MySQL or MariaDB) and
 /// `sqlite`. Unknown names are false.
 fn render(template: &str, variables: &[(&str, &str)], conditions: Conditions) -> String {
@@ -715,6 +820,7 @@ fn render(template: &str, variables: &[(&str, &str)], conditions: Conditions) ->
     let condition = |name: &str| match name {
         "docker" => docker,
         "views" => views,
+        "authentication" => views && database == Database::Postgresql,
         "database" => database.is_enabled(),
         "postgresql" => database == Database::Postgresql,
         "mysql" => database == Database::Mysql,
@@ -804,7 +910,7 @@ pub(crate) fn write_new_file(path: &Path, content: &str) -> Result<(), CliError>
         })
 }
 
-fn write_file(path: &Path, content: &str) -> Result<(), CliError> {
+fn write_file(path: &Path, content: impl AsRef<[u8]>) -> Result<(), CliError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|source| CliError::CreateDirectory {
             path: parent.to_path_buf(),
@@ -840,8 +946,8 @@ mod tests {
     }
 
     /// Reads every file below `root` except build outputs and the lockfile.
-    fn snapshot(root: &Path) -> BTreeMap<String, String> {
-        fn visit(root: &Path, directory: &Path, files: &mut BTreeMap<String, String>) {
+    fn snapshot(root: &Path) -> BTreeMap<String, Vec<u8>> {
+        fn visit(root: &Path, directory: &Path, files: &mut BTreeMap<String, Vec<u8>>) {
             let entries = fs::read_dir(directory).expect("directory should be readable");
             for entry in entries {
                 let path = entry.expect("entry should be readable").path();
@@ -856,7 +962,7 @@ mod tests {
                 if path.is_dir() {
                     visit(root, &path, files);
                 } else {
-                    let content = fs::read_to_string(&path).expect("file should be UTF-8");
+                    let content = fs::read(&path).expect("file should be readable");
                     files.insert(relative, content);
                 }
             }
@@ -864,6 +970,20 @@ mod tests {
         let mut files = BTreeMap::new();
         visit(root, root, &mut files);
         files
+    }
+
+    /// The rendered text files below `root`: the snapshot without the binary
+    /// files `forge new` copies verbatim. Every other file must be UTF-8.
+    fn text_snapshot(root: &Path) -> BTreeMap<String, String> {
+        snapshot(root)
+            .into_iter()
+            .filter(|(path, _)| !BINARY_FILES.iter().any(|file| file.path == path))
+            .map(|(path, content)| {
+                let text =
+                    String::from_utf8(content).unwrap_or_else(|_| panic!("{path} should be UTF-8"));
+                (path, text)
+            })
+            .collect()
     }
 
     #[test]
@@ -1013,10 +1133,10 @@ mod tests {
         assert!(postgres_init.contains("CREATE ROLE app_runtime"));
         assert!(postgres_init.contains("NOBYPASSRLS"));
         assert!(manifest.contains(&format!(
-            "forge = {{ git = \"https://github.com/fabriciobonjorno/forge-rust\", tag = \"v{FORGE_VERSION}\", features = [\"views\"] }}"
+            "forge = {{ git = \"https://github.com/rocketinsidecorp/forge-rust\", tag = \"v{FORGE_VERSION}\", features = [\"views\"] }}"
         )));
         assert!(manifest.contains(&format!(
-            "forge-views = {{ git = \"https://github.com/fabriciobonjorno/forge-rust\", tag = \"v{FORGE_VERSION}\", default-features = false, features = [\"build\"] }}"
+            "forge-views = {{ git = \"https://github.com/rocketinsidecorp/forge-rust\", tag = \"v{FORGE_VERSION}\", default-features = false, features = [\"build\"] }}"
         )));
 
         let dockerfile = read(&root, "Dockerfile");
@@ -1137,7 +1257,7 @@ mod tests {
         for file in POSTGRES_ONLY_FILES {
             assert!(!root.join(file).exists(), "{file} must not be generated");
         }
-        for (path, content) in snapshot(root) {
+        for (path, content) in text_snapshot(root) {
             for needle in [
                 "gen_random_uuid",
                 "ROW LEVEL SECURITY",
@@ -1250,6 +1370,84 @@ mod tests {
         }
     }
 
+    const AUTHENTICATION_FILES: &[&str] = &[
+        "migrations/00000000000000000003_forge_authentication.up.sql",
+        "migrations/00000000000000000003_forge_authentication.down.sql",
+        "src/infrastructure/accounts/mod.rs",
+        "src/adapters/http/authentication.rs",
+        "src/adapters/http/views/authentication.rs",
+        "templates/sessions/new.html",
+        "templates/sessions/_sign_out.html",
+        "templates/passwords/new.html",
+        "templates/passwords/edit.html",
+        "src/bootstrap/setup.rs",
+        "tests/authentication_http.rs",
+        "tests/authentication_postgres.rs",
+    ];
+
+    #[test]
+    fn full_stack_postgresql_applications_get_the_sign_in_pages_setup_and_seeds() {
+        let parent = tempfile::tempdir().expect("temporary directory should be available");
+        let root = create_application(parent.path(), &options("auth-app"))
+            .expect("application generation should succeed");
+
+        for file in AUTHENTICATION_FILES {
+            assert!(root.join(file).is_file(), "{file}");
+        }
+        assert!(root.join("src/bootstrap/seeds.rs").is_file());
+        let bootstrap = read(&root, "src/bootstrap/mod.rs");
+        assert!(bootstrap.contains("pub mod seeds;\npub mod setup;\n"));
+        assert!(bootstrap.contains(".command(\"setup\", setup::SUMMARY, setup::run)"));
+        assert!(bootstrap.contains(".command(\"seed\", seeds::SUMMARY, seeds::run)"));
+        assert!(bootstrap.contains("crate::adapters::http::authentication::routes("));
+        assert!(bootstrap.contains("forge::auth::UndeliverablePasswordResets"));
+        assert!(read(&root, "src/infrastructure/mod.rs").contains("pub mod accounts;"));
+        assert!(read(&root, "src/adapters/http/mod.rs").contains("pub mod authentication;"));
+        assert!(read(&root, "src/adapters/http/views/mod.rs").contains("pub mod authentication;"));
+        let migration = read(
+            &root,
+            "migrations/00000000000000000003_forge_authentication.up.sql",
+        );
+        assert!(migration.contains("token_digest bytea NOT NULL UNIQUE"));
+        assert!(migration.contains("GRANT UPDATE (used_at) ON TABLE forge_password_resets"));
+        assert!(!migration.contains("gen_random_uuid"));
+    }
+
+    #[test]
+    fn only_full_stack_postgresql_applications_get_the_sign_in_pages() {
+        for (database, views) in [
+            (Database::Postgresql, false),
+            (Database::Mysql, true),
+            (Database::Sqlite3, true),
+            (Database::Disabled, true),
+        ] {
+            let parent = tempfile::tempdir().expect("temporary directory should be available");
+            let mut options = options("plain-app");
+            options.database = database;
+            options.views = views;
+            let root = create_application(parent.path(), &options)
+                .expect("application generation should succeed");
+
+            for file in AUTHENTICATION_FILES {
+                assert!(!root.join(file).exists(), "{database:?} {views}: {file}");
+            }
+            let bootstrap = read(&root, "src/bootstrap/mod.rs");
+            assert!(
+                !bootstrap.contains("pub mod setup;"),
+                "{database:?} {views}"
+            );
+            assert_eq!(
+                root.join("src/bootstrap/seeds.rs").is_file(),
+                database != Database::Disabled,
+                "{database:?}"
+            );
+            assert_eq!(
+                bootstrap.contains(".command(\"seed\""),
+                database != Database::Disabled
+            );
+        }
+    }
+
     #[test]
     fn none_has_no_database_assets_and_minimal_forge_features() {
         let (_parent, root) = generate(Database::Disabled, true);
@@ -1284,7 +1482,7 @@ mod tests {
                         ..options("sample-app")
                     };
                     let root = create_application(parent.path(), &options).expect("generation");
-                    for (path, content) in snapshot(&root) {
+                    for (path, content) in text_snapshot(&root) {
                         assert!(!content.contains("%%"), "{database:?} {views} {path}");
                     }
                 }
@@ -1315,7 +1513,7 @@ mod tests {
         let root = create_application(parent.path(), &options("sample-app"))
             .expect("generation should succeed");
 
-        for (path, content) in snapshot(&root) {
+        for (path, content) in text_snapshot(&root) {
             assert!(
                 !content.contains("%%"),
                 "{path} contains an unrendered placeholder"
@@ -1376,6 +1574,7 @@ mod tests {
         "templates/welcome/index.html",
         "assets/application.css",
         "assets/application.js",
+        "assets/forge-rust-logo.png",
         "tests/http.rs",
     ];
 

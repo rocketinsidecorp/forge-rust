@@ -1,0 +1,113 @@
+//! `setup`: creates the first tenant and its owner, so a new application can
+//! be signed into without hand-written SQL (ADR 0026).
+//!
+//! ```sh
+//! export FORGE_MIGRATION_DATABASE_URL='postgres://app_migrator:app_migrator@127.0.0.1:5432/app'
+//! cargo run -- setup --tenant acme --email owner@example.com --organization "Acme Inc"
+//! ```
+//!
+//! It runs with the migration credential, in one transaction under an
+//! advisory lock, and refuses once any tenant exists: it bootstraps an empty
+//! identity database and can never add an account to, or take over, a
+//! running installation. The owner gets the `owner` role in the tenant.
+//!
+//! The password is typed twice at the terminal with echo off, piped as one
+//! line with `--password-stdin`, or read from `FORGE_SETUP_PASSWORD`. It is
+//! never an argument, never printed or logged, and has at least 12
+//! characters.
+
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use forge::auth::{CanonicalLogin, NewPassword, PasswordHasher as _, UnixTimestamp};
+use forge::tenancy::TenantSlug;
+use forge::{CommandContext, CommandError};
+
+use crate::infrastructure::accounts::{OwnerAccount, SetupError, provision_owner};
+use crate::infrastructure::security::Argon2idPasswordHasher;
+
+/// The line `help` shows.
+pub const SUMMARY: &str = "Create the first tenant and its owner: --tenant SLUG --email EMAIL [--organization NAME] [--password-stdin]";
+
+/// Runs the command.
+pub async fn run(mut context: CommandContext) -> Result<(), CommandError> {
+    let options = context.options(
+        &["--tenant", "--email", "--organization"],
+        &["--password-stdin"],
+    )?;
+    let tenant = TenantSlug::parse_input(options.required("--tenant")?)
+        .map_err(|error| CommandError::usage(format!("--tenant: {error}")))?;
+    let login = login(options.required("--email")?)?;
+    let organization = organization(options.value("--organization"), &tenant)?;
+    let password = context.read_secret(
+        forge::config::SETUP_PASSWORD_KEY,
+        options.flag("--password-stdin"),
+        "Owner password",
+    )?;
+    let password = NewPassword::new(password)
+        .map_err(|violation| CommandError::usage(format!("the owner password {violation}")))?;
+    let password_hash = Argon2idPasswordHasher
+        .hash(password.expose())
+        .await
+        .map_err(|error| CommandError::caused_by("cannot hash the owner password", error))?;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| UnixTimestamp::from_secs(elapsed.as_secs()))
+        .map_err(|error| CommandError::caused_by("the system clock is before 1970", error))?;
+
+    let pool = context.postgres()?.pool().clone();
+    let account = OwnerAccount {
+        tenant,
+        organization,
+        login,
+        password_hash,
+        now,
+    };
+    let owner = provision_owner(&pool, &account)
+        .await
+        .map_err(|error| match error {
+            SetupError::AlreadyProvisioned | SetupError::LoginTaken => {
+                CommandError::failed(error.to_string())
+            }
+            other => CommandError::caused_by("setup created nothing", other),
+        })?;
+
+    context.say(&format!(
+        "Created tenant {} ({}) and its owner {} ({}) with the owner role.",
+        account.tenant, owner.tenant_id, account.login, owner.principal_id
+    ))?;
+    context.say(&format!(
+        "Sign in at /session/new?tenant={}",
+        account.tenant
+    ))
+}
+
+/// A sign-in email in its canonical form (`forge::auth::CanonicalLogin`:
+/// trimmed, ASCII only, lowercased) with one `@` and text on both sides.
+fn login(value: &str) -> Result<CanonicalLogin, CommandError> {
+    let invalid =
+        || CommandError::usage("--email must be an ASCII email address such as owner@example.com");
+    let login = CanonicalLogin::parse(value).map_err(|_| invalid())?;
+    let well_formed = login
+        .as_str()
+        .split_once('@')
+        .is_some_and(|(local, domain)| {
+            !local.is_empty() && !domain.is_empty() && !domain.contains('@')
+        });
+    if well_formed {
+        Ok(login)
+    } else {
+        Err(invalid())
+    }
+}
+
+/// The tenant's display name: `--organization`, or the slug.
+fn organization(value: Option<&str>, tenant: &TenantSlug) -> Result<String, CommandError> {
+    let value = value.map_or(tenant.as_str(), str::trim);
+    if (1..=200).contains(&value.chars().count()) && !value.chars().any(char::is_control) {
+        Ok(value.to_owned())
+    } else {
+        Err(CommandError::usage(
+            "--organization must be 1 to 200 characters without control characters",
+        ))
+    }
+}

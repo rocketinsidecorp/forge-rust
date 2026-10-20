@@ -13,17 +13,36 @@ use std::{
 };
 
 use forge_config::{AppConfig, ConfigError, Environment, SecretString};
+use forge_core::Cancellation;
 use forge_http::{RouteError, Router, Server, ServerError};
 use thiserror::Error;
 use tokio::net::TcpListener;
 use tracing::{error, info};
 
+#[cfg(feature = "jobs")]
+use crate::{
+    background::{Background, BackgroundError, JobsDeclaration, JobsParts, WorkerMode},
+    cli::JobsCommand,
+};
 use crate::{
     cli::{self, Command},
+    command::{CommandContext, CommandError, RegisteredCommand},
     compose::{ComposeError, ComposeHook, Composition},
     database::{DatabaseHandle, Declaration, MigrationCommand, UrlPurpose, register_health},
     logging, probe, signal,
+    worker::{RunningWorkers, Worker},
 };
+
+/// Job registrations collected by composition hooks (`()` without `jobs`).
+#[cfg(feature = "jobs")]
+pub(crate) type JobsSlot = Option<JobsParts>;
+#[cfg(not(feature = "jobs"))]
+pub(crate) type JobsSlot = ();
+/// The runtime `serve` runs next to the server (`()` without `jobs`).
+#[cfg(feature = "jobs")]
+type BackgroundSlot = Option<Background>;
+#[cfg(not(feature = "jobs"))]
+type BackgroundSlot = ();
 
 /// `sysexits.h` `EX_USAGE`-style code for an invalid command line.
 const EXIT_USAGE: u8 = 2;
@@ -54,6 +73,9 @@ pub struct App {
     rollback: Option<DatabaseCommandHandler>,
     declarations: Vec<Declaration>,
     compose_hooks: Vec<ComposeHook>,
+    commands: Vec<RegisteredCommand>,
+    #[cfg(feature = "jobs")]
+    jobs: Option<JobsDeclaration>,
 }
 
 impl fmt::Debug for App {
@@ -70,6 +92,14 @@ impl fmt::Debug for App {
                     .declarations
                     .iter()
                     .map(Declaration::method)
+                    .collect::<Vec<_>>(),
+            )
+            .field(
+                "commands",
+                &self
+                    .commands
+                    .iter()
+                    .map(|command| command.name)
                     .collect::<Vec<_>>(),
             )
             .finish()
@@ -90,6 +120,9 @@ impl App {
             rollback: None,
             declarations: Vec::new(),
             compose_hooks: Vec::new(),
+            commands: Vec::new(),
+            #[cfg(feature = "jobs")]
+            jobs: None,
         }
     }
 
@@ -190,6 +223,42 @@ impl App {
         self
     }
 
+    /// Declares durable jobs (feature `jobs`, ADR 0025).
+    ///
+    /// Requires [`App::postgres`]; other backends are refused at startup
+    /// (exit code 1) instead of being emulated. The declaration makes
+    /// `migrate` apply the embedded job schema before the application's
+    /// migrations, hands composition hooks the registry through
+    /// [`Composition::jobs`], runs the workers, cron schedules and pruning
+    /// in `serve` (with [`WorkerMode::InServe`]) and in `jobs work`, and
+    /// enables the `jobs status|dead|retry|discard` operator commands, which
+    /// use the runtime `FORGE_DATABASE_URL`.
+    #[cfg(feature = "jobs")]
+    #[must_use]
+    pub fn jobs(mut self, mode: WorkerMode) -> Self {
+        let mut declaration = self.jobs.unwrap_or(JobsDeclaration::new(mode));
+        declaration.mode = mode;
+        self.jobs = Some(declaration);
+        self
+    }
+
+    /// Declares the transactional outbox (feature `events`, ADR 0025).
+    ///
+    /// Implies [`App::jobs`] with [`WorkerMode::InServe`] unless it was
+    /// declared. `migrate` applies the outbox/inbox schema; composition
+    /// hooks set the publisher through [`Composition::events`]; the
+    /// dispatcher runs wherever the job workers run.
+    #[cfg(feature = "events")]
+    #[must_use]
+    pub fn events(mut self) -> Self {
+        let mut declaration = self
+            .jobs
+            .unwrap_or(JobsDeclaration::new(WorkerMode::InServe));
+        declaration.events = true;
+        self.jobs = Some(declaration);
+        self
+    }
+
     /// Registers a composition hook that wires adapters and routes with the
     /// declared database.
     ///
@@ -203,6 +272,31 @@ impl App {
         hook: impl FnOnce(&mut Composition<'_>) -> Result<(), ComposeError> + Send + 'static,
     ) -> Self {
         self.compose_hooks.push(Box::new(hook));
+        self
+    }
+
+    /// Registers an application command, `<binary> <name> [ARGS]`, such as
+    /// `setup` or `seed` (see [`CommandContext`]).
+    ///
+    /// The command runs once inside the Tokio runtime after configuration and
+    /// logging are loaded. When the application declared a database, the
+    /// command's pool is connected with `FORGE_MIGRATION_DATABASE_URL`, the
+    /// administrative credential. `summary` is shown by `help`. Names are
+    /// lowercase letters, digits and `-`; a built-in name (`serve`,
+    /// `migrate`, ...) or a repeated name makes every command exit with
+    /// code 1. A [`CommandError::Usage`] exits with code 2, any other error
+    /// with code 1.
+    #[must_use]
+    pub fn command<F, Fut>(mut self, name: &'static str, summary: &'static str, run: F) -> Self
+    where
+        F: FnOnce(CommandContext) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<(), CommandError>> + Send + 'static,
+    {
+        self.commands.push(RegisteredCommand {
+            name,
+            summary,
+            handler: Box::new(move |context| Box::pin(run(context))),
+        });
         self
     }
 
@@ -227,8 +321,12 @@ impl App {
         args: impl IntoIterator<Item = OsString>,
         load_config: impl FnOnce() -> Result<AppConfig, ConfigError>,
     ) -> ExitCode {
-        match cli::parse(args) {
+        let names: Vec<&str> = self.commands.iter().map(|command| command.name).collect();
+        match cli::parse(args, &names) {
             Ok(Command::Serve) => self.checked(|app| app.serve(load_config)),
+            Ok(Command::App(index, arguments)) => {
+                self.checked(|app| app.run_application_command(index, arguments, load_config))
+            }
             Ok(Command::Healthcheck) => healthcheck(),
             Ok(Command::Migrate) => {
                 self.checked(|app| app.run_database_command(DatabaseCommand::Migrate, load_config))
@@ -237,16 +335,48 @@ impl App {
                 self.checked(|app| app.run_database_command(DatabaseCommand::Rollback, load_config))
             }
             Ok(Command::Version) => write_stdout(&format!("{} {}\n", self.name, self.version)),
-            Ok(Command::Help) => write_stdout(&cli::usage(self.name)),
+            Ok(Command::Help) => write_stdout(&cli::usage(self.name, &self.summaries())),
+            #[cfg(feature = "jobs")]
+            Ok(Command::Jobs(command)) => {
+                self.checked(|app| app.run_jobs_command(command, load_config))
+            }
             Err(error) => {
-                write_stderr(&format!("error: {error}\n\n{}", cli::usage(self.name)));
+                write_stderr(&format!(
+                    "error: {error}\n\n{}",
+                    cli::usage(self.name, &self.summaries())
+                ));
                 ExitCode::from(EXIT_USAGE)
             }
         }
     }
 
-    /// Rejects an application that declared more than one database backend.
+    fn summaries(&self) -> Vec<(&'static str, &'static str)> {
+        self.commands
+            .iter()
+            .map(|command| (command.name, command.summary))
+            .collect()
+    }
+
+    /// Rejects an application that declared more than one database backend
+    /// or registered an invalid, built-in or repeated command name.
     fn checked(self, run: impl FnOnce(Self) -> ExitCode) -> ExitCode {
+        for (index, command) in self.commands.iter().enumerate() {
+            let repeated = self.commands[..index]
+                .iter()
+                .any(|earlier| earlier.name == command.name);
+            if !crate::command::valid_name(command.name)
+                || cli::BUILT_IN.contains(&command.name)
+                || repeated
+            {
+                write_stderr(&format!(
+                    "error: the application registered the command {:?}; command names are \
+                     unique lowercase letters, digits and '-', and cannot replace a built-in \
+                     command\n",
+                    command.name
+                ));
+                return ExitCode::FAILURE;
+            }
+        }
         if self.declarations.len() > 1 {
             let methods: Vec<_> = self.declarations.iter().map(Declaration::method).collect();
             write_stderr(&format!(
@@ -254,6 +384,14 @@ impl App {
                 methods.join(", ")
             ));
             return ExitCode::FAILURE;
+        }
+        #[cfg(feature = "jobs")]
+        if self.jobs.is_some() {
+            let scheme = self.declarations.first().map(Declaration::scheme);
+            if let Err(reason) = crate::background::check_backend(scheme) {
+                write_stderr(&format!("error: {reason}\n"));
+                return ExitCode::FAILURE;
+            }
         }
         run(self)
     }
@@ -267,8 +405,15 @@ impl App {
             rollback: _,
             mut declarations,
             compose_hooks,
+            commands: _,
+            #[cfg(feature = "jobs")]
+            jobs,
         } = self;
         let declaration = declarations.pop();
+        #[cfg(feature = "jobs")]
+        let (jobs_slot, run_jobs_in_serve) = jobs_for_serve(jobs);
+        #[cfg(not(feature = "jobs"))]
+        let jobs_slot: JobsSlot = ();
 
         let config = match load_config() {
             Ok(config) => config,
@@ -307,14 +452,20 @@ impl App {
                 registrations,
                 compose_hooks,
                 declaration.zip(url),
+                jobs_slot,
             )
         };
-        let (router, database) = match composed {
+        let (router, database, workers, jobs_slot) = match composed {
             Ok(composed) => composed,
             Err(code) => return code,
         };
+        let background = background_for(jobs_slot, database.as_ref());
+        #[cfg(feature = "jobs")]
+        let background = background.filter(|_| run_jobs_in_serve);
 
-        let result = runtime.block_on(serve_until_signal(name, version, config, router, database));
+        let result = runtime.block_on(serve_until_signal(
+            name, version, config, router, database, workers, background,
+        ));
         runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
 
         match result {
@@ -377,8 +528,16 @@ impl App {
                 DatabaseCommand::Migrate => MigrationCommand::Migrate,
                 DatabaseCommand::Rollback => MigrationCommand::Rollback,
             };
-            let code =
-                runtime.block_on(declaration.run_migration_command(self.name, &url, migration));
+            #[cfg(feature = "jobs")]
+            let framework = match (command, self.jobs) {
+                (DatabaseCommand::Migrate, Some(jobs)) => jobs.migrators(),
+                _ => Vec::new(),
+            };
+            #[cfg(not(feature = "jobs"))]
+            let framework = Vec::new();
+            let code = runtime.block_on(
+                declaration.run_migration_command(self.name, &url, migration, &framework),
+            );
             runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
             return code;
         }
@@ -410,6 +569,227 @@ impl App {
     }
 }
 
+impl App {
+    /// Runs the application command at `index` with `arguments`.
+    fn run_application_command(
+        mut self,
+        index: usize,
+        arguments: Vec<String>,
+        load_config: impl FnOnce() -> Result<AppConfig, ConfigError>,
+    ) -> ExitCode {
+        let config = match load_config() {
+            Ok(config) => config,
+            Err(error) => return config_error(&error),
+        };
+        if let Err(error) = logging::init(&config.log) {
+            return config_error(&error);
+        }
+        if index >= self.commands.len() {
+            return ExitCode::FAILURE;
+        }
+        let command = self.commands.swap_remove(index);
+        let declaration = self.declarations.pop();
+        let url = match &declaration {
+            Some(declaration) => {
+                match declaration.validate(&config.database, UrlPurpose::Migration) {
+                    Ok(url) => Some(url.clone()),
+                    Err(error) => return config_error(&error),
+                }
+            }
+            None => None,
+        };
+        let runtime = match tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                error!(app = self.name, error = %ErrorChain(&error), "failed to start async runtime");
+                return ExitCode::FAILURE;
+            }
+        };
+        let name = self.name;
+        let result = runtime.block_on(async move {
+            let database = match declaration.zip(url) {
+                Some((declaration, url)) => match declaration.connect(&url).await {
+                    Ok(database) => Some(database),
+                    Err(error) => {
+                        return Err(CommandError::caused_by(
+                            "cannot connect with FORGE_MIGRATION_DATABASE_URL",
+                            error,
+                        ));
+                    }
+                },
+                None => None,
+            };
+            let context = CommandContext::for_process(
+                name,
+                command.name,
+                arguments,
+                config,
+                database.clone(),
+            );
+            let result = (command.handler)(context).await;
+            if let Some(database) = database {
+                database.close().await;
+            }
+            result
+        });
+        runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
+        match result {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                write_stderr(&format!("error: {}\n", ErrorChain(&error)));
+                if error.is_usage() {
+                    ExitCode::from(EXIT_USAGE)
+                } else {
+                    ExitCode::FAILURE
+                }
+            }
+        }
+    }
+}
+
+#[cfg(feature = "jobs")]
+impl App {
+    /// `jobs work` runs the job runtime without HTTP until a signal; the
+    /// other subcommands are operator queries over the runtime URL.
+    fn run_jobs_command(
+        mut self,
+        command: JobsCommand,
+        load_config: impl FnOnce() -> Result<AppConfig, ConfigError>,
+    ) -> ExitCode {
+        let config = match load_config() {
+            Ok(config) => config,
+            Err(error) => return config_error(&error),
+        };
+        if let Err(error) = logging::init(&config.log) {
+            return config_error(&error);
+        }
+        let (Some(jobs), Some(declaration)) = (self.jobs, self.declarations.pop()) else {
+            write_stderr("error: the jobs commands require App::postgres and App::jobs\n");
+            return ExitCode::FAILURE;
+        };
+        let url = match declaration.validate(&config.database, UrlPurpose::Runtime) {
+            Ok(url) => url.clone(),
+            Err(error) => return config_error(&error),
+        };
+        let runtime = match tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                error!(app = self.name, error = %ErrorChain(&error), "failed to start async runtime");
+                return ExitCode::FAILURE;
+            }
+        };
+        if command != JobsCommand::Work {
+            let output = runtime.block_on(crate::operator::execute(self.name, &url, command));
+            runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
+            return match output {
+                Ok(text) => write_stdout(&text),
+                Err(code) => code,
+            };
+        }
+
+        let composed = {
+            let _guard = runtime.enter();
+            compose(
+                self.name,
+                &config,
+                self.registrations,
+                self.compose_hooks,
+                Some((declaration, &url)),
+                Some(JobsParts::new(jobs)),
+            )
+        };
+        // Composition workers belong to the HTTP server's lifecycle (they
+        // start with `serve`); a dedicated job worker process does not run them.
+        let (_router, database, _workers, jobs_slot) = match composed {
+            Ok(composed) => composed,
+            Err(code) => return code,
+        };
+        let Some(background) = background_for(jobs_slot, database.as_ref()) else {
+            write_stderr("error: the jobs commands require App::postgres and App::jobs\n");
+            return ExitCode::FAILURE;
+        };
+        let name = self.name;
+        let result = runtime.block_on(async move {
+            let result = work_until_signal(name, background).await;
+            if let Some(database) = database {
+                database.close().await;
+            }
+            result
+        });
+        runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
+        match result {
+            Ok(()) => {
+                info!(app = name, "job workers stopped");
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                error!(app = name, error = %ErrorChain(&error), "job workers failed");
+                ExitCode::FAILURE
+            }
+        }
+    }
+}
+
+/// The registry handed to `serve`'s composition hooks and whether `serve`
+/// runs it. Hooks always see the registry, so the same composition function
+/// works for `serve` and `jobs work` in both modes.
+#[cfg(feature = "jobs")]
+fn jobs_for_serve(jobs: Option<JobsDeclaration>) -> (JobsSlot, bool) {
+    let run = jobs.is_some_and(|jobs| jobs.mode == WorkerMode::InServe);
+    (jobs.map(JobsParts::new), run)
+}
+
+/// The job runtime for the composed registrations and the PostgreSQL pool.
+#[cfg(feature = "jobs")]
+fn background_for(jobs: JobsSlot, database: Option<&DatabaseHandle>) -> BackgroundSlot {
+    let parts = jobs?;
+    #[allow(irrefutable_let_patterns)]
+    let Some(DatabaseHandle::Postgres(database)) = database else {
+        return None;
+    };
+    Some(parts.into_background(database.clone()))
+}
+
+#[cfg(not(feature = "jobs"))]
+fn background_for(jobs: JobsSlot, database: Option<&DatabaseHandle>) -> BackgroundSlot {
+    let _ = (jobs, database);
+}
+
+/// Runs the job runtime alone until a shutdown signal.
+#[cfg(feature = "jobs")]
+async fn work_until_signal(name: &'static str, background: Background) -> Result<(), ServeError> {
+    let signal = signal::shutdown_signal().map_err(ServeError::Signal)?;
+    let shutdown = Cancellation::new();
+    info!(app = name, "job workers started");
+    let run = async {
+        let result = background.run(shutdown.clone()).await;
+        shutdown.cancel();
+        result
+    };
+    let ((), result) = tokio::join!(watch_signal(name, signal, shutdown.clone()), run);
+    result.map_err(ServeError::Background)
+}
+
+/// Cancels `shutdown` on the first signal (or returns once it is cancelled
+/// for another reason).
+async fn watch_signal(
+    name: &'static str,
+    signal: impl Future<Output = &'static str>,
+    shutdown: Cancellation,
+) {
+    tokio::select! {
+        signal = signal => info!(app = name, signal, "shutdown started; draining connections and jobs"),
+        () = shutdown.cancelled() => {}
+    }
+    shutdown.cancel();
+}
+
 /// Builds the route table and the declared database pool, then runs the
 /// composition hooks. Must run inside the Tokio runtime context.
 fn compose(
@@ -418,7 +798,10 @@ fn compose(
     registrations: Vec<RouteRegistration>,
     hooks: Vec<ComposeHook>,
     declared: Option<(Declaration, &forge_config::SecretString)>,
-) -> Result<(Router, Option<DatabaseHandle>), ExitCode> {
+    jobs: JobsSlot,
+) -> Result<(Router, Option<DatabaseHandle>, Vec<Worker>, JobsSlot), ExitCode> {
+    #[cfg_attr(not(feature = "jobs"), allow(unused_mut))]
+    let mut jobs = jobs;
     let database = match declared {
         Some((declaration, url)) => match declaration.connect_lazy(url) {
             Ok(database) => Some(database),
@@ -436,16 +819,22 @@ fn compose(
             return Err(ExitCode::FAILURE);
         }
     };
+    let mut workers = Vec::new();
     if !hooks.is_empty() {
         let mut composition = Composition::new(&mut router, config, database.clone());
+        #[cfg(feature = "jobs")]
+        if let Some(parts) = jobs.as_mut() {
+            composition.attach_jobs(parts);
+        }
         for hook in hooks {
             if let Err(error) = hook(&mut composition) {
                 error!(app = name, error = %ErrorChain(&error), "composition hook failed");
                 return Err(ExitCode::FAILURE);
             }
         }
+        workers = composition.into_workers();
     }
-    Ok((router, database))
+    Ok((router, database, workers, jobs))
 }
 
 #[derive(Clone, Copy)]
@@ -490,6 +879,9 @@ enum ServeError {
     },
     #[error("HTTP server failed")]
     Server(#[from] ServerError),
+    #[cfg(feature = "jobs")]
+    #[error("background jobs failed")]
+    Background(#[source] BackgroundError),
 }
 
 async fn serve_until_signal(
@@ -498,8 +890,13 @@ async fn serve_until_signal(
     config: AppConfig,
     router: Router,
     database: Option<DatabaseHandle>,
+    workers: Vec<Worker>,
+    background: BackgroundSlot,
 ) -> Result<(), ServeError> {
-    let result = serve(name, version, config, router).await;
+    let workers = RunningWorkers::start(workers);
+    let result = serve(name, version, config, router, background).await;
+    // Workers stop after the server drained, before the pool closes.
+    workers.stop().await;
     if let Some(database) = database {
         database.close().await;
     }
@@ -511,6 +908,7 @@ async fn serve(
     version: &'static str,
     config: AppConfig,
     router: Router,
+    background: BackgroundSlot,
 ) -> Result<(), ServeError> {
     let signal = signal::shutdown_signal().map_err(ServeError::Signal)?;
     let bind = config.server.bind;
@@ -529,14 +927,34 @@ async fn serve(
         "listening"
     );
 
-    let shutdown = async move {
-        let signal = signal.await;
-        info!(app = name, signal, "shutdown started; draining connections");
+    // One shutdown for the server and the job runtime: a signal, or either
+    // of them failing, stops both.
+    let shutdown = Cancellation::new();
+    let server = async {
+        let stop = shutdown.clone();
+        let result = Server::new(config.server, router)
+            .serve(listener, async move { stop.cancelled().await })
+            .await;
+        shutdown.cancel();
+        result.map_err(ServeError::from)
     };
-    Server::new(config.server, router)
-        .serve(listener, shutdown)
-        .await?;
-    Ok(())
+    #[cfg(feature = "jobs")]
+    let jobs = async {
+        let Some(background) = background else {
+            return Ok(());
+        };
+        let result = background.run(shutdown.clone()).await;
+        shutdown.cancel();
+        result.map_err(ServeError::Background)
+    };
+    #[cfg(not(feature = "jobs"))]
+    let jobs = async {
+        let () = background;
+        Ok::<(), ServeError>(())
+    };
+    let ((), served, ran) =
+        tokio::join!(watch_signal(name, signal, shutdown.clone()), server, jobs);
+    served.and(ran)
 }
 
 fn environment_name(environment: Environment) -> &'static str {
@@ -654,6 +1072,97 @@ mod tests {
 
         assert!(app.migrate.is_some());
         assert!(app.rollback.is_some());
+    }
+
+    #[test]
+    fn application_commands_receive_their_arguments_and_map_errors_to_exit_codes() {
+        use std::sync::{Arc, Mutex};
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&seen);
+        let app = App::new("demo")
+            .command(
+                "setup",
+                "Create the first owner",
+                move |context| async move {
+                    if let Ok(mut seen) = recorded.lock() {
+                        seen.extend(context.arguments().iter().cloned());
+                    }
+                    let options = context.options(&["--tenant"], &[])?;
+                    options.required("--tenant")?;
+                    Ok(())
+                },
+            )
+            .command("seed", "Load seed data", |_| async {
+                Err(CommandError::failed("seeding failed"))
+            });
+
+        assert_eq!(
+            app.run_with(args(&["setup", "--tenant", "acme"]), no_config),
+            ExitCode::SUCCESS
+        );
+        assert_eq!(
+            seen.lock().map(|seen| seen.clone()).unwrap_or_default(),
+            vec!["--tenant".to_owned(), "acme".to_owned()]
+        );
+
+        let usage = App::new("demo").command("setup", "x", |context| async move {
+            context.options(&["--tenant"], &[])?.required("--tenant")?;
+            Ok(())
+        });
+        assert_eq!(
+            usage.run_with(args(&["setup"]), no_config),
+            ExitCode::from(EXIT_USAGE)
+        );
+        let failing = App::new("demo").command("seed", "x", |_| async {
+            Err(CommandError::failed("seeding failed"))
+        });
+        assert_eq!(
+            failing.run_with(args(&["seed"]), no_config),
+            ExitCode::FAILURE
+        );
+        // Commands load the configuration like every other command.
+        let configured = App::new("demo").command("seed", "x", |_| async { Ok(()) });
+        assert_eq!(
+            configured.run_with(args(&["seed"]), || {
+                Err(ConfigError::NotUnicode { key: "FORGE_BIND" })
+            }),
+            ExitCode::from(EXIT_CONFIG)
+        );
+    }
+
+    #[test]
+    fn invalid_or_built_in_command_names_are_refused() {
+        for name in ["migrate", "Setup", ""] {
+            let app = App::new("demo").command(name, "x", |_| async { Ok(()) });
+            assert_eq!(
+                app.run_with(args(&["version"]), no_config),
+                ExitCode::SUCCESS,
+                "informational commands do not check"
+            );
+            let app = App::new("demo").command(name, "x", |_| async { Ok(()) });
+            assert_eq!(app.run_with(args(&["serve"]), no_config), ExitCode::FAILURE);
+        }
+        let repeated = App::new("demo")
+            .command("seed", "x", |_| async { Ok(()) })
+            .command("seed", "y", |_| async { Ok(()) });
+        assert_eq!(
+            repeated.run_with(args(&["seed"]), no_config),
+            ExitCode::FAILURE
+        );
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn database_commands_need_the_migration_credential() {
+        let app = App::new("demo")
+            .postgres(forge_db::Migrator::DEFAULT)
+            .command("seed", "x", |_| async { Ok(()) });
+        let vars = [("FORGE_DATABASE_URL", "postgres://u:p@h/app")];
+        assert_eq!(
+            app.run_with(args(&["seed"]), || config_with(&vars)),
+            ExitCode::from(EXIT_CONFIG)
+        );
     }
 
     #[test]
@@ -956,12 +1465,13 @@ mod tests {
                     })?;
                 Ok(())
             });
-            let (router, database) = compose(
+            let (router, database, _workers, _) = compose(
                 "demo",
                 &config,
                 Vec::new(),
                 vec![hook],
                 Some((Declaration::Sqlite(forge_db::Migrator::DEFAULT), url)),
+                JobsSlot::default(),
             )
             .expect("composition succeeds");
             assert!(format!("{router:?}").contains("GET /composed"));
@@ -980,9 +1490,288 @@ mod tests {
                     Vec::new(),
                     vec![hook],
                     Some((Declaration::Sqlite(forge_db::Migrator::DEFAULT), url)),
+                    JobsSlot::default(),
                 );
                 assert_eq!(outcome.err(), Some(ExitCode::FAILURE));
             }
+        }
+    }
+
+    #[cfg(feature = "jobs")]
+    mod jobs {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        use async_trait::async_trait;
+        use forge_jobs::{
+            EnqueueOptions, Job, JobContext, JobError, JobHandler, postgres::PgJobStore,
+        };
+        use serde::{Deserialize, Serialize};
+
+        use super::*;
+        use crate::background::{JobsDeclaration, WorkerMode};
+
+        #[test]
+        fn jobs_require_postgres_and_are_refused_elsewhere() {
+            // Without a database.
+            let code = App::new("demo")
+                .jobs(WorkerMode::InServe)
+                .run_with(args(&["serve"]), no_config);
+            assert_eq!(code, ExitCode::FAILURE);
+            assert_eq!(
+                crate::background::check_backend(None).expect_err("refused"),
+                "App::jobs requires App::postgres (durable jobs are stored in PostgreSQL)"
+            );
+            for scheme in [
+                forge_config::DatabaseScheme::MySql,
+                forge_config::DatabaseScheme::Sqlite,
+            ] {
+                let reason = crate::background::check_backend(Some(scheme)).expect_err("refused");
+                assert!(reason.contains("refused rather than emulated"), "{reason}");
+            }
+            assert!(
+                crate::background::check_backend(Some(forge_config::DatabaseScheme::Postgres))
+                    .is_ok()
+            );
+            #[cfg(feature = "sqlite")]
+            for command in ["serve", "migrate", "jobs"] {
+                let code = App::new("demo")
+                    .sqlite(forge_db::Migrator::DEFAULT)
+                    .jobs(WorkerMode::Dedicated)
+                    .run_with(args(&[command]), no_config);
+                assert_eq!(code, ExitCode::FAILURE, "{command}");
+            }
+        }
+
+        #[test]
+        fn declarations_select_mode_and_framework_schemas() {
+            let app = App::new("demo").jobs(WorkerMode::Dedicated);
+            let declaration = app.jobs.expect("declared");
+            assert_eq!(declaration.mode, WorkerMode::Dedicated);
+            assert_eq!(declaration.migrators().len(), 1);
+            #[cfg(feature = "events")]
+            {
+                let app = App::new("demo").jobs(WorkerMode::Dedicated).events();
+                let declaration = app.jobs.expect("declared");
+                assert_eq!(
+                    declaration.mode,
+                    WorkerMode::Dedicated,
+                    "events keep the mode"
+                );
+                assert_eq!(declaration.migrators().len(), 2);
+                let implied = App::new("demo").events().jobs.expect("implied");
+                assert_eq!(implied.mode, WorkerMode::InServe);
+            }
+            let config = AppConfig::default();
+            let mut router = Router::new();
+            let mut composition = Composition::new(&mut router, &config, None);
+            assert!(matches!(
+                composition.jobs(),
+                Err(ComposeError::JobsNotDeclared)
+            ));
+            let mut parts = JobsParts::new(JobsDeclaration::new(WorkerMode::InServe));
+            composition.attach_jobs(&mut parts);
+            assert!(composition.jobs().is_ok());
+            #[cfg(feature = "events")]
+            assert!(matches!(
+                composition.events(),
+                Err(ComposeError::EventsNotDeclared)
+            ));
+
+            // Hooks get the registry in both modes; only InServe runs it in `serve`.
+            let (slot, run) = jobs_for_serve(Some(JobsDeclaration::new(WorkerMode::Dedicated)));
+            assert!(slot.is_some() && !run);
+            let (slot, run) = jobs_for_serve(Some(JobsDeclaration::new(WorkerMode::InServe)));
+            assert!(slot.is_some() && run);
+            let (slot, run) = jobs_for_serve(None);
+            assert!(slot.is_none() && !run);
+        }
+
+        #[derive(Serialize, Deserialize)]
+        struct Greet;
+
+        impl Job for Greet {
+            const NAME: &'static str = "demo.greet";
+        }
+
+        struct Greeter(Arc<AtomicUsize>);
+
+        #[async_trait]
+        impl JobHandler for Greeter {
+            type Job = Greet;
+
+            async fn perform(&self, _: &JobContext, _: Greet) -> Result<(), JobError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        #[cfg(feature = "events")]
+        #[derive(Serialize, Deserialize)]
+        struct Greeted;
+
+        #[cfg(feature = "events")]
+        impl forge_events::IntegrationEvent for Greeted {
+            const TYPE: &'static str = "demo.greeted";
+        }
+
+        #[cfg(feature = "events")]
+        struct Listener(Arc<AtomicUsize>);
+
+        #[cfg(feature = "events")]
+        #[async_trait]
+        impl forge_events::EventSubscriber for Listener {
+            async fn handle(
+                &self,
+                _: &forge_events::EventEnvelope,
+            ) -> Result<(), forge_events::PublishError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        async fn run_command(command: &'static [&'static str], url: String) -> ExitCode {
+            tokio::task::spawn_blocking(move || {
+                let app = App::new("demo")
+                    .postgres(forge_db::Migrator::DEFAULT)
+                    .jobs(WorkerMode::Dedicated);
+                #[cfg(feature = "events")]
+                let app = app.events();
+                app.run_with(args(command), || {
+                    config_with(&[
+                        ("FORGE_DATABASE_URL", url.as_str()),
+                        ("FORGE_MIGRATION_DATABASE_URL", url.as_str()),
+                    ])
+                })
+            })
+            .await
+            .expect("join")
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        #[ignore = "needs FORGE_TEST_DATABASE_URL"]
+        async fn migrate_operator_commands_and_the_composed_runtime_work_end_to_end() {
+            let test = forge_db::testing::TestDatabase::<forge_db::sqlx::Postgres>::create_empty()
+                .await
+                .expect("needs FORGE_TEST_DATABASE_URL");
+            let url = test.url().expose().to_owned();
+
+            assert_eq!(
+                run_command(&["migrate"], url.clone()).await,
+                ExitCode::SUCCESS
+            );
+            assert_eq!(
+                run_command(&["migrate"], url.clone()).await,
+                ExitCode::SUCCESS,
+                "idempotent"
+            );
+            let tables: Vec<String> = sqlx::query_scalar(
+                "SELECT tablename::text FROM pg_tables WHERE tablename LIKE 'forge\\_%' ORDER BY 1",
+            )
+            .fetch_all(test.database().pool())
+            .await
+            .expect("tables");
+            assert!(tables.contains(&"forge_jobs".to_owned()), "{tables:?}");
+            #[cfg(feature = "events")]
+            assert!(
+                tables.contains(&"forge_outbox_events".to_owned()),
+                "{tables:?}"
+            );
+            for command in [&["jobs", "status"][..], &["jobs", "dead", "5"]] {
+                assert_eq!(
+                    run_command(command, url.clone()).await,
+                    ExitCode::SUCCESS,
+                    "{command:?}"
+                );
+            }
+            assert_eq!(
+                run_command(
+                    &["jobs", "retry", "01a1567c-bf31-73d9-966c-0123456789ab"],
+                    url.clone()
+                )
+                .await,
+                ExitCode::FAILURE,
+                "no such dead job"
+            );
+
+            // The runtime `serve`/`jobs work` build from composition hooks.
+            let greeted = Arc::new(AtomicUsize::new(0));
+            let heard = Arc::new(AtomicUsize::new(0));
+            let config = config_with(&[("FORGE_DATABASE_URL", url.as_str())]).expect("config");
+            let runtime_url = config.database.url.clone().expect("url");
+            let hook_greeted = Arc::clone(&greeted);
+            let hook_heard = Arc::clone(&heard);
+            let hook: ComposeHook = Box::new(move |composition| {
+                composition
+                    .jobs()?
+                    .register(Greeter(hook_greeted))
+                    .map_err(ComposeError::other)?;
+                #[cfg(feature = "events")]
+                {
+                    let mut subscribers = forge_events::Subscribers::new();
+                    subscribers
+                        .subscribe::<Greeted>(Listener(hook_heard))
+                        .map_err(ComposeError::other)?;
+                    composition.events()?.publish_to(subscribers);
+                }
+                #[cfg(not(feature = "events"))]
+                drop(hook_heard);
+                Ok(())
+            });
+            #[cfg_attr(not(feature = "events"), allow(unused_mut))]
+            let mut declaration = JobsDeclaration::new(WorkerMode::InServe);
+            #[cfg(feature = "events")]
+            {
+                declaration.events = true;
+            }
+            let (_router, database, _workers, slot) = compose(
+                "demo",
+                &config,
+                Vec::new(),
+                vec![hook],
+                Some((
+                    Declaration::Postgres(forge_db::Migrator::DEFAULT),
+                    &runtime_url,
+                )),
+                Some(JobsParts::new(declaration)),
+            )
+            .expect("composition");
+            let background = background_for(slot, database.as_ref()).expect("background");
+
+            let store = PgJobStore::new(test.database().clone());
+            store
+                .enqueue(&Greet, EnqueueOptions::new())
+                .await
+                .expect("enqueue");
+            #[cfg(feature = "events")]
+            {
+                let mut transaction = test.database().begin().await.expect("begin");
+                forge_events::postgres::append(&mut transaction, &Greeted)
+                    .await
+                    .expect("append");
+                transaction.commit().await.expect("commit");
+            }
+            let shutdown = Cancellation::new();
+            let running = tokio::spawn(background.run(shutdown.clone()));
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+            let expected_events = usize::from(cfg!(feature = "events"));
+            while greeted.load(Ordering::SeqCst) == 0
+                || heard.load(Ordering::SeqCst) < expected_events
+            {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the runtime did not run the job"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            shutdown.cancel();
+            running.await.expect("join").expect("clean shutdown");
+            if let Some(database) = database {
+                database.close().await;
+            }
+            test.cleanup().await.expect("cleanup");
         }
     }
 }

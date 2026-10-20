@@ -1,10 +1,22 @@
 //! Authentication and server-side session contracts.
 //!
 //! This crate models session lifecycle and authenticated identity. It does not
-//! implement password hashing, cookie signing, or bearer-token cryptography;
-//! those are adapter mechanisms that require separate dependency/security
-//! review. A session proves identity only. Tenant roles are resolved separately
-//! so authorization changes do not remain stale inside credentials.
+//! implement password hashing, cookie signing, or session bearer-token
+//! cryptography; those are adapter mechanisms that require separate
+//! dependency/security review. A session proves identity only. Tenant roles
+//! are resolved separately so authorization changes do not remain stale inside
+//! credentials.
+//!
+//! It also owns the framework rules of the sign-in and password-reset flows
+//! (ADR 0026): [`LoginThrottle`] with the bounded [`MemoryLoginThrottle`],
+//! the [`NewPassword`] policy, and one-time [`PasswordResetToken`]s (256
+//! bits from the OS CSPRNG through `getrandom`, persisted only as SHA-256
+//! digests through `sha2`) delivered by a [`PasswordResetNotifier`].
+
+mod login;
+mod password_policy;
+mod password_reset;
+mod throttle;
 
 use std::num::NonZeroU64;
 
@@ -12,6 +24,20 @@ use async_trait::async_trait;
 use forge_core::Id;
 use forge_security::PrincipalId;
 use thiserror::Error;
+
+pub use login::{CanonicalLogin, LoginFormatError, MAX_LOGIN_BYTES};
+pub use password_policy::{
+    MAX_PASSWORD_BYTES, MIN_PASSWORD_CHARS, NewPassword, PasswordPolicyError,
+};
+pub use password_reset::{
+    PASSWORD_RESET_LIFETIME_SECS, PASSWORD_RESET_PATH, PasswordResetDelivery,
+    PasswordResetDeliveryError, PasswordResetNotifier, PasswordResetToken,
+    PasswordResetTokenDigest, UndeliverablePasswordResets,
+};
+pub use throttle::{
+    LoginThrottle, MemoryLoginThrottle, ThrottleConfig, ThrottleConfigError, ThrottleDecision,
+    ThrottleError, ThrottleKey,
+};
 
 /// Marker type for a session identity.
 #[derive(Debug)]
@@ -122,6 +148,9 @@ pub enum CredentialError {
     /// Session/CSRF token was not in the canonical high-entropy encoding.
     #[error("invalid authentication token")]
     InvalidToken,
+    /// The operating-system CSPRNG could not provide a token.
+    #[error("secure randomness unavailable")]
+    RandomnessUnavailable,
 }
 
 /// Fixed-size digest of an opaque session bearer credential.
@@ -426,6 +455,7 @@ pub struct PasswordCredential {
     password_hash: PasswordHash,
     disabled: bool,
     version: PasswordCredentialVersion,
+    login: Option<String>,
 }
 
 impl PasswordCredential {
@@ -442,7 +472,22 @@ impl PasswordCredential {
             password_hash,
             disabled,
             version,
+            login: None,
         }
+    }
+
+    /// Adds the login exactly as stored, the only address reset links may
+    /// be delivered to (never the address a visitor typed).
+    #[must_use]
+    pub fn with_login(mut self, login: impl Into<String>) -> Self {
+        self.login = Some(login.into());
+        self
+    }
+
+    /// The stored login, when the store provided it.
+    #[must_use]
+    pub fn login(&self) -> Option<&str> {
+        self.login.as_deref()
     }
 
     /// Principal owning the credential.
@@ -473,7 +518,8 @@ impl PasswordCredential {
 /// Persistence boundary used by password authentication.
 #[async_trait]
 pub trait PasswordCredentialStore: Send + Sync {
-    /// Resolves one case-insensitive login identifier.
+    /// Resolves one login. Callers pass a [`CanonicalLogin`]; stores should
+    /// return the stored login with [`PasswordCredential::with_login`].
     async fn find_by_login(
         &self,
         login: &str,

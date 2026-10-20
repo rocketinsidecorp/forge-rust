@@ -1,0 +1,22 @@
+{% extends "layouts/application.html" %}
+
+{% block content %}
+<h1>Choose a new password</h1>
+{% if let Some(error) = error %}<p class="flash flash-alert" role="alert">{{ error }}</p>{% endif %}
+<form action="/passwords" method="post">
+  {{ csrf_field|safe }}
+  <input type="hidden" name="_method" value="patch">
+  <input type="hidden" name="token" value="{{ token }}">
+  <div>
+    <label for="password_password">New password</label>
+    <input type="password" id="password_password" name="password" required minlength="12" maxlength="1024" autocomplete="new-password">
+    {% if let Some(message) = errors.get("password") %}<p class="flash flash-alert" role="alert">Password {{ message }}</p>{% endif %}
+  </div>
+  <div>
+    <label for="password_password_confirmation">Confirm the new password</label>
+    <input type="password" id="password_password_confirmation" name="password_confirmation" required minlength="12" maxlength="1024" autocomplete="new-password">
+    {% if let Some(message) = errors.get("password_confirmation") %}<p class="flash flash-alert" role="alert">Confirmation {{ message }}</p>{% endif %}
+  </div>
+  <button type="submit">Change password</button>
+</form>
+{% endblock %}

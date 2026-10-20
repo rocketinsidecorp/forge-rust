@@ -20,6 +20,8 @@
 //! - [`csrf_meta`], [`csrf_field`], [`method_override`], [`FieldErrors`]:
 //!   form helpers.
 //! - [`Flash`] and [`FlashLayer`]: one-shot `notice`/`alert` messages.
+//! - [`SignInRedirect`], [`return_path`], [`prefers_html`]: send signed-out
+//!   browsers to the sign-in page with a validated return path (ADR 0026).
 //! - [`vendor`]: the pinned Turbo and Stimulus modules as embedded assets.
 //!
 //! Views belong in the HTTP adapter ring; domain and application code never
@@ -57,6 +59,8 @@ mod forms;
 mod import_map;
 #[cfg(feature = "runtime")]
 mod render;
+#[cfg(feature = "runtime")]
+mod sign_in;
 #[cfg(all(test, feature = "runtime"))]
 mod test_support;
 #[cfg(feature = "runtime")]
@@ -84,6 +88,11 @@ pub use forms::{
 pub use import_map::{ImportMap, ImportMapBuilder, ImportMapError};
 #[cfg(feature = "runtime")]
 pub use render::{html, html_with_status};
+#[cfg(feature = "runtime")]
+pub use sign_in::{
+    MAX_RETURN_PATH_BYTES, RETURN_TO_PARAM, SignInRedirect, prefers_html, return_path,
+    sign_in_location,
+};
 #[cfg(feature = "runtime")]
 pub use turbo::{
     DomId, DomIdError, RedirectError, StreamAction, TurboStreamAction, TurboStreamError, dom_id,

@@ -1,0 +1,48 @@
+//! View models of the sign-in and password-reset pages in
+//! `templates/sessions/` and `templates/passwords/`. They never carry a
+//! password; the reset page carries the reset token in a hidden field only.
+
+use askama::Template;
+use forge::views::FieldErrors;
+
+use super::Layout;
+
+/// `templates/sessions/new.html`: organization, email and password.
+#[derive(Template)]
+#[template(path = "sessions/new.html")]
+pub struct SessionNew<'a> {
+    pub layout: Layout<'a>,
+    pub csrf_field: String,
+    /// The organization (tenant slug) as typed, or from `?tenant=`.
+    pub tenant: String,
+    pub email: String,
+    /// A validated local path to return to after signing in, or empty.
+    pub return_to: String,
+    /// The one message a failed or throttled sign-in shows.
+    pub error: Option<String>,
+    /// Whether this browser already has a valid session (shows sign out).
+    pub signed_in: bool,
+}
+
+/// `templates/passwords/new.html`: asks which account forgot its password.
+#[derive(Template)]
+#[template(path = "passwords/new.html")]
+pub struct PasswordNew<'a> {
+    pub layout: Layout<'a>,
+    pub csrf_field: String,
+    pub tenant: String,
+    pub email: String,
+    pub error: Option<String>,
+}
+
+/// `templates/passwords/edit.html`: chooses a new password.
+#[derive(Template)]
+#[template(path = "passwords/edit.html")]
+pub struct PasswordEdit<'a> {
+    pub layout: Layout<'a>,
+    pub csrf_field: String,
+    /// The reset token from the link, carried in a hidden field.
+    pub token: String,
+    pub error: Option<String>,
+    pub errors: FieldErrors,
+}

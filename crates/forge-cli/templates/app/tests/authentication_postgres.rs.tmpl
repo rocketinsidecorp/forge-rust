@@ -1,0 +1,306 @@
+//! `setup` and the PostgreSQL authentication adapters against a real
+//! database migrated with the application's migrations
+//! (`forge::db::testing::TestDatabase`): one owner only, also under
+//! concurrency; reset tokens that work once, expire and revoke sessions.
+//!
+//! PostgreSQL tests need `FORGE_TEST_DATABASE_URL` (a role that may create
+//! databases) and are ignored by default:
+//! `cargo test -- --include-ignored`.
+
+use std::error::Error;
+
+use app::bootstrap::setup;
+use app::infrastructure::accounts::{
+    OWNER_ROLE, OwnerAccount, PgPasswordResetStore, PgTenantDirectory, SetupError, provision_owner,
+};
+use app::infrastructure::auth::{PostgresPasswordCredentialStore, PostgresSessionStore};
+use app::infrastructure::security::{
+    Argon2idPasswordHasher, authenticate_password, issue_persisted_session,
+};
+use forge::CommandContext;
+use forge::auth::{
+    CanonicalLogin, PasswordHasher as _, PasswordResetToken, SessionStore as _, UnixTimestamp,
+};
+use forge::db::testing::TestDatabase;
+use forge::tenancy::{
+    PasswordResetGrant, PasswordResetStore as _, TenantDirectory as _, TenantSlug,
+};
+
+type TestResult = Result<(), Box<dyn Error>>;
+
+static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!();
+
+const PASSWORD: &str = "correct horse battery";
+
+fn now() -> Result<UnixTimestamp, Box<dyn Error>> {
+    Ok(UnixTimestamp::from_secs(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs(),
+    ))
+}
+
+fn setup_arguments<'a>(tenant: &'a str, email: &'a str) -> [&'a str; 5] {
+    ["--tenant", tenant, "--email", email, "--password-stdin"]
+}
+
+#[tokio::test]
+async fn setup_refuses_password_arguments_and_short_passwords_before_touching_a_database()
+-> TestResult {
+    let argument = setup::run(CommandContext::for_testing(&[
+        "--tenant",
+        "acme",
+        "--email",
+        "owner@example.com",
+        "--password",
+        "hunter2hunter2",
+    ]))
+    .await
+    .err()
+    .ok_or("a password argument is refused")?;
+    assert!(argument.to_string().contains("never accepted as arguments"));
+    assert!(!argument.to_string().contains("hunter2"));
+
+    let short = setup::run(
+        CommandContext::for_testing(&setup_arguments("acme", "owner@example.com"))
+            .with_stdin("too short\n"),
+    )
+    .await
+    .err()
+    .ok_or("a short password is refused")?;
+    assert!(short.to_string().contains("at least 12 characters"));
+
+    let unattended = setup::run(CommandContext::for_testing(&[
+        "--tenant",
+        "acme",
+        "--email",
+        "owner@example.com",
+    ]))
+    .await
+    .err()
+    .ok_or("no password source is refused")?;
+    assert!(unattended.to_string().contains("--password-stdin"));
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "needs FORGE_TEST_DATABASE_URL"]
+async fn setup_creates_one_owner_who_can_sign_in_and_refuses_afterwards() -> TestResult {
+    let database = TestDatabase::<sqlx::Postgres>::create(&MIGRATOR).await?;
+    let pool = database.database().pool().clone();
+    let run = |tenant: &'static str, email: &'static str| {
+        setup::run(
+            CommandContext::for_testing(&setup_arguments(tenant, email))
+                .with_stdin(&format!("{PASSWORD}\n"))
+                .with_postgres(database.database().clone()),
+        )
+    };
+
+    run("acme", "Owner@Example.com").await?;
+    let again = run("acme", "owner@example.com")
+        .await
+        .err()
+        .ok_or("refused")?;
+    assert!(again.to_string().contains("already set up"), "{again}");
+    let other = run("globex", "other@example.com")
+        .await
+        .err()
+        .ok_or("refused")?;
+    assert!(other.to_string().contains("already set up"), "{other}");
+
+    let tenant = PgTenantDirectory::new(pool.clone())
+        .find_by_slug(&TenantSlug::new("acme")?)
+        .await?
+        .ok_or("the tenant exists")?;
+    let principal = authenticate_password(
+        &PostgresPasswordCredentialStore::new(pool.clone()),
+        &Argon2idPasswordHasher,
+        "owner@example.com",
+        PASSWORD.as_bytes(),
+    )
+    .await?;
+    let (roles, state): (Vec<String>, String) = sqlx::query_as(
+        "SELECT roles, state FROM forge_tenant_memberships WHERE tenant_id = $1 AND principal_id = $2",
+    )
+    .bind(tenant.into_uuid())
+    .bind(principal.into_uuid())
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(roles, vec![OWNER_ROLE.to_owned()]);
+    let stored: String = sqlx::query_scalar("SELECT login FROM forge_principals")
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(
+        stored, "owner@example.com",
+        "setup stores the canonical login"
+    );
+    assert_eq!(state, "active");
+    let counts: (i64, i64, i64) = sqlx::query_as(
+        "SELECT
+            (SELECT count(*) FROM forge_tenants),
+            (SELECT count(*) FROM forge_principals),
+            (SELECT count(*) FROM forge_audit_events
+              WHERE action = 'auth.setup.owner_provisioned' AND tenant_id = $1)",
+    )
+    .bind(tenant.into_uuid())
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(counts, (1, 1, 1));
+    database.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "needs FORGE_TEST_DATABASE_URL"]
+async fn concurrent_setups_create_exactly_one_tenant() -> TestResult {
+    let database = TestDatabase::<sqlx::Postgres>::create(&MIGRATOR).await?;
+    let pool = database.database().pool().clone();
+    let password_hash = Argon2idPasswordHasher.hash(PASSWORD.as_bytes()).await?;
+    let mut runs = Vec::new();
+    for index in 0..6 {
+        let pool = pool.clone();
+        let account = OwnerAccount {
+            tenant: TenantSlug::new(format!("tenant-{index}"))?,
+            organization: format!("Tenant {index}"),
+            login: CanonicalLogin::parse(&format!("owner{index}@example.com"))?,
+            password_hash: password_hash.clone(),
+            now: now()?,
+        };
+        runs.push(tokio::spawn(async move {
+            provision_owner(&pool, &account).await
+        }));
+    }
+    let mut created = 0;
+    for run in runs {
+        match run.await? {
+            Ok(_) => created += 1,
+            Err(SetupError::AlreadyProvisioned) => {}
+            Err(other) => return Err(other.into()),
+        }
+    }
+    assert_eq!(created, 1);
+    let tenants: i64 = sqlx::query_scalar("SELECT count(*) FROM forge_tenants")
+        .fetch_one(&pool)
+        .await?;
+    let principals: i64 = sqlx::query_scalar("SELECT count(*) FROM forge_principals")
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!((tenants, principals), (1, 1));
+    database.cleanup().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "needs FORGE_TEST_DATABASE_URL"]
+async fn reset_tokens_work_once_expire_and_revoke_every_session() -> TestResult {
+    let database = TestDatabase::<sqlx::Postgres>::create(&MIGRATOR).await?;
+    let pool = database.database().pool().clone();
+    let now = now()?;
+    let owner = provision_owner(
+        &pool,
+        &OwnerAccount {
+            tenant: TenantSlug::new("acme")?,
+            organization: "Acme".to_owned(),
+            login: CanonicalLogin::parse("owner@example.com")?,
+            password_hash: Argon2idPasswordHasher.hash(PASSWORD.as_bytes()).await?,
+            now,
+        },
+    )
+    .await?;
+    let sessions = PostgresSessionStore::new(pool.clone());
+    let later = UnixTimestamp::from_secs(now.as_secs() + 3_600);
+    let first = issue_persisted_session(&sessions, owner.principal_id, now, later).await?;
+    let second = issue_persisted_session(&sessions, owner.principal_id, now, later).await?;
+
+    let resets = PgPasswordResetStore::new(pool.clone());
+    let grant = |token: &PasswordResetToken, expires_at: u64| {
+        PasswordResetGrant::new(
+            owner.principal_id,
+            owner.tenant_id,
+            token.digest(),
+            now,
+            UnixTimestamp::from_secs(expires_at),
+        )
+    };
+    let expired = PasswordResetToken::generate()?;
+    resets.issue(&grant(&expired, now.as_secs() + 1)?).await?;
+    let token = PasswordResetToken::generate()?;
+    resets.issue(&grant(&token, now.as_secs() + 900)?).await?;
+    let unrelated = PasswordResetToken::generate()?;
+    let new_hash = Argon2idPasswordHasher.hash(b"a brand new secret").await?;
+
+    let after_expiry = UnixTimestamp::from_secs(now.as_secs() + 2);
+    assert!(resets.is_redeemable(&token.digest(), after_expiry).await?);
+    assert!(
+        !resets
+            .is_redeemable(&expired.digest(), after_expiry)
+            .await?
+    );
+    assert!(
+        !resets
+            .is_redeemable(&unrelated.digest(), after_expiry)
+            .await?
+    );
+    assert_eq!(
+        resets
+            .redeem(&expired.digest(), after_expiry, &new_hash)
+            .await?,
+        None
+    );
+    assert_eq!(
+        resets
+            .redeem(&unrelated.digest(), after_expiry, &new_hash)
+            .await?,
+        None
+    );
+    let redeemed = resets
+        .redeem(&token.digest(), after_expiry, &new_hash)
+        .await?
+        .ok_or("the token is redeemed")?;
+    assert_eq!(redeemed.principal_id, owner.principal_id);
+    assert_eq!(redeemed.tenant_id, owner.tenant_id);
+    assert_eq!(
+        resets
+            .redeem(&token.digest(), after_expiry, &new_hash)
+            .await?,
+        None
+    );
+    assert!(!resets.is_redeemable(&token.digest(), after_expiry).await?);
+
+    for issued in [first, second] {
+        let session = sessions
+            .find_by_credential(&issued.secrets.bearer_digest)
+            .await?
+            .ok_or("the session is kept as history")?;
+        assert!(session.revoked_at().is_some(), "every session is revoked");
+    }
+    let credentials = PostgresPasswordCredentialStore::new(pool.clone());
+    assert!(
+        authenticate_password(
+            &credentials,
+            &Argon2idPasswordHasher,
+            "owner@example.com",
+            PASSWORD.as_bytes()
+        )
+        .await
+        .is_err()
+    );
+    authenticate_password(
+        &credentials,
+        &Argon2idPasswordHasher,
+        "owner@example.com",
+        b"a brand new secret",
+    )
+    .await?;
+    let stored: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM forge_password_resets WHERE octet_length(token_digest) = 32 AND used_at IS NOT NULL",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(
+        stored, 2,
+        "the redeemed and the outstanding token are used up"
+    );
+    database.cleanup().await?;
+    Ok(())
+}

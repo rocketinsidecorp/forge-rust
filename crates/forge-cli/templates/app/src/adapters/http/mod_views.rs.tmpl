@@ -2,6 +2,9 @@
 //! map the result to a response, usually an HTML page rendered from a view
 //! model in `views` (or a `303` redirect after a form submission).
 
+%%if authentication%%
+pub mod authentication;
+%%end%%
 pub mod views;
 
 use std::sync::Arc;
@@ -35,6 +38,7 @@ pub fn routes(router: &mut Router, site: &Arc<Site>) -> Result<(), ComposeError>
 fn index(site: &Site, request: &Request) -> Response {
     forge::web::html(&WelcomeIndex {
         layout: site.layout(request, "Welcome"),
+        logo: site.logo(),
         application: env!("CARGO_PKG_NAME"),
         version: env!("CARGO_PKG_VERSION"),
     })

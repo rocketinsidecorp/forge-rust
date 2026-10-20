@@ -3,6 +3,12 @@
 //! There is no default or ambient tenant. A TenantContext can be created only
 //! by combining a currently authenticated principal, an active membership for
 //! the same principal, and an explicit successful RBAC decision.
+//!
+//! Browser sign-in and password resets use the tenant-aware contracts
+//! [`TenantDirectory`] and [`PasswordResetStore`]; people name a tenant by
+//! its [`TenantSlug`].
+
+mod accounts;
 
 use async_trait::async_trait;
 use forge_auth::AuthenticatedPrincipal;
@@ -11,6 +17,11 @@ use forge_security::{
     AuthorizationError, AuthorizationGrant, Permission, PrincipalId, RbacPolicy, Role,
 };
 use thiserror::Error;
+
+pub use accounts::{
+    AccountStoreError, PasswordResetGrant, PasswordResetGrantError, PasswordResetStore,
+    RedeemedPasswordReset, TenantDirectory, TenantSlug, TenantSlugError,
+};
 
 /// Marker type for a tenant identity.
 #[derive(Debug)]

@@ -38,6 +38,7 @@ src/adapters/http/views/mod.rs      Site (assets, import map, CSP, layers) and L
 src/adapters/http/views/welcome.rs  WelcomeIndex view model
 assets/application.css              digested and embedded by build.rs
 assets/application.js               imports Turbo and starts Stimulus
+assets/forge-rust-logo.png          the logo shown on the welcome page
 build.rs                            forge_views::build::embed_assets_with_crate_path("assets", "forge::views")
 tests/http.rs                       layout, CSP, CSRF and asset tests
 ```
@@ -213,9 +214,12 @@ impl GlobalAccess for Operators {
 
 A `--tenant-scoped` resource lives under `/tenants/{tenant_id}/posts` and, on
 PostgreSQL, is wired with `SessionTenantAccess` (session, session CSRF token,
-membership, RBAC); grant `posts:read` and `posts:write` to tenant roles in the
-printed `RbacPolicy`. Its rows are isolated by a `tenant_id` predicate in every
-statement and, on PostgreSQL, by forced row-level security.
+membership, RBAC); the printed `RbacPolicy` grants `posts:read` and
+`posts:write` to the `owner` role that `setup` gives the first member, and
+nothing to other roles until you grant them. Its rows are isolated by a
+`tenant_id` predicate in every statement and, on PostgreSQL, by forced
+row-level security. A signed-out browser is sent to the sign-in page (next
+section) and back.
 
 What the generated pages do:
 
@@ -236,6 +240,41 @@ as UTC, in whole seconds: sub-second input is refused, because browsers blank
 values with more than three fractional digits.
 The templates are ordinary Askama files: edit them freely; the view models in
 `src/adapters/http/views/posts.rs` give every value as display text.
+
+## Sign-in pages
+
+Full-stack PostgreSQL applications have the pages of
+`rails generate authentication` in `src/adapters/http/authentication.rs`,
+`src/adapters/http/views/authentication.rs`, `templates/sessions/` and
+`templates/passwords/` (`forge generate authentication` adds them to an older
+application; see [docs/cli.md](cli.md#forge-generate-authentication) and
+[ADR 0026](adr/0026-authentication-pages-and-setup.md)):
+
+```sh
+FORGE_MIGRATION_DATABASE_URL=... cargo run -- migrate
+FORGE_MIGRATION_DATABASE_URL=... cargo run -- setup --tenant acme --email owner@example.com
+FORGE_DATABASE_URL=... cargo run
+# http://127.0.0.1:3000/session/new?tenant=acme
+```
+
+They are ordinary handlers and templates: change the markup and wording
+freely. Keep the security steps each handler documents: the
+`csrf_verified` check, the throttle before any credential check, the uniform
+failure message, `issue_persisted_session` plus the session and CSRF cookies
+at sign-in, `return_path` on every return path, and `no-store` with
+`Referrer-Policy: no-referrer` on the reset pages.
+
+`authentication::routes` also registers `forge::views::SignInRedirect`: when
+an access policy answers `401` to a client whose `Accept` header prefers
+HTML (`forge::views::prefers_html`), the layer answers `303` to
+`/session/new?return_to=<page>` instead (`GET`/`HEAD` keep the page; other
+methods go to the sign-in page alone). JSON clients keep the `401`. To show a
+sign-out button elsewhere, include `templates/sessions/_sign_out.html` in a
+template whose view model has a `csrf_field`.
+
+Reset links go through the `PasswordResetNotifier` in `compose`; the
+generated `forge::auth::UndeliverablePasswordResets` delivers nothing until a
+mailer adapter replaces it, and the page answers the same either way.
 
 ## Rendering
 
@@ -529,7 +568,7 @@ those rules.
 
 ## Not in this slice
 
-JSON scaffolds and `forge generate controller`, development-mode
+MFA and user management pages, JSON scaffolds and `forge generate controller`, development-mode
 asset serving from disk, `forge assets precompile`, `forge dev`, multipart
 forms and file uploads, per-response CSRF token masking, and Turbo Streams over
 SSE/WebSockets (Phase 4).

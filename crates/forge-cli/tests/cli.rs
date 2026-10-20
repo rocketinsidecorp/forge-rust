@@ -112,6 +112,7 @@ fn new_is_full_stack_by_default_and_api_opts_out() {
         "templates/welcome/index.html",
         "assets/application.css",
         "assets/application.js",
+        "assets/forge-rust-logo.png",
         "src/adapters/http/views/mod.rs",
         "tests/http.rs",
     ] {

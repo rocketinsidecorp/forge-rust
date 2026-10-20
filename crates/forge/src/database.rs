@@ -75,33 +75,58 @@ impl Declaration {
         }
     }
 
+    /// Connects eagerly with `url`, for application commands.
+    pub(crate) async fn connect(&self, url: &SecretString) -> Result<DatabaseHandle, DbError> {
+        let _ = url;
+        match *self {
+            #[cfg(feature = "postgres")]
+            Self::Postgres(_) => forge_db::Database::connect(url)
+                .await
+                .map(DatabaseHandle::Postgres),
+            #[cfg(feature = "mysql")]
+            Self::MySql(_) => forge_db::Database::connect(url)
+                .await
+                .map(DatabaseHandle::MySql),
+            #[cfg(feature = "sqlite")]
+            Self::Sqlite(_) => forge_db::Database::connect(url)
+                .await
+                .map(DatabaseHandle::Sqlite),
+        }
+    }
+
     /// Connects eagerly with `url` and runs `command`; returns the exit code.
+    ///
+    /// `framework` holds embedded framework schemas (jobs, outbox) that
+    /// `migrate` applies before the application's migrations; each keeps
+    /// its own bookkeeping table. `rollback` only reverts application
+    /// migrations.
     pub(crate) async fn run_migration_command(
         &self,
         app: &'static str,
         url: &SecretString,
         command: MigrationCommand,
+        framework: &[forge_db::Migrator],
     ) -> ExitCode {
-        let _ = (app, url, command);
+        let _ = (app, url, command, framework);
         match *self {
             #[cfg(feature = "postgres")]
             Self::Postgres(ref migrator) => {
                 commands::run_migration_command::<forge_db::sqlx::Postgres>(
-                    app, url, migrator, command,
+                    app, url, migrator, command, framework,
                 )
                 .await
             }
             #[cfg(feature = "mysql")]
             Self::MySql(ref migrator) => {
                 commands::run_migration_command::<forge_db::sqlx::MySql>(
-                    app, url, migrator, command,
+                    app, url, migrator, command, framework,
                 )
                 .await
             }
             #[cfg(feature = "sqlite")]
             Self::Sqlite(ref migrator) => {
                 commands::run_migration_command::<forge_db::sqlx::Sqlite>(
-                    app, url, migrator, command,
+                    app, url, migrator, command, framework,
                 )
                 .await
             }
@@ -324,6 +349,7 @@ mod commands {
         url: &SecretString,
         migrator: &Migrator,
         command: MigrationCommand,
+        framework: &[Migrator],
     ) -> ExitCode {
         let database = match Database::<B>::connect(url).await {
             Ok(database) => database,
@@ -333,7 +359,20 @@ mod commands {
             }
         };
         let code = match command {
-            MigrationCommand::Migrate => migrate(app, &database, migrator).await,
+            MigrationCommand::Migrate => {
+                let mut code = ExitCode::SUCCESS;
+                for schema in framework {
+                    code = migrate(app, &database, schema).await;
+                    if code != ExitCode::SUCCESS {
+                        break;
+                    }
+                }
+                if code == ExitCode::SUCCESS {
+                    migrate(app, &database, migrator).await
+                } else {
+                    code
+                }
+            }
             MigrationCommand::Rollback => rollback(app, &database, migrator).await,
         };
         if tokio::time::timeout(CLOSE_TIMEOUT, database.close())

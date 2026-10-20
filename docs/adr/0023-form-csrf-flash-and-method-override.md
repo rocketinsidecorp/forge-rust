@@ -3,6 +3,7 @@
 - Status: Accepted
 - Date: 2026-10-19
 - Refines: [ADR 0022](0022-server-rendered-views.md), [ADR 0014](0014-argon2-session-cookie-and-csrf.md)
+- Refined by: [ADR 0026](0026-authentication-pages-and-setup.md) (sign-in binds the form token to the session)
 
 ## Context
 

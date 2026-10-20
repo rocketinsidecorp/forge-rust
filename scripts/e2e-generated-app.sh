@@ -4,7 +4,10 @@
 # health and graceful shutdown. FORGE_E2E_SKIP_DOCKER=1 keeps a database-free
 # host-only smoke path for environments without Docker. Both paths serve the
 # full-stack HTML page (layout, CSP, CSRF, digested Hotwire assets) and check
-# the quality gates of an --api application.
+# the quality gates of an --api application. The Docker path also creates the
+# first owner with `setup`, signs in and out through the generated pages, and
+# checks the authentication tables' runtime privileges. Builds honor
+# CARGO_TARGET_DIR.
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -44,7 +47,9 @@ wait_for_http() {
 
 log "Building the forge CLI"
 cargo build --quiet --locked --manifest-path "$repo_root/Cargo.toml" -p forge-cli
-forge="$repo_root/target/debug/forge"
+forge="${CARGO_TARGET_DIR:-$repo_root/target}/debug/forge"
+# The generated application's binary, wherever Cargo puts it.
+app_bin="${CARGO_TARGET_DIR:-$app_dir/target}/debug/$app_name"
 
 log "Generating $app_name"
 new_args=(new "$app_name" --skip-lockfile --forge-path .forge/crates/forge)
@@ -58,6 +63,14 @@ tar -C "$repo_root" --exclude ./target --exclude ./.git --exclude './examples/*/
 
 cd "$app_dir"
 cargo generate-lockfile --quiet
+
+if [[ "$skip_docker" == 1 ]]; then
+  log "Checking that forge generate authentication refuses a database-free application"
+  if refusal="$("$forge" generate authentication --dry-run 2>&1)"; then
+    fail "generate authentication must refuse a -d none application"
+  fi
+  grep -q "no database" <<<"$refusal" || fail "the refusal must explain why: $refusal"
+fi
 
 log "Running the generated application's quality gates"
 cargo fmt --all -- --check
@@ -110,11 +123,11 @@ SQL
   runtime_database_url="postgres://app_runtime:app_runtime@127.0.0.1:${postgres_port}/forge_e2e_app"
   migration_database_url="postgres://app_migrator:app_migrator@127.0.0.1:${postgres_port}/forge_e2e_app"
 
-  if FORGE_DATABASE_URL="$runtime_database_url" "target/debug/$app_name" migrate 2>/dev/null; then
+  if FORGE_DATABASE_URL="$runtime_database_url" "$app_bin" migrate 2>/dev/null; then
     fail "migrate must not accept the runtime database credential"
   fi
 
-  FORGE_MIGRATION_DATABASE_URL="$migration_database_url" "target/debug/$app_name" migrate
+  FORGE_MIGRATION_DATABASE_URL="$migration_database_url" "$app_bin" migrate
   [[ "$(docker compose exec -T db psql -U postgres -d forge_e2e_app -Atc "SELECT to_regclass('public.forge_e2e_probe')")" == "forge_e2e_probe" ]]     || fail "migrate did not create the probe table"
   [[ "$(docker compose exec -T db psql -U postgres -d forge_e2e_app -Atc "SELECT to_regclass('public.forge_audit_events')")" == "forge_audit_events" ]] \
     || fail "framework audit migration did not create the audit table"
@@ -333,10 +346,35 @@ SQL
     fail "RLS must reject a cross-tenant write"
   fi
 
-  FORGE_MIGRATION_DATABASE_URL="$migration_database_url" "target/debug/$app_name" rollback
+  FORGE_MIGRATION_DATABASE_URL="$migration_database_url" "$app_bin" rollback
   [[ -z "$(docker compose exec -T db psql -U postgres -d forge_e2e_app -Atc "SELECT to_regclass('public.forge_e2e_probe')")" ]]     || fail "rollback did not remove the probe table"
 
-  FORGE_MIGRATION_DATABASE_URL="$migration_database_url" "target/debug/$app_name" migrate
+  FORGE_MIGRATION_DATABASE_URL="$migration_database_url" "$app_bin" migrate
+
+  log "Creating the first owner with setup"
+  if docker compose exec -T db psql -q -U app_runtime -d forge_e2e_app -v ON_ERROR_STOP=1 \
+      -c "INSERT INTO forge_tenants (id, slug, name) VALUES ('$tenant_two', 'intruder', 'x');" \
+      >/dev/null 2>&1; then
+    fail "the runtime role must not create tenants"
+  fi
+  if printf 'correct horse battery\n' | FORGE_DATABASE_URL="$runtime_database_url" \
+      "$app_bin" setup --tenant acme --email owner@example.com --password-stdin 2>/dev/null; then
+    fail "setup must not accept the runtime database credential"
+  fi
+  if "$app_bin" setup --tenant acme --email owner@example.com --password 'correct horse battery' \
+      2>/dev/null; then
+    fail "setup must refuse a password argument"
+  fi
+  setup_output="$(printf 'correct horse battery\n' \
+    | FORGE_MIGRATION_DATABASE_URL="$migration_database_url" \
+      "$app_bin" setup --tenant acme --email owner@example.com --organization "Acme Inc" --password-stdin)"
+  grep -q "Created tenant acme" <<<"$setup_output" || fail "setup output: $setup_output"
+  if printf 'correct horse battery\n' | FORGE_MIGRATION_DATABASE_URL="$migration_database_url" \
+      "$app_bin" setup --tenant other --email other@example.com --password-stdin 2>/dev/null; then
+    fail "setup must refuse once a tenant exists"
+  fi
+  FORGE_MIGRATION_DATABASE_URL="$migration_database_url" "$app_bin" seed | grep -q "Seed data loaded" \
+    || fail "seed"
 fi
 
 log "Host run: serve, probe and graceful shutdown"
@@ -346,7 +384,7 @@ env_args=(FORGE_BIND="127.0.0.1:$port" FORGE_SHUTDOWN_GRACE_SECS=5)
 if [[ -n "$runtime_database_url" ]]; then
   env_args+=(FORGE_DATABASE_URL="$runtime_database_url")
 fi
-env "${env_args[@]}" "target/debug/$app_name" &
+env "${env_args[@]}" "$app_bin" &
 server_pid=$!
 wait_for_http "http://127.0.0.1:$port/health/live"
 curl --silent --fail "http://127.0.0.1:$port/health/ready" | grep -q '"ready"' || fail "readiness body"
@@ -381,8 +419,43 @@ post_status() {
 [[ "$(post_status -H "cookie: __Host-forge_csrf=$csrf_token" --data "csrf_token=$csrf_token")" == 405 ]] \
   || fail "a form POST with the page's CSRF token must pass to routing (405: / is GET only)"
 [[ "$(curl --silent --output /dev/null --write-out '%{http_code}' "http://127.0.0.1:$port/missing")" == 404 ]]   || fail "unknown route must return 404"
-env "${env_args[@]}" "target/debug/$app_name" healthcheck || fail "healthcheck subcommand"
-if FORGE_BIDN="typo" "target/debug/$app_name" healthcheck 2>/dev/null; then
+if [[ -n "$runtime_database_url" ]]; then
+  log "Signing in and out through the generated pages"
+  headers="$work_dir/auth.headers"
+  # Prints the value a response's Set-Cookie gives cookie $1.
+  set_cookie() { sed -n "s/^set-cookie: $1=\([0-9a-f]\{64\}\);.*/\1/Ip" "$headers" | head -n 1; }
+  page="$(curl --silent --fail --dump-header "$headers" "http://127.0.0.1:$port/session/new?tenant=acme")"
+  grep -q 'value="acme"' <<<"$page" || fail "the sign-in page must prefill the organization"
+  anonymous="$(set_cookie __Host-forge_csrf)"
+  [[ -n "$anonymous" ]] || fail "the sign-in page must issue the CSRF cookie"
+  sign_in_status() {
+    curl --silent --output /dev/null --dump-header "$headers" --write-out '%{http_code}' \
+      -H "cookie: __Host-forge_csrf=$anonymous" \
+      --data "csrf_token=$anonymous&tenant=acme&email=owner%40example.com&password=$1" \
+      "http://127.0.0.1:$port/session"
+  }
+  [[ "$(sign_in_status wrong+password+here)" == 422 ]] || fail "a wrong password must answer 422"
+  [[ "$(sign_in_status correct+horse+battery)" == 303 ]] || fail "sign-in must answer 303"
+  session="$(set_cookie __Host-forge_session)"
+  signed_in_csrf="$(set_cookie __Host-forge_csrf)"
+  [[ -n "$session" ]] || fail "sign-in must set the session cookie"
+  [[ -n "$signed_in_csrf" && "$signed_in_csrf" != "$anonymous" ]] || fail "sign-in must rotate the CSRF token"
+  cookies="cookie: __Host-forge_session=$session; __Host-forge_csrf=$signed_in_csrf"
+  curl --silent --fail -H "$cookies" "http://127.0.0.1:$port/session/new" | grep -q "You are signed in." \
+    || fail "the sign-in page must recognize the session"
+  [[ "$(curl --silent --output /dev/null --write-out '%{http_code}' -H "$cookies" \
+      --data "_method=delete" "http://127.0.0.1:$port/session")" == 403 ]] \
+    || fail "sign-out without the CSRF token must be refused"
+  [[ "$(curl --silent --output /dev/null --write-out '%{http_code}' -H "$cookies" \
+      --data "csrf_token=$signed_in_csrf&_method=delete" "http://127.0.0.1:$port/session")" == 303 ]] \
+    || fail "sign-out must answer 303"
+  [[ "$(docker compose exec -T db psql -U postgres -d forge_e2e_app -Atc \
+      "SELECT count(*) FROM forge_sessions s JOIN forge_principals p ON p.id = s.principal_id
+       WHERE p.login = 'owner@example.com' AND s.revoked_at IS NULL")" == 0 ]] \
+    || fail "sign-out must revoke the session"
+fi
+env "${env_args[@]}" "$app_bin" healthcheck || fail "healthcheck subcommand"
+if FORGE_BIDN="typo" "$app_bin" healthcheck 2>/dev/null; then
   fail "unknown FORGE_* keys must be rejected"
 fi
 kill -TERM "$server_pid"
@@ -390,7 +463,7 @@ status=0
 wait "$server_pid" || status=$?
 server_pid=""
 [[ "$status" == 0 ]] || fail "SIGTERM should exit 0, got $status"
-if env "${env_args[@]}" "target/debug/$app_name" healthcheck 2>/dev/null; then
+if env "${env_args[@]}" "$app_bin" healthcheck 2>/dev/null; then
   fail "healthcheck must fail when the server is down"
 fi
 echo "host run OK"

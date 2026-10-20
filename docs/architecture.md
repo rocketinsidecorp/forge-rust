@@ -9,8 +9,19 @@ membership and authorized TenantContext contracts, least-privilege PostgreSQL/RL
 digest-only persistent sessions, Argon2id password verification, opaque
 session/CSRF secrets, secure cookie helpers, and append-only audit persistence
 are implemented, including optimistic Argon2id rehash-on-policy-upgrade after a
-successful login. Login throttling, turnkey HTTP auth route composition, and
-stronger audit integrity/retention controls remain open.
+successful login. Full-stack PostgreSQL applications are generated with
+sign-in, sign-out and password-reset pages, bounded in-process sign-in
+throttling, a `setup` command for the first tenant and owner, and seeds ([ADR
+0026](adr/0026-authentication-pages-and-setup.md)). Still open in Phase 3:
+password-reset delivery (no mailer yet; the generated notifier fails closed),
+MFA, a shared persistent throttle for horizontally scaled deployments, user
+invitation and management, identity persistence on MySQL, MariaDB and SQLite,
+and stronger audit integrity/retention controls. Phase 4 is implemented as a
+library: `forge-jobs` (durable PostgreSQL jobs, fenced leases, workers, cron
+schedules) and `forge-events` (transactional outbox, dispatcher, consumer
+inbox), exposed through the `forge` features `jobs` and `events` ([ADR
+0025](adr/0025-durable-jobs-scheduler-and-outbox.md)); generator wiring for
+`forge new` is pending.
 
 Forge is an opinionated Rust application framework for long-lived services. Its
 value is the integration of explicit application architecture, secure defaults,
@@ -106,10 +117,11 @@ forge/
 │   ├── forge-security      # policy/capability primitives
 │   ├── forge-auth          # authentication/session adapters
 │   ├── forge-tenancy       # tenant context and RLS integration
-│   ├── forge-jobs          # job contracts and PostgreSQL adapter
-│   ├── forge-events        # events, outbox, consumer contracts
-│   ├── forge-cache         # cache port and adapters
-│   ├── forge-storage       # object storage port and adapters
+│   ├── forge-jobs          # job contracts, PostgreSQL adapter, workers, cron (Phase 4)
+│   ├── forge-events        # events, outbox, dispatcher, consumer inbox (Phase 4)
+│   ├── forge-cache         # cache port and adapters (implemented, ADR 0028)
+│   ├── forge-ratelimit     # fixed-window limiter, stores, HTTP middleware (ADR 0027)
+│   ├── forge-storage       # storage port, disk adapter, signed links, uploads (ADR 0029)
 │   ├── forge-telemetry     # OpenTelemetry lifecycle and context
 │   ├── forge-openapi       # contract/schema projection
 │   ├── forge-ai            # provider and controlled execution ports
@@ -244,6 +256,21 @@ Request layers (`forge_http::Middleware`) run before the route table. See
 [ADR 0023](adr/0023-form-csrf-flash-and-method-override.md) and
 [views](views.md).
 
+Browser sign-in is generated application code in the HTTP adapter ring
+(`src/adapters/http/authentication.rs`, like Rails' authentication
+generator) over framework rules: `forge-auth` throttles attempts per account
+and source (`MemoryLoginThrottle`, bounded; when full it evicts idle
+counters and refuses only if every counter is blocking), defines the
+canonical ASCII login used for lookup, throttling and delivery, sets
+the new-password policy and issues one-time reset tokens persisted only as
+SHA-256 digests; `forge-tenancy` resolves tenants by slug and defines the
+tenant-bound reset store; `forge-views` redirects signed-out browsers to the
+sign-in page with a validated return path (`SignInRedirect`). Sign-in
+verifies the CSRF-layer proof, issues a fresh session and CSRF token and
+revokes any previous session. Administrative commands (`setup`, `seed`) are
+registered with `App::command` and run with the migration credential. See
+[ADR 0026](adr/0026-authentication-pages-and-setup.md).
+
 ### Database and transactions
 
 PostgreSQL is the first database. SQL remains visible, with compile-time checked
@@ -289,6 +316,30 @@ external sinks, retention enforcement and privileged reader workflows remain
 separate controls. See
 [ADR 0012](adr/0012-structured-append-only-audit-evidence.md).
 
+### Rate limiting, cache and file storage
+
+Three platform services sit at the HTTP/infrastructure edge, behind features of
+the facade (`ratelimit`, `cache`, `storage`) and with PostgreSQL, MySQL/MariaDB
+and SQLite stores that share `forge-db`'s pruning pacing and migration
+composition:
+
+- `forge-ratelimit` counts fixed-window hits per SHA-256 key: a bounded memory
+  limiter with no background task, shared stores using one atomic statement per
+  hit, and a `Middleware`/handler wrapper that answers `429` with `Retry-After`
+  and fails closed (`503`) when the limiter fails. It never trusts forwarded
+  headers; the application chooses the client key. See
+  [ADR 0027](adr/0027-rate-limiting.md) and [rate limiting](rate-limiting.md).
+- `forge-cache` is a bounded key/value cache (memory LRU, or shared tables addressed by
+  key hash) whose `fetch` collapses concurrent misses per process and survives a
+  cancelled leader; tenant data is keyed from an authorized `TenantContext`. See
+  [ADR 0028](adr/0028-cache.md) and [caching](caching.md).
+- `forge-storage` keeps blobs under `StorageKey`s that cannot express traversal,
+  on a disk adapter that resolves every path with `openat` and `O_NOFOLLOW`,
+  serves them through HMAC-signed expiring links as sandboxed downloads (inline
+  only for raster images), and accepts uploads through a strict bounded
+  multipart parser with a mandatory allow-list on the sniffed type. See
+  [ADR 0029](adr/0029-file-storage.md) and [storage](storage.md).
+
 ### Jobs and events
 
 The first durable job adapter is PostgreSQL-backed. Enqueue and outbox writes can
@@ -302,6 +353,18 @@ events are versioned external contracts written to an outbox in the same commit 
 domain state. Publishers deliver only committed rows. Consumers persist an
 idempotency key before acknowledging. Forge does not promise exactly-once
 delivery; it provides at-least-once delivery plus idempotent handling.
+
+Implementation (ADR 0025): every claim carries a fencing lease token that all
+later transitions must present, so a reclaimed job cannot be acknowledged by
+its stale worker; `complete_in` commits a handler's database effects with
+the job's completion. The runtime role reaches other tenants' rows only
+through `SECURITY DEFINER` claim/transition functions; everything else is
+filtered by the ADR 0011 RLS policy. `Jobs::run` owns one bounded worker loop
+per queue, the scheduler and the pruner under one cancellation, and the
+facade shares that cancellation with the HTTP server. Cron schedules fire
+each tick once across replicas through a conditional upsert of the
+schedule's last tick. MySQL/MariaDB and SQLite are refused, not emulated.
+See the [jobs guide](jobs.md).
 
 ### HTTP, OpenAPI, WebSockets, and SSE
 
@@ -370,7 +433,9 @@ duplicate `*_new` files. `forge generate scaffold` writes only new files and
 prints the module declarations and composition-root lines to add, so existing
 code changes only by the developer's hand
 ([ADR 0024](adr/0024-scaffold-generator.md)); its routes are deny-by-default
-until the application chooses an access policy.
+until the application chooses an access policy. `forge generate
+authentication` adds the sign-in pages that `forge new` generates to an
+older PostgreSQL application the same way.
 
 `forge new` emits the application Docker assets in Phase 1 and `forge build` can
 produce the same release binary locally or in the container build. A development

@@ -1,5 +1,8 @@
 //! Concrete mechanisms that implement application ports.
 
+%%if authentication%%
+pub mod accounts;
+%%end%%
 %%if postgresql%%
 pub mod audit;
 pub mod auth;

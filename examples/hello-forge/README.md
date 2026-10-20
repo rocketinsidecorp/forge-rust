@@ -1,6 +1,6 @@
 # hello-forge
 
-A [Forge](https://github.com/fabriciobonjorno/forge-rust) application organized
+A [Forge](https://github.com/rocketinsidecorp/forge-rust) application organized
 around hexagonal architecture boundaries:
 
 ```text
@@ -16,14 +16,14 @@ src/bootstrap       composition root and process lifecycle
 ## Views
 
 Pages are rendered on the server, as in Rails
-([ADR 0022](https://github.com/fabriciobonjorno/forge-rust/blob/main/docs/adr/0022-server-rendered-views.md)):
+([ADR 0022](https://github.com/rocketinsidecorp/forge-rust/blob/main/docs/adr/0022-server-rendered-views.md)):
 
 ```text
 templates/layouts/application.html  layout: CSRF meta tag, stylesheet, import map
 templates/layouts/_flash.html       one-shot notice/alert messages
 templates/welcome/index.html        the page served at /
 src/adapters/http/views/            view models checked against the templates at compile time
-assets/                             CSS and JavaScript, digested and embedded by build.rs
+assets/                             CSS, JavaScript and the logo, digested and embedded by build.rs
 ```
 
 Templates use [Askama](https://askama.rs): `{{ value }}` is HTML-escaped and a

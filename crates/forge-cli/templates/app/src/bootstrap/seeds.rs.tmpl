@@ -1,0 +1,67 @@
+//! `seed`: loads the application's seed data, like `rails db:seed`.
+//!
+//! ```sh
+//! cargo run -- seed
+//! ```
+//!
+//! [`seed`] runs in one transaction with the migration credential
+//! (`FORGE_MIGRATION_DATABASE_URL`) and is committed only when it succeeds.
+//! Write every statement so that running it again changes nothing (for
+//! example `INSERT ... ON CONFLICT DO NOTHING`): deployments may seed more
+//! than once. Seeds are not for accounts or credentials; the first owner is
+%%if authentication%%
+//! created by `setup`.
+%%end%%
+%%if !authentication%%
+//! created by the application's own provisioning.
+%%end%%
+
+use forge::{CommandContext, CommandError};
+
+/// The line `help` shows.
+pub const SUMMARY: &str = "Load the seed data of src/bootstrap/seeds.rs in one transaction";
+
+/// Runs the command.
+pub async fn run(mut context: CommandContext) -> Result<(), CommandError> {
+%%if postgresql%%
+    let pool = context.postgres()?.pool().clone();
+%%end%%
+%%if mysql_family%%
+    let pool = context.mysql()?.pool().clone();
+%%end%%
+%%if sqlite%%
+    let pool = context.sqlite()?.pool().clone();
+%%end%%
+    let failed = |error| CommandError::caused_by("seeding failed; nothing was committed", error);
+    let mut transaction = pool.begin().await.map_err(failed)?;
+    seed(&mut transaction).await.map_err(failed)?;
+    transaction.commit().await.map_err(failed)?;
+    context.say("Seed data loaded.")
+}
+
+/// The seed data: add idempotent statements here, for example
+///
+/// ```text
+/// sqlx::query("INSERT INTO plans (id, name) VALUES ($1, $2) ON CONFLICT (name) DO NOTHING")
+///     .bind(forge::core::Id::<Plan>::new().into_uuid())
+///     .bind("Free")
+///     .execute(&mut **transaction)
+///     .await?;
+/// ```
+%%if postgresql%%
+pub async fn seed(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+) -> Result<(), sqlx::Error> {
+%%end%%
+%%if mysql_family%%
+pub async fn seed(transaction: &mut sqlx::Transaction<'_, sqlx::MySql>) -> Result<(), sqlx::Error> {
+%%end%%
+%%if sqlite%%
+pub async fn seed(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+) -> Result<(), sqlx::Error> {
+%%end%%
+    // A new application has no seed data yet.
+    let _ = transaction;
+    Ok(())
+}
