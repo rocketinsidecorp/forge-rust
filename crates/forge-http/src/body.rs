@@ -15,8 +15,13 @@ use hyper::body::{Frame, SizeHint};
 /// trait object keeps [`crate::Response`] free of type parameters.
 pub(crate) trait ChunkSource: Send {
     /// The next non-empty chunk, or `None` once the body is complete.
+    /// `Pending` with the waker already woken when it skipped many empty
+    /// chunks, so a step that never produces data cannot starve other tasks.
     fn poll_chunk(&mut self, context: &mut Context<'_>) -> Poll<Option<Bytes>>;
 }
+
+/// Empty chunks skipped in one poll before the body yields to the scheduler.
+const MAX_EMPTY_CHUNKS_PER_POLL: u32 = 32;
 
 type StepFuture<S> = Pin<Box<dyn Future<Output = Option<(Bytes, S)>> + Send>>;
 
@@ -50,6 +55,7 @@ where
     Fut: Future<Output = Option<(Bytes, S)>> + Send + 'static,
 {
     fn poll_chunk(&mut self, context: &mut Context<'_>) -> Poll<Option<Bytes>> {
+        let mut empty = 0;
         loop {
             match std::mem::replace(&mut self.state, UnfoldState::Done) {
                 UnfoldState::Ready(state) => {
@@ -63,9 +69,18 @@ where
                     Poll::Ready(None) => return Poll::Ready(None),
                     Poll::Ready(Some((chunk, state))) => {
                         self.state = UnfoldState::Ready(state);
-                        // An empty chunk carries nothing; ask for the next.
                         if !chunk.is_empty() {
                             return Poll::Ready(Some(chunk));
+                        }
+                        // An empty chunk carries nothing; ask for the next,
+                        // but a step that keeps returning empty chunks at
+                        // once must not hold the worker thread: after a few,
+                        // yield to the scheduler and continue when polled
+                        // again.
+                        empty += 1;
+                        if empty == MAX_EMPTY_CHUNKS_PER_POLL {
+                            context.waker().wake_by_ref();
+                            return Poll::Pending;
                         }
                     }
                 },

@@ -271,7 +271,9 @@ impl Response {
     /// Starting from `state`, the server calls `step` for each chunk: it
     /// returns the chunk and the next state, or `None` to end the body.
     /// Chunks are written (with chunked transfer encoding) as soon as they
-    /// are produced; empty chunks are skipped. `step` runs on the
+    /// are produced; empty chunks are skipped (after 32 in a row the body
+    /// yields to the scheduler, so a step that never produces data does not
+    /// hold a worker thread). `step` runs on the
     /// connection's task, so the body is owned by the connection: it stops
     /// when the client disconnects, when a write makes no progress for the
     /// request timeout or 30 seconds, whichever is longer
@@ -1723,6 +1725,35 @@ mod tests {
 
         assert_eq!(response.next_chunk().await.as_deref(), Some(&b"x"[..]));
         assert_eq!(response.next_chunk().await, None);
+    }
+
+    #[test]
+    fn a_step_that_only_returns_empty_chunks_does_not_starve_other_tasks() {
+        // On a single-threaded runtime, a body that spun without yielding
+        // would keep the other task from ever running. The verdict comes
+        // through a channel so that a regression fails instead of hanging.
+        let (verdict, outcome) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .expect("runtime must build");
+            runtime.block_on(async {
+                let mut empty =
+                    Response::stream(StatusCode::OK, (), |()| async { Some((Bytes::new(), ())) });
+                let reader = tokio::spawn(async move { empty.next_chunk().await });
+                let other = tokio::spawn(async { "ran" });
+                let ran = other.await.expect("the other task must not panic");
+                reader.abort();
+                let _ = verdict.send(ran);
+            });
+        });
+
+        assert_eq!(
+            outcome.recv_timeout(CLIENT_TIMEOUT),
+            Ok("ran"),
+            "an always-empty body must yield to other tasks"
+        );
     }
 
     #[tokio::test]
