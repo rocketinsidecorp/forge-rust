@@ -1133,10 +1133,10 @@ mod tests {
         assert!(postgres_init.contains("CREATE ROLE app_runtime"));
         assert!(postgres_init.contains("NOBYPASSRLS"));
         assert!(manifest.contains(&format!(
-            "forge = {{ git = \"https://github.com/fabriciobonjorno/forge-rust\", tag = \"v{FORGE_VERSION}\", features = [\"views\"] }}"
+            "forge = {{ git = \"https://github.com/rocketinsidecorp/forge-rust\", tag = \"v{FORGE_VERSION}\", features = [\"views\"] }}"
         )));
         assert!(manifest.contains(&format!(
-            "forge-views = {{ git = \"https://github.com/fabriciobonjorno/forge-rust\", tag = \"v{FORGE_VERSION}\", default-features = false, features = [\"build\"] }}"
+            "forge-views = {{ git = \"https://github.com/rocketinsidecorp/forge-rust\", tag = \"v{FORGE_VERSION}\", default-features = false, features = [\"build\"] }}"
         )));
 
         let dockerfile = read(&root, "Dockerfile");

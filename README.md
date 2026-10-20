@@ -38,7 +38,7 @@ See the [delivery sequence](docs/architecture.md#delivery-sequence-and-exit-crit
 Install the CLI from Git:
 
 ```sh
-cargo install --locked --git https://github.com/fabriciobonjorno/forge-rust forge-cli
+cargo install --locked --git https://github.com/rocketinsidecorp/forge-rust forge-cli
 ```
 
 Create an application, migrate it, create the first tenant and its owner,

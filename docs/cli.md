@@ -6,7 +6,7 @@ Status: Phase 3 in progress. This page documents the `forge` executable
 ## Installation
 
 ```sh
-cargo install --locked --git https://github.com/fabriciobonjorno/forge-rust forge-cli
+cargo install --locked --git https://github.com/rocketinsidecorp/forge-rust forge-cli
 ```
 
 `--locked` installs with the dependency graph from the repository's committed
