@@ -140,6 +140,7 @@ from env files, Kubernetes manifests and unit files.
 | `FORGE_STORAGE_MAX_UPLOAD_BYTES` | `524288` | Largest uploaded file, at most `1073741824`; when storage is configured it must not exceed `FORGE_MAX_BODY_BYTES`. |
 | `FORGE_STORAGE_LINK_TTL_SECS` | `900` | Default lifetime of signed links, `1` to `604800`. |
 | `FORGE_STREAMS_KEY` | none | HMAC key of signed live-update stream names: base64 (standard or URL-safe, padded or not) of at least 32 random bytes, as `openssl rand -base64 32` prints; the same on every replica. Redacted. **Required in `production` by applications that serve live updates** (`scaffold --broadcast`); development and test use a random per-process key ([views](views.md#live-updates)). |
+| `FORGE_TELEMETRY_*` | on, exporting nothing | Traces, metrics and log export ([observability](observability.md#configuration)). The ones operators set most: `FORGE_TELEMETRY_METRICS_ADDR` (separate Prometheus listener; in a container `0.0.0.0:9464` with `FORGE_TELEMETRY_METRICS_PUBLIC=true` and the port kept off the internet), `FORGE_TELEMETRY_EXPORTER=otlp` and `FORGE_TELEMETRY_LOGS_EXPORTER=otlp` with `FORGE_TELEMETRY_OTLP_ENDPOINT` (`https` in production unless `FORGE_TELEMETRY_OTLP_ALLOW_PLAINTEXT=true`), `FORGE_TELEMETRY_OTLP_HEADERS` (secret, redacted), `FORGE_TELEMETRY_SERVICE_NAME`, `FORGE_TELEMETRY_TRUST_TRACEPARENT` (only behind a gateway that sets or sanitizes `traceparent`). `FORGE_TELEMETRY_ENABLED=false` turns it off. |
 
 Logs go to standard output, and the platform (Docker, Kubernetes, journald)
 collects them. The HTTP layer also enforces a header-read timeout and adds
@@ -199,6 +200,10 @@ These routes are always registered:
 Use liveness to decide when to restart and readiness to decide when to route
 traffic. Do not point liveness at readiness: a dependency outage should take an
 instance out of rotation, not restart it in a loop.
+
+Metrics are not on these routes: the Prometheus text is served only by the
+separate `FORGE_TELEMETRY_METRICS_ADDR` listener
+([observability](observability.md#prometheus-and-grafana)).
 
 The access-controlled diagnostic behavior for `/health` described in the
 [architecture](architecture.md#observability-and-health) is not part of Phase 1.

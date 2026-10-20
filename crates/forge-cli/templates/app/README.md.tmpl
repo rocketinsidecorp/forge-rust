@@ -210,6 +210,36 @@ export FORGE_HTTP_TRUSTED_PROXIES=172.30.0.0/24,fd00:1::/64   # proxy CIDRs or a
 cargo run
 ```
 
+## Observability
+
+The framework traces every request (a span named after the route template),
+records request, job, connection pool, process and runtime metrics, and puts
+`trace_id`/`span_id` on every log line of a request. Telemetry is on and
+exports nothing until you choose a path; the variables and metric names are
+Forge-Go's ([observability guide](https://github.com/rocketinsidecorp/forge-rust/blob/main/docs/observability.md)):
+
+```bash
+# Prometheus text on a separate, private listener (never on the app port)
+FORGE_TELEMETRY_METRICS_ADDR=127.0.0.1:9464 cargo run
+curl -s http://127.0.0.1:9464/metrics | grep http_server_request_duration_seconds_count
+# Spans in the development log
+FORGE_TELEMETRY_EXPORTER=log cargo run
+# Traces, metrics and logs to an OpenTelemetry Collector (OTLP/HTTP)
+FORGE_TELEMETRY_EXPORTER=otlp FORGE_TELEMETRY_LOGS_EXPORTER=otlp \
+  FORGE_TELEMETRY_OTLP_ENDPOINT=http://127.0.0.1:4318 cargo run
+# Off entirely
+FORGE_TELEMETRY_ENABLED=false cargo run
+```
+
+Production requires an `https` collector endpoint; API keys go in
+`FORGE_TELEMETRY_OTLP_HEADERS` (`authorization=Bearer%20TOKEN`), which is
+redacted everywhere. Register application metrics and spans through
+`composition.telemetry()` in `src/bootstrap`.
+%%if docker%%
+In a container, bind the metrics listener to `0.0.0.0:9464`, confirm it with
+`FORGE_TELEMETRY_METRICS_PUBLIC=true`, and do not publish that port.
+%%end%%
+
 %%if docker%%
 ## Container
 

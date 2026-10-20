@@ -29,7 +29,8 @@ results.
 | 2 | PostgreSQL, migrations, transaction contracts, repositories | Behavior implemented; CI runner gate still blocked |
 | 3 | Authentication, authorization, tenancy, RLS, audit | Implemented for PostgreSQL (sign-in pages, setup, RBAC, RLS, audit); MFA, reset delivery and other backends pending |
 | 4 | PostgreSQL jobs, cron scheduler, outbox, idempotent consumers | Library implemented and tested (`forge` features `jobs`, `events`); `forge new` wiring pending |
-| 5+ | Telemetry, OpenAPI, AI, hardening | Design only |
+| 5 | Traces, metrics, correlated logs (OTLP, Prometheus) | Implemented ([ADR 0033](docs/adr/0033-telemetry.md)); local Grafana stack pending |
+| 6+ | OpenAPI, AI, hardening | Design only |
 
 See the [delivery sequence](docs/architecture.md#delivery-sequence-and-exit-criteria).
 
@@ -229,6 +230,46 @@ List only proxy networks and keep the application port reachable only
 through them: anything inside a listed network can claim any client address.
 nginx, Traefik, Compose and Kubernetes setups are in the
 [deployment guide](docs/deployment.md#client-addresses-behind-a-proxy).
+
+### Traces, metrics and logs
+
+Every application is instrumented by the framework
+([ADR 0033](docs/adr/0033-telemetry.md), [observability](docs/observability.md)):
+a server span per request named after the route template, request, job,
+outbox, connection pool, process and Tokio runtime metrics, and `trace_id`/
+`span_id` on every log line of a request. Telemetry is on and exports
+nothing by default; the variables and metric names are Forge-Go's, so the
+same collector, Prometheus and dashboards serve both frameworks.
+
+```sh
+# Prometheus text on a separate, private listener (never on the app port)
+FORGE_TELEMETRY_METRICS_ADDR=127.0.0.1:9464 cargo run
+curl -s http://127.0.0.1:9464/metrics | grep http_server_request_duration_seconds_count
+
+# Spans in the development log
+FORGE_TELEMETRY_EXPORTER=log cargo run
+
+# Traces, metrics and logs to an OpenTelemetry Collector (OTLP/HTTP, JSON)
+FORGE_TELEMETRY_EXPORTER=otlp FORGE_TELEMETRY_LOGS_EXPORTER=otlp \
+FORGE_TELEMETRY_OTLP_ENDPOINT=http://127.0.0.1:4318 \
+FORGE_TELEMETRY_SERVICE_NAME=shop cargo run
+
+# A vendor directly: https is required in production, header values are secret
+FORGE_ENV=production FORGE_TELEMETRY_EXPORTER=otlp \
+FORGE_TELEMETRY_OTLP_ENDPOINT=https://otlp.example.com \
+FORGE_TELEMETRY_OTLP_HEADERS='authorization=Bearer%20TOKEN' ./target/release/shop
+
+# Continue traces from a gateway that sets traceparent; sample 10% of new traces
+FORGE_TELEMETRY_TRUST_TRACEPARENT=true FORGE_TELEMETRY_SAMPLE_RATIO=0.1 cargo run
+
+# No telemetry at all
+FORGE_TELEMETRY_ENABLED=false cargo run
+```
+
+Custom spans and application metrics use `Composition::telemetry()`; a
+handler parents its spans with `request.trace_context()`. Queues are bounded
+(a full queue drops and counts, requests never wait) and telemetry is
+flushed last at shutdown, within `FORGE_SHUTDOWN_GRACE_SECS`.
 
 > **Before the first tag:** generated applications depend on `forge` through the
 > Git tag `v<cli version>` (for example `v0.1.0`). Until that tag is pushed, the
@@ -527,6 +568,7 @@ crates/
 ├── forge-ratelimit # fixed-window limiter: memory and shared stores, fail-closed middleware
 ├── forge-security # deny-by-default RBAC roles, permissions and grants
 ├── forge-storage  # file storage: disk adapter, signed links, strict uploads
+├── forge-telemetry # traces, metrics, log export: W3C context, OTLP/HTTP JSON, Prometheus text
 ├── forge-tenancy  # membership and explicit authorized TenantContext
 ├── forge-views    # server-rendered views: HTML, CSRF, flash, assets, import map, CSP
 └── forge-cli      # the `forge` executable and application generator
@@ -592,6 +634,7 @@ Contribution rules:
 - [CLI reference](docs/cli.md)
 - [Jobs, schedules, outbox and consumers](docs/jobs.md)
 - [Deployment](docs/deployment.md)
+- [Observability: traces, metrics and logs](docs/observability.md)
 - [Rate limiting](docs/rate-limiting.md), [caching](docs/caching.md) and [file storage](docs/storage.md)
 - [Views, Turbo and live updates](docs/views.md)
 - [Threat model](docs/threat-model.md)

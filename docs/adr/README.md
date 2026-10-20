@@ -32,6 +32,7 @@ does not mean implementation exists.
 | [0030](0030-framework-migration-ownership.md) | Framework migration ownership: application `rollback` never reverts framework migrations; disabled features are tolerated | Accepted |
 | [0031](0031-live-updates-over-server-sent-events.md) | Live updates: Turbo Streams over Server-Sent Events, signed stream names, PostgreSQL `LISTEN/NOTIFY` fanout, `scaffold --broadcast` | Accepted |
 | [0032](0032-trusted-proxies-and-client-ip.md) | Trusted proxies and the client address: `FORGE_HTTP_TRUSTED_PROXIES`, right-to-left `X-Forwarded-For`, `Request::client_ip` | Accepted |
+| [0033](0033-telemetry.md) | Forge-owned telemetry over OpenTelemetry protocols: `FORGE_TELEMETRY_*`, W3C propagation, OTLP/HTTP JSON, Prometheus listener, correlated log export | Accepted |
 
 New ADRs use the next four-digit number. A changed decision receives a new ADR
 that marks the prior record `Superseded`; accepted records are not rewritten to

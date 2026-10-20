@@ -337,3 +337,35 @@ The trusted-proxy resolver (ADR 0032) mirrors the Forge-Go ADR 0037 tests:
   direct forgers in their own counters, and group IPv6 by `/64`; the
   generated `clients_behind_one_trusted_proxy_have_their_own_sign_in_counters`
   does the same through the real sign-in pages.
+
+## Telemetry tests
+
+`forge-telemetry` (ADR 0033) tests the port against Forge-Go's behavior:
+
+- **Configuration:** every `FORGE_TELEMETRY_*` key and Go duration, the
+  production rules (https unless plaintext is allowed, no `log` exporter,
+  loopback metrics unless confirmed public), header and endpoint values never
+  echoed and redacted in `Debug` and serialization, disabled telemetry not
+  validated further.
+- **Propagation:** strict `traceparent`/`tracestate` parsing with a
+  deterministic fuzz loop; incoming context ignored unless trusted, over real
+  connections (`crates/forge-http/tests/telemetry.rs`).
+- **Export** against an OTLP receiver (`forge_telemetry::testing::Receiver`,
+  a hyper server): span, metric and log JSON documents field by field, gzip
+  and secret headers, retries on 503 and none on 400, a full queue dropping
+  without blocking, a shutdown bounded by its deadline against a collector
+  that never answers, and a failing log export that does not feed itself
+  (its own binary, with a global subscriber).
+- **HTTP:** route templates and empty routes as labels (raw paths and queries
+  never appear), requests answered by a layer, a panicking handler recorded
+  as 5xx with the active gauge back to zero, spans named after the template
+  and log records carrying the server span's ids.
+- **Jobs and outbox** (`--include-ignored`): outcomes counted by job name
+  and event type, panicking attempts included, payloads never exported.
+- **Catalogue:** `tests/catalogue.rs` holds the metrics shared with Forge-Go
+  (name, kind, unit, labels, Prometheus name), requires every other Go metric
+  to be explained in `docs/observability.md`, and every registered metric to
+  be documented there.
+- **End to end:** the generated-app script scrapes the separate metrics
+  listener, checks route-template labels, that the application port never
+  serves `/metrics`, and that an OTLP endpoint error does not echo it.

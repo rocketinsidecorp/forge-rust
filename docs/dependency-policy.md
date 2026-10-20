@@ -269,6 +269,60 @@ Admission review:
 - The supply-chain gate (`cargo deny check`) is unchanged and was run with these
   crates in the graph.
 
+## Telemetry dependency decision
+
+[ADR 0033](adr/0033-telemetry.md) ports Forge-Go's dependency-free telemetry
+as the workspace crate `forge-telemetry` instead of adopting the
+OpenTelemetry SDK (`opentelemetry`, `opentelemetry_sdk`,
+`opentelemetry-otlp` with `tonic`/`prost` or `reqwest`,
+`tracing-opentelemetry`, `opentelemetry-prometheus` with `prometheus`): that
+stack would add several dozen packages, a second HTTP client, gRPC and
+protobuf code generation, pre-1.0 crates with frequent breaking releases and
+background tasks outside Forge's lifecycle, for a wire format Forge can
+produce with serde_json over the hyper and rustls it already ships. New
+packages in `Cargo.lock`:
+
+| Crate | Version | Used by | Purpose | Feature policy |
+| --- | --- | --- | --- | --- |
+| `tokio-rustls` | `0.26.6` | `forge-telemetry` | TLS for `https` OTLP endpoints over the existing `rustls` | defaults disabled (no `aws_lc_rs`, no `logging`); `ring`, `tls12` |
+| `flate2` | `1.1.10` | `forge-telemetry` | gzip request bodies (`FORGE_TELEMETRY_OTLP_COMPRESSION=gzip`) | defaults disabled; `rust_backend` (pure-Rust `miniz_oxide`, no zlib or C) |
+| `miniz_oxide`, `adler2`, `crc32fast`, `simd-adler32` | `0.9.1`, `2.0.1`, `1.5.2`, `0.3.10` | via `flate2` | DEFLATE and checksums | as `flate2` requires |
+| `want`, `try-lock` | `0.3.2`, `0.2.5` | via `hyper` `client` | hyper's client-side dispatch | hyper's `client` feature only (`http1` already enabled) |
+
+Directly declared crates that were already in the graph: `rustls` 0.23
+(defaults disabled; `ring`, `std`, `tls12`, as SQLx's
+`tls-rustls-ring-webpki` already enabled), `webpki-roots` 1.0 (the Mozilla
+root store SQLx uses; its CDLA-Permissive-2.0 exception in `deny.toml` now
+covers this consumer too), `httpdate` 1.0 (hyper's own; `Retry-After`
+dates), `getrandom` 0.4 (trace and span ids from the OS CSPRNG), and
+`tracing-subscriber` (the log export layer).
+
+Admission review:
+
+- `tokio-rustls` is maintained by the rustls organization alongside
+  `rustls`, MIT OR Apache-2.0, no build script, proc macro or native code of
+  its own, no RustSec advisories; it is a thin async adapter and its types
+  stay private to the exporter. Replacement: a hand-written adapter over
+  `rustls::ClientConnection`.
+- `flate2` is maintained under the rust-lang organization, MIT OR
+  Apache-2.0; with `rust_backend` it compiles no C. `miniz_oxide` and
+  `adler2` are also dependencies of the Rust standard library's backtrace
+  support; `crc32fast` and `simd-adler32` use `unsafe` for SIMD checksums
+  (reviewed by role: they checksum Forge's own request bodies, never hostile
+  input). Only compression is used; Forge never decompresses. Replacement:
+  dropping gzip support (the variable would then refuse `gzip`).
+- `want` and `try-lock` are hyper's own small client-side crates (same
+  maintainer as hyper), MIT.
+- No new type appears in a public signature except `http::HeaderMap` in
+  `OtlpClient::new`, already a public Forge type. Public telemetry contracts
+  (`Telemetry`, `Registry`, `Span`, `SpanContext`) are Forge-owned.
+- Graph impact for generated applications: every application (database-free
+  ones included) now links `rustls` with the `ring` provider, which builds C
+  and assembly with `cc` at compile time; the generated Dockerfile's builder
+  image already provides that toolchain and database-enabled applications
+  already compiled it through SQLx.
+- `cargo deny check` was run with these crates in the graph.
+
 ## Features and public API containment
 
 - Set `default-features = false` when defaults add unused protocols, native
