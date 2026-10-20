@@ -339,11 +339,13 @@ pub(crate) enum AfterFailure {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TickOutcome {
     /// This replica won the tick and enqueued the job.
-    Fired(Enqueued),
+    Fired(JobId),
     /// This replica won the tick but it was older than the allowed lateness.
     Skipped,
     /// Another replica (or an earlier run) already handled this tick.
     AlreadyHandled,
+    /// The tick is later than the database clock: not recorded.
+    Early,
 }
 
 /// Lifecycle state of a job.
@@ -672,8 +674,8 @@ impl PgJobStore {
     }
 
     /// Records `tick` as the schedule's latest and, when this replica wins
-    /// it and it is not later than `lateness`, enqueues the job in the same
-    /// transaction.
+    /// it, enqueues the job in the same transaction. The database clock
+    /// decides whether the tick is due (`Early`) or too late (`Skipped`).
     pub(crate) async fn fire_tick(
         &self,
         schedule: &str,
@@ -681,28 +683,37 @@ impl PgJobStore {
         lateness: Duration,
         job: NewJob,
     ) -> Result<TickOutcome, JobsError> {
-        let tick_us = tick.unix_micros();
-        let mut transaction = self.database.begin().await?;
-        let won: Option<bool> = sqlx::query_scalar(
-            "INSERT INTO forge_job_schedules (name, last_tick_at)
-             VALUES ($1, timestamptz 'epoch' + $2::bigint * interval '1 microsecond')
-             ON CONFLICT (name) DO UPDATE
-                 SET last_tick_at = EXCLUDED.last_tick_at, updated_at = clock_timestamp()
-                 WHERE forge_job_schedules.last_tick_at < EXCLUDED.last_tick_at
-             RETURNING now() - last_tick_at <= $3::bigint * interval '1 millisecond'",
+        let outcome: String = sqlx::query_scalar(
+            "SELECT forge_jobs_fire_tick($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
         )
         .bind(schedule)
-        .bind(tick_us)
+        .bind(tick.unix_micros())
         .bind(millis(lateness))
-        .fetch_optional(transaction.connection())
+        .bind(job.id.into_uuid())
+        .bind(job.queue)
+        .bind(job.name)
+        .bind(&job.payload)
+        .bind(job.priority)
+        .bind(job.max_attempts)
+        .bind(job.unique_key.as_deref())
+        .fetch_one(self.database.pool())
         .await?;
-        let outcome = match won {
-            None => TickOutcome::AlreadyHandled,
-            Some(false) => TickOutcome::Skipped,
-            Some(true) => TickOutcome::Fired(insert(transaction.connection(), &job).await?),
-        };
-        transaction.commit().await?;
-        Ok(outcome)
+        match outcome.as_str() {
+            "fired" => Ok(TickOutcome::Fired(job.id)),
+            "skipped" => Ok(TickOutcome::Skipped),
+            "handled" => Ok(TickOutcome::AlreadyHandled),
+            "early" => Ok(TickOutcome::Early),
+            _ => Err(JobsError::Corrupt),
+        }
+    }
+
+    /// The database's current time, which schedulers use instead of the
+    /// replica clock.
+    pub(crate) async fn database_now(&self) -> Result<Timestamp, JobsError> {
+        let micros: i64 = sqlx::query_scalar("SELECT forge_jobs_now_us()")
+            .fetch_one(self.database.pool())
+            .await?;
+        timestamp(micros)
     }
 }
 

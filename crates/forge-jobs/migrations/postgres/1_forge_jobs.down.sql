@@ -1,3 +1,5 @@
+DROP FUNCTION IF EXISTS forge_jobs_now_us();
+DROP FUNCTION IF EXISTS forge_jobs_fire_tick(text, bigint, bigint, uuid, text, text, text, smallint, integer, text);
 DROP FUNCTION IF EXISTS forge_jobs_prune(bigint, bigint, integer);
 DROP FUNCTION IF EXISTS forge_jobs_stats();
 DROP FUNCTION IF EXISTS forge_jobs_dead(integer, uuid);

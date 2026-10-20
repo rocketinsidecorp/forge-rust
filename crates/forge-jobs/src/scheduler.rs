@@ -104,7 +104,18 @@ pub(crate) async fn run(store: PgJobStore, schedules: Vec<Schedule>, shutdown: C
     let mut handled: Vec<Option<Timestamp>> = vec![None; schedules.len()];
     info!(schedules = schedules.len(), "scheduler started");
     while !shutdown.is_cancelled() {
-        let now = Timestamp::now();
+        // The database clock decides which tick is due, so replicas with
+        // skewed clocks agree (the database also refuses future ticks).
+        let now = match store.database_now().await {
+            Ok(now) => now,
+            Err(error) => {
+                warn!(%error, "could not read the database clock; retrying");
+                tokio::select! {
+                    () = shutdown.cancelled() => break,
+                    () = tokio::time::sleep(jitter(Duration::from_secs(5))) => continue,
+                }
+            }
+        };
         for (schedule, last) in schedules.iter().zip(handled.iter_mut()) {
             let Some(due) = schedule.cron.latest_at_or_before(now) else {
                 continue;
@@ -122,7 +133,7 @@ pub(crate) async fn run(store: PgJobStore, schedules: Vec<Schedule>, shutdown: C
             .min();
         let wait = next
             .map(|next| {
-                let micros = next.unix_micros() - Timestamp::now().unix_micros();
+                let micros = next.unix_micros() - now.unix_micros();
                 Duration::from_micros(u64::try_from(micros).unwrap_or(0))
             })
             .unwrap_or(Duration::from_secs(1))
@@ -150,11 +161,11 @@ async fn fire(store: &PgJobStore, schedule: &Schedule, due: Timestamp) -> bool {
         .fire_tick(&schedule.name, due, schedule.lateness, job)
         .await
     {
-        Ok(TickOutcome::Fired(enqueued)) => {
+        Ok(TickOutcome::Fired(job_id)) => {
             info!(
                 schedule = schedule.name,
                 job = schedule.spec.name,
-                job_id = %enqueued.id(),
+                %job_id,
                 "scheduled job enqueued"
             );
             true
@@ -172,6 +183,13 @@ async fn fire(store: &PgJobStore, schedule: &Schedule, due: Timestamp) -> bool {
                 "tick already handled by another scheduler"
             );
             true
+        }
+        Ok(TickOutcome::Early) => {
+            warn!(
+                schedule = schedule.name,
+                "tick is later than the database clock; will retry"
+            );
+            false
         }
         Err(error) => {
             warn!(schedule = schedule.name, %error, "could not fire schedule; will retry");

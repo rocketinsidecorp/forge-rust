@@ -1085,3 +1085,51 @@ async fn pruning_is_bounded_and_respects_retention() {
     transaction.rollback().await.expect("rollback");
     db.cleanup().await.expect("cleanup");
 }
+
+#[tokio::test]
+#[ignore = "needs FORGE_TEST_DATABASE_URL"]
+async fn ticks_from_a_fast_replica_clock_are_refused_and_do_not_block_others() {
+    let db = fresh().await;
+    let store = PgJobStore::new(db.runtime().clone());
+    let every_minute: Cron = "* * * * *".parse().expect("cron");
+    let schedule =
+        Schedule::new("skewed", every_minute.clone(), &Count { n: 0 }).expect("schedule");
+    let now = store.database_now().await.expect("database clock");
+    let current = every_minute.latest_at_or_before(now).expect("tick");
+    // A replica whose clock runs an hour fast computes a future tick.
+    let future =
+        Timestamp::from_unix_micros(current.unix_micros() + 3_600_000_000).expect("future");
+    let lateness = Duration::from_secs(300);
+    assert_eq!(
+        store
+            .fire_tick(
+                "skewed",
+                future,
+                lateness,
+                schedule.job_for(future).expect("job")
+            )
+            .await
+            .expect("future tick"),
+        TickOutcome::Early
+    );
+    let recorded: i64 = sqlx::query_scalar("SELECT count(*) FROM forge_job_schedules")
+        .fetch_one(db.admin().pool())
+        .await
+        .expect("count");
+    assert_eq!(recorded, 0, "a future tick is not recorded");
+    // The correctly clocked replica still fires the current tick.
+    assert!(matches!(
+        store
+            .fire_tick(
+                "skewed",
+                current,
+                lateness,
+                schedule.job_for(current).expect("job")
+            )
+            .await
+            .expect("current tick"),
+        TickOutcome::Fired(_)
+    ));
+    assert_eq!(count_state(&db, "queued").await, 1);
+    db.cleanup().await.expect("cleanup");
+}

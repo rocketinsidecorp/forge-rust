@@ -375,6 +375,73 @@ AS $$
     SELECT count(*) FROM deleted;
 $$;
 
+-- Records a schedule tick and enqueues its job, exactly once across replicas.
+-- The database clock decides: a tick later than now() is refused ('early',
+-- so a replica with a fast clock can neither fire early nor block the
+-- others), a tick older than now() - p_lateness_ms is recorded but not
+-- enqueued ('skipped'), and only the caller that advances last_tick_at
+-- enqueues ('fired'; 'handled' otherwise). The idempotency key is
+-- reserved: row-level security keeps the runtime role from inserting it.
+CREATE FUNCTION forge_jobs_fire_tick(
+    p_schedule text,
+    p_tick_us bigint,
+    p_lateness_ms bigint,
+    p_id uuid,
+    p_queue text,
+    p_job_name text,
+    p_payload text,
+    p_priority smallint,
+    p_max_attempts integer,
+    p_unique_key text
+)
+RETURNS text
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+DECLARE
+    tick timestamptz := timestamptz 'epoch' + p_tick_us * interval '1 microsecond';
+    advanced boolean;
+BEGIN
+    IF tick > now() THEN
+        RETURN 'early';
+    END IF;
+    INSERT INTO forge_job_schedules AS s (name, last_tick_at)
+    VALUES (p_schedule, tick)
+    ON CONFLICT (name) DO UPDATE
+        SET last_tick_at = EXCLUDED.last_tick_at, updated_at = clock_timestamp()
+        WHERE s.last_tick_at < EXCLUDED.last_tick_at
+    RETURNING true INTO advanced;
+    IF advanced IS NULL THEN
+        RETURN 'handled';
+    END IF;
+    IF tick < now() - greatest(p_lateness_ms, 0) * interval '1 millisecond' THEN
+        RETURN 'skipped';
+    END IF;
+    INSERT INTO forge_jobs (
+        id, queue, job_name, payload, priority, max_attempts, run_at, unique_key
+    ) VALUES (
+        p_id, p_queue, p_job_name, p_payload::jsonb, p_priority, p_max_attempts, now(),
+        p_unique_key
+    )
+    ON CONFLICT ((coalesce(tenant_id, '00000000-0000-0000-0000-000000000000'::uuid)), unique_key)
+        WHERE unique_key IS NOT NULL
+    DO NOTHING;
+    IF FOUND THEN
+        RETURN 'fired';
+    END IF;
+    RETURN 'handled';
+END;
+$$;
+
+-- The database clock, for schedulers on replicas whose clocks disagree.
+CREATE FUNCTION forge_jobs_now_us()
+RETURNS bigint
+LANGUAGE sql
+SECURITY DEFINER
+AS $$
+    SELECT (extract(epoch FROM clock_timestamp()) * 1000000)::bigint;
+$$;
+
 REVOKE ALL ON TABLE forge_jobs FROM PUBLIC;
 REVOKE ALL ON TABLE forge_job_schedules FROM PUBLIC;
 
@@ -407,7 +474,6 @@ BEGIN
 
     EXECUTE format('REVOKE ALL ON TABLE forge_jobs, forge_job_schedules FROM %I', runtime_role);
     EXECUTE format('GRANT SELECT, INSERT ON TABLE forge_jobs TO %I', runtime_role);
-    EXECUTE format('GRANT SELECT, INSERT, UPDATE ON TABLE forge_job_schedules TO %I', runtime_role);
     FOR fn IN
         SELECT p.oid::regprocedure
         FROM pg_proc AS p
