@@ -142,8 +142,11 @@ impl ServerInstrumentation {
 }
 
 /// The telemetry of one request in progress. [`RequestTelemetry::finish`]
-/// records it; dropped unfinished (a panicking handler, an aborted
-/// connection) it is recorded as a 500 without a route.
+/// records it. Dropped unfinished (the client went away or shutdown aborted
+/// the connection, so there is no response) it is a cancellation: the
+/// active gauge goes down and the span ends with `error.type` `canceled`,
+/// but no duration is recorded. A server that catches a panicking handler
+/// calls `finish` with `500`.
 #[derive(Debug)]
 pub struct RequestTelemetry {
     span: Option<Span>,
@@ -199,7 +202,14 @@ impl RequestTelemetry {
 
 impl Drop for RequestTelemetry {
     fn drop(&mut self) {
-        self.record(None, 500);
+        let Some(span) = self.span.take() else {
+            return;
+        };
+        self.active.add(-1.0, &[self.method]);
+        if span.is_recording() {
+            span.record_error_type("canceled");
+        }
+        span.end();
     }
 }
 
@@ -217,5 +227,21 @@ mod tests {
         assert_eq!(status_class(204), "2xx");
         assert_eq!(status_class(503), "5xx");
         assert_eq!(status_class(42), "other");
+    }
+
+    #[test]
+    fn a_dropped_request_is_a_cancellation_without_a_duration() {
+        let telemetry = Telemetry::new(crate::Options::new("svc")).expect("valid");
+        let http = telemetry.http_server().expect("instruments");
+        drop(http.start(&Method::GET, Version::HTTP_11, &HeaderMap::new()));
+        let text = crate::prometheus::render(telemetry.metrics());
+        assert!(
+            text.contains("http_server_active_requests{http_request_method=\"GET\"} 0"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("http_server_request_duration_seconds_count"),
+            "{text}"
+        );
     }
 }

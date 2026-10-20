@@ -68,8 +68,11 @@ the matched route template, `http.server.request.duration` (method,
 template, status class) and `http.server.active_requests`. The router
 reports the template through a private slot in the request extensions
 (Forge-Go's `web.RouteInfo`), so layers cannot forge it and unmatched
-requests have an empty route. A panicking handler is recorded as a 5xx and
-the active gauge returns to zero. Handlers read `Request::trace_context` to
+requests have an empty route. A panicking handler is caught around the
+dispatch, recorded as a 5xx with its route and resumed (the connection task
+still fails as before); a request dropped without a response (client gone,
+shutdown abort) ends its span as `canceled` without a duration. The active
+gauge returns to zero in every case. Handlers read `Request::trace_context` to
 parent spans or propagate the trace.
 
 ### Log correlation and export

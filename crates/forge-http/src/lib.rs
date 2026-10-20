@@ -984,9 +984,18 @@ async fn handle_request(
             app.trusted_proxies.apply(&mut request);
             app.router.dispatch(request).await
         };
-        let response = match tokio::time::timeout(request_timeout, exchange).await {
-            Ok(response) => response,
-            Err(_elapsed) => Response::new(StatusCode::GATEWAY_TIMEOUT, "request timed out"),
+        let exchange = tokio::time::timeout(request_timeout, exchange);
+        let response = match io::CatchUnwind::new(exchange).await {
+            Ok(Ok(response)) => response,
+            Ok(Err(_elapsed)) => Response::new(StatusCode::GATEWAY_TIMEOUT, "request timed out"),
+            Err(panic) => {
+                // Recorded as a server error, then the panic continues as
+                // before: the connection task fails and the client is cut off.
+                if let Some(telemetry) = telemetry {
+                    telemetry.finish(matched.0.get().map(AsRef::as_ref), 500);
+                }
+                std::panic::resume_unwind(panic);
+            }
         };
         if let Some(telemetry) = telemetry {
             telemetry.finish(matched.0.get().map(AsRef::as_ref), response.status.as_u16());

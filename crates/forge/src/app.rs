@@ -778,18 +778,9 @@ impl App {
         let grace = config.server.shutdown_grace;
         let metrics = config.telemetry.metrics_addr;
         let result = runtime.block_on(async move {
-            let began = async {
-                shutdown.cancelled().await;
-                Instant::now()
-            };
-            let run = async {
-                let result =
-                    work_until_signal(name, background, telemetry.as_ref(), metrics, &shutdown)
-                        .await;
-                shutdown.cancel();
-                result
-            };
-            let (began, result) = tokio::join!(began, run);
+            let (result, began) =
+                work_until_signal(name, background, telemetry.as_ref(), metrics).await;
+            shutdown.cancel();
             drop(pool);
             if let Some(database) = database {
                 database.close().await;
@@ -845,9 +836,30 @@ fn background_for(
 }
 
 /// Runs the job runtime (and the metrics listener, when configured) alone
-/// until a shutdown signal.
+/// until a shutdown signal; also returns when shutdown began.
 #[cfg(feature = "jobs")]
 async fn work_until_signal(
+    name: &'static str,
+    background: Background,
+    telemetry: Option<&Telemetry>,
+    metrics: Option<SocketAddr>,
+) -> (Result<(), ServeError>, Instant) {
+    let shutdown = Cancellation::new();
+    let began = async {
+        shutdown.cancelled().await;
+        Instant::now()
+    };
+    let work = async {
+        let result = work(name, background, telemetry, metrics, &shutdown).await;
+        shutdown.cancel();
+        result
+    };
+    let (began, result) = tokio::join!(began, work);
+    (result, began)
+}
+
+#[cfg(feature = "jobs")]
+async fn work(
     name: &'static str,
     background: Background,
     telemetry: Option<&Telemetry>,

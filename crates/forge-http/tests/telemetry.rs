@@ -108,7 +108,7 @@ async fn a_panicking_handler_is_recorded_as_a_server_error() {
     let text = prometheus::render(telemetry.metrics());
     assert!(
         text.contains(
-            "http_server_request_duration_seconds_count{http_request_method=\"GET\",http_route=\"\",http_response_status_class=\"5xx\"} 1"
+            "http_server_request_duration_seconds_count{http_request_method=\"GET\",http_route=\"/panic\",http_response_status_class=\"5xx\"} 1"
         ),
         "{text}"
     );

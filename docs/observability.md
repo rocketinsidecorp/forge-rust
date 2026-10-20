@@ -134,6 +134,12 @@ trace IDs.
 | `forge.telemetry.export.errors` (`forge_telemetry_export_errors_total`) | counter | `signal` (`traces`, `metrics`, `logs`) |
 | `forge.telemetry.metric.overflows` (`forge_telemetry_metric_overflows_total`) | counter | |
 
+A request whose handler panics is recorded as a 5xx with its route; one
+whose client went away or that shutdown aborted has no response and records
+no duration (its span ends with `error.type` `canceled`). The duration ends
+when the handler returns, so for a streamed response (Server-Sent Events) it
+does not include the stream.
+
 Job outcomes are Forge-Go's: `succeeded`, `retry`, `dead`, `released`
 (interrupted by shutdown), `lease_lost`, `store_failed`; attempts that
 panicked or were aborted are counted too. Outbox outcomes: `delivered`,
