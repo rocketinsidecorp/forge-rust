@@ -8,7 +8,7 @@
 
 use std::{fmt, process::ExitCode, sync::Arc, time::Duration};
 
-use forge_config::{DatabaseConfig, DatabaseScheme, SecretString};
+use forge_config::{DatabaseConfig, DatabaseScheme, Environment, SecretString};
 use forge_db::DbError;
 #[cfg(any(feature = "postgres", feature = "mysql", feature = "sqlite"))]
 use forge_db::Migrator;
@@ -16,7 +16,7 @@ use forge_http::{HeaderValue, Method, Response, RouteError, Router, StatusCode, 
 use thiserror::Error;
 use tracing::warn;
 
-use crate::app::ErrorChain;
+use crate::{app::ErrorChain, cli::DbCommand};
 
 /// Upper bound for closing the pool after the server has drained.
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -129,6 +129,34 @@ impl Declaration {
                     app, url, migrator, command, framework,
                 )
                 .await
+            }
+        }
+    }
+
+    /// Runs a `db` command against the database named by `url`; returns the
+    /// exit code.
+    pub(crate) async fn run_admin_command(
+        &self,
+        url: &SecretString,
+        command: DbCommand,
+        environment: Environment,
+    ) -> ExitCode {
+        let _ = (url, command, environment);
+        match *self {
+            #[cfg(feature = "postgres")]
+            Self::Postgres(_) => {
+                commands::run_admin_command::<forge_db::sqlx::Postgres>(url, command, environment)
+                    .await
+            }
+            #[cfg(feature = "mysql")]
+            Self::MySql(_) => {
+                commands::run_admin_command::<forge_db::sqlx::MySql>(url, command, environment)
+                    .await
+            }
+            #[cfg(feature = "sqlite")]
+            Self::Sqlite(_) => {
+                commands::run_admin_command::<forge_db::sqlx::Sqlite>(url, command, environment)
+                    .await
             }
         }
     }
@@ -285,9 +313,19 @@ impl DatabaseHandle {
 pub(crate) enum MigrationCommand {
     /// Apply every pending migration.
     Migrate,
-    /// Revert the most recently applied migration.
-    Rollback,
+    /// List every migration and its state.
+    Status,
+    /// Revert the most recently applied `steps` migrations.
+    Rollback {
+        /// How many to revert.
+        steps: u32,
+    },
 }
+
+/// Exit code of `db exists` when the database does not exist, so a script (or
+/// `forge db prepare`) can tell "no" from a failure.
+#[cfg(any(feature = "postgres", feature = "mysql", feature = "sqlite"))]
+pub(crate) const EXIT_DATABASE_MISSING: u8 = 3;
 
 /// Registers the standard health routes. With a database, `/health/ready`
 /// pings it and answers `503` while it is unreachable; without one it is
@@ -350,12 +388,12 @@ fn json(status: StatusCode, body: &'static str) -> Response {
 mod commands {
     use std::process::ExitCode;
 
-    use forge_config::SecretString;
+    use forge_config::{Environment, SecretString};
     use forge_db::{Backend, Database, Migrator};
     use tracing::{error, info, warn};
 
-    use super::{CLOSE_TIMEOUT, MigrationCommand};
-    use crate::app::ErrorChain;
+    use super::{CLOSE_TIMEOUT, DbCommand, EXIT_DATABASE_MISSING, ErrorChain, MigrationCommand};
+    use crate::app::{write_stderr, write_stdout};
 
     pub(super) async fn run_migration_command<B: Backend>(
         app: &'static str,
@@ -386,7 +424,17 @@ mod commands {
                     code
                 }
             }
-            MigrationCommand::Rollback => rollback(app, &database, migrator).await,
+            MigrationCommand::Status => {
+                let mut code = ExitCode::SUCCESS;
+                for schema in framework.iter().chain([migrator]) {
+                    code = status(app, &database, schema).await;
+                    if code != ExitCode::SUCCESS {
+                        break;
+                    }
+                }
+                code
+            }
+            MigrationCommand::Rollback { steps } => rollback(app, &database, migrator, steps).await,
         };
         if tokio::time::timeout(CLOSE_TIMEOUT, database.close())
             .await
@@ -426,28 +474,133 @@ mod commands {
         }
     }
 
-    async fn rollback<B: Backend>(
+    /// Prints one line per migration: `state version_description`.
+    async fn status<B: Backend>(
         app: &'static str,
         database: &Database<B>,
         migrator: &Migrator,
     ) -> ExitCode {
-        match database.rollback(migrator).await {
-            Ok(Some(version)) => {
-                info!(
-                    app,
-                    version,
-                    description = description(migrator, version),
-                    "reverted migration"
-                );
-                ExitCode::SUCCESS
-            }
-            Ok(None) => {
-                info!(app, "no applied migrations to revert");
-                ExitCode::SUCCESS
+        match database.migration_status(migrator).await {
+            Ok(statuses) => {
+                let mut text = String::new();
+                if statuses
+                    .iter()
+                    .all(|status| status.state == forge_db::MigrationState::Pending)
+                {
+                    text.push_str("no migrations applied\n");
+                }
+                for status in statuses {
+                    let name = status.description.replace(' ', "_");
+                    text.push_str(&format!(
+                        "{:<9} {}_{}\n",
+                        status.state.as_str(),
+                        status.version,
+                        name
+                    ));
+                }
+                write_stdout(&text)
             }
             Err(error) => {
-                error!(app, error = %ErrorChain(&error), "rollback failed");
+                error!(app, error = %ErrorChain(&error), "reading the migration status failed");
                 ExitCode::FAILURE
+            }
+        }
+    }
+
+    /// Reverts up to `steps` migrations, newest first, and stops at the first
+    /// failure or when nothing is left to revert.
+    async fn rollback<B: Backend>(
+        app: &'static str,
+        database: &Database<B>,
+        migrator: &Migrator,
+        steps: u32,
+    ) -> ExitCode {
+        for _ in 0..steps {
+            match database.rollback(migrator).await {
+                Ok(Some(version)) => {
+                    info!(
+                        app,
+                        version,
+                        description = description(migrator, version),
+                        "reverted migration"
+                    );
+                }
+                Ok(None) => {
+                    info!(app, "no applied migrations to revert");
+                    return ExitCode::SUCCESS;
+                }
+                Err(error) => {
+                    error!(app, error = %ErrorChain(&error), "rollback failed");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+        ExitCode::SUCCESS
+    }
+
+    /// Why a drop needs `--force-production`, or `None` when it does not:
+    /// only a local database in development or test is unguarded. `local`
+    /// comes from the driver's reading of the URL, so a `host` query
+    /// parameter cannot make a remote server look local.
+    fn protection(environment: Environment, local: bool) -> Option<String> {
+        match environment {
+            Environment::Production => Some("FORGE_ENV is production".to_owned()),
+            Environment::Development | Environment::Test if !local => {
+                Some("the database server is not on this machine".to_owned())
+            }
+            Environment::Development | Environment::Test => None,
+        }
+    }
+
+    pub(super) async fn run_admin_command<B: Backend>(
+        url: &SecretString,
+        command: DbCommand,
+        environment: Environment,
+    ) -> ExitCode {
+        // Every decision below is made on what the driver would connect to.
+        let target = match forge_db::target::<B>(url) {
+            Ok(target) => target,
+            Err(error) => {
+                write_stderr(&format!("error: {}\n", ErrorChain(&error)));
+                return ExitCode::FAILURE;
+            }
+        };
+        let described = target.describe().to_owned();
+        let failed = |action: &str, error: &(dyn std::error::Error + 'static)| {
+            write_stderr(&format!(
+                "error: could not {action} {described}: {}\n",
+                ErrorChain(error)
+            ));
+            ExitCode::FAILURE
+        };
+        match command {
+            DbCommand::Create => match forge_db::create_database::<B>(url).await {
+                Ok(true) => write_stdout(&format!("created {described}\n")),
+                Ok(false) => write_stdout(&format!("{described} already exists\n")),
+                Err(error) => failed("create", &error),
+            },
+            DbCommand::Exists => match forge_db::database_exists::<B>(url).await {
+                Ok(true) => write_stdout(&format!("{described} exists\n")),
+                Ok(false) => {
+                    let _ = write_stdout(&format!("{described} does not exist\n"));
+                    ExitCode::from(EXIT_DATABASE_MISSING)
+                }
+                Err(error) => failed("look for", &error),
+            },
+            DbCommand::Drop { force_production } => {
+                if let Some(reason) = protection(environment, target.is_local())
+                    && !force_production
+                {
+                    write_stderr(&format!(
+                        "error: refusing to drop {described}: {reason}; pass --force-production\n"
+                    ));
+                    return ExitCode::FAILURE;
+                }
+                match forge_db::drop_database::<B>(url).await {
+                    Ok(true) => write_stdout(&format!("dropped {described}\n")),
+                    Ok(false) => write_stdout(&format!("{described} does not exist\n")),
+                    Err(error) => failed("drop", &error),
+                }
             }
         }
     }
@@ -459,5 +612,58 @@ mod commands {
                 migration.version == version && migration.migration_type.is_up_migration()
             })
             .map_or("", |migration| migration.description.as_ref())
+    }
+    #[cfg(all(test, feature = "postgres"))]
+    mod tests {
+        use super::*;
+
+        fn guarded(environment: Environment, url: &str) -> Option<String> {
+            let target = forge_db::target::<forge_db::sqlx::Postgres>(&SecretString::new(url))
+                .expect("well formed");
+            protection(environment, target.is_local())
+        }
+
+        #[test]
+        fn a_drop_is_guarded_unless_the_driver_would_connect_to_this_machine() {
+            // Development and test are free only for a local server.
+            for url in [
+                "postgres://m:pw@localhost/shop",
+                "postgres://m:pw@127.0.0.1/shop",
+                "postgres:///shop?host=/var/run/postgresql",
+            ] {
+                assert_eq!(guarded(Environment::Development, url), None, "{url}");
+                assert_eq!(guarded(Environment::Test, url), None, "{url}");
+            }
+            // Query parameters that move the connection elsewhere do not hide it.
+            for url in [
+                "postgres://m:pw@localhost/shop?host=prod.db.internal",
+                "postgres://m:pw@localhost/shop?hostaddr=10.0.0.5",
+                "postgres:///shop?host=prod",
+                "postgres:///shop?host=",
+                "postgres://m:pw@db.internal/shop",
+            ] {
+                let reason = guarded(Environment::Development, url).expect(url);
+                assert!(reason.contains("not on this machine"), "{url}: {reason}");
+            }
+            // Production is guarded whatever the host.
+            assert!(guarded(Environment::Production, "postgres://m:pw@localhost/shop").is_some());
+        }
+
+        #[test]
+        fn a_database_name_override_cannot_reach_a_system_database() {
+            let url = SecretString::new("postgres://m:pw@localhost/shop?dbname=postgres");
+            let code = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime")
+                .block_on(run_admin_command::<forge_db::sqlx::Postgres>(
+                    &url,
+                    DbCommand::Drop {
+                        force_production: true,
+                    },
+                    Environment::Development,
+                ));
+            assert_eq!(code, ExitCode::FAILURE, "refused before any connection");
+        }
     }
 }

@@ -20,6 +20,7 @@ use base64::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub mod database_url;
 mod mail;
 mod telemetry;
 

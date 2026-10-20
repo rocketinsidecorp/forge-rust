@@ -349,6 +349,29 @@ askama type appears in a stable `forge-mail` signature except askama's
 The test CA and key in `crates/forge-mail/tests/fixtures/tls` are test
 material, not secrets.
 
+## CLI lifecycle dependencies
+
+[ADR 0036](adr/0036-application-lifecycle-commands.md) adds **no package to
+`Cargo.lock`** (`cargo deny check` is unchanged: the diff is one line, `rustix`
+in the `forge-cli` entry). `forge-cli` now depends, through the workspace, on:
+
+| Dependency | Why | Notes |
+| --- | --- | --- |
+| `forge-config` (path) | `forge doctor` loads the same `AppConfig` the application loads, and describes database URLs with `forge_config::database_url` | no secret leaves it: `SecretString` stays redacted |
+| `url` (via `forge-config`) | reads database URLs with the parser SQLx uses, so `forge doctor` and the guards mean what the driver means | already in the lock through `sqlx-core`; the workspace entry is `2.5.8` with default features, the ones SQLx enables |
+| `serde_json` | Cargo's `--message-format=json` (the built binary's path) and `doctor --json` | previously a dev-dependency; admitted workspace entry |
+| `tokio` | one current-thread runtime on one thread that installs the SIGINT/SIGTERM handlers and sets a flag | `rt` and `signal`, already unified in the workspace features; no network or task spawning |
+| `rustix` with `process` | SIGTERM/SIGKILL to the application's process group and to a build, with no `unsafe` and no shell | the workspace entry gains the `process` feature (it had `fs`, `std`); no new transitive package |
+
+File watching is standard-library polling: `notify` (inotify/FSEvents,
+`mio`, `walkdir`, `filetime`, ...) was not admitted because the loop must behave
+the same on bind mounts and network file systems, a poll of a few hundred files
+every 500 ms is negligible, and polling is what Forge-Go does. The CLI contains
+no `unsafe`, no build script and no procedural macro of its own, makes no
+network call other than the TCP connection `forge doctor` opens to the
+configured database host, and starts only `cargo`, `rustc --version` and the
+binary `cargo build` produced.
+
 ## Features and public API containment
 
 - Set `default-features = false` when defaults add unused protocols, native

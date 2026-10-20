@@ -1,6 +1,8 @@
 //! MySQL 8.4+ and MariaDB 11.4+ backend (one wire protocol, one backend).
 
-use forge_config::DatabaseScheme;
+use std::str::FromStr as _;
+
+use forge_config::{DatabaseScheme, database_url, is_loopback_host};
 use sqlx::MySql;
 
 use crate::{Backend, backend::sealed::Hooks};
@@ -8,6 +10,20 @@ use crate::{Backend, backend::sealed::Hooks};
 impl Hooks for MySql {
     const SCHEME: DatabaseScheme = DatabaseScheme::MySql;
     const TEST_URL_ENV: &'static str = "FORGE_TEST_MYSQL_URL";
+
+    fn endpoint(url: &str) -> Result<crate::admin::Endpoint, crate::DbError> {
+        // The parser that connects: the `socket` query parameter counts.
+        let options = sqlx::mysql::MySqlConnectOptions::from_str(url)
+            .map_err(|_| crate::DbError::configuration(database_url::MALFORMED))?;
+        let socket = options.get_socket().is_some();
+        let host = options.get_host();
+        Ok(crate::admin::Endpoint {
+            database: options.get_database().map(str::to_owned),
+            host: (!socket).then(|| host.to_owned()),
+            port: (!socket).then(|| options.get_port()),
+            local: socket || is_loopback_host(host),
+        })
+    }
 
     #[cfg(feature = "testing")]
     fn provision(

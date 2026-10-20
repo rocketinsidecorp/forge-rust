@@ -1,9 +1,12 @@
 -- Development-only PostgreSQL role bootstrap.
--- Runtime is intentionally unable to own schema objects or bypass RLS.
+-- Runtime is intentionally unable to own schema objects, create databases or
+-- bypass RLS. The migration role may create databases so that `forge db
+-- reset` (drop, then create) works against this container; give a production
+-- migration role CREATEDB only if your deployment runs `db create` at all.
 
 CREATE ROLE app_migrator
     LOGIN PASSWORD 'app_migrator'
-    NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+    NOSUPERUSER CREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
 
 CREATE ROLE app_runtime
     LOGIN PASSWORD 'app_runtime'

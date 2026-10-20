@@ -47,7 +47,7 @@ pub(crate) mod sealed {
     use super::{ConnectOptions, Migrate};
 
     /// Per-backend behavior behind [`super::Backend`].
-    pub trait Hooks: sqlx::Database<Connection: Migrate> {
+    pub trait Hooks: sqlx::Database<Connection: Migrate> + sqlx::migrate::MigrateDatabase {
         /// The engine this backend implements.
         const SCHEME: DatabaseScheme;
 
@@ -60,6 +60,11 @@ pub(crate) mod sealed {
             let _ = url;
             options
         }
+
+        /// What `url` really names once the driver has applied its query
+        /// overrides and environment defaults: the database, the server and
+        /// whether that is this machine. Never echoes the URL in an error.
+        fn endpoint(url: &str) -> Result<crate::admin::Endpoint, crate::DbError>;
 
         /// Adjusts the pool built from the common [`PoolSettings`]; the
         /// default keeps it.

@@ -28,12 +28,14 @@ use forge_core::Version;
 use forge_tenancy::TenantContext;
 use thiserror::Error;
 
+mod admin;
 mod backend;
 mod database;
 mod error;
 mod migrate;
 mod prune;
 
+pub use admin::{Target, create_database, database_exists, drop_database, target};
 pub use backend::{Backend, RowsAffected};
 #[cfg(feature = "mysql")]
 pub use database::MySqlDatabase;
@@ -43,7 +45,9 @@ pub use database::PgDatabase;
 pub use database::SqliteDatabase;
 pub use database::{Database, DbTransaction, PoolSettings, expect_rows};
 pub use error::DbError;
-pub use migrate::{FRAMEWORK_MIGRATIONS, FrameworkMigration, combine_migrations};
+pub use migrate::{
+    FRAMEWORK_MIGRATIONS, FrameworkMigration, MigrationState, MigrationStatus, combine_migrations,
+};
 #[cfg(feature = "postgres")]
 pub use postgres::advisory_key;
 pub use prune::{MAX_PRUNE_ROUNDS, PruneGate};

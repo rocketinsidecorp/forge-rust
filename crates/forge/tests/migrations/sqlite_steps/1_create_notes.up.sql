@@ -1,0 +1,4 @@
+CREATE TABLE notes (
+    id BLOB PRIMARY KEY NOT NULL,
+    title TEXT NOT NULL
+);

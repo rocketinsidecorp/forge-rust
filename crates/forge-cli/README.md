@@ -8,7 +8,15 @@ forge new <name> [flags]         create an application
 forge generate migration <name>  create a reversible migration pair
 forge generate scaffold <name> <field:type>... --global|--tenant-scoped [--plural P] [--dry-run]
                                  HTML CRUD through every ring, with tests
-forge check | test | format | lint | build
+forge check | test [ARGS] | format | lint | build [NAME]
+forge version                    print the CLI version
+forge doctor [--json]            toolchain, FORGE_* settings, database reachability
+forge dev [NAME] [--no-reload] [--poll-interval D] [--debounce D]
+                                 run; rebuild and restart gracefully on change
+forge migrate [status] | rollback [--steps N] | seed
+forge setup --tenant SLUG --email EMAIL [--organization NAME] [--password-stdin]
+forge db create | drop | reset | setup | prepare | migrate | rollback | status | seed
+                                 database lifecycle, like Rails' db:* tasks
 ```
 
 `forge new` creates a standalone Cargo package with Forge's hexagonal module
@@ -36,4 +44,11 @@ is under `tests/fixtures/scaffold` and `tests/scaffold.rs` (ignored, slow)
 builds scaffolded applications end to end.
 
 The quality commands run Cargo directly in the current directory; no shell is
-involved. See [docs/cli.md](../../docs/cli.md) for the full reference.
+involved. `dev`, `migrate`, `rollback`, `setup`, `seed` and `db` build the
+application with Cargo and run its own subcommands (`<app> migrate`, `<app> db
+create`, ...), so this crate holds no database code and reads no database URL;
+`db drop`, `db reset` and `db rollback` are refused when `FORGE_ENV` is not
+`development` or `test` ([ADR 0036](../../docs/adr/0036-application-lifecycle-commands.md)).
+Their end-to-end tests are in `tests/lifecycle.rs` (fake `cargo` and application)
+and `tests/scaffold.rs` (a real PostgreSQL application). See
+[docs/cli.md](../../docs/cli.md) for the full reference.

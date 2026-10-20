@@ -12,6 +12,9 @@ repository.workspace = true
 base64.workspace = true
 serde.workspace = true
 thiserror.workspace = true
+# The URL parser SQLx itself uses, so a database URL means the same here as it
+# does to the driver; already in the locked graph.
+url.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true

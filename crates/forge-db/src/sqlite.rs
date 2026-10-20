@@ -26,6 +26,16 @@ impl Hooks for Sqlite {
     const SCHEME: DatabaseScheme = DatabaseScheme::Sqlite;
     const TEST_URL_ENV: &'static str = "";
 
+    fn endpoint(_url: &str) -> Result<crate::admin::Endpoint, crate::DbError> {
+        // A file on this machine.
+        Ok(crate::admin::Endpoint {
+            database: None,
+            host: None,
+            port: None,
+            local: true,
+        })
+    }
+
     fn configure(url: &str, options: ConnectOptions<Self>) -> ConnectOptions<Self> {
         let options: SqliteConnectOptions = options.foreign_keys(true).busy_timeout(BUSY_TIMEOUT);
         match Location::of(url) {

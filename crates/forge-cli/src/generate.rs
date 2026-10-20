@@ -1315,6 +1315,14 @@ mod tests {
         assert!(postgres_init.contains("CREATE ROLE app_migrator"));
         assert!(postgres_init.contains("CREATE ROLE app_runtime"));
         assert!(postgres_init.contains("NOBYPASSRLS"));
+        assert!(
+            postgres_init.contains("LOGIN PASSWORD 'app_migrator'\n    NOSUPERUSER CREATEDB "),
+            "the migration role may create databases, for `forge db reset`"
+        );
+        assert!(
+            postgres_init.contains("LOGIN PASSWORD 'app_runtime'\n    NOSUPERUSER NOCREATEDB "),
+            "the runtime role may not"
+        );
         assert!(manifest.contains(&format!(
             "forge = {{ git = \"https://github.com/rocketinsidecorp/forge-rust\", tag = \"v{FORGE_VERSION}\", features = [\"views\", \"broadcast\"] }}"
         )));

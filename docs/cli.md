@@ -22,16 +22,27 @@ forge generate migration <name>
 forge generate authentication [--dry-run]
 forge generate scaffold <name> <field:type>... (--global | --tenant-scoped) [--plural <PLURAL>] [--dry-run]
 forge check
-forge test
+forge test [ARGS]
 forge format
 forge lint
-forge build
+forge build [NAME]
+forge version
+forge doctor [--json]
+forge dev [NAME] [--no-reload] [--poll-interval D] [--debounce D]
+forge migrate [status]
+forge rollback [--steps N]
+forge setup --tenant SLUG --email EMAIL [--organization NAME] [--password-stdin]
+forge seed
+forge db create | drop | reset | setup | prepare | migrate | status | seed
+forge db rollback [--steps N]
 ```
 
 The quality and build commands run `cargo` directly (no shell) in the current
 directory. They are thin wrappers, and the underlying Cargo commands are always
 valid to run yourself. A failed Cargo invocation makes `forge` exit with a
-non-zero status.
+non-zero status. The lifecycle commands (`dev`, `migrate`, `rollback`, `setup`,
+`seed`, `db`) are described under
+[Application lifecycle commands](#application-lifecycle-commands).
 
 ## `forge id`
 
@@ -126,11 +137,11 @@ ordinary Debug and serialization output.
 
 ```sh
 export FORGE_MIGRATION_DATABASE_URL='postgres://app_migrator:app_migrator@127.0.0.1:5432/shop'
-cargo run -- migrate
-cargo run -- rollback
+forge migrate                  # or: cargo run -- migrate
+forge rollback                 # or: cargo run -- rollback
 
 export FORGE_DATABASE_URL='postgres://app_runtime:app_runtime@127.0.0.1:5432/shop'
-cargo run
+forge dev                      # or: cargo run
 ```
 
 `migrate` and `rollback` require `FORGE_MIGRATION_DATABASE_URL`; they do
@@ -148,7 +159,8 @@ place and `migrate` keeps working
 
 With generated Docker assets, `docker/postgres/init.sql` creates separate
 development-only `app_migrator` and `app_runtime` roles. The runtime role is
-not schema owner and has `NOBYPASSRLS`. Generated
+not schema owner, cannot create databases and has `NOBYPASSRLS`; the migration
+role may create databases so that `forge db reset` works against the container. Generated
 `src/infrastructure/database/mod.rs` provides `begin_tenant_transaction`,
 which installs the authorized tenant and principal as transaction-local
 PostgreSQL settings for RLS policies.
@@ -579,6 +591,7 @@ The scaffold refuses, with an explanation and without writing:
 | --- | --- |
 | `forge check` | `cargo check --all-targets --all-features` |
 | `forge test` | `cargo test --all-targets --all-features` |
+| `forge test ARGS...` | `cargo test ARGS...`: arguments replace the defaults, like `forge test ARGS` replaces `./...` in Forge-Go (`forge test --lib orders -- --nocapture`) |
 | `forge format` | `cargo fmt --all` |
 | `forge lint` | `cargo clippy --all-targets --all-features -- -D warnings` |
 
@@ -586,7 +599,182 @@ The scaffold refuses, with an explanation and without writing:
 
 Runs `cargo build --release --locked`, producing `target/release/<name>`. This
 is the same release build the Dockerfile performs. It requires a `Cargo.lock`
-that is up to date with `Cargo.toml`.
+that is up to date with `Cargo.toml`. `forge build NAME` builds one binary
+(`--bin NAME`) of a package that has several.
+
+## Application lifecycle commands
+
+`forge version`, `forge doctor`, `forge dev`, `forge migrate`, `forge rollback`,
+`forge setup`, `forge seed` and `forge db ...` are the same commands, with the
+same names, flags and messages, that the Forge-Go CLI has
+([ADR 0036](adr/0036-application-lifecycle-commands.md)). `dev`, `migrate`,
+`rollback`, `setup`, `seed` and `db` run inside a generated application (a Cargo
+package that depends on `forge`) and refuse other directories.
+
+```sh
+forge version                      # forge 0.1.0 (also forge --version)
+forge doctor                       # toolchain, FORGE_* settings, database server reachable?
+forge doctor --json                # {"schema_version":1,"ok":true,"environment":...,"diagnostics":[]}
+forge dev                          # http://127.0.0.1:3000, rebuilds and restarts on save
+forge dev --poll-interval 1s       # scan less often (large trees, slow disks)
+forge dev --no-reload              # build and run once
+forge migrate                      # apply pending migrations
+forge migrate status               # applied / pending / modified / disabled / missing
+forge rollback --steps 2           # your newest two migrations; never a Forge-owned table
+forge setup --tenant acme --email owner@example.com --organization "Acme Inc"
+forge seed
+forge db setup                     # create + migrate + seed
+forge db prepare                   # setup if the database is missing, else migrate (safe to repeat)
+forge db reset                     # drop + setup: a clean development database
+forge db status
+forge db drop
+FORGE_ALLOW_DESTRUCTIVE=true forge db drop --force-production --yes
+```
+
+### How they run
+
+Each command builds the application once with `cargo build --locked
+--message-format=json-render-diagnostics`, finds the binary Cargo produced in
+its messages and runs it as a direct child with your terminal, working
+directory and environment. Cargo's diagnostics are printed as usual; the
+application's output is yours. Nothing is reimplemented in the CLI: `migrate`
+is `<app> migrate`, `db create` is `<app> db create`, and so on, so development
+and production use one implementation. A failing application command makes
+`forge` exit with status 1 and `application command "migrate" failed with
+status 78` (the application's own code is in the message). Ctrl-C and SIGTERM
+reach the application (SIGTERM, then a kill after 35 seconds, or at once on a
+second Ctrl-C); a build is stopped with its whole process group, and nothing the
+CLI started outlives it.
+
+| `forge` | Runs | Notes |
+| --- | --- | --- |
+| `migrate` | `<app> migrate` | Needs `FORGE_MIGRATION_DATABASE_URL`. |
+| `migrate status` | `<app> migrate status` | One line per migration, `state version_name`: `applied`, `pending`, `modified` (file changed after it was applied; `migrate` refuses), `disabled` (a Forge feature you no longer compose) or `missing` (unknown to the application; `migrate` fails closed). Only reads: without the bookkeeping table nothing is applied (the output starts with `no migrations applied`) and the table is not created. |
+| `rollback [--steps N]` | `<app> rollback [--steps N]` | N from 1 to 1000, default 1. Forge-owned migrations are never reverted ([ADR 0030](adr/0030-framework-migration-ownership.md)). Not guarded, like Forge-Go; `db rollback` is. |
+| `seed` | `<app> seed` | One transaction, idempotent. |
+| `setup --tenant SLUG --email EMAIL [--organization NAME] [--password-stdin]` | `<app> setup ...` | The password is prompted for with echo off (standard input stays your terminal), piped with `--password-stdin` or in `FORGE_SETUP_PASSWORD`; never an argument. |
+| `db create` | `<app> db create` | Prints `created ...` or `... already exists`. Uses `FORGE_MIGRATION_DATABASE_URL`, whose role must be allowed to create databases (PostgreSQL `CREATEDB`; the Compose `app_migrator` is). |
+| `db drop` | `<app> db drop` | Guarded, below. Prints `dropped ...` or `... does not exist`. |
+| `db reset` | `db drop`, then `db setup` | Guarded once, before the drop. Against the Compose container it does not re-run `docker/postgres/init.sql`'s per-database statements (`REVOKE CONNECT ... FROM PUBLIC`, `GRANT CONNECT`, `ALTER DEFAULT PRIVILEGES ... TO app_runtime`): the generated migrations grant the runtime role what it needs, but the new database lets `PUBLIC` connect and gives tables you create by hand no default privileges; `docker compose down -v && docker compose up -d db` restores the original. |
+| `db setup` | `db create`, `migrate`, `seed` | Stops at the first failure. |
+| `db prepare` | `db exists`; then `migrate`, or `db setup` when it is missing | `db exists` exits 3 for "missing", so a failure is never mistaken for it. |
+| `db migrate`, `db status`, `db seed` | as `migrate`, `migrate status`, `seed` | |
+| `db rollback [--steps N]` | `<app> rollback [--steps N]` | Guarded like `drop`. |
+
+The application's `db` subcommand is for scripts and containers too:
+`<app> db create|exists|drop [--force-production]`. `db exists` exits 0 when the
+database exists and 3 when it does not. A URL with an unescaped `/`, `?`, `#` or `@` in the password is refused as malformed (percent-encode them), and the error never shows it. Database names are limited to 1 to 63
+letters, digits, `_`, `-` and `$`, and the engines' system databases
+(`postgres`, `template0`, `template1`, `mysql`, `information_schema`,
+`performance_schema`, `sys`) are never created or dropped. PostgreSQL drops
+terminate other sessions first (a running development server cannot block
+them). SQLite creates and removes the file.
+
+### Destructive commands
+
+`db drop`, `db reset` and `db rollback` are refused when `FORGE_ENV` is not
+`development` or `test` (an unset `FORGE_ENV` is `development`; a value
+the framework would reject counts as protected):
+
+```text
+error: refusing to drop the database of "shop": FORGE_ENV is production; pass --force-production, and confirm
+```
+
+Nothing has been built or run when this happens. With `--force-production` the
+CLI asks for confirmation: a person types the application name at a terminal, or
+`--yes` is given **and** `FORGE_ALLOW_DESTRUCTIVE=true` is set in the process
+environment (a value other than `true` is refused; `--yes` alone is a usage
+error). The CLI removes `FORGE_ALLOW_DESTRUCTIVE` from the environment it gives
+the application, which would refuse the unknown key. Because only the application
+sees the database URL, `<app> db drop` enforces the second half of the rule
+itself: it refuses `FORGE_ENV=production` and a server that is not on this machine
+(not loopback, `localhost` or a socket path starting with `/`, judged on what the
+driver would connect to after the `host`, `hostaddr`, `port`, `dbname` and
+`socket` query parameters) unless `--force-production` is
+passed, whether it is started by `forge` or directly in a container. The CLI
+passes `--force-production` on only after confirmation, and asks for it whenever
+you give the flag, even in development, because it cannot see the address.
+
+### `forge doctor`
+
+Checks, prints and exits 1 when something is wrong:
+
+```text
+configuration: ok
+environment: development
+http address: 127.0.0.1:3000
+database: postgres database "shop" on 127.0.0.1:5432
+database reachability: the server accepts connections
+toolchain: cargo 1.98.1 (...); rustc 1.98.1 (...)
+```
+
+- **Toolchain**: `cargo` and `rustc` run.
+- **Configuration**: the process environment passes the same loader the
+  application uses (`FORGE_*` keys are known, values valid). The message names
+  the key; secret values never appear, and `--json` omits values altogether.
+- **Database**: the URL is described (engine, database, host and port, never a
+  user, password or query) and a TCP connection to the host is opened (3
+  seconds). The CLI does not log in; the application does that with its own
+  credentials, so a wrong password still shows up only when you migrate or
+  serve. SQLite reports whether the file exists. A Unix socket is not checked.
+  `FORGE_MIGRATION_DATABASE_URL` missing is mentioned, not an error.
+
+`--json` prints the report Forge-Go prints: `schema_version`, `ok`,
+`environment`, `database` (`postgres`, `mysql`, `sqlite` or `none`) and
+`diagnostics` with `code`, `severity`, `summary` and `remediation`
+(`configuration.invalid`, `database.unreachable`, `toolchain.cargo_missing`,
+`toolchain.rustc_missing`). It does not include the toolchain versions.
+
+### `forge dev`
+
+Builds and runs the application, then follows changes:
+
+- A polling watcher (standard library, on the supervising thread) scans every
+  `--poll-interval` (default 500ms, 50ms to 1m) and reports one batch once the
+  tree has been quiet for `--debounce` (default 300ms, 0 to 1m). Durations use Go
+  syntax (`500ms`, `1s`, `1m30s`).
+- It watches Rust sources and `build.rs`, `Cargo.toml`, `Cargo.lock`,
+  `rust-toolchain.toml`, templates, assets and migrations (`.rs`, `.html`,
+  `.css`, `.js`, `.mjs`, `.json`, `.sql`, `.txt`, images and fonts). It never
+  enters dot-directories, `target`, `tmp`, `vendor`, `node_modules`, `storage`,
+  `log`, `logs`, `coverage` or `dist`, nor, at the root, `tests`, `benches`,
+  `examples`, `docs` or `docker`, and refuses trees beyond 50 000 files.
+- **The old process keeps serving until a build succeeds.** Then it gets
+  SIGTERM, is awaited (35 seconds, then killed) and the new binary starts. A
+  failed build prints Cargo's diagnostics and leaves the running application
+  alone; if the tree changes while a build runs, that build is discarded and
+  the build starts over. A crashed application waits for the next change.
+- The application and `cargo build` each run in their own process group, which
+  is signalled as a whole, so helpers they started do not outlive a restart or
+  Ctrl-C. Progress lines start with `forge dev:` on standard error.
+- `--no-reload` builds and runs once, forwarding signals. `NAME` selects one
+  binary when the package has several.
+
+The environment is yours (`FORGE_ENV` defaults to `development` in the
+application); `forge dev` does not read `.env` files.
+
+### Differences from Forge-Go
+
+Same command names, flags, messages and exit codes, except:
+
+- `forge rollback --steps N`: Rust CLIs spell long flags with two dashes
+  (Go's `flag` package accepts `-steps` and `--steps`).
+- `forge db create|drop` and `exists` run in the application, not the CLI, so
+  the CLI never holds a database credential. They use
+  `FORGE_MIGRATION_DATABASE_URL` for both the credentials and the database
+  name; Forge-Go takes the name from `FORGE_DATABASE_URL` and the credentials
+  from the privileged URL.
+- `forge dev` has no browser-reload proxy, and does not read `.env.development`
+  or `.env.local` (generated Rust applications have no env files).
+- Not ported: `forge routes` (Rust routes are registered by code and
+  composition hooks at run time, so a source scan would be wrong and an
+  accurate listing needs the application's composition, which needs its
+  configuration), `forge inspect`, `db schema:dump`, `db schema:load` and
+  `db console` (they run `pg_dump`, `psql` and friends with the database
+  credential), `destroy`, `deploy`, `logs`, `app`, `credentials`, `i18n`. They
+  are tracked in [Rails parity](rails-parity.md).
+- `forge doctor` also checks the toolchain and that the database server answers.
+- Progress lines of `forge dev` carry no time stamp.
 
 ## Generated application binary
 
@@ -597,7 +785,9 @@ Every application built with `forge::App` accepts these subcommands:
 | `serve` (default) | Loads and validates `FORGE_*` configuration, starts the HTTP server, and shuts down gracefully on SIGTERM/SIGINT. |
 | `healthcheck` | Sends `GET /health/live` to the loopback address on the configured port. Exits `0` if healthy, `1` otherwise. |
 | `migrate` | For database-enabled apps, applies all pending embedded migrations (with `App::jobs`/`App::events`, the framework job and outbox schemas first). |
-| `rollback` | For database-enabled apps, reverts the latest reversible migration. |
+| `migrate status` | Lists every migration as `applied`, `pending`, `modified`, `disabled` or `missing`; applies nothing. |
+| `rollback [--steps N]` | For database-enabled apps, reverts the latest reversible migration (N of them with `--steps`, 1 to 1000). |
+| `db create` / `db exists` / `db drop [--force-production]` | Database-enabled apps, with `FORGE_MIGRATION_DATABASE_URL`: creates the database unless it exists, exits 0 when it exists and 3 when it does not, or drops it (refused when `FORGE_ENV` is not development or test, or the server is not on this machine, unless `--force-production`). |
 | `setup --tenant SLUG --email EMAIL [--organization NAME] [--password-stdin]` | Full-stack PostgreSQL apps: creates the first tenant and its owner (see below). |
 | `seed` | Database apps: runs `seed` in `src/bootstrap/seeds.rs` in one transaction, committed only on success. |
 | `jobs [work]` | With `App::jobs` (feature `jobs`): runs job workers, cron schedules and the outbox dispatcher without HTTP until `SIGTERM`/`SIGINT`. |
@@ -618,6 +808,10 @@ with code `2`, any other failure with `1`.
 
 ```sh
 export FORGE_MIGRATION_DATABASE_URL='postgres://app_migrator:app_migrator@127.0.0.1:5432/shop'
+forge setup --tenant acme --email owner@example.com --organization "Acme Inc"
+printf '%s\n' "$OWNER_PASSWORD" | forge setup --tenant acme --email owner@example.com --password-stdin
+forge seed
+# the same through Cargo:
 cargo run -- setup --tenant acme --email owner@example.com --organization "Acme Inc"
 printf '%s\n' "$OWNER_PASSWORD" | cargo run -- setup --tenant acme --email owner@example.com --password-stdin
 cargo run -- seed
@@ -641,9 +835,10 @@ argument, never printed or logged, and must have at least 12 characters.
 CONFLICT DO NOTHING`) so seeding twice changes nothing. Seeds are not for
 accounts or credentials.
 
-The `forge` CLI does not wrap application commands (there is no `forge
-migrate` either): run them through Cargo during development, or call the
-binary directly in a container or release.
+During development `forge migrate`, `forge rollback`, `forge setup` and
+`forge seed` run these commands for you (see
+[Application lifecycle commands](#application-lifecycle-commands)); in a
+container or a release call the binary directly.
 
 `healthcheck` exists because the distroless runtime image has no shell or
 `curl`. The Dockerfile's exec-form `HEALTHCHECK` runs `<binary> healthcheck`.
