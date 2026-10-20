@@ -101,12 +101,13 @@ certificate and time parsing it feeds are.
 ## Findings
 
 The first runs of the targets (30 s each) found no panic, overflow or
-unbounded recursion in any parser. They found one gap, left for a follow-up
-because it is in `forge-config`, outside this change: `FORGE_DATABASE_URL`
-and `database_url::endpoint` accept port `0` (`postgres://u:p@host:0/db`),
-where Forge-Go refuses ports outside 1-65535. The `config_database_url` seed
-`port-zero` covers it; when the fix lands, restore the `port != 0` assertion
-in the target. The mail URL, which already refuses port 0, is asserted.
+unbounded recursion in any parser. They found one gap, fixed in the same
+change: database URLs with port `0` (`postgres://u:p@host:0/db`, or
+`?port=0`) were well formed and had an endpoint, where Forge-Go refuses ports
+outside 1-65535. They are now malformed, with no endpoint; the
+`config_database_url` seed `port-zero` keeps it covered and the target asserts
+the endpoint port is never 0. The mail URL, which already refused port 0, is
+asserted too.
 (Four other early failures were wrong properties in the new targets, fixed
 before they were committed: an echoed substring of generic error text, a
 SQLite file name taken for a credential, the RFC 2047 wire form of a

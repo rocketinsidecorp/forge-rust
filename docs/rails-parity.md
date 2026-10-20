@@ -171,8 +171,9 @@ the work is finished and waiting for its review; **Planned** means not started.
   `forge_storage` key parsing and signed links, `forge_broadcast` stream
   tokens, `forge_core::Timestamp::parse` and the MFA key and backup-code
   parsers. The Rust-only targets are `credentials_envelope`, `deploy_yaml`,
-  `proxy_*` and `mail_message`; (5) fuzzing found that `FORGE_DATABASE_URL`
-  accepts port 0 where Forge-Go refuses it ([supply chain](supply-chain.md#findings)).
+  `proxy_*` and `mail_message`; (5) fuzzing found that database URLs accepted
+  port 0 where Forge-Go refuses it; fixed in the same change
+  ([supply chain](supply-chain.md#findings)).
 
 ## Review gate
 

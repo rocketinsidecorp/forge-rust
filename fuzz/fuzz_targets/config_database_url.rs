@@ -48,10 +48,9 @@ fn check(environment: Option<&str>, url: &str, carries_marker: bool) {
             // plain host.
             if let Some((host, port)) = database_url::endpoint(secret) {
                 assert!(database_url::is_well_formed(secret));
-                // Known finding, not yet fixed: `postgres://u:p@host:0/db` is
-                // accepted and its endpoint has port 0 (Forge-Go refuses
-                // ports outside 1-65535). docs/supply-chain.md, "Findings".
-                let _ = port;
+                // Port 0 names no server (found by this target, fixed in
+                // database_url::location; seed `port-zero`).
+                assert_ne!(port, 0, "endpoint with port 0");
                 assert!(!host.is_empty());
                 assert!(
                     !host.chars().any(|character| character.is_whitespace()
