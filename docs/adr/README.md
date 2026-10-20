@@ -37,6 +37,7 @@ does not mean implementation exists.
 | [0035](0035-mail.md) | Mail: validated MIME, a Forge-owned TLS-enforcing SMTP client, development and test senders, askama templates, previews, password reset emails | Accepted |
 | [0036](0036-application-lifecycle-commands.md) | Application lifecycle commands: `forge dev`, `migrate`, `rollback`, `setup`, `seed`, `db`, `doctor`, `version` delegate to the application's own subcommands; destructive-command protection; process ownership | Accepted |
 | [0037](0037-internationalization.md) | Internationalization: Rails-style JSON catalogs in `config/locales`, CLDR plural rules, locale negotiation, `t`/`l`/`number`/`locale` helpers, `forge new --locale`, `forge i18n check` (port of Forge-Go ADR 0042) | Accepted |
+| [0038](0038-generators-and-destroy.md) | Model, controller, mailer and queue job generators, and `forge destroy` that removes only files still identical to what the generator writes (port of Forge-Go ADR 0041) | Accepted |
 
 New ADRs use the next four-digit number. A changed decision receives a new ADR
 that marks the prior record `Superseded`; accepted records are not rewritten to

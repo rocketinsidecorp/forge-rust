@@ -518,6 +518,7 @@ mod tests {
                         plural: None,
                         broadcast,
                         dry_run: false,
+                        layers: crate::scaffold::Layers::Scaffold,
                     },
                     "1760832000000000000",
                 )

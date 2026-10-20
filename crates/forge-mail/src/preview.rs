@@ -83,8 +83,9 @@ const CONTENT_CSP: &str = "default-src 'none'; img-src 'self' data: https: http:
 /// `FORGE_MAIL_PREVIEW` in production.
 ///
 /// Register it as a layer (`router.layer(handler)`); it answers `GET` and
-/// `HEAD` below the prefix (whole path segments only) and passes every other
-/// path on. HTML is served under `Content-Security-Policy: ...; sandbox` and
+/// `HEAD` for its index and its previews below the prefix (whole path
+/// segments only) and passes every other path on, so handlers with nested
+/// prefixes (`/_mail`, `/_mail/user`) can be layered in any order. HTML is served under `Content-Security-Policy: ...; sandbox` and
 /// inside a sandboxed iframe, so even hostile template data cannot run script
 /// in the developer's browser; every response is `nosniff` and `no-store`.
 pub struct PreviewHandler {
@@ -138,11 +139,19 @@ impl PreviewHandler {
         })
     }
 
-    /// Answers `request` when its path is below the prefix.
+    /// Answers `request` when its path is the prefix (the index) or names
+    /// one of the handler's previews below it. Other paths, including other
+    /// segments below the prefix, are left to the next layer, so handlers
+    /// nest: `/_mail` with the password reset preview and `/_mail/user` with
+    /// a generated mailer's previews work in either order.
     pub fn serve(&self, request: &Request) -> Option<Response> {
         let rest = request.uri().path().strip_prefix(self.prefix.as_str())?;
         // The prefix must end at a path segment: `/_mailx` is not below it.
         if !rest.is_empty() && !rest.starts_with('/') {
+            return None;
+        }
+        let first = rest.trim_start_matches('/').split('/').next().unwrap_or("");
+        if !first.is_empty() && !self.previews.iter().any(|preview| preview.name == first) {
             return None;
         }
         let response = if request.method() != Method::GET && request.method() != Method::HEAD {
@@ -648,11 +657,10 @@ mod tests {
     fn routing_is_by_whole_segments_and_read_only() {
         assert!(get("/_mailwelcome").is_none());
         assert!(get("/other").is_none());
-        for path in [
-            "/_mail/missing",
-            "/_mail/welcome/nope",
-            "/_mail/welcome/cid/other",
-        ] {
+        // A segment that names no preview is another handler's (nesting).
+        assert!(get("/_mail/missing").is_none());
+        assert!(get("/_mail/user/welcome").is_none());
+        for path in ["/_mail/welcome/nope", "/_mail/welcome/cid/other"] {
             assert_eq!(
                 get(path).expect("served").status(),
                 StatusCode::NOT_FOUND,

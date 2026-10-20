@@ -29,6 +29,7 @@ fn options(name: &str, fields: &[&str], scope: Scope) -> ScaffoldOptions {
         plural: None,
         broadcast: false,
         dry_run: false,
+        layers: Layers::Scaffold,
     }
 }
 

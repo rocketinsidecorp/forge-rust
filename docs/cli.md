@@ -20,7 +20,12 @@ forge id
 forge new <name> [-d <DATABASE>] [--api] [--locale en|es|pt-BR] [--skip-docker] [--skip-ci] [--skip-lockfile] [--forge-path <PATH>]
 forge generate migration <name>
 forge generate authentication [--dry-run]
-forge generate scaffold <name> <field:type>... (--global | --tenant-scoped) [--plural <PLURAL>] [--dry-run]
+forge generate scaffold <name> <field:type>... (--global | --tenant-scoped) [--plural <PLURAL>] [--broadcast] [--dry-run]
+forge generate model <name> <field:type>... (--global | --tenant-scoped) [--plural <PLURAL>] [--dry-run]
+forge generate controller <name> <action>... [--api] [--public] [--dry-run]
+forge generate mailer <name> <method[:field,...]>... [--dry-run]
+forge generate job <name> [<field:type>...] --queue [--dry-run]
+forge destroy model|scaffold|controller|mailer|job <arguments of the generator> [--dry-run] [--force] [--migrations]
 forge check
 forge test [ARGS]
 forge format
@@ -595,6 +600,31 @@ The scaffold refuses, with an explanation and without writing:
   with the `testing` feature or (PostgreSQL tenant resources)
   `begin_tenant_transaction`, all of which `forge new` generates.
 - An `src/adapters/http/access.rs` that lacks the generated traits.
+
+## `forge generate model|controller|mailer|job` and `forge destroy`
+
+```sh
+forge generate model post title:string 'body:text?' --global          # the scaffold's model files, no pages
+forge generate controller pages index about_us --public               # read-only GET pages
+forge generate controller reports monthly                             # guarded: asks for reports:read
+forge generate controller status_checks index --api                   # JSON under /v1
+forge generate mailer user welcome:name,url password_reset            # typed emails, templates, previews
+forge generate job send_welcome user_id:uuid 'note:string?' --queue   # persistent PostgreSQL queue job
+forge destroy controller pages index about_us --public --dry-run      # what would be removed
+forge destroy model post title:string 'body:text?' --global --migrations
+```
+
+The `rails g` and `rails d` of Forge, with Forge-Go's commands and rules
+([ADR 0038](adr/0038-generators-and-destroy.md)). Every generator writes only
+new files, all or nothing, refuses symlinks and prints the module
+declarations and `fn compose` lines to add. Guarded controllers ask the
+access policy for `NAME:read` and reuse the permission of the model of the
+same name; a model or scaffold refuses a permission another module already
+declares. `forge destroy` takes the generator's arguments and removes a file
+only while it is byte-identical to what the generator writes (`--force`
+otherwise); migrations stay unless `--migrations`, translated locale files
+are kept, and the shared access, streams and jobs modules are never removed.
+Details, files and refusals: [generators](generators.md).
 
 ## `forge i18n check`
 

@@ -1,6 +1,7 @@
 //! `forge generate scaffold`: a server-rendered HTML CRUD resource through
 //! every hexagonal ring, for the application's database backend
-//! (ADR 0022, decision 7).
+//! (ADR 0022, decision 7), and `forge generate model`: the same resource
+//! without its HTTP layer (ADR 0038).
 //!
 //! The generator writes only new files, all or nothing, and never edits an
 //! existing file: the module declarations and the composition-root lines
@@ -19,13 +20,34 @@ pub(crate) use render::Backend;
 pub(crate) use render::File;
 use render::{Broadcast, STREAMS_PATH};
 pub(crate) use spec::Scope;
+pub(crate) use spec::{pascal_case, sentence_case};
 
 use crate::CliError;
 use crate::generate::write_new_file;
-use render::ACCESS_PATH;
+use crate::generators::{self, Planned, Role};
+pub(crate) use render::ACCESS_PATH;
 use spec::Resource;
 
-/// Arguments of `forge generate scaffold`.
+/// Which layers of a resource a generator writes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Layers {
+    /// `forge generate model`: migration, entity, repository port, use
+    /// cases, repository adapter and its tests.
+    Model,
+    /// `forge generate scaffold`: the model plus the HTML pages.
+    Scaffold,
+}
+
+impl Layers {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Model => "model",
+            Self::Scaffold => "scaffold",
+        }
+    }
+}
+
+/// Arguments of `forge generate scaffold` and `forge generate model`.
 #[derive(Debug, Clone)]
 pub(crate) struct ScaffoldOptions {
     pub(crate) name: String,
@@ -34,6 +56,7 @@ pub(crate) struct ScaffoldOptions {
     pub(crate) plural: Option<String>,
     pub(crate) broadcast: bool,
     pub(crate) dry_run: bool,
+    pub(crate) layers: Layers,
 }
 
 /// What the generator did (or, with `--dry-run`, would do).
@@ -84,24 +107,131 @@ pub(crate) fn application_default_locale(root: &Path) -> String {
         .unwrap_or_else(|| DEFAULT_TEXT_LOCALE.to_owned())
 }
 
-/// Generates the scaffold in the application at `root`. `migration` is the
-/// numeric version prefix of the migration pair.
+/// The shared access-policy module (`src/adapters/http/access.rs`) the
+/// first scaffold or guarded controller writes, before formatting.
+pub(crate) fn access_module() -> String {
+    render::ACCESS.to_owned()
+}
+
+/// Whether a plan is for writing the files or for `forge destroy`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Purpose {
+    Generate,
+    Destroy,
+}
+
+/// A rendered resource and what was learned on the way.
+struct Plan {
+    resource: Resource,
+    application: Application,
+    broadcast: Broadcast,
+    files: Vec<Planned>,
+}
+
+/// Generates the scaffold (or model) in the application at `root`.
+/// `migration` is the numeric version prefix of the migration pair.
 pub(crate) fn generate(
     root: &Path,
     options: &ScaffoldOptions,
     migration: &str,
 ) -> Result<Outcome, CliError> {
+    let plan = plan(root, options, Some(migration), Purpose::Generate)?;
+    let wiring = match options.layers {
+        Layers::Scaffold => wiring(
+            root,
+            &plan.resource,
+            plan.application.backend,
+            !plan.application.access_exists,
+            plan.broadcast,
+        )?,
+        Layers::Model => model_wiring(root, &plan.resource, plan.application.backend)?,
+    };
+    if !options.dry_run {
+        generators::write(root, &plan.files)?;
+    }
+    let scaffold = options.layers == Layers::Scaffold;
+    Ok(Outcome {
+        created: plan.files.iter().map(|file| file.path.clone()).collect(),
+        reused_access: scaffold && plan.application.access_exists,
+        reused_streams: scaffold && options.broadcast && plan.application.streams_exists,
+        wiring,
+    })
+}
+
+/// What `forge destroy scaffold|model` removes: the files the generator
+/// writes from `options`, found where they are (the migrations at the
+/// version they have), without the shared access and streams modules, plus
+/// what to take out of the composition root and, when a bigger or
+/// dependent generation still needs the files, why.
+pub(crate) fn plan_destroy(
+    root: &Path,
+    options: &ScaffoldOptions,
+) -> Result<(Vec<Planned>, String, Option<String>), CliError> {
+    let plan = plan(root, options, None, Purpose::Destroy)?;
+    let plural = &plan.resource.plural;
+    let mut owned_elsewhere = None;
+    if options.layers == Layers::Model {
+        let pages = format!("src/adapters/http/{plural}.rs");
+        if fs::symlink_metadata(root.join(&pages)).is_ok() {
+            owned_elsewhere = Some(format!(
+                "{pages} exists, and `forge generate scaffold {}` writes it around this model: \
+                 the model's files belong to that scaffold, and removing them alone would \
+                 leave code that no longer compiles. Run `forge destroy scaffold` with the \
+                 arguments it was generated with, or pass --force to remove only the model's \
+                 files",
+                plan.resource.singular
+            ));
+        }
+    }
+    let controller = format!("src/adapters/http/{plural}_controller.rs");
+    if owned_elsewhere.is_none()
+        && read(root, &controller)
+            .is_some_and(|source| source.contains(&format!("use_cases::{plural}::READ_PERMISSION")))
+    {
+        owned_elsewhere = Some(format!(
+            "{controller} reuses the permission `{plural}:read` of this {}, and would no \
+             longer compile without it. Run `forge destroy controller {plural}` with the \
+             actions it was generated with first, or pass --force",
+            options.layers.name()
+        ));
+    }
+    let unwire = match options.layers {
+        Layers::Scaffold => wiring(
+            root,
+            &plan.resource,
+            plan.application.backend,
+            false,
+            Broadcast {
+                enabled: options.broadcast,
+                streams_module: false,
+            },
+        )?,
+        Layers::Model => model_wiring(root, &plan.resource, plan.application.backend)?,
+    };
+    Ok((plan.files, unwire, owned_elsewhere))
+}
+
+fn plan(
+    root: &Path,
+    options: &ScaffoldOptions,
+    migration: Option<&str>,
+    purpose: Purpose,
+) -> Result<Plan, CliError> {
+    let layers = options.layers;
     let resource = spec::parse(
         &options.name,
         &options.fields,
         options.scope,
         options.plural.as_deref(),
     )
-    .map_err(|invalid| CliError::Scaffold(invalid.to_string()))?;
-    let application = inspect(root, &resource, options.broadcast)?;
+    .map_err(|invalid| fail(layers, invalid.to_string()))?;
+    let broadcast_requested = layers == Layers::Scaffold && options.broadcast;
+    let application = inspect(root, &resource, broadcast_requested, layers, purpose)?;
     let broadcast = Broadcast {
-        enabled: options.broadcast,
-        streams_module: options.broadcast && !application.streams_exists,
+        enabled: broadcast_requested,
+        streams_module: broadcast_requested
+            && !application.streams_exists
+            && purpose == Purpose::Generate,
     };
     // The text is English; an application whose default locale is another
     // one gets it under that locale too, so production never falls back to
@@ -110,34 +240,161 @@ pub(crate) fn generate(
     if application.default_locale != DEFAULT_TEXT_LOCALE {
         locales.push(application.default_locale.clone());
     }
-    let mut files = render::files(
+    let write_access =
+        layers == Layers::Scaffold && !application.access_exists && purpose == Purpose::Generate;
+    let rendered = render::files(
         &resource,
         application.backend,
-        migration,
-        !application.access_exists,
+        migration.unwrap_or("0"),
+        write_access,
         broadcast,
         &locales,
     );
-    refuse_collisions(root, &resource, &files)?;
+    let plural = &resource.plural;
+    let migration_name = format!("create_{plural}");
+    let model_paths = [
+        format!("src/domain/entities/{}.rs", resource.singular),
+        format!("src/application/ports/{}_repository.rs", resource.singular),
+        format!("src/application/use_cases/{plural}.rs"),
+        format!("src/infrastructure/database/{plural}.rs"),
+        format!("tests/{plural}_repository.rs"),
+    ];
+    let mut files = Vec::new();
+    for file in rendered {
+        if file.path.starts_with("migrations/") {
+            if purpose == Purpose::Destroy {
+                continue;
+            }
+            files.push(Planned::new(file.path, file.content, Role::Migration));
+            continue;
+        }
+        if layers == Layers::Model && !model_paths.contains(&file.path) {
+            continue;
+        }
+        let role = if file.path == ACCESS_PATH || file.path == STREAMS_PATH {
+            Role::Shared
+        } else if file.path.starts_with("config/locales/")
+            && !file.path.ends_with(&format!(".{DEFAULT_TEXT_LOCALE}.json"))
+        {
+            Role::Translation
+        } else {
+            Role::Owned
+        };
+        files.push(Planned::new(file.path, file.content, role));
+    }
+    if purpose == Purpose::Destroy {
+        let (up, down) = render::migration(&resource, application.backend);
+        let (ups, downs) = generators::existing_migrations(root, &migration_name);
+        let mut migrations: Vec<Planned> = ups
+            .into_iter()
+            .map(|path| Planned::new(path, up.clone(), Role::Migration))
+            .chain(
+                downs
+                    .into_iter()
+                    .map(|path| Planned::new(path, down.clone(), Role::Migration)),
+            )
+            .collect();
+        migrations.append(&mut files);
+        files = migrations;
+        generators::refuse_symlinks(root, files.iter().map(|file| file.path.as_str()))
+            .map_err(|reason| fail(layers, reason))?;
+    } else {
+        refuse_collisions(root, &resource, &files, layers)?;
+        refuse_second_permission_owner(root, &resource, layers)?;
+    }
     for file in files.iter_mut().filter(|file| file.path.ends_with(".rs")) {
         file.content = rustfmt(root, &file.path, &file.content)?;
     }
-    let wiring = wiring(
-        root,
-        &resource,
-        application.backend,
-        !application.access_exists,
+    Ok(Plan {
+        resource,
+        application,
         broadcast,
-    )?;
-    if !options.dry_run {
-        write_all(root, &files)?;
-    }
-    Ok(Outcome {
-        created: files.iter().map(|file| file.path.clone()).collect(),
-        reused_access: application.access_exists,
-        reused_streams: options.broadcast && application.streams_exists,
-        wiring,
+        files,
     })
+}
+
+/// Refuses a resource whose permissions another module already declares:
+/// every permission has one owner (ADR 0038).
+fn refuse_second_permission_owner(
+    root: &Path,
+    resource: &Resource,
+    layers: Layers,
+) -> Result<(), CliError> {
+    let plural = &resource.plural;
+    let permissions = [format!("{plural}:read"), format!("{plural}:write")];
+    let Some((owner, permission)) = generators::permission_owner(root, &permissions, &[]) else {
+        return Ok(());
+    };
+    let kind = layers.name();
+    Err(fail(
+        layers,
+        format!(
+            "{owner} already declares the permission `{permission}`, which the {kind}'s use \
+             cases would declare too. A permission belongs to the one module that declares \
+             it, so it never gets a second one. Choose another name or --plural; or, to let \
+             the {kind} own `{permission}`, destroy that generation first (a controller \
+             generated afterwards reuses the {kind}'s permission)"
+        ),
+    ))
+}
+
+/// The wiring printed by `forge generate model`: the module declarations
+/// and how to build the use cases.
+fn model_wiring(root: &Path, resource: &Resource, backend: Backend) -> Result<String, CliError> {
+    let singular = &resource.singular;
+    let plural = &resource.plural;
+    let type_name = spec::pascal_case(singular);
+    let (database, prefix) = match backend {
+        Backend::Postgresql => ("postgres", "Pg"),
+        Backend::MySql => ("mysql", "MySql"),
+        Backend::Sqlite => ("sqlite", "Sqlite"),
+    };
+    let declarations = [
+        ("src/domain/entities/mod.rs", singular.clone()),
+        (
+            "src/application/ports/mod.rs",
+            format!("{singular}_repository"),
+        ),
+        ("src/application/use_cases/mod.rs", plural.clone()),
+        ("src/infrastructure/database/mod.rs", plural.clone()),
+    ];
+    let mut out = String::from(
+        "\nForge did not edit any existing file. Wire the model by hand:\n\n  \
+         1. Declare the new modules (each in the listed file, keeping `mod` lines sorted):\n\n",
+    );
+    for (file, module) in &declarations {
+        out.push_str(&format!("       {file:<38} pub mod {module};\n"));
+    }
+    out.push_str(&format!(
+        "\n  2. Build the use cases where you need them, for example in `fn compose` of\n  \
+         src/bootstrap/mod.rs, and pass `{plural}` to the code that uses it:\n\n"
+    ));
+    let code = format!(
+        "    let {plural} = crate::application::use_cases::{plural}::{type_name}Service::new(\n        \
+         std::sync::Arc::new(\n            \
+         crate::infrastructure::database::{plural}::{prefix}{type_name}Repository::new(\n                \
+         composition.{database}()?.clone(),\n            \
+         ),\n        \
+         ),\n    \
+         );\n"
+    );
+    out.push_str(&format_statements(root, &code)?);
+    out.push_str(&format!(
+        "\n  The service offers list, find, create, update and delete with optimistic\n  \
+         locking; `{plural}:read` and `{plural}:write` are its permissions\n  \
+         (crate::application::use_cases::{plural}::READ_PERMISSION, WRITE_PERMISSION).\n"
+    ));
+    if resource.scope == Scope::Tenant {
+        out.push_str(&format!(
+            "  {type_name} is tenant-scoped: every use case takes the authorized TenantContext.\n"
+        ));
+    }
+    out.push_str(
+        "\n  Then apply the migration (`forge migrate`) and run `forge test` (repository\n  \
+         tests on a database server need `cargo test -- --include-ignored` and\n  \
+         FORGE_TEST_* URLs, see docs/database.md).\n",
+    );
+    Ok(out)
 }
 
 /// Formats generated Rust with the application's pinned `rustfmt` (edition
@@ -177,7 +434,7 @@ pub(crate) fn rustfmt(root: &Path, path: &str, source: &str) -> Result<String, C
 /// Whether the `GlobalAccess` trait of an existing access module has the
 /// current shape, returning the admitted principal (an `Option`), rather
 /// than the `Result<(), AccessDenied>` of applications generated before.
-fn global_access_returns_principal(access: &str) -> bool {
+pub(crate) fn global_access_returns_principal(access: &str) -> bool {
     access
         .split_once("pub trait GlobalAccess")
         .and_then(|(_, rest)| rest.split_once('}'))
@@ -188,18 +445,50 @@ fn unsupported<T>(reason: impl Into<String>) -> Result<T, CliError> {
     Err(CliError::Scaffold(reason.into()))
 }
 
+/// The refusal of `layers`' generator.
+fn fail(layers: Layers, reason: String) -> CliError {
+    match layers {
+        Layers::Scaffold => CliError::Scaffold(reason),
+        Layers::Model => generators::generate_error("model", reason),
+    }
+}
+
+/// Labels the refusals of [`inspect_application`] with the generator.
+fn inspect(
+    root: &Path,
+    resource: &Resource,
+    broadcast: bool,
+    layers: Layers,
+    purpose: Purpose,
+) -> Result<Application, CliError> {
+    inspect_application(root, resource, broadcast, layers, purpose).map_err(|error| match error {
+        CliError::Scaffold(reason) => fail(layers, reason),
+        other => other,
+    })
+}
+
 fn read(root: &Path, relative: &str) -> Option<String> {
     fs::read_to_string(root.join(relative)).ok()
 }
 
 /// Detects the backend and shape from the files `forge new` generated and
-/// refuses applications the scaffold cannot serve.
-fn inspect(root: &Path, resource: &Resource, broadcast: bool) -> Result<Application, CliError> {
+/// refuses applications the scaffold (or model) cannot serve. A destroy
+/// plan skips the checks of the shared modules it never removes.
+fn inspect_application(
+    root: &Path,
+    resource: &Resource,
+    broadcast: bool,
+    layers: Layers,
+    purpose: Purpose,
+) -> Result<Application, CliError> {
+    let scaffold = layers == Layers::Scaffold;
+    let generating = purpose == Purpose::Generate;
     let Some(manifest) = read(root, "Cargo.toml") else {
         return unsupported(format!(
-            "no Cargo.toml in {}; run `forge generate scaffold` in the root of an application \
+            "no Cargo.toml in {}; run `forge generate {}` in the root of an application \
              created by `forge new`",
-            root.display()
+            root.display(),
+            layers.name()
         ));
     };
     let dependency = |name: &str| {
@@ -208,7 +497,10 @@ fn inspect(root: &Path, resource: &Resource, broadcast: bool) -> Result<Applicat
             .find(|line| line.trim_start().starts_with(&format!("{name} =")))
             .map(str::to_owned)
     };
-    if dependency("askama").is_none() || !root.join("src/adapters/http/views/mod.rs").is_file() {
+    if scaffold
+        && (dependency("askama").is_none()
+            || !root.join("src/adapters/http/views/mod.rs").is_file())
+    {
         return unsupported(
             "this application has no views (it was created with `forge new --api`). The \
              scaffold generates server-rendered HTML pages; JSON scaffolds are not available \
@@ -217,8 +509,8 @@ fn inspect(root: &Path, resource: &Resource, broadcast: bool) -> Result<Applicat
     }
     let Some(sqlx) = dependency("sqlx") else {
         return unsupported(
-            "this application has no database (`forge new -d none`); the scaffold needs \
-             PostgreSQL, MySQL, MariaDB or SQLite. Create a database application with \
+            "this application has no database (`forge new -d none`); models and scaffolds \
+             need PostgreSQL, MySQL, MariaDB or SQLite. Create a database application with \
              `forge new <name> -d <database>`",
         );
     };
@@ -242,14 +534,14 @@ fn inspect(root: &Path, resource: &Resource, broadcast: bool) -> Result<Applicat
         );
     }
     let compose = read(root, "src/bootstrap/mod.rs").unwrap_or_default();
-    if !compose.contains("crate::adapters::http::site(") {
+    if scaffold && generating && !compose.contains("crate::adapters::http::site(") {
         return unsupported(
             "src/bootstrap/mod.rs has no `compose` function that loads the site with \
              `crate::adapters::http::site(..)`; the printed wiring needs it (see the \
              `compose` function generated by `forge new`)",
         );
     }
-    if !root.join(LOCALES_MODULE).is_file() {
+    if scaffold && generating && !root.join(LOCALES_MODULE).is_file() {
         return unsupported(format!(
             "{LOCALES_MODULE} is missing: the pages are translated with `layout.i18n` and \
              config/locales (ADR 0037). Add them as \"Applications created before i18n\" in \
@@ -264,7 +556,9 @@ fn inspect(root: &Path, resource: &Resource, broadcast: bool) -> Result<Applicat
         "src/infrastructure/security/mod.rs",
         "src/adapters/http/mod.rs",
     ] {
-        if !root.join(module).is_file() {
+        let model_module = !module.starts_with("src/infrastructure/security")
+            && !module.starts_with("src/adapters/http");
+        if (scaffold || model_module) && !root.join(module).is_file() {
             return unsupported(format!(
                 "{module} is missing; the scaffold adds modules next to the ones `forge new` \
                  generates"
@@ -282,6 +576,7 @@ fn inspect(root: &Path, resource: &Resource, broadcast: bool) -> Result<Applicat
     }
     let access_exists = match read(root, ACCESS_PATH) {
         None => false,
+        Some(_) if !scaffold || !generating => true,
         Some(access) => {
             for item in [
                 "pub trait GlobalAccess",
@@ -313,7 +608,7 @@ fn inspect(root: &Path, resource: &Resource, broadcast: bool) -> Result<Applicat
         }
     };
     let streams_exists = match read(root, STREAMS_PATH) {
-        Some(streams) if broadcast => {
+        Some(streams) if broadcast && generating => {
             for item in [
                 "pub struct Streams",
                 "pub fn allow_tenant",
@@ -331,7 +626,7 @@ fn inspect(root: &Path, resource: &Resource, broadcast: bool) -> Result<Applicat
         Some(_) => true,
         None => false,
     };
-    if broadcast {
+    if broadcast && generating {
         let forge = dependency("forge").unwrap_or_default();
         if !forge.contains("\"broadcast\"") {
             return unsupported(
@@ -351,12 +646,15 @@ fn inspect(root: &Path, resource: &Resource, broadcast: bool) -> Result<Applicat
 
 /// Fails, before anything is written, when a file to create exists or the
 /// resource was scaffolded before.
-fn refuse_collisions(root: &Path, resource: &Resource, files: &[File]) -> Result<(), CliError> {
-    let mut existing: Vec<String> = files
-        .iter()
-        .filter(|file| root.join(&file.path).exists())
-        .map(|file| file.path.clone())
-        .collect();
+fn refuse_collisions(
+    root: &Path,
+    resource: &Resource,
+    files: &[Planned],
+    layers: Layers,
+) -> Result<(), CliError> {
+    generators::refuse_symlinks(root, files.iter().map(|file| file.path.as_str()))
+        .map_err(|reason| fail(layers, reason))?;
+    let mut existing = generators::existing(root, files);
     let suffix = format!("_create_{}.up.sql", resource.plural);
     if let Ok(entries) = fs::read_dir(root.join("migrations")) {
         let mut migrations: Vec<String> = entries
@@ -371,9 +669,12 @@ fn refuse_collisions(root: &Path, resource: &Resource, files: &[File]) -> Result
     if existing.is_empty() {
         return Ok(());
     }
-    unsupported(format!(
-        "refusing to overwrite existing files; nothing was written:\n  {}",
-        existing.join("\n  ")
+    Err(fail(
+        layers,
+        format!(
+            "refusing to overwrite existing files; nothing was written:\n  {}",
+            existing.join("\n  ")
+        ),
     ))
 }
 
@@ -590,7 +891,7 @@ fn wiring(
 
 /// Formats statements as they will read inside `fn compose`, so pasting them
 /// keeps `cargo fmt --check` clean.
-fn format_statements(root: &Path, statements: &str) -> Result<String, CliError> {
+pub(crate) fn format_statements(root: &Path, statements: &str) -> Result<String, CliError> {
     const HEAD: &str = "fn compose() {\n";
     let formatted = rustfmt(root, "wiring", &format!("{HEAD}{statements}}}\n"))?;
     Ok(formatted

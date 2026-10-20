@@ -77,6 +77,14 @@ pub(crate) enum Command {
         #[command(subcommand)]
         generator: GenerateCommand,
     },
+    /// Remove what a generator created (like `rails destroy`): give the
+    /// arguments the generator was run with. Only files that still match
+    /// what the generator writes are removed; migrations are kept unless
+    /// --migrations.
+    Destroy {
+        #[command(subcommand)]
+        generator: DestroyCommand,
+    },
     /// Type-check the current application.
     Check,
     /// Run the current application's tests (`cargo test`). ARGS replace the
@@ -264,6 +272,35 @@ pub(crate) enum GenerateCommand {
         /// Human-readable migration name.
         name: String,
     },
+    /// Create a model through the inner rings: migration, entity,
+    /// repository port, use cases, repository adapter and its tests (like
+    /// `rails generate model`). No HTTP layer; writes only new files and
+    /// prints the wiring to add by hand.
+    Model {
+        #[command(flatten)]
+        resource: ResourceArgs,
+    },
+    /// Create read-only GET pages (or JSON endpoints with --api), their
+    /// routes, views and tests, without persistence (like `rails generate
+    /// controller`). Routes ask the access policy for NAME:read unless
+    /// --public.
+    Controller {
+        #[command(flatten)]
+        controller: ControllerArgs,
+    },
+    /// Create a mailer: one typed method per email, askama subject, text and
+    /// HTML templates, previews and tests (like `rails generate mailer`).
+    Mailer {
+        #[command(flatten)]
+        mailer: MailerArgs,
+    },
+    /// Create a typed job for the persistent PostgreSQL queue (--queue): the
+    /// payload, its handler, registration, enqueue function and tests (like
+    /// `rails generate job`).
+    Job {
+        #[command(flatten)]
+        job: JobArgs,
+    },
     /// Create an HTML CRUD resource through every ring: migration, entity,
     /// port, use cases, repository, handlers, views and tests (like
     /// `rails generate scaffold`). Writes only new files and prints the
@@ -300,5 +337,143 @@ pub(crate) enum GenerateCommand {
         /// writing anything.
         #[arg(long)]
         dry_run: bool,
+    },
+}
+
+/// The arguments of `forge generate model` (and `forge destroy model`).
+#[derive(Debug, Args)]
+pub(crate) struct ResourceArgs {
+    /// Singular resource name, snake_case or PascalCase (`line_item`).
+    pub(crate) name: String,
+    /// Fields as name:type, type one of string, text, integer, boolean,
+    /// timestamp, uuid; append `?` for an optional field.
+    #[arg(required = true, value_name = "FIELD:TYPE")]
+    pub(crate) fields: Vec<String>,
+    /// Rows belong to a tenant: tenant predicates and (PostgreSQL)
+    /// row-level security.
+    #[arg(long, required_unless_present = "global", conflicts_with = "global")]
+    pub(crate) tenant_scoped: bool,
+    /// Rows are shared by every tenant.
+    #[arg(long)]
+    pub(crate) global: bool,
+    /// Plural name when the English rules get it wrong.
+    #[arg(long, value_name = "PLURAL")]
+    pub(crate) plural: Option<String>,
+    /// List the files without writing (or removing) anything.
+    #[arg(long)]
+    pub(crate) dry_run: bool,
+}
+
+/// The arguments of `forge generate controller` (and `forge destroy
+/// controller`).
+#[derive(Debug, Args)]
+pub(crate) struct ControllerArgs {
+    /// Controller name, snake_case and usually plural (`pages`).
+    pub(crate) name: String,
+    /// Read-only actions, each a GET route: `index` is /NAME, any other is
+    /// /NAME/ACTION. create, update and destroy belong to the scaffold.
+    #[arg(value_name = "ACTION")]
+    pub(crate) actions: Vec<String>,
+    /// JSON endpoints under /v1/NAME instead of HTML pages.
+    #[arg(long)]
+    pub(crate) api: bool,
+    /// Mount the routes without a guard: anyone may call them.
+    #[arg(long)]
+    pub(crate) public: bool,
+    /// List the files without writing (or removing) anything.
+    #[arg(long)]
+    pub(crate) dry_run: bool,
+}
+
+/// The arguments of `forge generate mailer` (and `forge destroy mailer`).
+#[derive(Debug, Args)]
+pub(crate) struct MailerArgs {
+    /// Mailer name, snake_case (`user` becomes `UserMailer`).
+    pub(crate) name: String,
+    /// One email per METHOD, optionally followed by the string fields of its
+    /// template data: `welcome:name,url`.
+    #[arg(value_name = "METHOD[:FIELD,...]")]
+    pub(crate) methods: Vec<String>,
+    /// List the files without writing (or removing) anything.
+    #[arg(long)]
+    pub(crate) dry_run: bool,
+}
+
+/// The arguments of `forge generate job` (and `forge destroy job`).
+#[derive(Debug, Args)]
+pub(crate) struct JobArgs {
+    /// Job name, snake_case (`send_welcome`).
+    pub(crate) name: String,
+    /// Payload fields as name:type (the model field types; `?` for
+    /// optional).
+    #[arg(value_name = "FIELD:TYPE")]
+    pub(crate) fields: Vec<String>,
+    /// A job of the persistent PostgreSQL queue (`forge::jobs`). Required:
+    /// Forge-Rust schedules are queue jobs too (docs/jobs.md).
+    #[arg(long)]
+    pub(crate) queue: bool,
+    /// List the files without writing (or removing) anything.
+    #[arg(long)]
+    pub(crate) dry_run: bool,
+}
+
+/// The flags `forge destroy` adds to the generator's arguments.
+#[derive(Clone, Copy, Debug, Args)]
+pub(crate) struct DestroyArgs {
+    /// Remove files that differ from what the generator writes, or that a
+    /// bigger generation still needs.
+    #[arg(long)]
+    pub(crate) force: bool,
+    /// Remove the migrations too (revert them with `forge rollback` first).
+    #[arg(long)]
+    pub(crate) migrations: bool,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum DestroyCommand {
+    /// Remove what `forge generate model` created.
+    Model {
+        #[command(flatten)]
+        resource: ResourceArgs,
+        #[command(flatten)]
+        flags: DestroyArgs,
+    },
+    /// Remove what `forge generate scaffold` created (the shared access and
+    /// streams modules stay).
+    Scaffold {
+        #[command(flatten)]
+        resource: ResourceArgs,
+        /// The scaffold was generated with --broadcast.
+        #[arg(long)]
+        broadcast: bool,
+        #[command(flatten)]
+        flags: DestroyArgs,
+    },
+    /// Remove what `forge generate controller` created.
+    Controller {
+        #[command(flatten)]
+        controller: ControllerArgs,
+        #[command(flatten)]
+        flags: DestroyArgs,
+    },
+    /// Remove what `forge generate mailer` created.
+    Mailer {
+        #[command(flatten)]
+        mailer: MailerArgs,
+        #[command(flatten)]
+        flags: DestroyArgs,
+    },
+    /// Remove what `forge generate job --queue` created.
+    Job {
+        #[command(flatten)]
+        job: JobArgs,
+        #[command(flatten)]
+        flags: DestroyArgs,
+    },
+    /// Not supported: a migration that ran is part of the database's
+    /// history (explains what to do instead).
+    Migration {
+        /// The migration name.
+        name: String,
     },
 }

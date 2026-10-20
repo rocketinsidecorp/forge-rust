@@ -20,6 +20,14 @@ pub enum CliError {
     Clock(std::time::SystemTimeError),
     /// `forge generate scaffold` refused the request; nothing was written.
     Scaffold(String),
+    /// `forge generate model|controller|mailer|job` refused the request;
+    /// nothing was written.
+    Generate {
+        generator: &'static str,
+        reason: String,
+    },
+    /// `forge destroy` refused the request; nothing was removed.
+    Destroy(String),
     /// `forge generate authentication` refused the request; nothing was
     /// written.
     Authentication(String),
@@ -105,6 +113,10 @@ impl fmt::Display for CliError {
                 write!(formatter, "system clock is before the Unix epoch: {error}")
             }
             Self::Scaffold(reason) => write!(formatter, "cannot generate the scaffold: {reason}"),
+            Self::Generate { generator, reason } => {
+                write!(formatter, "cannot generate the {generator}: {reason}")
+            }
+            Self::Destroy(reason) => formatter.write_str(reason),
             Self::Authentication(reason) => {
                 write!(formatter, "cannot generate authentication: {reason}")
             }
@@ -183,6 +195,8 @@ impl std::error::Error for CliError {
             | Self::InvalidForgePath { .. }
             | Self::InvalidMigrationName { .. }
             | Self::Scaffold(_)
+            | Self::Generate { .. }
+            | Self::Destroy(_)
             | Self::Authentication(_)
             | Self::DestinationExists(_)
             | Self::NotAnApplication(_)
