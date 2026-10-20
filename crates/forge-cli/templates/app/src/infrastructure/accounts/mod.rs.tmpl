@@ -367,6 +367,10 @@ impl MfaStore for PgMfaStore {
         let Some(enabled) = lock_account(&mut transaction, principal).await? else {
             return Ok(false);
         };
+        // The pending seed of a rotation sits where an enrollment's does. With
+        // the account locked, an enrollment of an account that has a factor
+        // (and a rotation of one that has none) is refused here, explicitly,
+        // rather than by the statements below failing on the factor's key.
         if enabled != (change == MfaChange::Rotation) {
             return Ok(false);
         }
@@ -732,24 +736,37 @@ impl MfaStore for PgMfaStore {
 
 /// Locks an enabled account's row; `Some(has a factor)`, or `None` when the
 /// account is missing or disabled.
+///
+/// The factor is looked up by a second statement, once the lock is held:
+/// under READ COMMITTED a statement reads the rows committed before it
+/// started, so the locking statement itself would miss a factor installed by
+/// the transaction it waited for.
 async fn lock_account(
     transaction: &mut Transaction<'_, Postgres>,
     principal: PrincipalId,
 ) -> Result<Option<bool>, AccountStoreError> {
-    let enabled = sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS (
-            SELECT 1 FROM forge_totp_factors WHERE principal_id = principal.id
-         )
-         FROM forge_principals AS principal
-         WHERE principal.id = $1
-           AND principal.disabled_at IS NULL
-         FOR UPDATE OF principal",
+    let locked = sqlx::query_scalar::<_, i32>(
+        "SELECT 1
+         FROM forge_principals
+         WHERE id = $1
+           AND disabled_at IS NULL
+         FOR UPDATE",
     )
     .bind(principal.into_uuid())
     .fetch_optional(&mut **transaction)
     .await
     .map_err(classify)?;
-    Ok(enabled)
+    if locked.is_none() {
+        return Ok(None);
+    }
+    let enabled = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (SELECT 1 FROM forge_totp_factors WHERE principal_id = $1)",
+    )
+    .bind(principal.into_uuid())
+    .fetch_one(&mut **transaction)
+    .await
+    .map_err(classify)?;
+    Ok(Some(enabled))
 }
 
 /// Replaces the account's backup codes with `codes`.

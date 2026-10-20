@@ -523,6 +523,38 @@ async fn create_session(pages: Arc<Pages>, request: Request) -> Response {
         Ok(issued) => issued,
         Err(error) => return unavailable_because("session_store_unavailable", error),
     };
+    // A factor installed after the check above revoked every session of the
+    // account before this one existed, so check again now that it is stored:
+    // on PostgreSQL its insert waits for the account row the installation
+    // locks (the foreign key), so that factor is visible here. The session's
+    // cookie has not been sent; it ends, and the code is asked for instead.
+    match ports.mfa.status(principal).await {
+        Ok(None) => {}
+        Ok(Some(_)) => {
+            if ports
+                .sessions
+                .revoke(issued.session.id(), now)
+                .await
+                .is_err()
+            {
+                return unavailable("session_store_unavailable");
+            }
+            return challenge_second_factor(
+                &pages,
+                &request,
+                values,
+                (principal, tenant, version),
+                UnixTimestamp::from_secs(expires_at),
+                now,
+            )
+            .await;
+        }
+        Err(error) => {
+            // Never sent, so unusable; revoked anyway when the store answers.
+            let _ = ports.sessions.revoke(issued.session.id(), now).await;
+            return unavailable_because("mfa_unavailable", error);
+        }
+    }
     record(
         ports,
         now,
@@ -1383,6 +1415,10 @@ async fn disable_mfa(pages: Arc<Pages>, request: Request) -> Response {
 enum StepUpFailure {
     /// A wrong password or code (one answer for both).
     Denied,
+    /// A step-up without a code (turning two-factor on or confirming it) of
+    /// an account that already has a factor, refused before the password is
+    /// checked: the same answer whatever the password.
+    AlreadyEnabled,
     /// Too many attempts.
     Throttled(Duration),
     /// A dependency failed.
@@ -1391,10 +1427,12 @@ enum StepUpFailure {
 
 /// Step-up authentication of the signed-in `principal`: the password, and
 /// `code` (an authenticator or backup code, used up) when given. Counted on
-/// the second-factor throttle before anything is checked; a success clears
-/// the counters only when it checked a code or the account has no factor.
-/// Returns the
-/// stored login, the account label of the authenticator entry.
+/// the second-factor throttle before anything is checked. Without `code`, an
+/// account that already has a factor is refused next, before the password
+/// is checked, so the answer never tells a right password from a wrong one.
+/// A success clears the counters: it checked a code or the account has no
+/// factor. Returns the stored login, the account label of the authenticator
+/// entry.
 async fn step_up(
     pages: &Pages,
     request: &Request,
@@ -1415,6 +1453,18 @@ async fn step_up(
             return Err(StepUpFailure::Throttled(retry_after));
         }
         Err(_) => return Err(StepUpFailure::Unavailable("mfa_throttle_unavailable")),
+    }
+    // With no code to check (turning two-factor on, confirming it), a wrong
+    // password (`422`) and a right one (`303`, "changed") of an account that
+    // already has a factor would tell a session holder the password: such an
+    // account is refused before the password is checked, whatever it is. A
+    // pending rotation is confirmed only with a current code.
+    if code.is_none() {
+        match ports.mfa.status(principal).await {
+            Ok(None) => {}
+            Ok(Some(_)) => return Err(StepUpFailure::AlreadyEnabled),
+            Err(_) => return Err(StepUpFailure::Unavailable("mfa_unavailable")),
+        }
     }
     let login = match verify_principal_password(
         ports.credentials.as_ref(),
@@ -1439,25 +1489,20 @@ async fn step_up(
             Err(_) => return Err(StepUpFailure::Unavailable("mfa_unavailable")),
         }
     }
-    // The password alone clears the counters only while the account has no
-    // factor: with one, they guard its codes, and clearing them after a
-    // password-only step-up would let a session holding the password mix
-    // unlimited code guesses with password-only step-ups.
-    let clears = match code {
-        Some(_) => true,
-        None => match ports.mfa.status(principal).await {
-            Ok(status) => status.is_none(),
-            Err(_) => return Err(StepUpFailure::Unavailable("mfa_unavailable")),
-        },
-    };
-    if clears && ports.mfa.throttle().success(&key).await.is_err() {
+    // A code was checked, or the account has no factor (checked above): the
+    // password alone never clears the counters of an account with a factor,
+    // since they guard its codes, and clearing them would let a session
+    // holding the password mix unlimited code guesses with password-only
+    // step-ups.
+    if ports.mfa.throttle().success(&key).await.is_err() {
         return Err(StepUpFailure::Unavailable("mfa_throttle_unavailable"));
     }
     Ok(login)
 }
 
 /// Records a refused step-up as the denied `action` and shows the settings
-/// page again with one message (`422`, or `429` when throttled).
+/// page again with one message (`422`, or `429` when throttled); an account
+/// that already has a factor goes back to `/mfa` (`303`, "changed").
 async fn step_up_failed(
     pages: &Pages,
     request: &Request,
@@ -1468,6 +1513,20 @@ async fn step_up_failed(
 ) -> Response {
     let (outcome, status, message, retry) = match failure {
         StepUpFailure::Unavailable(code) => return unavailable(code),
+        StepUpFailure::AlreadyEnabled => {
+            // Audited whatever the password, so the trail does not depend
+            // on it either.
+            record(
+                &pages.ports,
+                now,
+                AuditActor::Principal(principal),
+                None,
+                action,
+                AuditOutcome::Denied,
+            )
+            .await;
+            return mfa_change_failed(pages, request, MfaError::AlreadyEnabled);
+        }
         StepUpFailure::Denied => (
             AuditOutcome::Denied,
             StatusCode::UNPROCESSABLE_ENTITY,

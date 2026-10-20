@@ -626,6 +626,79 @@ async fn rotation_keeps_the_old_factor_until_confirmed_and_disable_removes_it() 
     );
 }
 
+/// The pending seed of a rotation sits where an enrollment's does: an
+/// enrollment confirmation of an account with a factor is refused
+/// explicitly, leaving the factor, the pending rotation and the sessions
+/// untouched.
+#[tokio::test]
+async fn an_enrollment_confirmation_of_an_account_with_a_factor_is_refused() {
+    let harness = harness();
+    let ada = PrincipalId::new();
+    let (old, _) = enrolled(&harness, ada).await;
+    let now = START + 1500;
+    let rotation = harness
+        .service
+        .begin(ada, MfaChange::Rotation, ISSUER, ACCOUNT, at(now))
+        .await
+        .expect("rotation");
+    let revoked = harness.revoked.lock().expect("lock").len();
+    assert_eq!(
+        harness
+            .service
+            .confirm(
+                ada,
+                MfaChange::Enrollment,
+                &rotation.secret.code_at(at(now)),
+                at(now)
+            )
+            .await
+            .err(),
+        Some(MfaError::AlreadyEnabled)
+    );
+    assert_eq!(harness.revoked.lock().expect("lock").len(), revoked);
+    assert_eq!(
+        harness
+            .service
+            .verify_second_factor(ada, &old.code_at(at(now)), at(now))
+            .await,
+        Ok(SecondFactor::Totp),
+        "the old factor is still the active one"
+    );
+    // The pending rotation is still confirmable as a rotation.
+    harness
+        .service
+        .confirm(
+            ada,
+            MfaChange::Rotation,
+            &rotation.secret.code_at(at(now + 30)),
+            at(now + 30),
+        )
+        .await
+        .expect("rotated");
+
+    // And a rotation of an account without a factor is refused as such.
+    let bob = PrincipalId::new();
+    let enrollment = harness
+        .service
+        .begin(bob, MfaChange::Enrollment, ISSUER, ACCOUNT, at(now))
+        .await
+        .expect("begin");
+    assert_eq!(
+        harness
+            .service
+            .confirm(
+                bob,
+                MfaChange::Rotation,
+                &enrollment.secret.code_at(at(now)),
+                at(now)
+            )
+            .await
+            .err(),
+        Some(MfaError::NotEnabled)
+    );
+    assert_eq!(harness.service.status(bob).await, Ok(None));
+}
+
 #[tokio::test]
 async fn a_wrong_key_or_tampered_seed_fails_closed() {
     let harness = harness();

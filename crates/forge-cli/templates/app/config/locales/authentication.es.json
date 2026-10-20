@@ -65,6 +65,7 @@
         "enable": "Activar la autenticación en dos pasos",
         "rotate_title": "Reemplazar tu autenticador",
         "rotate": "Reemplazar el autenticador",
+        "rotate_hint": "Iniciar el reemplazo agota el código actual de tu aplicación de autenticación. Para terminar, espera al siguiente código o usa un código de respaldo.",
         "backup_codes_title": "Códigos de respaldo",
         "regenerate": "Crear nuevos códigos de respaldo",
         "disable_title": "Desactivar",

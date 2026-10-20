@@ -204,7 +204,9 @@ pub trait MfaStore: Send + Sync {
     ) -> Result<bool, AccountStoreError>;
 
     /// Replaces every backup code of the account's factor. `false` without
-    /// a factor.
+    /// a factor. Like Forge-Go's, it revokes no session and voids no pending
+    /// challenge: neither depends on the backup codes, and an old code stops
+    /// completing a challenge because it is gone.
     async fn replace_backup_codes(
         &self,
         principal: PrincipalId,
@@ -498,7 +500,10 @@ impl MfaService {
 
     /// Confirms the pending seed with a live code of it: installs the
     /// factor and returns its [`MFA_BACKUP_CODE_COUNT`] backup codes, to
-    /// show once. Every session of the account is revoked.
+    /// show once. Every session of the account is revoked. An enrollment of
+    /// an account that has a factor is [`MfaError::AlreadyEnabled`] and a
+    /// rotation of one without is [`MfaError::NotEnabled`], whatever is
+    /// pending.
     pub async fn confirm(
         &self,
         principal: PrincipalId,
@@ -530,7 +535,14 @@ impl MfaService {
             )
             .await?;
         if !activated {
-            return Err(MfaError::EnrollmentInvalid);
+            // The store refused under the account lock. Say why when the
+            // factor itself is the reason: the pending seed of a rotation is
+            // never confirmed as an enrollment, nor the reverse.
+            return Err(match (change, self.store.status(principal).await?) {
+                (MfaChange::Enrollment, Some(_)) => MfaError::AlreadyEnabled,
+                (MfaChange::Rotation, None) => MfaError::NotEnabled,
+                _ => MfaError::EnrollmentInvalid,
+            });
         }
         Ok(codes)
     }

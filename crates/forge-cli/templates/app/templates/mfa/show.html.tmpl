@@ -10,6 +10,7 @@
 {% else if enabled %}
 <p>{{ layout.i18n.t("mfa.show.enabled") }} {{ remaining }}</p>
 <h2>{{ layout.i18n.t("mfa.show.rotate_title") }}</h2>
+<p class="muted">{{ layout.i18n.t("mfa.show.rotate_hint") }}</p>
 <form action="/mfa/rotation" method="post">
   {{ csrf_field|safe }}
   {% include "mfa/_step_up.html" %}
