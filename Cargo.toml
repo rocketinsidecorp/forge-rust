@@ -3,6 +3,7 @@ members = [
     "crates/forge",
     "crates/forge-audit",
     "crates/forge-auth",
+    "crates/forge-broadcast",
     "crates/forge-cache",
     "crates/forge-cli",
     "crates/forge-config",

@@ -1,0 +1,45 @@
+[package]
+name = "forge-broadcast"
+publish = false
+description = "Live page updates for Forge: Turbo Streams over Server-Sent Events, signed stream names and PostgreSQL LISTEN/NOTIFY fanout"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+base64.workspace = true
+bytes.workspace = true
+forge-config = { path = "../forge-config" }
+forge-core = { path = "../forge-core" }
+forge-db = { path = "../forge-db", optional = true }
+forge-http = { path = "../forge-http" }
+forge-security = { path = "../forge-security" }
+forge-tenancy = { path = "../forge-tenancy" }
+forge-views = { path = "../forge-views", default-features = false, features = ["runtime"] }
+getrandom.workspace = true
+hmac.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+sqlx = { workspace = true, features = ["postgres"], optional = true }
+subtle.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[features]
+# Cross-replica fanout over PostgreSQL LISTEN/NOTIFY (`forge_broadcast::postgres`).
+postgres = ["dep:forge-db", "dep:sqlx", "forge-db/postgres"]
+
+[dev-dependencies]
+askama.workspace = true
+forge-auth = { path = "../forge-auth" }
+forge-broadcast = { path = ".", features = ["postgres"] }
+forge-db = { path = "../forge-db", features = ["postgres", "testing"] }
+uuid.workspace = true
+
+[lints]
+workspace = true

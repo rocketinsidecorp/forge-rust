@@ -539,6 +539,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "forge-broadcast"
+version = "0.1.0"
+dependencies = [
+ "askama",
+ "async-trait",
+ "base64",
+ "bytes",
+ "forge-auth",
+ "forge-broadcast",
+ "forge-config",
+ "forge-core",
+ "forge-db",
+ "forge-http",
+ "forge-security",
+ "forge-tenancy",
+ "forge-views",
+ "getrandom 0.4.3",
+ "hmac",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "sqlx",
+ "subtle",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "forge-cache"
 version = "0.1.0"
 dependencies = [
