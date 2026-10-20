@@ -114,3 +114,31 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for StallTimeout<T> {
         }
     }
 }
+
+/// Polls a future inside `catch_unwind`, so the server can record a
+/// panicking handler before the panic continues (`resume_unwind`). Without
+/// it the panic reaches the connection task, which tokio catches only after
+/// the request's state is gone.
+pub(crate) struct CatchUnwind<F> {
+    inner: Pin<Box<F>>,
+}
+
+impl<F: Future> CatchUnwind<F> {
+    pub(crate) fn new(inner: F) -> Self {
+        Self {
+            inner: Box::pin(inner),
+        }
+    }
+}
+
+impl<F: Future> Future for CatchUnwind<F> {
+    type Output = Result<F::Output, Box<dyn std::any::Any + Send>>;
+
+    fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        let inner = self.inner.as_mut();
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| inner.poll(context))) {
+            Ok(poll) => poll.map(Ok),
+            Err(panic) => Poll::Ready(Err(panic)),
+        }
+    }
+}

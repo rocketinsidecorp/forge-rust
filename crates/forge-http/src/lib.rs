@@ -11,7 +11,7 @@ use std::{
     future::Future,
     net::{IpAddr, SocketAddr},
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::Duration,
 };
 
@@ -32,7 +32,7 @@ use tokio::{
     task::{JoinError, JoinSet},
 };
 use tokio_util::sync::CancellationToken;
-use tracing::{Instrument, info_span, warn};
+use tracing::{Instrument, Span, info_span, warn};
 use uuid::Uuid;
 
 use crate::body::{OutgoingBody, ResponseBody};
@@ -46,6 +46,7 @@ mod query;
 mod routing;
 
 pub use client_ip::{MAX_FORWARDED_HOPS, TrustedProxies, X_FORWARDED_FOR};
+pub use forge_telemetry::{SpanContext, http::ServerInstrumentation};
 pub use form::{
     CSRF_FIELD_NAME, FORM_CONTENT_TYPE, FormError, FormErrorKind, MAX_FORM_FIELDS,
     METHOD_FIELD_NAME, RESERVED_FORM_FIELDS,
@@ -80,8 +81,16 @@ pub struct Request {
     /// Set only by [`TrustedProxies::apply`].
     client_ip: Option<IpAddr>,
     request_id: Uuid,
+    /// The matched route template, set by the router before the handler.
+    route: Option<Arc<str>>,
     extensions: Extensions,
 }
+
+/// Where the router reports the matched route template to the server's
+/// telemetry, which runs outside every layer. Private, so no layer can
+/// replace it.
+#[derive(Clone, Debug, Default)]
+struct MatchedRoute(Arc<OnceLock<Arc<str>>>);
 
 impl Request {
     /// HTTP method.
@@ -138,6 +147,21 @@ impl Request {
         self.request_id
     }
 
+    /// The template of the matched route, such as `/customers/{id}`; `None`
+    /// before routing (in a [`Middleware`]).
+    #[must_use]
+    pub fn route(&self) -> Option<&str> {
+        self.route.as_deref()
+    }
+
+    /// The trace context of the request's server span when telemetry is on
+    /// (ADR 0033): parent child spans with it, or propagate it to a
+    /// downstream service with [`SpanContext::inject`].
+    #[must_use]
+    pub fn trace_context(&self) -> Option<&SpanContext> {
+        self.extensions.get::<SpanContext>()
+    }
+
     /// Typed per-request values attached by [`Middleware`] layers (for
     /// example the CSRF token a page must render) and read by handlers.
     #[must_use]
@@ -180,6 +204,7 @@ impl Request {
             remote_addr,
             client_ip: None,
             request_id,
+            route: None,
             extensions: Extensions::new(),
         }
     }
@@ -622,6 +647,10 @@ impl Router {
             .collect();
         let mut request = request;
         request.path_params = params;
+        if let Some(matched) = request.extensions.get::<MatchedRoute>() {
+            let _ = matched.0.set(Arc::clone(&endpoint.path));
+        }
+        request.route = Some(Arc::clone(&endpoint.path));
         endpoint.handler.call(request).await
     }
 }
@@ -691,10 +720,27 @@ impl Server {
             app: Arc::new(ServedApp {
                 trusted_proxies: TrustedProxies::new(config.trusted_proxies.iter().copied()),
                 router,
+                telemetry: None,
             }),
             config,
             min_write_stall: MIN_WRITE_STALL_TIMEOUT,
         }
+    }
+
+    /// Instruments every request (ADR 0033): a server span, continued from
+    /// an incoming `traceparent` only when the telemetry trusts it, whose
+    /// `trace_id` and `span_id` are fields of the request's log span and
+    /// whose context is [`Request::trace_context`]; and the
+    /// `http.server.request.duration` and `http.server.active_requests`
+    /// metrics labelled with the route template, never the raw path. It runs
+    /// outside every [`Middleware`], so requests a layer answers are
+    /// measured too.
+    #[must_use]
+    pub fn with_telemetry(mut self, instrumentation: ServerInstrumentation) -> Self {
+        if let Some(app) = Arc::get_mut(&mut self.app) {
+            app.telemetry = Some(instrumentation);
+        }
+        self
     }
 
     /// Binds the configured address and serves until the shutdown future resolves.
@@ -845,6 +891,7 @@ fn log_connection_result(completed: Result<(), JoinError>) {
 struct ServedApp {
     router: Router,
     trusted_proxies: TrustedProxies,
+    telemetry: Option<ServerInstrumentation>,
 }
 
 async fn serve_connection(
@@ -900,8 +947,15 @@ async fn handle_request(
     let request_id = Uuid::now_v7();
     let method = request.method().clone();
     let path = request.uri().path().to_owned();
-    let span = info_span!("http.request", %request_id, %method, %path, %remote_addr);
+    let telemetry = app.telemetry.as_ref().map(|instrumentation| {
+        instrumentation.start(&method, request.version(), request.headers())
+    });
+    let trace = telemetry
+        .as_ref()
+        .map(forge_telemetry::http::RequestTelemetry::context);
+    let span = request_span(request_id, &method, &path, remote_addr, trace.as_ref());
     let response = async move {
+        let matched = MatchedRoute::default();
         let (parts, body) = request.into_parts();
         // The deadline covers reading the body as well as the handler, so a
         // client trickling body bytes cannot hold a connection indefinitely.
@@ -919,22 +973,62 @@ async fn handle_request(
                 remote_addr,
                 client_ip: None,
                 request_id,
+                route: None,
                 extensions: Extensions::new(),
             };
+            if let Some(trace) = trace {
+                request.extensions.insert(trace);
+                request.extensions.insert(matched.clone());
+            }
             // The client address is resolved once, outside every layer.
             app.trusted_proxies.apply(&mut request);
             app.router.dispatch(request).await
         };
-        let response = match tokio::time::timeout(request_timeout, exchange).await {
-            Ok(response) => response,
-            Err(_elapsed) => Response::new(StatusCode::GATEWAY_TIMEOUT, "request timed out"),
+        let exchange = tokio::time::timeout(request_timeout, exchange);
+        let response = match io::CatchUnwind::new(exchange).await {
+            Ok(Ok(response)) => response,
+            Ok(Err(_elapsed)) => Response::new(StatusCode::GATEWAY_TIMEOUT, "request timed out"),
+            Err(panic) => {
+                // Recorded as a server error, then the panic continues as
+                // before: the connection task fails and the client is cut off.
+                if let Some(telemetry) = telemetry {
+                    telemetry.finish(matched.0.get().map(AsRef::as_ref), 500);
+                }
+                std::panic::resume_unwind(panic);
+            }
         };
+        if let Some(telemetry) = telemetry {
+            telemetry.finish(matched.0.get().map(AsRef::as_ref), response.status.as_u16());
+        }
         to_hyper_response(response, request_id)
     }
     .instrument(span)
     .await;
 
     Ok(response)
+}
+
+/// The log span of a request; with telemetry it carries the trace and span
+/// identifiers, so every line logged inside the request is correlated.
+fn request_span(
+    request_id: Uuid,
+    method: &Method,
+    path: &str,
+    remote_addr: SocketAddr,
+    trace: Option<&SpanContext>,
+) -> Span {
+    match trace {
+        Some(trace) => info_span!(
+            "http.request",
+            %request_id,
+            %method,
+            %path,
+            %remote_addr,
+            trace_id = %trace.trace_id,
+            span_id = %trace.span_id,
+        ),
+        None => info_span!("http.request", %request_id, %method, %path, %remote_addr),
+    }
 }
 
 /// Reason a request body was rejected before dispatch.
@@ -1025,6 +1119,7 @@ mod tests {
             remote_addr: "127.0.0.1:4000".parse().expect("valid test address"),
             client_ip: None,
             request_id: Uuid::now_v7(),
+            route: None,
             extensions: Extensions::new(),
         }
     }

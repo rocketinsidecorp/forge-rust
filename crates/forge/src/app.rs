@@ -15,8 +15,9 @@ use std::{
 use forge_config::{AppConfig, ConfigError, Environment, SecretString};
 use forge_core::Cancellation;
 use forge_http::{RouteError, Router, Server, ServerError};
+use forge_telemetry::{MetricError, Telemetry, pool::PoolObservation};
 use thiserror::Error;
-use tokio::net::TcpListener;
+use tokio::{net::TcpListener, time::Instant};
 use tracing::{error, info};
 
 #[cfg(feature = "jobs")]
@@ -29,7 +30,7 @@ use crate::{
     command::{CommandContext, CommandError, RegisteredCommand},
     compose::{ComposeError, ComposeHook, Composition},
     database::{DatabaseHandle, Declaration, MigrationCommand, UrlPurpose, register_health},
-    logging, probe, signal,
+    logging, observability as process_telemetry, probe, signal,
     worker::{RunningWorkers, Worker},
 };
 
@@ -51,7 +52,7 @@ const EXIT_USAGE: u8 = 2;
 const EXIT_CONFIG: u8 = 78;
 /// Upper bound for runtime teardown after the server has already drained.
 const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
-const UNKNOWN_VERSION: &str = "unknown";
+pub(crate) const UNKNOWN_VERSION: &str = "unknown";
 
 type RouteRegistration = Box<dyn FnOnce(&mut Router) -> Result<(), RouteError> + Send + 'static>;
 type DatabaseCommandFuture =
@@ -419,9 +420,17 @@ impl App {
             Ok(config) => config,
             Err(error) => return config_error(&error),
         };
-        if let Err(error) = logging::init(&config.log) {
+        let telemetry = match process_telemetry::build(&config, name, version) {
+            Ok(telemetry) => telemetry,
+            Err(error) => return config_error(&error),
+        };
+        if let Err(error) = logging::init(
+            &config.log,
+            telemetry.as_ref().and_then(Telemetry::log_layer),
+        ) {
             return config_error(&error);
         }
+        process_telemetry::warn_public_metrics(&config);
         let url = match declaration
             .as_ref()
             .map(|declaration| declaration.validate(&config.database, UrlPurpose::Runtime))
@@ -450,6 +459,9 @@ impl App {
         // context even before the first request arrives.
         let composed = {
             let _guard = runtime.enter();
+            if let Some(telemetry) = &telemetry {
+                telemetry.start();
+            }
             compose(
                 name,
                 &config,
@@ -458,13 +470,20 @@ impl App {
                 declaration.zip(url),
                 jobs_slot,
                 &shutdown,
+                telemetry.as_ref(),
             )
         };
-        let (router, database, workers, jobs_slot) = match composed {
-            Ok(composed) => composed,
+        let Built {
+            router,
+            database,
+            workers,
+            jobs: jobs_slot,
+            pool,
+        } = match composed {
+            Ok(built) => built,
             Err(code) => return code,
         };
-        let background = background_for(jobs_slot, database.as_ref());
+        let background = background_for(jobs_slot, database.as_ref(), telemetry.as_ref());
         #[cfg(feature = "jobs")]
         let background = background.filter(|_| run_jobs_in_serve);
 
@@ -474,6 +493,8 @@ impl App {
             workers,
             background,
             shutdown,
+            telemetry,
+            pool,
         };
         let result = runtime.block_on(serve_until_signal(name, version, config, composed));
         runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
@@ -499,7 +520,7 @@ impl App {
             Ok(config) => config,
             Err(error) => return config_error(&error),
         };
-        if let Err(error) = logging::init(&config.log) {
+        if let Err(error) = logging::init(&config.log, None) {
             return config_error(&error);
         }
 
@@ -591,7 +612,7 @@ impl App {
             Ok(config) => config,
             Err(error) => return config_error(&error),
         };
-        if let Err(error) = logging::init(&config.log) {
+        if let Err(error) = logging::init(&config.log, None) {
             return config_error(&error);
         }
         if index >= self.commands.len() {
@@ -673,8 +694,23 @@ impl App {
             Ok(config) => config,
             Err(error) => return config_error(&error),
         };
-        if let Err(error) = logging::init(&config.log) {
+        // Only `jobs work` runs long enough to export telemetry.
+        let telemetry = if command == JobsCommand::Work {
+            match process_telemetry::build(&config, self.name, self.version) {
+                Ok(telemetry) => telemetry,
+                Err(error) => return config_error(&error),
+            }
+        } else {
+            None
+        };
+        if let Err(error) = logging::init(
+            &config.log,
+            telemetry.as_ref().and_then(Telemetry::log_layer),
+        ) {
             return config_error(&error);
+        }
+        if telemetry.is_some() {
+            process_telemetry::warn_public_metrics(&config);
         }
         let (Some(jobs), Some(declaration)) = (self.jobs, self.declarations.pop()) else {
             write_stderr("error: the jobs commands require App::postgres and App::jobs\n");
@@ -708,6 +744,9 @@ impl App {
         let shutdown = Cancellation::new();
         let composed = {
             let _guard = runtime.enter();
+            if let Some(telemetry) = &telemetry {
+                telemetry.start();
+            }
             compose(
                 self.name,
                 &config,
@@ -716,25 +755,37 @@ impl App {
                 Some((declaration, &url)),
                 Some(JobsParts::new(jobs)),
                 &shutdown,
+                telemetry.as_ref(),
             )
         };
         // Composition workers belong to the HTTP server's lifecycle (they
         // start with `serve`); a dedicated job worker process does not run them.
-        let (_router, database, _workers, jobs_slot) = match composed {
-            Ok(composed) => composed,
+        let Built {
+            database,
+            jobs: jobs_slot,
+            pool,
+            ..
+        } = match composed {
+            Ok(built) => built,
             Err(code) => return code,
         };
-        let Some(background) = background_for(jobs_slot, database.as_ref()) else {
+        let Some(background) = background_for(jobs_slot, database.as_ref(), telemetry.as_ref())
+        else {
             write_stderr("error: the jobs commands require App::postgres and App::jobs\n");
             return ExitCode::FAILURE;
         };
         let name = self.name;
+        let grace = config.server.shutdown_grace;
+        let metrics = config.telemetry.metrics_addr;
         let result = runtime.block_on(async move {
-            let result = work_until_signal(name, background).await;
+            let (result, began) =
+                work_until_signal(name, background, telemetry.as_ref(), metrics).await;
             shutdown.cancel();
+            drop(pool);
             if let Some(database) = database {
                 database.close().await;
             }
+            process_telemetry::shutdown(telemetry, began + grace).await;
             result
         });
         runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
@@ -762,33 +813,109 @@ fn jobs_for_serve(jobs: Option<JobsDeclaration>) -> (JobsSlot, bool) {
 
 /// The job runtime for the composed registrations and the PostgreSQL pool.
 #[cfg(feature = "jobs")]
-fn background_for(jobs: JobsSlot, database: Option<&DatabaseHandle>) -> BackgroundSlot {
+fn background_for(
+    jobs: JobsSlot,
+    database: Option<&DatabaseHandle>,
+    telemetry: Option<&Telemetry>,
+) -> BackgroundSlot {
     let parts = jobs?;
     #[allow(irrefutable_let_patterns)]
     let Some(DatabaseHandle::Postgres(database)) = database else {
         return None;
     };
-    Some(parts.into_background(database.clone()))
+    Some(parts.into_background(database.clone(), telemetry))
 }
 
 #[cfg(not(feature = "jobs"))]
-fn background_for(jobs: JobsSlot, database: Option<&DatabaseHandle>) -> BackgroundSlot {
-    let _ = (jobs, database);
+fn background_for(
+    jobs: JobsSlot,
+    database: Option<&DatabaseHandle>,
+    telemetry: Option<&Telemetry>,
+) -> BackgroundSlot {
+    let _ = (jobs, database, telemetry);
 }
 
-/// Runs the job runtime alone until a shutdown signal.
+/// Runs the job runtime (and the metrics listener, when configured) alone
+/// until a shutdown signal; also returns when shutdown began.
 #[cfg(feature = "jobs")]
-async fn work_until_signal(name: &'static str, background: Background) -> Result<(), ServeError> {
-    let signal = signal::shutdown_signal().map_err(ServeError::Signal)?;
+async fn work_until_signal(
+    name: &'static str,
+    background: Background,
+    telemetry: Option<&Telemetry>,
+    metrics: Option<SocketAddr>,
+) -> (Result<(), ServeError>, Instant) {
     let shutdown = Cancellation::new();
+    let began = async {
+        shutdown.cancelled().await;
+        Instant::now()
+    };
+    let work = async {
+        let result = work(name, background, telemetry, metrics, &shutdown).await;
+        shutdown.cancel();
+        result
+    };
+    let (began, result) = tokio::join!(began, work);
+    (result, began)
+}
+
+#[cfg(feature = "jobs")]
+async fn work(
+    name: &'static str,
+    background: Background,
+    telemetry: Option<&Telemetry>,
+    metrics: Option<SocketAddr>,
+    shutdown: &Cancellation,
+) -> Result<(), ServeError> {
+    let signal = signal::shutdown_signal().map_err(ServeError::Signal)?;
+    let metrics = bind_metrics(telemetry, metrics).await?;
     info!(app = name, "job workers started");
     let run = async {
         let result = background.run(shutdown.clone()).await;
         shutdown.cancel();
-        result
+        result.map_err(ServeError::Background)
     };
-    let ((), result) = tokio::join!(watch_signal(name, signal, shutdown.clone()), run);
-    result.map_err(ServeError::Background)
+    let ((), result, served) = tokio::join!(
+        watch_signal(name, signal, shutdown.clone()),
+        run,
+        serve_metrics(metrics, shutdown)
+    );
+    result.and(served)
+}
+
+/// The metrics listener, bound before serving starts so a taken port fails
+/// startup.
+async fn bind_metrics(
+    telemetry: Option<&Telemetry>,
+    address: Option<SocketAddr>,
+) -> Result<Option<(Server, TcpListener)>, ServeError> {
+    let (Some(telemetry), Some(address)) = (telemetry, address) else {
+        return Ok(None);
+    };
+    let listener = TcpListener::bind(address)
+        .await
+        .map_err(|source| ServeError::Bind { address, source })?;
+    let local = listener.local_addr().unwrap_or(address);
+    info!(address = %local, "metrics listening on GET /metrics");
+    Ok(Some((
+        process_telemetry::metrics_server(telemetry, address),
+        listener,
+    )))
+}
+
+/// Serves the metrics listener until `shutdown`.
+async fn serve_metrics(
+    metrics: Option<(Server, TcpListener)>,
+    shutdown: &Cancellation,
+) -> Result<(), ServeError> {
+    let Some((server, listener)) = metrics else {
+        return Ok(());
+    };
+    let stop = shutdown.clone();
+    let result = server
+        .serve(listener, async move { stop.cancelled().await })
+        .await;
+    shutdown.cancel();
+    result.map_err(ServeError::from)
 }
 
 /// Cancels `shutdown` on the first signal (or returns once it is cancelled
@@ -805,8 +932,19 @@ async fn watch_signal(
     shutdown.cancel();
 }
 
+/// What composition built.
+struct Built {
+    router: Router,
+    database: Option<DatabaseHandle>,
+    workers: Vec<Worker>,
+    jobs: JobsSlot,
+    /// Reads the pool for the metrics until dropped (before it closes).
+    pool: Option<PoolObservation>,
+}
+
 /// Builds the route table and the declared database pool, then runs the
 /// composition hooks. Must run inside the Tokio runtime context.
+#[allow(clippy::too_many_arguments)]
 fn compose(
     name: &'static str,
     config: &AppConfig,
@@ -815,7 +953,8 @@ fn compose(
     declared: Option<(Declaration, &forge_config::SecretString)>,
     jobs: JobsSlot,
     shutdown: &Cancellation,
-) -> Result<(Router, Option<DatabaseHandle>, Vec<Worker>, JobsSlot), ExitCode> {
+    telemetry: Option<&Telemetry>,
+) -> Result<Built, ExitCode> {
     #[cfg_attr(not(feature = "jobs"), allow(unused_mut))]
     let mut jobs = jobs;
     let database = match declared {
@@ -828,6 +967,9 @@ fn compose(
         },
         None => None,
     };
+    let pool = telemetry
+        .zip(database.as_ref())
+        .and_then(|(telemetry, database)| process_telemetry::observe_database(telemetry, database));
     let mut router = match build_router(registrations, database.clone()) {
         Ok(router) => router,
         Err(error) => {
@@ -837,8 +979,13 @@ fn compose(
     };
     let mut workers = Vec::new();
     if !hooks.is_empty() {
-        let mut composition =
-            Composition::new(&mut router, config, database.clone(), shutdown.clone());
+        let mut composition = Composition::new(
+            &mut router,
+            config,
+            database.clone(),
+            shutdown.clone(),
+            telemetry.cloned(),
+        );
         #[cfg(feature = "jobs")]
         if let Some(parts) = jobs.as_mut() {
             composition.attach_jobs(parts);
@@ -851,7 +998,13 @@ fn compose(
         }
         workers = composition.into_workers();
     }
-    Ok((router, database, workers, jobs))
+    Ok(Built {
+        router,
+        database,
+        workers,
+        jobs,
+        pool,
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -896,6 +1049,8 @@ enum ServeError {
     },
     #[error("HTTP server failed")]
     Server(#[from] ServerError),
+    #[error("the HTTP telemetry instruments could not be registered")]
+    Telemetry(#[source] MetricError),
     #[cfg(feature = "jobs")]
     #[error("background jobs failed")]
     Background(#[source] BackgroundError),
@@ -908,6 +1063,8 @@ struct Composed {
     workers: Vec<Worker>,
     background: BackgroundSlot,
     shutdown: Cancellation,
+    telemetry: Option<Telemetry>,
+    pool: Option<PoolObservation>,
 }
 
 async fn serve_until_signal(
@@ -922,14 +1079,39 @@ async fn serve_until_signal(
         workers,
         background,
         shutdown,
+        telemetry,
+        pool,
     } = composed;
+    let grace = config.server.shutdown_grace;
     let workers = RunningWorkers::start(workers);
-    let result = serve(name, version, config, router, background, shutdown).await;
+    let began = async {
+        shutdown.cancelled().await;
+        Instant::now()
+    };
+    let run = async {
+        let result = serve(
+            name,
+            version,
+            config,
+            router,
+            background,
+            shutdown.clone(),
+            telemetry.as_ref(),
+        )
+        .await;
+        shutdown.cancel();
+        result
+    };
+    let (began, result) = tokio::join!(began, run);
     // Workers stop after the server drained, before the pool closes.
     workers.stop().await;
+    drop(pool);
     if let Some(database) = database {
         database.close().await;
     }
+    // Last, so the spans of everything above are exported: what is queued
+    // is flushed within what remains of the shutdown grace period.
+    process_telemetry::shutdown(telemetry, began + grace).await;
     result
 }
 
@@ -940,8 +1122,13 @@ async fn serve(
     router: Router,
     background: BackgroundSlot,
     shutdown: Cancellation,
+    telemetry: Option<&Telemetry>,
 ) -> Result<(), ServeError> {
     let signal = signal::shutdown_signal().map_err(ServeError::Signal)?;
+    let instrumentation = telemetry
+        .map(Telemetry::http_server)
+        .transpose()
+        .map_err(ServeError::Telemetry)?;
     let bind = config.server.bind;
     let listener = TcpListener::bind(bind)
         .await
@@ -949,6 +1136,7 @@ async fn serve(
             address: bind,
             source,
         })?;
+    let metrics = bind_metrics(telemetry, config.telemetry.metrics_addr).await?;
     let address = listener.local_addr().unwrap_or(bind);
     info!(
         app = name,
@@ -956,6 +1144,7 @@ async fn serve(
         environment = environment_name(config.environment),
         %address,
         trusted_proxies = config.server.trusted_proxies.len(),
+        telemetry = telemetry.is_some(),
         "listening"
     );
 
@@ -963,7 +1152,11 @@ async fn serve(
     // of them failing, stops both.
     let server = async {
         let stop = shutdown.clone();
-        let result = Server::new(config.server, router)
+        let mut server = Server::new(config.server, router);
+        if let Some(instrumentation) = instrumentation {
+            server = server.with_telemetry(instrumentation);
+        }
+        let result = server
             .serve(listener, async move { stop.cancelled().await })
             .await;
         shutdown.cancel();
@@ -983,9 +1176,13 @@ async fn serve(
         let () = background;
         Ok::<(), ServeError>(())
     };
-    let ((), served, ran) =
-        tokio::join!(watch_signal(name, signal, shutdown.clone()), server, jobs);
-    served.and(ran)
+    let ((), served, ran, metrics) = tokio::join!(
+        watch_signal(name, signal, shutdown.clone()),
+        server,
+        jobs,
+        serve_metrics(metrics, &shutdown)
+    );
+    served.and(ran).and(metrics)
 }
 
 fn environment_name(environment: Environment) -> &'static str {
@@ -1573,7 +1770,9 @@ mod tests {
                     })?;
                 Ok(())
             });
-            let (router, database, _workers, _) = compose(
+            let Built {
+                router, database, ..
+            } = compose(
                 "demo",
                 &config,
                 Vec::new(),
@@ -1581,6 +1780,7 @@ mod tests {
                 Some((Declaration::Sqlite(forge_db::Migrator::DEFAULT), url)),
                 JobsSlot::default(),
                 &Cancellation::new(),
+                None,
             )
             .expect("composition succeeds");
             assert!(format!("{router:?}").contains("GET /composed"));
@@ -1601,6 +1801,7 @@ mod tests {
                     Some((Declaration::Sqlite(forge_db::Migrator::DEFAULT), url)),
                     JobsSlot::default(),
                     &Cancellation::new(),
+                    None,
                 );
                 assert_eq!(outcome.err(), Some(ExitCode::FAILURE));
             }
@@ -1676,7 +1877,8 @@ mod tests {
             }
             let config = AppConfig::default();
             let mut router = Router::new();
-            let mut composition = Composition::new(&mut router, &config, None, Cancellation::new());
+            let mut composition =
+                Composition::new(&mut router, &config, None, Cancellation::new(), None);
             assert!(matches!(
                 composition.jobs(),
                 Err(ComposeError::JobsNotDeclared)
@@ -1836,7 +2038,11 @@ mod tests {
             {
                 declaration.events = true;
             }
-            let (_router, database, _workers, slot) = compose(
+            let Built {
+                database,
+                jobs: slot,
+                ..
+            } = compose(
                 "demo",
                 &config,
                 Vec::new(),
@@ -1847,9 +2053,10 @@ mod tests {
                 )),
                 Some(JobsParts::new(declaration)),
                 &Cancellation::new(),
+                None,
             )
             .expect("composition");
-            let background = background_for(slot, database.as_ref()).expect("background");
+            let background = background_for(slot, database.as_ref(), None).expect("background");
 
             let store = PgJobStore::new(test.database().clone());
             store

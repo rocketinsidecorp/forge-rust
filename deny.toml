@@ -41,7 +41,8 @@ unused-allowed-license = "allow"
 
 # Scoped exceptions: a license accepted for one crate only, with its reason.
 [[licenses.exceptions]]
-# Mozilla's CA root bundle used by SQLx's rustls TLS (`tls-rustls-ring-webpki`).
+# Mozilla's CA root bundle used by SQLx's rustls TLS (`tls-rustls-ring-webpki`)
+# and by the OTLP exporter of forge-telemetry (ADR 0033).
 # CDLA-Permissive-2.0 is a permissive data license (no copyleft); keep its text
 # with binary distributions. Reviewed 2026-10-14; revisit if the bundle changes.
 crate = "webpki-roots"

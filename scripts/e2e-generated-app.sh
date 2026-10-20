@@ -380,7 +380,9 @@ fi
 log "Host run: serve, probe and graceful shutdown"
 cargo build --quiet --locked
 port="$(free_port)"
-env_args=(FORGE_BIND="127.0.0.1:$port" FORGE_SHUTDOWN_GRACE_SECS=5)
+metrics_port="$(free_port)"
+env_args=(FORGE_BIND="127.0.0.1:$port" FORGE_SHUTDOWN_GRACE_SECS=5
+  FORGE_TELEMETRY_METRICS_ADDR="127.0.0.1:$metrics_port")
 if [[ -n "$runtime_database_url" ]]; then
   env_args+=(FORGE_DATABASE_URL="$runtime_database_url")
 fi
@@ -419,6 +421,16 @@ post_status() {
 [[ "$(post_status -H "cookie: __Host-forge_csrf=$csrf_token" --data "csrf_token=$csrf_token")" == 405 ]] \
   || fail "a form POST with the page's CSRF token must pass to routing (405: / is GET only)"
 [[ "$(curl --silent --output /dev/null --write-out '%{http_code}' "http://127.0.0.1:$port/missing")" == 404 ]]   || fail "unknown route must return 404"
+log "Telemetry: the separate Prometheus listener"
+metrics="$(curl --silent --fail "http://127.0.0.1:$metrics_port/metrics")" || fail "metrics listener"
+grep -q '^http_server_request_duration_seconds_count{http_request_method="GET",http_route="/",http_response_status_class="2xx"} ' \
+  <<<"$metrics" || fail "request metrics must be labelled with the route template"
+grep -q '^http_server_request_duration_seconds_count{http_request_method="GET",http_route="",http_response_status_class="4xx"} ' \
+  <<<"$metrics" || fail "unmatched requests must have an empty route"
+! grep -q '/missing' <<<"$metrics" || fail "raw paths must never become labels"
+grep -q '^tokio_task_count ' <<<"$metrics" || fail "runtime metrics must be exported"
+[[ "$(curl --silent --output /dev/null --write-out '%{http_code}' "http://127.0.0.1:$port/metrics")" == 404 ]] \
+  || fail "the application listener must never serve /metrics"
 if [[ -n "$runtime_database_url" ]]; then
   log "Signing in and out through the generated pages"
   headers="$work_dir/auth.headers"
@@ -463,6 +475,12 @@ if proxies_error="$(FORGE_HTTP_TRUSTED_PROXIES="10.0.0.0/8,0.0.0.0/0" "$app_bin"
 fi
 [[ "$proxies_error" == *"FORGE_HTTP_TRUSTED_PROXIES: entry 2"* && "$proxies_error" != *"0.0.0.0/0"* ]] \
   || fail "trusted proxy errors must name the entry position without echoing it"
+if otlp_error="$(FORGE_TELEMETRY_EXPORTER=otlp FORGE_TELEMETRY_OTLP_ENDPOINT="http://user:sk-e2e-secret@collector:4318" \
+  "$app_bin" 2>&1)"; then
+  fail "an OTLP endpoint with credentials must be rejected"
+fi
+[[ "$otlp_error" == *"FORGE_TELEMETRY_OTLP_ENDPOINT"* && "$otlp_error" != *"sk-e2e-secret"* ]] \
+  || fail "OTLP endpoint errors must not echo the endpoint"
 kill -TERM "$server_pid"
 status=0
 wait "$server_pid" || status=$?

@@ -1,12 +1,16 @@
 //! The outbox dispatcher: claims committed events under a fenced lease and
 //! publishes them with retries, a timeout and panic isolation.
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use forge_core::Cancellation;
 use forge_jobs::Backoff;
+use forge_telemetry::jobs::OutboxInstrumentation;
 use tokio::task::JoinSet;
-use tracing::{error, info, warn};
+use tracing::{Instrument as _, error, info, info_span, warn};
 use uuid::Uuid;
 
 use crate::{
@@ -116,6 +120,7 @@ pub struct Dispatcher {
     store: PgOutboxStore,
     publisher: Arc<dyn EventPublisher>,
     settings: DispatcherSettings,
+    telemetry: Option<OutboxInstrumentation>,
 }
 
 impl std::fmt::Debug for Dispatcher {
@@ -135,7 +140,18 @@ impl Dispatcher {
             store,
             publisher: Arc::new(publisher),
             settings: DispatcherSettings::default(),
+            telemetry: None,
         }
+    }
+
+    /// Instruments every delivery (ADR 0033): a `process outbox` consumer
+    /// span (a new trace carrying the event id) whose ids are on the
+    /// delivery's log lines, and `forge.outbox.dispatch.duration` by event
+    /// type and outcome.
+    #[must_use]
+    pub fn instrument(mut self, instrumentation: OutboxInstrumentation) -> Self {
+        self.telemetry = Some(instrumentation);
+        self
     }
 
     /// Replaces the settings.
@@ -196,6 +212,29 @@ impl Dispatcher {
     }
 
     async fn dispatch(&self, event: &EventEnvelope, token: Uuid) {
+        let Some(instrumentation) = &self.telemetry else {
+            self.deliver(event, token).await;
+            return;
+        };
+        let started = Instant::now();
+        let span = instrumentation.start(
+            &event.id().to_string(),
+            event.event_type(),
+            i64::from(event.version()),
+            event.attempt(),
+        );
+        let log_span = info_span!(
+            "outbox",
+            trace_id = %span.context().trace_id,
+            span_id = %span.context().span_id,
+        );
+        let outcome = self.deliver(event, token).instrument(log_span).await;
+        instrumentation.finish(span, event.event_type(), outcome, started.elapsed());
+    }
+
+    /// Publishes one event and records the result; returns the telemetry
+    /// outcome (Forge-Go's names).
+    async fn deliver(&self, event: &EventEnvelope, token: Uuid) -> &'static str {
         let publisher = Arc::clone(&self.publisher);
         let copy = event.clone();
         let timeout = self.settings.publish_timeout;
@@ -215,13 +254,16 @@ impl Dispatcher {
         match outcome {
             Ok(()) => match self.store.published(event.id(), token).await {
                 Ok(true) => {
-                    info!(event_id = %fields.0, event_type = fields.1, attempt = fields.2, "event published")
+                    info!(event_id = %fields.0, event_type = fields.1, attempt = fields.2, "event published");
+                    "delivered"
                 }
                 Ok(false) => {
-                    warn!(event_id = %fields.0, event_type = fields.1, "event published after its lease was lost")
+                    warn!(event_id = %fields.0, event_type = fields.1, "event published after its lease was lost");
+                    "lease_lost"
                 }
                 Err(error) => {
-                    warn!(event_id = %fields.0, %error, "could not record publication; the event will be published again")
+                    warn!(event_id = %fields.0, %error, "could not record publication; the event will be published again");
+                    "error"
                 }
             },
             Err(failure) => {
@@ -244,16 +286,20 @@ impl Dispatcher {
                     .await
                 {
                     Ok(Some(AfterFailure::Retrying)) => {
-                        warn!(event_id = %fields.0, event_type = fields.1, attempt = fields.2, error = %message, "publication failed; will retry")
+                        warn!(event_id = %fields.0, event_type = fields.1, attempt = fields.2, error = %message, "publication failed; will retry");
+                        "retry"
                     }
                     Ok(Some(AfterFailure::Dead)) => {
-                        error!(event_id = %fields.0, event_type = fields.1, attempt = fields.2, error = %message, "publication failed; event is dead")
+                        error!(event_id = %fields.0, event_type = fields.1, attempt = fields.2, error = %message, "publication failed; event is dead");
+                        "dead_lettered"
                     }
                     Ok(None) => {
-                        warn!(event_id = %fields.0, "publication failed after its lease was lost")
+                        warn!(event_id = %fields.0, "publication failed after its lease was lost");
+                        "lease_lost"
                     }
                     Err(error) => {
-                        warn!(event_id = %fields.0, %error, "could not record the failed publication")
+                        warn!(event_id = %fields.0, %error, "could not record the failed publication");
+                        "error"
                     }
                 }
             }

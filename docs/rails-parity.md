@@ -25,7 +25,7 @@ the work is finished and waiting for its review; **Planned** means not started.
 | File storage with signed URLs | Active Storage | Done (disk) | Done (disk) |
 | Import maps, Turbo, Stimulus | Hotwire | In review | Done |
 | Turbo Streams over SSE | Action Cable | In review | Done (`scaffold --broadcast`, ADR 0031) |
-| Traces, metrics, log correlation | (gems) | Done (OpenTelemetry, Prometheus) | Planned |
+| Traces, metrics, log correlation | (gems) | Done (OpenTelemetry, Prometheus) | Done (OpenTelemetry, Prometheus; ADR 0033) |
 | Preconfigured Prometheus, Grafana, Tempo, Loki | — | Planned | Planned |
 | Zero-downtime deploys, rollback, remote logs | Kamal | In review (`forge deploy`) | Planned |
 | Live reload and database lifecycle | `bin/dev`, `db:*` | In review (`forge dev`, `forge db`) | Planned |
@@ -47,6 +47,18 @@ the work is finished and waiting for its review; **Planned** means not started.
   applied migration of any set and refuses versions this build does not
   contain; it adopts the same rule in rocketinsidecorp/forge-go#13 (in
   progress, next Forge-Go pull request after the observability stack).
+
+- Telemetry (ADR 0033, rocketinsidecorp/forge-rust#13): part 1 ports
+  Forge-Go's telemetry (same `FORGE_TELEMETRY_*` variables, metric names and
+  OTLP/Prometheus formats). Still open in the same issue: part 2, the
+  generated local observability stack (`compose.observability.yaml` with the
+  Collector, Prometheus, Tempo, Loki and Grafana, the "Preconfigured
+  Prometheus, Grafana, Tempo, Loki" row); and metrics Forge-Rust cannot
+  record yet: `db.client.operation.duration` and per-query spans (SQLx has no
+  query hook), `forge.db.pool.waits`/`forge.db.pool.wait.duration` (the SQLx
+  pool exposes no wait counters), `http.client.request.duration` (no
+  instrumented client), `forge.mail.send.duration` (no mailer). See
+  [observability](observability.md#differences-from-forge-go).
 
 - Stream signing key rotation (ADR 0031, rocketinsidecorp/forge-rust#14):
   both libraries verify previous keys (`Signer::new(key, previous)`,

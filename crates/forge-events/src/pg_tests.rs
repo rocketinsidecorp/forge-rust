@@ -522,3 +522,77 @@ async fn dispatcher_functions_refuse_tenant_scope_and_can_be_split_from_the_runt
     assert_eq!(claimed.len(), 1);
     db.cleanup().await.expect("cleanup");
 }
+
+/// Accepts every event except invoice 0, which it refuses for good.
+struct Picky;
+
+#[async_trait]
+impl EventPublisher for Picky {
+    async fn publish(&self, event: &EventEnvelope) -> Result<(), PublishError> {
+        if event
+            .decode::<InvoicePaid>()
+            .is_ok_and(|paid| paid.invoice == 0)
+        {
+            return Err(PublishError::permanent("rejected by the broker"));
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs FORGE_TEST_DATABASE_URL"]
+async fn deliveries_are_traced_and_measured_by_outcome() {
+    use forge_telemetry::{
+        Options, SpanSink, Telemetry,
+        testing::{Behavior, Receiver},
+    };
+
+    let receiver = Receiver::start(Behavior::Accept).await;
+    let mut options = Options::new("worker");
+    options.spans = Some(SpanSink::Otlp(receiver.client(
+        http::HeaderMap::new(),
+        false,
+        Duration::from_secs(10),
+    )));
+    let telemetry = Telemetry::new(options).expect("telemetry");
+    telemetry.start();
+
+    let db = fresh().await;
+    let store = PgOutboxStore::new(db.runtime().clone());
+    let mut transaction = db.runtime().begin().await.expect("begin");
+    let delivered = append(&mut transaction, &InvoicePaid { invoice: 7 })
+        .await
+        .expect("append");
+    let refused = append(&mut transaction, &InvoicePaid { invoice: 0 })
+        .await
+        .expect("append");
+    transaction.commit().await.expect("commit");
+
+    let dispatcher = Dispatcher::new(store.clone(), Picky)
+        .settings(fast())
+        .instrument(telemetry.outbox().expect("instruments"));
+    let (shutdown, handle) = spawn(dispatcher);
+    wait_until("both events to settle", || async {
+        state(&db, delivered).await.0 == "published" && state(&db, refused).await.0 == "dead"
+    })
+    .await;
+    stop(shutdown, handle).await;
+    telemetry.force_flush(Duration::from_secs(10)).await;
+
+    let text = forge_telemetry::prometheus::render(telemetry.metrics());
+    for outcome in ["delivered", "dead_lettered"] {
+        let line = format!(
+            "forge_outbox_dispatch_duration_seconds_count{{forge_event_type=\"billing.invoice_paid\",forge_outbox_outcome=\"{outcome}\"}} 1"
+        );
+        assert!(text.contains(&line), "{line}\n{text}");
+    }
+    let spans = receiver
+        .received("/v1/traces")
+        .iter()
+        .map(|request| request.body.to_string())
+        .collect::<String>();
+    assert!(spans.contains("\"process outbox\""), "{spans}");
+    assert!(spans.contains(&delivered.to_string()), "{spans}");
+    assert!(!spans.contains("rejected by the broker"), "{spans}");
+    db.cleanup().await.expect("cleanup");
+}

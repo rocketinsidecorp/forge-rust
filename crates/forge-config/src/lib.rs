@@ -20,6 +20,14 @@ use base64::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+mod telemetry;
+
+pub use telemetry::{
+    EndpointScheme, OtlpCompression, OtlpHeader, SampleRatio, TELEMETRY_ENABLED_KEY,
+    TELEMETRY_KEYS, TelemetryConfig, TelemetryExporter, TelemetryLogLevel, TelemetryLogsExporter,
+    endpoint_scheme, parse_go_duration,
+};
+
 const DEFAULT_BIND: &str = "127.0.0.1:3000";
 const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_SHUTDOWN_GRACE_SECS: u64 = 15;
@@ -85,6 +93,23 @@ pub const KNOWN_KEYS: &[&str] = &[
     "FORGE_STORAGE_MAX_UPLOAD_BYTES",
     "FORGE_STORAGE_LINK_TTL_SECS",
     "FORGE_STREAMS_KEY",
+    // TELEMETRY_KEYS, ADR 0033.
+    "FORGE_TELEMETRY_ENABLED",
+    "FORGE_TELEMETRY_SERVICE_NAME",
+    "FORGE_TELEMETRY_SERVICE_VERSION",
+    "FORGE_TELEMETRY_EXPORTER",
+    "FORGE_TELEMETRY_LOGS_EXPORTER",
+    "FORGE_TELEMETRY_LOGS_LEVEL",
+    "FORGE_TELEMETRY_OTLP_ENDPOINT",
+    "FORGE_TELEMETRY_OTLP_HEADERS",
+    "FORGE_TELEMETRY_OTLP_TIMEOUT",
+    "FORGE_TELEMETRY_OTLP_COMPRESSION",
+    "FORGE_TELEMETRY_OTLP_ALLOW_PLAINTEXT",
+    "FORGE_TELEMETRY_SAMPLE_RATIO",
+    "FORGE_TELEMETRY_TRUST_TRACEPARENT",
+    "FORGE_TELEMETRY_METRICS_ADDR",
+    "FORGE_TELEMETRY_METRICS_PUBLIC",
+    "FORGE_TELEMETRY_METRICS_INTERVAL",
 ];
 
 /// The reverse proxies whose `X-Forwarded-For` header is believed (ADR 0032):
@@ -744,6 +769,9 @@ pub struct AppConfig {
     pub storage: StorageConfig,
     /// Live-update stream settings.
     pub streams: StreamsConfig,
+    /// Traces, metrics and log export (`FORGE_TELEMETRY_*`, ADR 0033).
+    #[serde(default)]
+    pub telemetry: TelemetryConfig,
 }
 
 impl AppConfig {
@@ -837,6 +865,7 @@ impl AppConfig {
                 Some(parse_secret_url("FORGE_MIGRATION_DATABASE_URL", value)?);
         }
         apply_services(&lookup, &mut config)?;
+        telemetry::apply(&lookup, &mut config.telemetry)?;
         // The format default depends on the environment, so derive it only
         // after FORGE_ENV has been applied.
         config.log.format = match lookup("FORGE_LOG_FORMAT") {
@@ -845,6 +874,7 @@ impl AppConfig {
         };
 
         validate_services(&config)?;
+        telemetry::validate(&config.telemetry, config.environment, config.server.bind)?;
         Ok(config)
     }
 }
@@ -1098,6 +1128,18 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
+
+    #[test]
+    fn telemetry_keys_are_known_keys() {
+        for key in TELEMETRY_KEYS {
+            assert!(KNOWN_KEYS.contains(key), "{key}");
+        }
+        let telemetry_known = KNOWN_KEYS
+            .iter()
+            .filter(|key| key.starts_with("FORGE_TELEMETRY_"))
+            .count();
+        assert_eq!(telemetry_known, TELEMETRY_KEYS.len());
+    }
 
     #[test]
     fn defaults_are_safe_for_local_development() {
@@ -1420,6 +1462,22 @@ mod tests {
             "10",
             "60",
             "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=",
+            "true",
+            "billing",
+            "1.0.0",
+            "otlp",
+            "otlp",
+            "warn",
+            "https://collector.example:4318",
+            "authorization=Bearer%20token",
+            "5s",
+            "gzip",
+            "false",
+            "0.5",
+            "true",
+            "127.0.0.1:9464",
+            "false",
+            "30s",
         ];
         let pairs: Vec<(&str, &str)> = KNOWN_KEYS.iter().copied().zip(values).collect();
         assert_eq!(pairs.len(), KNOWN_KEYS.len());

@@ -3,8 +3,12 @@
 use std::io::IsTerminal;
 
 use forge_config::{LogConfig, LogFormat};
+use forge_telemetry::LogLayer;
 use thiserror::Error;
-use tracing_subscriber::{EnvFilter, filter::ParseError};
+use tracing_subscriber::{
+    EnvFilter, Layer as _, filter::ParseError, layer::SubscriberExt as _,
+    util::SubscriberInitExt as _,
+};
 
 /// `FORGE_LOG` could not be parsed as filter directives.
 ///
@@ -17,23 +21,33 @@ pub(crate) struct InvalidLogFilter {
     reason: ParseError,
 }
 
-/// Installs the global subscriber writing to standard output.
+/// Installs the global subscriber writing to standard output and, when
+/// `export` is given (`FORGE_TELEMETRY_LOGS_EXPORTER=otlp`, ADR 0033), also
+/// queueing every line for OTLP export. `FORGE_LOG` filters both: the
+/// exporter never receives a line standard output does not print.
 ///
 /// If a global subscriber is already installed (for example by a test
 /// harness embedding the application) it is kept and this call succeeds.
-pub(crate) fn init(config: &LogConfig) -> Result<(), InvalidLogFilter> {
+pub(crate) fn init(config: &LogConfig, export: Option<LogLayer>) -> Result<(), InvalidLogFilter> {
     let filter = EnvFilter::try_new(&config.filter).map_err(|reason| InvalidLogFilter {
         filter: config.filter.clone(),
         reason,
     })?;
-    let builder = tracing_subscriber::fmt().with_env_filter(filter);
-    let installed = match config.format {
-        LogFormat::Json => builder.json().with_ansi(false).try_init(),
-        LogFormat::Text => builder
+    let stdout = match config.format {
+        LogFormat::Json => tracing_subscriber::fmt::layer()
+            .json()
+            .with_ansi(false)
+            .boxed(),
+        LogFormat::Text => tracing_subscriber::fmt::layer()
             .compact()
             .with_ansi(std::io::stdout().is_terminal())
-            .try_init(),
+            .boxed(),
     };
+    let installed = tracing_subscriber::registry()
+        .with(stdout)
+        .with(export)
+        .with(filter)
+        .try_init();
     // `try_init` fails only when a global subscriber already exists; keep it.
     drop(installed);
     Ok(())
@@ -50,7 +64,7 @@ mod tests {
             format: LogFormat::Text,
         };
 
-        let error = init(&config).expect_err("invalid level must be rejected");
+        let error = init(&config, None).expect_err("invalid level must be rejected");
 
         assert!(error.to_string().contains("FORGE_LOG"));
     }
@@ -62,7 +76,7 @@ mod tests {
                 filter: "info,forge=debug".to_owned(),
                 format,
             };
-            init(&config).expect("valid filter must initialize");
+            init(&config, None).expect("valid filter must initialize");
         }
     }
 }

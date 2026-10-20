@@ -13,6 +13,7 @@ async-trait.workspace = true
 forge-core = { path = "../forge-core", features = ["postgres"] }
 forge-db = { path = "../forge-db", features = ["postgres"] }
 forge-jobs = { path = "../forge-jobs" }
+forge-telemetry = { path = "../forge-telemetry" }
 forge-tenancy = { path = "../forge-tenancy" }
 serde.workspace = true
 serde_json.workspace = true
@@ -26,6 +27,8 @@ uuid.workspace = true
 forge-auth = { path = "../forge-auth" }
 forge-jobs = { path = "../forge-jobs", features = ["testing"] }
 forge-security = { path = "../forge-security" }
+forge-telemetry = { path = "../forge-telemetry", features = ["testing"] }
+http.workspace = true
 
 [lints]
 workspace = true

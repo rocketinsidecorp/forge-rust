@@ -13,11 +13,12 @@ use std::{
 
 use async_trait::async_trait;
 use forge_core::Cancellation;
+use forge_telemetry::{Span, jobs::JobInstrumentation};
 use tokio::{
     task::{self, AbortHandle, JoinError, JoinSet},
     time::MissedTickBehavior,
 };
-use tracing::{debug, error, info, warn};
+use tracing::{Instrument as _, debug, error, info, info_span, warn};
 
 use crate::{
     Backoff, JobContext, JobError, JobHandler, JobId, WorkerSettings,
@@ -78,6 +79,9 @@ struct InFlight {
     /// When the lease was last known to be held: the claim, then every
     /// successful renewal.
     last_renewed: Instant,
+    /// When the attempt was claimed, for the duration of an attempt that
+    /// panicked or was aborted.
+    claimed_at: Instant,
     /// When the attempt was cancelled because its lease was (or could be)
     /// lost; it is aborted if it is still running after the cancel grace.
     cancelled_at: Option<Instant>,
@@ -90,6 +94,7 @@ pub(crate) struct QueueWorker {
     pub(crate) handlers: HashMap<&'static str, Arc<dyn ErasedHandler>>,
     pub(crate) store: PgJobStore,
     pub(crate) settings: WorkerSettings,
+    pub(crate) telemetry: Option<JobInstrumentation>,
 }
 
 impl QueueWorker {
@@ -213,6 +218,20 @@ impl QueueWorker {
             cancel.clone(),
         );
         let completed = Arc::clone(&context.completed_in_transaction);
+        let telemetry = self.telemetry.as_ref().map(|instrumentation| {
+            let span =
+                instrumentation.start(self.queue, handler.name(), &job.id.to_string(), job.attempt);
+            (instrumentation.clone(), span)
+        });
+        // With telemetry, the attempt's lines carry its trace and span ids.
+        let log_span = match &telemetry {
+            Some((_, span)) => info_span!(
+                "job",
+                trace_id = %span.context().trace_id,
+                span_id = %span.context().span_id,
+            ),
+            None => tracing::Span::none(),
+        };
         let execution = Execution {
             store: self.store.clone(),
             handler: Arc::clone(&handler),
@@ -220,8 +239,11 @@ impl QueueWorker {
             payload: job.payload,
             scope_valid,
             interrupt: interrupt.clone(),
+            telemetry,
         };
-        let abort = tasks.spawn(crate::panics::redacted(execution.run()));
+        let abort = tasks.spawn(crate::panics::redacted(
+            execution.run().instrument(log_span),
+        ));
         in_flight.insert(
             abort.id(),
             InFlight {
@@ -234,6 +256,7 @@ impl QueueWorker {
                 lease_lost: false,
                 completed,
                 last_renewed: claimed_at,
+                claimed_at,
                 cancelled_at: None,
                 abort,
             },
@@ -260,11 +283,18 @@ impl QueueWorker {
         if failure.is_panic() {
             // The panic payload may quote job data; it is not recorded.
             let delay = job.backoff.delay(job.attempt);
-            match self
+            let recorded = self
                 .store
                 .fail(job.id, job.token, "the job panicked", delay, false)
-                .await
-            {
+                .await;
+            self.record(
+                &job,
+                match &recorded {
+                    Ok(state) => outcome_of(*state),
+                    Err(_) => OUTCOME_STORE_FAILED,
+                },
+            );
+            match recorded {
                 Ok(state) => error!(
                     queue = self.queue,
                     job = job.name,
@@ -282,6 +312,7 @@ impl QueueWorker {
                 ),
             }
         } else if !job.lease_lost {
+            self.record(&job, OUTCOME_RELEASED);
             match self.store.release(job.id, job.token).await {
                 Ok(released) => info!(
                     queue = self.queue,
@@ -297,6 +328,14 @@ impl QueueWorker {
                     "could not release an aborted job; its lease will expire"
                 ),
             }
+        }
+    }
+
+    /// Records the duration of an attempt whose task did not finish itself
+    /// (its span ended when the task was dropped).
+    fn record(&self, job: &InFlight, outcome: &'static str) {
+        if let Some(instrumentation) = &self.telemetry {
+            instrumentation.record(self.queue, job.name, outcome, job.claimed_at.elapsed());
         }
     }
 
@@ -434,10 +473,11 @@ struct Execution {
     payload: String,
     scope_valid: bool,
     interrupt: Cancellation,
+    telemetry: Option<(JobInstrumentation, Span)>,
 }
 
 impl Execution {
-    async fn run(self) {
+    async fn run(mut self) {
         let context = &self.context;
         let started = Instant::now();
         debug!(queue = context.queue(), job = context.name(), job_id = %context.id(), attempt = context.attempt(), "job started");
@@ -458,16 +498,34 @@ impl Execution {
             Err(JobError::permanent("the stored tenant scope is invalid"))
         };
         let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-        match result {
+        let outcome = match result {
             Ok(()) => self.complete(elapsed_ms).await,
             Err(_) if self.interrupt.is_cancelled() => self.release().await,
             Err(failure) => self.fail(&failure, elapsed_ms).await,
+        };
+        if let Some((instrumentation, span)) = self.telemetry.take() {
+            instrumentation.finish(
+                span,
+                self.context.queue(),
+                self.context.name(),
+                outcome,
+                started.elapsed(),
+            );
         }
     }
 
-    async fn complete(&self, elapsed_ms: u64) {
+    async fn complete(&self, elapsed_ms: u64) -> &'static str {
         let context = &self.context;
-        match self.store.complete(context.id(), context.lease).await {
+        let recorded = self.store.complete(context.id(), context.lease).await;
+        let outcome = match &recorded {
+            Ok(true) => OUTCOME_SUCCEEDED,
+            Ok(false) if context.completed_in_transaction.load(Ordering::Acquire) => {
+                OUTCOME_SUCCEEDED
+            }
+            Ok(false) => OUTCOME_LEASE_LOST,
+            Err(_) => OUTCOME_STORE_FAILED,
+        };
+        match recorded {
             Ok(true) => info!(
                 queue = context.queue(),
                 job = context.name(),
@@ -498,11 +556,18 @@ impl Execution {
                 "could not record completion; the job will run again when its lease expires"
             ),
         }
+        outcome
     }
 
-    async fn release(&self) {
+    async fn release(&self) -> &'static str {
         let context = &self.context;
-        match self.store.release(context.id(), context.lease).await {
+        let released = self.store.release(context.id(), context.lease).await;
+        let outcome = if released.is_ok() {
+            OUTCOME_RELEASED
+        } else {
+            OUTCOME_STORE_FAILED
+        };
+        match released {
             Ok(released) => info!(
                 queue = context.queue(),
                 job = context.name(),
@@ -517,16 +582,17 @@ impl Execution {
                 "could not release an interrupted job; its lease will expire"
             ),
         }
+        outcome
     }
 
-    async fn fail(&self, failure: &JobError, elapsed_ms: u64) {
+    async fn fail(&self, failure: &JobError, elapsed_ms: u64) -> &'static str {
         let context = &self.context;
         let (delay, discard) = match failure.disposition() {
             Disposition::Retry(Some(delay)) => (delay, false),
             Disposition::Retry(None) => (self.handler.backoff().delay(context.attempt()), false),
             Disposition::Discard => (Duration::ZERO, true),
         };
-        match self
+        let recorded = self
             .store
             .fail(
                 context.id(),
@@ -535,8 +601,12 @@ impl Execution {
                 delay,
                 discard,
             )
-            .await
-        {
+            .await;
+        let outcome = match &recorded {
+            Ok(state) => outcome_of(*state),
+            Err(_) => OUTCOME_STORE_FAILED,
+        };
+        match recorded {
             Ok(Some(AfterFailure::Retrying)) => warn!(
                 queue = context.queue(),
                 job = context.name(),
@@ -569,6 +639,24 @@ impl Execution {
                 "could not record the failure; the job will run again when its lease expires"
             ),
         }
+        outcome
+    }
+}
+
+// The forge.job.outcome values, Forge-Go's (ADR 0033).
+const OUTCOME_SUCCEEDED: &str = "succeeded";
+const OUTCOME_RETRY: &str = "retry";
+const OUTCOME_DEAD: &str = "dead";
+const OUTCOME_RELEASED: &str = "released";
+const OUTCOME_LEASE_LOST: &str = "lease_lost";
+const OUTCOME_STORE_FAILED: &str = "store_failed";
+
+/// The telemetry outcome of a recorded failure.
+fn outcome_of(state: Option<AfterFailure>) -> &'static str {
+    match state {
+        Some(AfterFailure::Retrying) => OUTCOME_RETRY,
+        Some(AfterFailure::Dead) => OUTCOME_DEAD,
+        None => OUTCOME_LEASE_LOST,
     }
 }
 

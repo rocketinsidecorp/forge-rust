@@ -1,0 +1,39 @@
+[package]
+name = "forge-telemetry"
+publish = false
+description = "Dependency-light traces, metrics and log export for Forge applications: W3C trace context, OTLP/HTTP JSON and Prometheus text"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+bytes.workspace = true
+flate2 = { workspace = true }
+forge-config = { path = "../forge-config" }
+getrandom.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+httpdate = "1.0.3"
+hyper = { workspace = true, features = ["client"] }
+hyper-util.workspace = true
+rustls = { workspace = true }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-rustls = { workspace = true }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+webpki-roots = { workspace = true }
+
+[features]
+# `testing::Receiver`, an OTLP/HTTP receiver for tests.
+testing = ["hyper/server"]
+
+[dev-dependencies]
+forge-telemetry = { path = ".", features = ["testing"] }
+
+[lints]
+workspace = true

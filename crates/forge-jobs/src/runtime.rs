@@ -9,6 +9,7 @@ use std::{
 };
 
 use forge_core::Cancellation;
+use forge_telemetry::jobs::JobInstrumentation;
 use tokio::task::JoinSet;
 use tracing::{error, info, warn};
 
@@ -171,6 +172,7 @@ pub struct Jobs {
     schedules: Vec<Schedule>,
     settings: WorkerSettings,
     pruning: Option<Pruning>,
+    telemetry: Option<JobInstrumentation>,
 }
 
 impl fmt::Debug for Jobs {
@@ -191,6 +193,7 @@ impl fmt::Debug for Jobs {
             )
             .field("settings", &self.settings)
             .field("pruning", &self.pruning)
+            .field("telemetry", &self.telemetry.is_some())
             .finish()
     }
 }
@@ -211,6 +214,7 @@ impl Jobs {
             schedules: Vec::new(),
             settings: WorkerSettings::default(),
             pruning: Some(Pruning::default()),
+            telemetry: None,
         }
     }
 
@@ -264,6 +268,15 @@ impl Jobs {
         self
     }
 
+    /// Instruments every attempt (ADR 0033): a `process <queue>` consumer
+    /// span (a new trace carrying the job id as `messaging.message.id`)
+    /// whose ids are on the attempt's log lines, and
+    /// `forge.queue.job.duration` by queue, job name and outcome.
+    pub fn instrument(&mut self, instrumentation: JobInstrumentation) -> &mut Self {
+        self.telemetry = Some(instrumentation);
+        self
+    }
+
     /// Whether no handler is registered.
     #[must_use]
     pub fn is_empty(&self) -> bool {
@@ -308,6 +321,7 @@ impl Jobs {
             schedules,
             settings,
             pruning,
+            telemetry,
         } = self;
 
         let mut queues: BTreeMap<&'static str, HashMap<&'static str, Arc<dyn ErasedHandler>>> =
@@ -333,6 +347,7 @@ impl Jobs {
                 handlers,
                 store: store.clone(),
                 settings,
+                telemetry: telemetry.clone(),
             };
             let handle = tasks.spawn(worker.run(stop.clone()));
             names.insert(handle.id(), "queue worker");

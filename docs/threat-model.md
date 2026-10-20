@@ -374,6 +374,35 @@ address. The minimum prefix lengths stop only obvious mistakes (a `/8` still
 trusts 16 million addresses). Forge-Rust has no `forge deploy` yet, so the
 value is the operator's to set; audit records carry no source digest yet.
 
+## Telemetry review
+
+Review date: 2026-10-20 ([ADR 0033](adr/0033-telemetry.md), port of Forge-Go
+ADR 0034 and 0040). Scope: `FORGE_TELEMETRY_*`, the HTTP server
+instrumentation, the job and outbox instruments, the OTLP exporter, the log
+export layer and the Prometheus listener.
+
+| Threat | STRIDE | Control | Verification |
+| --- | --- | --- | --- |
+| A client picks the trace IDs in the logs, forces recording past the sample ratio or pushes `tracestate` downstream | S, T, D | Incoming `traceparent`/`tracestate` are ignored unless `FORGE_TELEMETRY_TRUST_TRACEPARENT=true`; parsing is strict (lowercase hex, exact lengths, no zero ids, one `traceparent` header, W3C `tracestate` grammar, 32 members, 512 bytes) | `incoming_traceparent_is_ignored_unless_trusted`, `invalid_traceparents_are_refused`, `tracestate_is_validated`, `extract_requires_exactly_one_traceparent`, `parsers_never_panic_on_arbitrary_input` |
+| Personal data or secrets reach spans or metrics | I | Spans and labels hold the method, route template, status, outcome, queue and job names and ids; never paths, queries, headers, cookies, client addresses, bodies, SQL, payloads or error messages (errors become `error.type`) | `metrics_use_route_templates_and_status_classes`, `server_spans_and_correlated_logs_are_exported`, `attempts_are_traced_and_measured_by_outcome`, `deliveries_are_traced_and_measured_by_outcome`, e2e script |
+| Exported log records carry more than standard output | I | The log layer sits behind the same `FORGE_LOG` filter, records only event and span fields formatted as the formatter formats them (`SecretString` is `[REDACTED]`), and is opt-in | `logs_are_exported_with_trace_context_and_redacted_values` |
+| Request input explodes metric cardinality (memory, backend cost) | D | Route templates, empty route for unmatched requests, `_OTHER` methods, status classes; 1000 series per instrument then one `_overflow` series and a counter; label values cut at 128 bytes | `series_beyond_the_limit_fold_into_overflow`, `label_values_are_cut`, `methods_and_statuses_are_bounded` |
+| A slow or broken collector slows requests or exhausts memory | D | Bounded queues (2048) that drop and count without waiting; exports run on owned tasks with a hard timeout; shutdown flush is bounded by the remaining grace period | `full_queue_drops_and_counts_without_waiting`, `a_full_queue_drops_and_counts_without_blocking`, `shutdown_is_bounded_by_its_deadline` |
+| A failing log export logs its failure, which is exported and fails again | D | Export diagnostics use the `forge_telemetry` target, which the log layer never exports | `a_failing_log_export_does_not_feed_itself` |
+| Collector or vendor credentials leak | I | `FORGE_TELEMETRY_OTLP_HEADERS` values are `SecretString`, sent as sensitive header values; configuration and export errors never contain the endpoint, headers or response bodies; redirects are not followed | `header_values_are_redacted_and_never_echoed`, `otlp_needs_a_valid_endpoint_that_is_never_echoed`, `spans_are_exported_as_otlp_json`, e2e script |
+| Telemetry is read or altered in transit | I, T | `production` requires an `https` endpoint (rustls, webpki roots) unless `FORGE_TELEMETRY_OTLP_ALLOW_PLAINTEXT=true` confirms a sidecar or private network | `production_requires_https_unless_plaintext_is_allowed` |
+| Anyone reads the metrics endpoint | I | Off by default; a separate listener never mounted on the application router; non-loopback addresses refused in production unless `FORGE_TELEMETRY_METRICS_PUBLIC=true`, warned elsewhere; only `GET`/`HEAD /metrics`, 16 connections | `metrics_listener_rules`, e2e script (`/metrics` on the application port is 404) |
+| The development span log leaks into production | I | `FORGE_TELEMETRY_EXPORTER=log` is refused in production | `log_exporter_is_refused_in_production` |
+
+Residual risks: with `FORGE_TELEMETRY_LOGS_EXPORTER=otlp` every log line goes
+to the collector, which must be protected like the log store; a raw secret
+logged by application code leaks there as it does to standard output.
+Attributes added by application code are the application's responsibility.
+The metrics listener has no authentication: confirming it public relies on
+the network keeping it private. Trusting `traceparent` is safe only behind a
+gateway that sets or sanitizes it. Dropped spans and log records under load
+are counted, not retried.
+
 ## Review cadence
 
 Update this model when adding a trust boundary, privileged capability, protocol,

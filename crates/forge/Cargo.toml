@@ -22,6 +22,7 @@ forge-cache = { path = "../forge-cache", optional = true }
 forge-ratelimit = { path = "../forge-ratelimit", optional = true }
 forge-storage = { path = "../forge-storage", optional = true }
 forge-security = { path = "../forge-security" }
+forge-telemetry = { path = "../forge-telemetry" }
 forge-tenancy = { path = "../forge-tenancy" }
 forge-views = { path = "../forge-views", optional = true, default-features = false, features = ["runtime"] }
 serde.workspace = true

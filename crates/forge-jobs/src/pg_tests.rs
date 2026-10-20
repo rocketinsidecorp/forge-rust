@@ -1507,3 +1507,84 @@ async fn attempts_ignoring_cancellation_after_losing_the_lease_free_their_slot()
     stop(shutdown, handle).await;
     db.cleanup().await.expect("cleanup");
 }
+
+// ----------------------------------------------------------- telemetry
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs FORGE_TEST_DATABASE_URL"]
+async fn attempts_are_traced_and_measured_by_outcome() {
+    use forge_telemetry::{
+        Options, SpanSink, Telemetry,
+        testing::{Behavior, Receiver},
+    };
+
+    let receiver = Receiver::start(Behavior::Accept).await;
+    let mut options = Options::new("worker");
+    options.spans = Some(SpanSink::Otlp(receiver.client(
+        http::HeaderMap::new(),
+        false,
+        Duration::from_secs(10),
+    )));
+    let telemetry = Telemetry::new(options).expect("telemetry");
+    telemetry.start();
+
+    let db = fresh().await;
+    let store = PgJobStore::new(db.runtime().clone());
+    let ok = store
+        .enqueue(&Count { n: 1 }, EnqueueOptions::new())
+        .await
+        .expect("enqueue")
+        .id();
+    let flaky = store
+        .enqueue(&Flaky, EnqueueOptions::new())
+        .await
+        .expect("enqueue")
+        .id();
+    let boom = store
+        .enqueue(&Explode, EnqueueOptions::new())
+        .await
+        .expect("enqueue")
+        .id();
+    let mut jobs = Jobs::new();
+    jobs.register(Counter::default()).expect("register");
+    jobs.register(AlwaysFails(Arc::new(AtomicUsize::new(0))))
+        .expect("register");
+    jobs.register(Panics).expect("register");
+    jobs.settings(fast());
+    jobs.instrument(telemetry.jobs().expect("instruments"));
+    let (shutdown, handle) = spawn_runtime(jobs, store.database());
+    wait_until("every job to settle", || async {
+        job_row(&db, ok).await.state == "completed"
+            && job_row(&db, flaky).await.state == "dead"
+            && job_row(&db, boom).await.state == "dead"
+    })
+    .await;
+    stop(shutdown, handle).await;
+    telemetry.force_flush(Duration::from_secs(10)).await;
+
+    let text = forge_telemetry::prometheus::render(telemetry.metrics());
+    for (kind, outcome, count) in [
+        ("test.count", "succeeded", 1),
+        ("test.flaky", "retry", 2),
+        ("test.flaky", "dead", 1),
+        ("test.explode", "dead", 1),
+    ] {
+        let line = format!(
+            "forge_queue_job_duration_seconds_count{{messaging_destination_name=\"default\",forge_job_kind=\"{kind}\",forge_job_outcome=\"{outcome}\"}} {count}"
+        );
+        assert!(text.contains(&line), "{line}\n{text}");
+    }
+    let spans = receiver
+        .received("/v1/traces")
+        .iter()
+        .map(|request| request.body.to_string())
+        .collect::<String>();
+    assert!(spans.contains("\"process default\""), "{spans}");
+    assert!(
+        spans.contains(&ok.to_string()),
+        "messaging.message.id: {spans}"
+    );
+    assert!(spans.contains("\"forge.job.outcome\""), "{spans}");
+    assert!(!spans.contains("secret payload"), "{spans}");
+    db.cleanup().await.expect("cleanup");
+}

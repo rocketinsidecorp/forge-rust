@@ -123,7 +123,7 @@ forge/
 │   ├── forge-ratelimit     # fixed-window limiter, stores, HTTP middleware (ADR 0027)
 │   ├── forge-storage       # storage port, disk adapter, signed links, uploads (ADR 0029)
 │   ├── forge-broadcast     # live updates: Turbo Streams over SSE, LISTEN/NOTIFY fanout (ADR 0031)
-│   ├── forge-telemetry     # OpenTelemetry lifecycle and context
+│   ├── forge-telemetry     # traces, metrics, log export over OTLP/Prometheus (ADR 0033)
 │   ├── forge-openapi       # contract/schema projection
 │   ├── forge-ai            # provider and controlled execution ports
 │   ├── forge-cli           # `forge` executable
@@ -424,6 +424,16 @@ application calls, database queries, jobs, events, external APIs, and AI streams
 Low-cardinality identifiers are available in structured logs; tenant, user, and
 prompt data require explicit classification and redaction. Metrics must not use
 tenant or request IDs as labels.
+
+Implemented by `forge-telemetry` ([ADR 0033](adr/0033-telemetry.md),
+[observability](observability.md)), the port of Forge-Go's telemetry: W3C
+propagation (incoming context untrusted by default), server spans named after
+route templates, job and outbox consumer spans, Forge-Go's metric catalogue
+with a per-instrument series cap, `trace_id`/`span_id` on request log lines,
+and export over OTLP/HTTP JSON and a separate Prometheus listener. It lives in
+the adapter and infrastructure rings; `forge` builds it from `FORGE_TELEMETRY_*`
+and shuts it down last. Domain and application code never depend on it.
+Per-query database spans are not implemented yet (SQLx has no query hook).
 
 - `/health/live` reports whether the process event loop is alive.
 - `/health/ready` reports whether the instance can accept its configured work and
