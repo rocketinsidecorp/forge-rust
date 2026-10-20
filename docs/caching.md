@@ -72,7 +72,11 @@ let store_options = StoreOptions::default().with_options(Options::from_config(&c
 let cache: Arc<dyn Cache> = Arc::new(PostgresCache::new(db.clone(), store_options)?);
 ```
 
-`cargo run -- migrate` creates `forge_cache_entries`; `rollback` drops it.
+`cargo run -- migrate` creates `forge_cache_entries`. `cargo run -- rollback`
+never drops it: the application rollback reverts only the application's own
+migrations, and turning the shared cache off later does not break `migrate`
+([ADR 0030](adr/0030-framework-migration-ownership.md)). Dropping the table is
+explicit: `database.rollback_framework(&migrations)`.
 Database rows are addressed by `SHA-256(key)`: keys are never stored, indexed or
 logged (they often name users or sessions), and cannot be listed or deleted by
 pattern. Namespace keys (`key("users", &[id, "profile"])`) and let ttl and

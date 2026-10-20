@@ -123,6 +123,15 @@ cargo run
 not fall back to the runtime credential. The serving process should receive only
 `FORGE_DATABASE_URL`.
 
+`rollback` reverts the application's newest applied migration, one per call.
+It never reverts migrations shipped by Forge crates: the job and outbox schemas
+have their own bookkeeping tables, and the rate-limit and cache migrations
+merged with `combine_migrations` are skipped even though their versions are
+higher. When only those remain, `rollback` exits with status 1 and changes
+nothing. Removing a store from `combine_migrations` later leaves its table in
+place and `migrate` keeps working
+([ADR 0030](adr/0030-framework-migration-ownership.md)).
+
 With generated Docker assets, `docker/postgres/init.sql` creates separate
 development-only `app_migrator` and `app_runtime` roles. The runtime role is
 not schema owner and has `NOBYPASSRLS`. Generated

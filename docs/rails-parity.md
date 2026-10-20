@@ -36,6 +36,16 @@ the work is finished and waiting for its review; **Planned** means not started.
 | Published benchmarks | — | Planned | Planned |
 | Getting Started guide | Rails Guides | Planned | Planned |
 
+## Parity follow-ups
+
+- Framework migration ownership ([ADR 0030](adr/0030-framework-migration-ownership.md),
+  rocketinsidecorp/forge-rust#10): Forge-Rust's `rollback` never reverts the
+  rate-limit or cache migrations merged into the application's table and
+  `migrate` tolerates them once their feature is off. Forge-Go merges its
+  framework sets into `forge_schema_migrations`, reverts the most recently
+  applied migration of any set and refuses versions this build does not
+  contain; it should adopt the same rule.
+
 ## Review gate
 
 Every pull request passes the Claude Code Review before it merges to `main`,

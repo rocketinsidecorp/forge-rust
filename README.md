@@ -151,7 +151,8 @@ application gets the same files with `forge generate authentication`
 
    A signed-out browser is sent to `/session/new` and comes back to the
    invoices after signing in; the sign-in page also has the sign-out button.
-   `cargo run -- rollback` reverts the latest migration. Repository and
+   `cargo run -- rollback` reverts the application's latest migration (never a
+   framework table such as the cache or rate-limit store). Repository and
    authentication tests against a database server are ignored by default;
    run them with
    `FORGE_TEST_DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5432/postgres cargo test -- --include-ignored`.
@@ -420,7 +421,10 @@ export FORGE_STORAGE_LINK_TTL_SECS=900           # default signed link lifetime
 
 Shared stores need their tables: merge the crate migration into your own with
 `forge::db::combine_migrations(&[&APP_MIGRATIONS, &forge::cache::postgres::MIGRATIONS, &forge::ratelimit::postgres::MIGRATIONS])`
-and run `cargo run -- migrate`. Limits and keys are configured with
+and run `cargo run -- migrate`. `cargo run -- rollback` reverts only your own
+migrations, never these framework tables, and removing a store from the list
+later keeps `migrate` working ([ADR 0030](docs/adr/0030-framework-migration-ownership.md)).
+Limits and keys are configured with
 `FORGE_RATE_LIMIT_MAX_KEYS`, `FORGE_CACHE_*` and `FORGE_STORAGE_*`
 ([deployment guide](docs/deployment.md)); in `production` a storage root must be
 absolute and `FORGE_STORAGE_SIGNING_KEY` is required.
