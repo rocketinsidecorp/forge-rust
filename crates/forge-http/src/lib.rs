@@ -404,6 +404,19 @@ impl Response {
         Ok(response)
     }
 
+    /// Creates a `text/plain; charset=utf-8` response, the media type the
+    /// OpenAPI document declares for Forge's own refusals (`401`, `403`,
+    /// `413`).
+    #[must_use]
+    pub fn text(status: StatusCode, body: impl Into<Bytes>) -> Self {
+        let mut response = Self::new(status, body);
+        response.headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/plain; charset=utf-8"),
+        );
+        response
+    }
+
     /// Creates an empty response.
     #[must_use]
     pub fn empty(status: StatusCode) -> Self {
@@ -1095,10 +1108,10 @@ impl BodyRejection {
     fn into_response(self) -> Response {
         match self {
             Self::TooLarge => {
-                Response::new(StatusCode::PAYLOAD_TOO_LARGE, "request body too large")
+                Response::text(StatusCode::PAYLOAD_TOO_LARGE, "request body too large")
             }
             Self::Unreadable => {
-                Response::new(StatusCode::BAD_REQUEST, "request body could not be read")
+                Response::text(StatusCode::BAD_REQUEST, "request body could not be read")
             }
         }
     }
@@ -1879,6 +1892,13 @@ mod tests {
         )
         .await;
         assert!(declared.starts_with("HTTP/1.1 413 "), "{declared}");
+        // The media type the OpenAPI document declares for the refusal.
+        assert!(
+            declared
+                .to_ascii_lowercase()
+                .contains("content-type: text/plain; charset=utf-8"),
+            "{declared}"
+        );
 
         // An 80-byte chunk exceeds the 64-byte limit without a Content-Length.
         let chunked = exchange(

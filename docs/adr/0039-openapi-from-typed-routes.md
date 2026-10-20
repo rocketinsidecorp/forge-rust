@@ -99,7 +99,11 @@ enough to commit and diff.
    `authenticated` imply `401` (`text/plain`, as Forge's guards answer it)
    and the `sessionCookie` security scheme (`apiKey` in the
    `__Host-forge_session` cookie); `permission` adds `403` (`text/plain`)
-   and `x-forge-permission`. The same build errors as Go: no response, a
+   and `x-forge-permission`. Those refusals (the server's `413`/`400` and
+   the generated access policy's `401`/`403`/`503`) are written with
+   `Response::text`, so they carry `Content-Type: text/plain;
+   charset=utf-8` as declared; the generated contract tests found that they
+   had none. The same build errors as Go: no response, a
    body on `204`/`304`, a status both declared and an error, an error
    status outside 4xx/5xx, a path parameter the path lacks, duplicate
    parameters, operation IDs or members, methods OpenAPI lacks.
