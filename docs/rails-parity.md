@@ -17,7 +17,7 @@ the work is finished and waiting for its review; **Planned** means not started.
 | First tenant and owner, seeds | `db:seed` | Done (`forge setup`, `forge seed`) | Done (`setup`, `seed`) |
 | Multi-tenancy with database enforcement | (gems) | Done (PostgreSQL RLS) | Done (PostgreSQL RLS) |
 | TOTP MFA | (gems) | Done | Planned |
-| Persistent jobs, cron, outbox | Solid Queue | Done | Done |
+| Persistent jobs, cron, outbox | Solid Queue | Done | Done (framework crates; `forge new` wiring planned) |
 | Mailer with previews | Action Mailer | Done | Planned |
 | Rate limiting | `rate_limit` | Done | Done |
 | Cache | Solid Cache | Done | Done |
