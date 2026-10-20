@@ -28,7 +28,7 @@
 //! - [`LocaleNegotiation`], [`I18n`], [`Translation`]: each request's
 //!   locale (path prefix, query, `locale` cookie, `Accept-Language`) and the
 //!   template helpers `t`, `l`, `number` and `locale` over `forge-i18n`;
-//!   [`set_content_language`] and [`locale_cookie`] (ADR 0037).
+//!   [`set_content_language`], [`path_prefix`] and [`locale_cookie`] (ADR 0037).
 //!
 //! Views belong in the HTTP adapter ring; domain and application code never
 //! see this crate. See `docs/views.md` for the developer guide.
@@ -95,7 +95,7 @@ pub use forms::{
 #[cfg(feature = "runtime")]
 pub use i18n::{
     I18n, I18nError, LOCALE_COOKIE_NAME, LocaleNegotiation, Translation, locale_cookie,
-    set_content_language,
+    path_prefix, set_content_language,
 };
 #[cfg(feature = "runtime")]
 pub use import_map::{ImportMap, ImportMapBuilder, ImportMapError};
