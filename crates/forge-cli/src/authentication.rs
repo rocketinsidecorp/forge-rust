@@ -212,7 +212,11 @@ fn wiring() -> Result<String, CliError> {
          FORGE_MIGRATION_DATABASE_URL=... cargo run -- migrate\n    \
          FORGE_MIGRATION_DATABASE_URL=... cargo run -- setup --tenant acme --email owner@example.com\n\n  \
          Reset links are not delivered until a PasswordResetNotifier replaces\n  \
-         forge::auth::UndeliverablePasswordResets (the page answers the same either way).\n",
+         forge::auth::UndeliverablePasswordResets (the page answers the same either way).\n  \
+         They go only to the login the credential store returns: if\n  \
+         src/infrastructure/auth/mod.rs predates this generator, select `login` in\n  \
+         `find_by_login` and add `.with_login(login)` to the credential, as `forge new`\n  \
+         does; without it no link is delivered.\n",
     );
     Ok(out)
 }

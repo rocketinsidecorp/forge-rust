@@ -89,7 +89,7 @@ fn compose(composition: &mut forge::Composition<'_>) -> Result<(), forge::Compos
         sign_in_throttle: throttle()?,
         reset_throttle: throttle()?,
     };
-    crate::adapters::http::authentication::routes(composition.router(), &site, ports)?;
+    crate::adapters::http::authentication::routes(composition, &site, ports)?;
 %%end%%
     Ok(())
 }

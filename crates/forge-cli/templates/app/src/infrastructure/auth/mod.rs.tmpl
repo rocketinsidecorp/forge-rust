@@ -36,8 +36,8 @@ impl PasswordCredentialStore for PostgresPasswordCredentialStore {
         &self,
         login: &str,
     ) -> Result<Option<PasswordCredential>, PasswordCredentialStoreError> {
-        let row = sqlx::query_as::<_, (Uuid, String, bool, i64)>(
-            "SELECT id, password_hash, disabled_at IS NOT NULL, version
+        let row = sqlx::query_as::<_, (Uuid, String, bool, i64, String)>(
+            "SELECT id, password_hash, disabled_at IS NOT NULL, version, login
              FROM forge_principals
              WHERE lower(login) = lower($1)
                AND password_hash IS NOT NULL
@@ -48,22 +48,23 @@ impl PasswordCredentialStore for PostgresPasswordCredentialStore {
         .await
         .map_err(|_| PasswordCredentialStoreError::Unavailable)?;
 
-        row.map(|(principal_id, password_hash, disabled, version)| {
-            let principal_id = PrincipalId::from_uuid(principal_id)
-                .map_err(|_| PasswordCredentialStoreError::CorruptRecord)?;
-            let password_hash = PasswordHash::new(password_hash)
-                .map_err(|_| PasswordCredentialStoreError::CorruptRecord)?;
-            let version = u64::try_from(version)
-                .ok()
-                .and_then(PasswordCredentialVersion::new)
-                .ok_or(PasswordCredentialStoreError::CorruptRecord)?;
-            Ok(PasswordCredential::new(
-                principal_id,
-                password_hash,
-                disabled,
-                version,
-            ))
-        })
+        row.map(
+            |(principal_id, password_hash, disabled, version, stored_login)| {
+                let principal_id = PrincipalId::from_uuid(principal_id)
+                    .map_err(|_| PasswordCredentialStoreError::CorruptRecord)?;
+                let password_hash = PasswordHash::new(password_hash)
+                    .map_err(|_| PasswordCredentialStoreError::CorruptRecord)?;
+                let version = u64::try_from(version)
+                    .ok()
+                    .and_then(PasswordCredentialVersion::new)
+                    .ok_or(PasswordCredentialStoreError::CorruptRecord)?;
+                // Reset links go to the login as stored, never as typed.
+                Ok(
+                    PasswordCredential::new(principal_id, password_hash, disabled, version)
+                        .with_login(stored_login),
+                )
+            },
+        )
         .transpose()
     }
 

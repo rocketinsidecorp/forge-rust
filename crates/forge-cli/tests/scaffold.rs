@@ -771,8 +771,7 @@ fn postgresql_application_regains_its_sign_in_pages_with_generate_authentication
     let start = source
         .find("    // Sign-in, sign-out")
         .unwrap_or_else(|| panic!("{source}"));
-    let call =
-        "crate::adapters::http::authentication::routes(composition.router(), &site, ports)?;\n";
+    let call = "crate::adapters::http::authentication::routes(composition, &site, ports)?;\n";
     let end = source[start..]
         .find(call)
         .map(|offset| start + offset + call.len())

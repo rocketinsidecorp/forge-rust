@@ -25,7 +25,7 @@ use forge::tenancy::{
     TenantDirectory, TenantId, TenantSlug,
 };
 
-use app::adapters::http::authentication::{AuthenticationPorts, routes};
+use app::adapters::http::authentication::{AuthenticationPorts, RESET_RESPONSE_TIME, routes};
 
 type TestResult = Result<(), Box<dyn Error>>;
 
@@ -58,7 +58,15 @@ struct World {
     deliveries: Mutex<Vec<(String, String)>>,
     audit: Mutex<Vec<(String, AuditOutcome)>>,
     hashes: Mutex<u32>,
+    membership_lookups: Mutex<u32>,
     deliver_fails: bool,
+}
+
+/// PostgreSQL's `lower()` under common collations folds `İ` to `i` (no
+/// combining dot); the fake store matches logins the same way, so the tests
+/// see what a look-alike spelling would match in production.
+fn fold(login: &str) -> String {
+    login.to_lowercase().replace('\u{307}', "")
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -98,7 +106,7 @@ impl PasswordCredentialStore for World {
     ) -> Result<Option<PasswordCredential>, PasswordCredentialStoreError> {
         lock(&self.accounts)
             .iter()
-            .find(|account| account.login.eq_ignore_ascii_case(login))
+            .find(|account| fold(&account.login) == fold(login))
             .map(|account| {
                 let version = PasswordCredentialVersion::new(account.version)
                     .ok_or(PasswordCredentialStoreError::CorruptRecord)?;
@@ -107,7 +115,8 @@ impl PasswordCredentialStore for World {
                     account.hash.clone(),
                     account.disabled,
                     version,
-                ))
+                )
+                .with_login(account.login.clone()))
             })
             .transpose()
     }
@@ -182,6 +191,7 @@ impl MembershipStore for World {
         tenant: TenantId,
         principal: PrincipalId,
     ) -> Result<Option<Membership>, MembershipStoreError> {
+        *lock(&self.membership_lookups) += 1;
         Ok(lock(&self.memberships)
             .iter()
             .find(|membership| {
@@ -219,6 +229,16 @@ impl PasswordResetStore for World {
             used: false,
         });
         Ok(())
+    }
+
+    async fn is_redeemable(
+        &self,
+        digest: &PasswordResetTokenDigest,
+        now: UnixTimestamp,
+    ) -> Result<bool, AccountStoreError> {
+        Ok(lock(&self.resets).iter().any(|reset| {
+            reset.grant.digest() == digest && !reset.used && reset.grant.expires_at() > now
+        }))
     }
 
     /// The PostgreSQL adapter's contract, in memory.
@@ -305,13 +325,15 @@ struct Fixture {
     world: Arc<World>,
     router: Router,
     ada: PrincipalId,
+    /// The reset-request worker, stopped when the fixture is dropped.
+    _workers: forge::RunningWorkers,
 }
 
 fn fixture() -> Result<Fixture, Box<dyn Error>> {
     fixture_with(false, 3)
 }
 
-fn fixture_with(deliver_fails: bool, account_limit: u32) -> Result<Fixture, Box<dyn Error>> {
+fn fixture_with(deliver_fails: bool, pair_limit: u32) -> Result<Fixture, Box<dyn Error>> {
     let world = Arc::new(World {
         deliver_fails,
         ..World::default()
@@ -324,6 +346,7 @@ fn fixture_with(deliver_fails: bool, account_limit: u32) -> Result<Fixture, Box<
     for (principal, login, disabled) in [
         (ada, "ada@example.com", false),
         (eve, "eve@example.com", true),
+        (PrincipalId::new(), "Victim@iCloud.com", false),
     ] {
         lock(&world.accounts).push(Account {
             principal,
@@ -342,7 +365,8 @@ fn fixture_with(deliver_fails: bool, account_limit: u32) -> Result<Fixture, Box<
     let throttle = || -> Result<Arc<MemoryLoginThrottle>, Box<dyn Error>> {
         Ok(Arc::new(MemoryLoginThrottle::new(ThrottleConfig {
             window: Duration::from_secs(900),
-            account_limit,
+            pair_limit,
+            account_limit: 50,
             source_limit: 300,
             max_entries: 1_000,
         })?))
@@ -359,15 +383,23 @@ fn fixture_with(deliver_fails: bool, account_limit: u32) -> Result<Fixture, Box<
         sign_in_throttle: throttle()?,
         reset_throttle: throttle()?,
     };
+    let config = forge::config::AppConfig::default();
     let mut router = Router::new();
     let site = app::adapters::http::site(&mut router)?;
     app::adapters::http::routes(&mut router, &site)?;
-    routes(&mut router, &site, ports)?;
+    let mut composition = forge::Composition::for_testing(&config, &mut router);
+    routes(&mut composition, &site, ports)?;
+    let workers = composition.start_workers();
     // A protected page: what an access policy answers without a session.
     router.route(Method::GET, "/protected", |_| async {
         Response::new(StatusCode::UNAUTHORIZED, "authentication required")
     })?;
-    Ok(Fixture { world, router, ada })
+    Ok(Fixture {
+        world,
+        router,
+        ada,
+        _workers: workers,
+    })
 }
 
 /// A cookie jar that sends what responses set.
@@ -488,6 +520,13 @@ fn header_of(response: &Response, name: header::HeaderName) -> Option<String> {
         .get(name)
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned)
+}
+
+/// Lets the reset-request worker finish what was queued.
+async fn settle() {
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+    }
 }
 
 fn audited(world: &World, action: &str, outcome: AuditOutcome) -> bool {
@@ -820,6 +859,7 @@ async fn reset_request(
             &[("tenant", tenant), ("email", email)],
         )
         .await?;
+    settle().await;
     let flash = response
         .headers()
         .get_all(header::SET_COOKIE)
@@ -1035,6 +1075,154 @@ async fn expired_or_malformed_reset_links_are_refused() -> TestResult {
     assert_eq!(
         header_of(&malformed, header::LOCATION).as_deref(),
         Some("/passwords/new")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn reset_links_go_to_the_stored_login_and_look_alikes_get_nothing() -> TestResult {
+    let fixture = fixture_with(false, 100)?;
+    let typed = reset_request(&fixture, "acme", "VICTIM@icloud.COM").await?;
+    let delivered: Vec<String> = lock(&fixture.world.deliveries)
+        .iter()
+        .map(|(login, _)| login.clone())
+        .collect();
+    assert_eq!(
+        delivered,
+        vec!["Victim@iCloud.com".to_owned()],
+        "never the typed address"
+    );
+
+    // `İ` folds to `i` in PostgreSQL: the look-alike would match the victim.
+    let look_alike = reset_request(&fixture, "acme", "victim@\u{130}cloud.com").await?;
+    assert_eq!(look_alike, typed, "the same answer");
+    assert_eq!(
+        lock(&fixture.world.deliveries).len(),
+        1,
+        "nothing for the look-alike"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn letter_case_and_unicode_variants_do_not_get_fresh_guesses() -> TestResult {
+    let fixture = fixture_with(false, 3)?;
+    let mut browser = Browser::default();
+    for variant in [
+        "VICTIM@icloud.com",
+        "Victim@iCloud.com",
+        " victim@ICLOUD.com ",
+    ] {
+        let response = browser
+            .sign_in(&fixture.router, "acme", variant, "wrong password!")
+            .await?;
+        assert_eq!(
+            response.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{variant}"
+        );
+    }
+    let throttled = browser
+        .sign_in(&fixture.router, "acme", "victim@icloud.com", PASSWORD)
+        .await?;
+    assert_eq!(throttled.status(), StatusCode::TOO_MANY_REQUESTS);
+
+    // `İ` spellings would match the victim in PostgreSQL; they are unknown
+    // accounts, so they give no fresh guesses at the victim's password.
+    for look_alike in ["vict\u{130}m@icloud.com", "victim@\u{130}cloud.com"] {
+        let response = browser
+            .sign_in(&fixture.router, "acme", look_alike, PASSWORD)
+            .await?;
+        assert_eq!(
+            response.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{look_alike}"
+        );
+        assert!(
+            browser.cookie("__Host-forge_session").is_none(),
+            "{look_alike}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn reset_requests_take_the_same_minimum_time() -> TestResult {
+    let fixture = fixture_with(false, 100)?;
+    for (tenant, email) in [
+        ("initech", "nobody@example.com"),
+        ("acme", "ada@example.com"),
+        ("Not A Slug!", "x"),
+    ] {
+        let mut browser = Browser::default();
+        browser.get(&fixture.router, "/passwords/new").await?;
+        let started = std::time::Instant::now();
+        let response = browser
+            .post(
+                &fixture.router,
+                "/passwords",
+                &[("tenant", tenant), ("email", email)],
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        assert!(started.elapsed() >= RESET_RESPONSE_TIME, "{tenant} {email}");
+    }
+    settle().await;
+    assert_eq!(lock(&fixture.world.deliveries).len(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn sign_in_looks_up_a_membership_whatever_the_organization() -> TestResult {
+    let fixture = fixture_with(false, 100)?;
+    for tenant in ["acme", "initech", "Not A Slug!", ""] {
+        let before = *lock(&fixture.world.membership_lookups);
+        let response = Browser::default()
+            .sign_in(
+                &fixture.router,
+                tenant,
+                "ada@example.com",
+                "wrong password!",
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            *lock(&fixture.world.membership_lookups),
+            before + 1,
+            "{tenant:?}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn unknown_reset_tokens_are_refused_before_hashing() -> TestResult {
+    let fixture = fixture()?;
+    let mut browser = Browser::default();
+    browser.get(&fixture.router, "/passwords/new").await?;
+    let hashes = *lock(&fixture.world.hashes);
+    let unknown = "ab".repeat(32);
+    let response = browser
+        .post(
+            &fixture.router,
+            "/passwords",
+            &[
+                ("_method", "patch"),
+                ("token", &unknown),
+                ("password", "a brand new secret"),
+                ("password_confirmation", "a brand new secret"),
+            ],
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        header_of(&response, header::LOCATION).as_deref(),
+        Some("/passwords/new")
+    );
+    assert_eq!(
+        *lock(&fixture.world.hashes),
+        hashes,
+        "no Argon2 work for an unknown token"
     );
     Ok(())
 }

@@ -8,7 +8,7 @@
 
 use async_trait::async_trait;
 use forge::audit::{AuditAction, AuditActor, AuditEvent, AuditOutcome};
-use forge::auth::{PasswordHash, PasswordResetTokenDigest, UnixTimestamp};
+use forge::auth::{CanonicalLogin, PasswordHash, PasswordResetTokenDigest, UnixTimestamp};
 use forge::core::Id;
 use forge::security::PrincipalId;
 use forge::tenancy::{
@@ -91,6 +91,26 @@ impl PasswordResetStore for PgPasswordResetStore {
         .await
         .map_err(classify)?;
         Ok(())
+    }
+
+    async fn is_redeemable(
+        &self,
+        digest: &PasswordResetTokenDigest,
+        now: UnixTimestamp,
+    ) -> Result<bool, AccountStoreError> {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (
+                SELECT 1 FROM forge_password_resets
+                WHERE token_digest = $1
+                  AND used_at IS NULL
+                  AND expires_at > to_timestamp($2::double precision)
+             )",
+        )
+        .bind(digest.as_bytes().as_slice())
+        .bind(seconds(now)?)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(classify)
     }
 
     async fn redeem(
@@ -186,8 +206,8 @@ pub struct OwnerAccount {
     pub tenant: TenantSlug,
     /// The tenant's display name.
     pub organization: String,
-    /// The owner's login (email address).
-    pub login: String,
+    /// The owner's login (email address), stored in its canonical form.
+    pub login: CanonicalLogin,
     /// The owner's hashed password.
     pub password_hash: PasswordHash,
     /// When the owner is created (also the audit event time).
@@ -272,7 +292,7 @@ pub async fn provision_owner(
     let taken = sqlx::query_scalar::<_, bool>(
         "SELECT EXISTS (SELECT 1 FROM forge_principals WHERE lower(login) = lower($1))",
     )
-    .bind(&account.login)
+    .bind(account.login.as_str())
     .fetch_one(&mut *transaction)
     .await?;
     if taken {
@@ -287,7 +307,7 @@ pub async fn provision_owner(
         .await?;
     sqlx::query("INSERT INTO forge_principals (id, login, password_hash) VALUES ($1, $2, $3)")
         .bind(principal_id.into_uuid())
-        .bind(&account.login)
+        .bind(account.login.as_str())
         .bind(account.password_hash.expose())
         .execute(&mut *transaction)
         .await?;

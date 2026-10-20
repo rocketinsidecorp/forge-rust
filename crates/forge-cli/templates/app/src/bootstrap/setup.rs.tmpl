@@ -18,7 +18,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use forge::auth::{NewPassword, PasswordHasher as _, UnixTimestamp};
+use forge::auth::{CanonicalLogin, NewPassword, PasswordHasher as _, UnixTimestamp};
 use forge::tenancy::TenantSlug;
 use forge::{CommandContext, CommandError};
 
@@ -81,23 +81,22 @@ pub async fn run(mut context: CommandContext) -> Result<(), CommandError> {
     ))
 }
 
-/// A sign-in email: trimmed, 3 to 320 bytes, one `@` with text on both
-/// sides, no whitespace or control characters.
-fn login(value: &str) -> Result<String, CommandError> {
-    let value = value.trim();
-    let valid = (3..=320).contains(&value.len())
-        && !value
-            .chars()
-            .any(|character| character.is_whitespace() || character.is_control())
-        && value.split_once('@').is_some_and(|(local, domain)| {
+/// A sign-in email in its canonical form (`forge::auth::CanonicalLogin`:
+/// trimmed, ASCII only, lowercased) with one `@` and text on both sides.
+fn login(value: &str) -> Result<CanonicalLogin, CommandError> {
+    let invalid =
+        || CommandError::usage("--email must be an ASCII email address such as owner@example.com");
+    let login = CanonicalLogin::parse(value).map_err(|_| invalid())?;
+    let well_formed = login
+        .as_str()
+        .split_once('@')
+        .is_some_and(|(local, domain)| {
             !local.is_empty() && !domain.is_empty() && !domain.contains('@')
         });
-    if valid {
-        Ok(value.to_owned())
+    if well_formed {
+        Ok(login)
     } else {
-        Err(CommandError::usage(
-            "--email must be an email address such as owner@example.com",
-        ))
+        Err(invalid())
     }
 }
 

@@ -30,20 +30,25 @@
 //!   to the account and the tenant they were requested through, are stored
 //!   as SHA-256 digests and never logged. The reset pages are `no-store`
 //!   with `Referrer-Policy: no-referrer`. A reset revokes every session.
+//! - Logins are canonical (`forge::auth::CanonicalLogin`: ASCII only,
+//!   lowercased); anything else is an unknown account. Reset links go to
+//!   the login as stored, never to the address typed into the form, and
+//!   are issued and delivered by a bounded background queue while the
+//!   page answers after a fixed minimum time, so timing does not reveal
+//!   whether an account exists.
 
 use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use forge::ComposeError;
 use forge::audit::{AuditAction, AuditActor, AuditEvent, AuditOutcome, AuditSink};
 use forge::auth::{
-    LoginThrottle, NewPassword, PASSWORD_RESET_LIFETIME_SECS, PasswordCredentialStore,
-    PasswordHasher, PasswordResetDelivery, PasswordResetNotifier, PasswordResetToken, SessionStore,
-    ThrottleDecision, ThrottleKey, UnixTimestamp,
+    CanonicalLogin, LoginThrottle, NewPassword, PASSWORD_RESET_LIFETIME_SECS,
+    PasswordCredentialStore, PasswordHasher, PasswordResetDelivery, PasswordResetNotifier,
+    PasswordResetToken, SessionStore, ThrottleDecision, ThrottleKey, UnixTimestamp,
 };
 use forge::core::{ErrorCategory, ForgeError};
-use forge::http::{HeaderValue, Method, Request, Response, Router, StatusCode, header};
+use forge::http::{HeaderValue, Method, Request, Response, StatusCode, header};
 use forge::security::PrincipalId;
 use forge::tenancy::{
     MembershipState, MembershipStore, PasswordResetGrant, PasswordResetStore, TenantDirectory,
@@ -53,6 +58,7 @@ use forge::views::{
     FieldErrors, Flash, SignInRedirect, csrf_cookie, csrf_field, csrf_token, csrf_verified,
     return_path, see_other,
 };
+use forge::{ComposeError, Composition, WorkQueue};
 
 use crate::adapters::http::views::Site;
 use crate::adapters::http::views::authentication::{PasswordEdit, PasswordNew, SessionNew};
@@ -69,6 +75,13 @@ pub const AFTER_SIGN_IN_PATH: &str = "/";
 pub const SESSION_LIFETIME: Duration = Duration::from_secs(24 * 60 * 60);
 
 const NEW_PASSWORD_PATH: &str = "/passwords/new";
+
+/// Reset requests waiting for the background worker; more are dropped
+/// (and logged) rather than slowing or failing the page.
+pub const RESET_QUEUE_CAPACITY: usize = 256;
+/// The reset-request page never answers faster than this, whatever
+/// happened, so its timing does not tell whether an account exists.
+pub const RESET_RESPONSE_TIME: Duration = Duration::from_millis(100);
 
 /// The only message a failed sign-in shows: it must not say whether the
 /// organization, the email or the password was wrong.
@@ -101,21 +114,48 @@ pub struct AuthenticationPorts {
 struct Pages {
     site: Arc<Site>,
     ports: AuthenticationPorts,
+    resets: WorkQueue<ResetRequest>,
 }
 
-/// Registers the pages and the [`SignInRedirect`] layer that sends
+/// A reset request for the background worker: a syntactically valid
+/// organization and login, whether or not they exist.
+struct ResetRequest {
+    tenant: TenantSlug,
+    login: CanonicalLogin,
+    received_at: UnixTimestamp,
+}
+
+/// Registers the pages, the reset-request worker (a bounded queue owned by
+/// the process lifecycle) and the [`SignInRedirect`] layer that sends
 /// signed-out browsers asking for a protected page (a `401` from an access
 /// policy) to [`SIGN_IN_PATH`]; JSON clients keep the `401`. The site's
 /// CSRF and flash layers must be registered first (`Site::register`).
 pub fn routes(
-    router: &mut Router,
+    composition: &mut Composition<'_>,
     site: &Arc<Site>,
     ports: AuthenticationPorts,
 ) -> Result<(), ComposeError> {
+    let worker_ports = ports.clone();
+    let resets = composition.work_queue(
+        "password_resets",
+        RESET_QUEUE_CAPACITY,
+        move |request: ResetRequest| {
+            let ports = worker_ports.clone();
+            async move {
+                if let Err(failure) = request_reset(&ports, &request).await {
+                    // Logged for operators; the visitor already got the
+                    // uniform answer.
+                    forge::web::report(&failure);
+                }
+            }
+        },
+    );
+    let router = composition.router();
     router.layer(SignInRedirect::new(SIGN_IN_PATH).map_err(ComposeError::other)?);
     let pages = Arc::new(Pages {
         site: Arc::clone(site),
         ports,
+        resets,
     });
     route(router, &pages, Method::GET, SIGN_IN_PATH, new_session)?;
     route(router, &pages, Method::POST, "/session", create_session)?;
@@ -134,7 +174,7 @@ pub fn routes(
 }
 
 fn route<H, F>(
-    router: &mut Router,
+    router: &mut forge::http::Router,
     pages: &Arc<Pages>,
     method: Method,
     path: &str,
@@ -234,10 +274,13 @@ async fn create_session(pages: Arc<Pages>, request: Request) -> Response {
         return_to: local_path(Some(&form.return_to)),
     };
     let ports = &pages.ports;
+    // A login that is not canonical (non-ASCII, for example) is an unknown
+    // account: it is checked as an empty login, which costs the same hash.
+    let login = CanonicalLogin::parse(&values.email).ok();
 
     let key = ThrottleKey::new(
         "sign_in",
-        &account_key(&values.email),
+        &account_key(login.as_ref(), &values.email),
         Some(request.remote_addr().ip()),
     );
     match ports.sign_in_throttle.attempt(&key).await {
@@ -263,7 +306,7 @@ async fn create_session(pages: Arc<Pages>, request: Request) -> Response {
     let principal = match authenticate_password(
         ports.credentials.as_ref(),
         ports.hasher.as_ref(),
-        &values.email,
+        login.as_ref().map_or("", CanonicalLogin::as_str),
         form.password.as_bytes(),
     )
     .await
@@ -417,22 +460,29 @@ async fn new_password(pages: Arc<Pages>, request: Request) -> Response {
     )
 }
 
-/// Asks for a reset link. Every outcome but throttling answers the same, so
-/// the page cannot tell anyone whether an account exists or whether a link
-/// was delivered.
+/// Asks for a reset link. Every outcome but throttling answers the same,
+/// no sooner than [`RESET_RESPONSE_TIME`]: the account is looked up, and the
+/// link issued and delivered, by the background worker, so neither the
+/// answer nor its timing tells whether an account exists or a link was
+/// delivered.
 async fn create_password(pages: Arc<Pages>, request: Request) -> Response {
     if csrf_verified(&request).is_none() {
         return forbidden();
     }
+    forge::web::at_least(RESET_RESPONSE_TIME, request_password_reset(pages, request)).await
+}
+
+async fn request_password_reset(pages: Arc<Pages>, request: Request) -> Response {
     let Some(now) = now() else {
         return unavailable("clock_unavailable");
     };
     let form = request.form::<ResetRequestForm>().unwrap_or_default();
     let tenant = form.tenant.trim().to_owned();
     let email = form.email.trim().to_owned();
+    let login = CanonicalLogin::parse(&email).ok();
     let key = ThrottleKey::new(
         "password_reset",
-        &account_key(&email),
+        &account_key(login.as_ref(), &email),
         Some(request.remote_addr().ip()),
     );
     match pages.ports.reset_throttle.attempt(&key).await {
@@ -452,30 +502,41 @@ async fn create_password(pages: Arc<Pages>, request: Request) -> Response {
         }
         Err(_) => return unavailable("password_reset_throttle_unavailable"),
     }
-    if let Err(failure) = request_reset(&pages.ports, &tenant, &email, now).await {
-        // Logged for operators; the visitor sees the uniform answer.
-        forge::web::report(&failure);
+    // Only well-formed requests are worth queueing; the rest name no
+    // account and get the same answer.
+    if let (Ok(tenant), Some(login)) = (TenantSlug::parse_input(&tenant), login) {
+        let queued = pages.resets.submit(ResetRequest {
+            tenant,
+            login,
+            received_at: now,
+        });
+        if let Err(error) = queued {
+            forge::web::report(
+                &ForgeError::new(
+                    ErrorCategory::Infrastructure,
+                    "password_reset_queue_full",
+                    "password reset request dropped",
+                )
+                .with_source(error),
+            );
+        }
     }
     redirect(SIGN_IN_PATH, Flash::new().with_notice(RESET_REQUESTED))
 }
 
-/// Issues and delivers a reset link when `tenant` and `email` name an
-/// enabled account with an active membership; otherwise does nothing.
+/// The background worker's step: issues and delivers a reset link when the
+/// request names an enabled account with an active membership; otherwise
+/// does nothing. The link goes to the login as stored, never as typed.
 async fn request_reset(
     ports: &AuthenticationPorts,
-    tenant: &str,
-    email: &str,
-    now: UnixTimestamp,
+    request: &ResetRequest,
 ) -> Result<(), ForgeError> {
     let failed = |code: &'static str| {
         ForgeError::new(ErrorCategory::Infrastructure, code, "password reset failed")
     };
-    let Ok(slug) = TenantSlug::parse_input(tenant) else {
-        return Ok(());
-    };
     let Some(tenant_id) = ports
         .tenants
-        .find_by_slug(&slug)
+        .find_by_slug(&request.tenant)
         .await
         .map_err(|error| failed("tenant_directory_unavailable").with_source(error))?
     else {
@@ -483,7 +544,7 @@ async fn request_reset(
     };
     let Some(credential) = ports
         .credentials
-        .find_by_login(email)
+        .find_by_login(request.login.as_str())
         .await
         .map_err(|error| failed("credential_store_unavailable").with_source(error))?
     else {
@@ -492,6 +553,11 @@ async fn request_reset(
     if credential.disabled() {
         return Ok(());
     }
+    let Some(stored_login) = credential.login().map(str::to_owned) else {
+        // A store that does not return the stored login cannot be trusted
+        // with an address: deliver nothing.
+        return Err(failed("password_reset_without_stored_login"));
+    };
     let principal = credential.principal_id();
     let active = ports
         .memberships
@@ -503,6 +569,7 @@ async fn request_reset(
         return Ok(());
     }
 
+    let now = request.received_at;
     let token = PasswordResetToken::generate()
         .map_err(|error| failed("password_reset_token_unavailable").with_source(error))?;
     let expires_at =
@@ -526,7 +593,7 @@ async fn request_reset(
     // The token leaves this process only through the notifier.
     ports
         .notifier
-        .deliver(&PasswordResetDelivery::new(email, token, expires_at))
+        .deliver(&PasswordResetDelivery::new(stored_login, token, expires_at))
         .await
         .map_err(|error| failed("password_reset_delivery_failed").with_source(error))
 }
@@ -593,6 +660,23 @@ async fn update_password(pages: Arc<Pages>, request: Request) -> Response {
         }
         Err(_) => return reset_page(unavailable("password_reset_throttle_unavailable")),
     }
+    // An unknown, used or expired token ends here, before the expensive
+    // password hash.
+    match ports.resets.is_redeemable(&token.digest(), now).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return reset_page(redirect(
+                NEW_PASSWORD_PATH,
+                Flash::new().with_alert(RESET_INVALID),
+            ));
+        }
+        Err(error) => {
+            return reset_page(unavailable_because(
+                "password_reset_store_unavailable",
+                error,
+            ));
+        }
+    }
 
     let mut errors = FieldErrors::new();
     let password = match NewPassword::new(form.password.as_str()) {
@@ -650,9 +734,10 @@ async fn update_password(pages: Arc<Pages>, request: Request) -> Response {
 
 /// The tenant named `tenant` when `principal` is an active member of it.
 ///
-/// The same lookups run whether or not the password was right (`None`
-/// looks up a random principal), so the response time does not tell a
-/// right password from a wrong one.
+/// The same lookups run whatever was typed and whether or not the password
+/// was right: a malformed organization looks up a random slug, an unknown
+/// one a random tenant, a wrong password a random principal, so the
+/// response time does not tell these cases apart.
 async fn active_tenant(
     ports: &AuthenticationPorts,
     tenant: &str,
@@ -665,26 +750,32 @@ async fn active_tenant(
             "service temporarily unavailable",
         )
     };
-    let Ok(slug) = TenantSlug::parse_input(tenant) else {
-        return Ok(None);
+    let slug = TenantSlug::parse_input(tenant);
+    let lookup = match &slug {
+        Ok(slug) => slug.clone(),
+        Err(_) => {
+            random_slug().map_err(|error| failed("tenant_slug_invalid").with_source(error))?
+        }
     };
-    let Some(tenant_id) = ports
+    let found = ports
         .tenants
-        .find_by_slug(&slug)
+        .find_by_slug(&lookup)
         .await
         .map_err(|error| failed("tenant_directory_unavailable").with_source(error))?
-    else {
-        return Ok(None);
-    };
-    // `PrincipalId::default()` is a new random UUIDv7 that matches nobody.
-    let candidate = principal.unwrap_or_default();
+        .filter(|_| slug.is_ok());
+    // `default()` ids are new random UUIDv7 values that match nothing.
     let active = ports
         .memberships
-        .find(tenant_id, candidate)
+        .find(found.unwrap_or_default(), principal.unwrap_or_default())
         .await
         .map_err(|error| failed("membership_store_unavailable").with_source(error))?
         .is_some_and(|membership| membership.state() == MembershipState::Active);
-    Ok((active && principal.is_some()).then_some(tenant_id))
+    Ok(found.filter(|_| active && principal.is_some()))
+}
+
+/// A valid slug no tenant has: `z` and 32 random hex digits.
+fn random_slug() -> Result<TenantSlug, forge::tenancy::TenantSlugError> {
+    TenantSlug::new(format!("z{}", TenantId::new().into_uuid().simple()))
 }
 
 /// Appends an audit event. A failed write is logged and does not change
@@ -791,9 +882,14 @@ fn local_path(candidate: Option<&str>) -> String {
 /// The identity a throttle counts attempts against, whether or not it exists.
 ///
 /// Passwords belong to the principal, not to a tenant, so the key is the
-/// login alone: changing the organization field does not reset the count.
-fn account_key(email: &str) -> String {
-    email.to_lowercase()
+/// canonical login alone: changing the organization field or the letter
+/// case does not reset the count. A login that is not canonical can match
+/// no account; it is counted by its trimmed text.
+fn account_key(login: Option<&CanonicalLogin>, typed: &str) -> String {
+    match login {
+        Some(login) => login.as_str().to_owned(),
+        None => format!("invalid\0{}", typed.trim()),
+    }
 }
 
 fn now() -> Option<UnixTimestamp> {

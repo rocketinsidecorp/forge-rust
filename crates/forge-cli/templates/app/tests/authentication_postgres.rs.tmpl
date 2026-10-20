@@ -18,7 +18,9 @@ use app::infrastructure::security::{
     Argon2idPasswordHasher, authenticate_password, issue_persisted_session,
 };
 use forge::CommandContext;
-use forge::auth::{PasswordHasher as _, PasswordResetToken, SessionStore as _, UnixTimestamp};
+use forge::auth::{
+    CanonicalLogin, PasswordHasher as _, PasswordResetToken, SessionStore as _, UnixTimestamp,
+};
 use forge::db::testing::TestDatabase;
 use forge::tenancy::{
     PasswordResetGrant, PasswordResetStore as _, TenantDirectory as _, TenantSlug,
@@ -125,6 +127,13 @@ async fn setup_creates_one_owner_who_can_sign_in_and_refuses_afterwards() -> Tes
     .fetch_one(&pool)
     .await?;
     assert_eq!(roles, vec![OWNER_ROLE.to_owned()]);
+    let stored: String = sqlx::query_scalar("SELECT login FROM forge_principals")
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(
+        stored, "owner@example.com",
+        "setup stores the canonical login"
+    );
     assert_eq!(state, "active");
     let counts: (i64, i64, i64) = sqlx::query_as(
         "SELECT
@@ -153,7 +162,7 @@ async fn concurrent_setups_create_exactly_one_tenant() -> TestResult {
         let account = OwnerAccount {
             tenant: TenantSlug::new(format!("tenant-{index}"))?,
             organization: format!("Tenant {index}"),
-            login: format!("owner{index}@example.com"),
+            login: CanonicalLogin::parse(&format!("owner{index}@example.com"))?,
             password_hash: password_hash.clone(),
             now: now()?,
         };
@@ -192,7 +201,7 @@ async fn reset_tokens_work_once_expire_and_revoke_every_session() -> TestResult 
         &OwnerAccount {
             tenant: TenantSlug::new("acme")?,
             organization: "Acme".to_owned(),
-            login: "owner@example.com".to_owned(),
+            login: CanonicalLogin::parse("owner@example.com")?,
             password_hash: Argon2idPasswordHasher.hash(PASSWORD.as_bytes()).await?,
             now,
         },
@@ -221,6 +230,17 @@ async fn reset_tokens_work_once_expire_and_revoke_every_session() -> TestResult 
     let new_hash = Argon2idPasswordHasher.hash(b"a brand new secret").await?;
 
     let after_expiry = UnixTimestamp::from_secs(now.as_secs() + 2);
+    assert!(resets.is_redeemable(&token.digest(), after_expiry).await?);
+    assert!(
+        !resets
+            .is_redeemable(&expired.digest(), after_expiry)
+            .await?
+    );
+    assert!(
+        !resets
+            .is_redeemable(&unrelated.digest(), after_expiry)
+            .await?
+    );
     assert_eq!(
         resets
             .redeem(&expired.digest(), after_expiry, &new_hash)
@@ -245,6 +265,7 @@ async fn reset_tokens_work_once_expire_and_revoke_every_session() -> TestResult 
             .await?,
         None
     );
+    assert!(!resets.is_redeemable(&token.digest(), after_expiry).await?);
 
     for issued in [first, second] {
         let session = sessions

@@ -330,8 +330,7 @@ pub(crate) fn authentication_compose_statements() -> Option<String> {
         .find(|template| template.path == "src/bootstrap/mod.rs")?;
     let rendered = render(bootstrap.content, &[], AUTHENTICATION_CONDITIONS);
     let start = rendered.find("    // Sign-in, sign-out")?;
-    let call =
-        "crate::adapters::http::authentication::routes(composition.router(), &site, ports)?;\n";
+    let call = "crate::adapters::http::authentication::routes(composition, &site, ports)?;\n";
     let end = start + rendered[start..].find(call)? + call.len();
     Some(rendered[start..end].to_owned())
 }
