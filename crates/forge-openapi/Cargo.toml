@@ -1,0 +1,21 @@
+[package]
+name = "forge-openapi"
+publish = false
+description = "OpenAPI 3.1 documents from typed Forge routes, without an HTTP dependency (ADR 0039)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# Id, Timestamp, Version and ErrorReport describe themselves here.
+forge-core = { path = "../forge-core" }
+forge-macros = { path = "../forge-macros" }
+serde_json.workspace = true
+
+[dev-dependencies]
+serde.workspace = true
+
+[lints]
+workspace = true
