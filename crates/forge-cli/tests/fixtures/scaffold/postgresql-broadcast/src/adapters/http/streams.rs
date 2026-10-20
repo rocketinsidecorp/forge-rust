@@ -212,10 +212,15 @@ impl StreamAccess for Readers {
                 .await
                 .map(|context| StreamViewer::member(&context))
                 .map_err(denied),
+            // A signed-in viewer is counted against its own stream limit;
+            // only anonymous viewers (of a public resource) share the limit
+            // of their address, which is the proxy's behind a reverse proxy.
             (Some(Reader::Global(access, permission)), None) => access
                 .authorize(request, &permission)
                 .await
-                .map(|()| StreamViewer::anonymous())
+                .map(|principal| {
+                    principal.map_or_else(StreamViewer::anonymous, StreamViewer::principal)
+                })
                 .map_err(denied),
             _ => Err(StreamDenied::Forbidden),
         }

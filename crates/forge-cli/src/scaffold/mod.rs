@@ -139,6 +139,16 @@ pub(crate) fn rustfmt(root: &Path, path: &str, source: &str) -> Result<String, C
     String::from_utf8(output.stdout).map_err(|error| failed(error.to_string()))
 }
 
+/// Whether the `GlobalAccess` trait of an existing access module has the
+/// current shape, returning the admitted principal (an `Option`), rather
+/// than the `Result<(), AccessDenied>` of applications generated before.
+fn global_access_returns_principal(access: &str) -> bool {
+    access
+        .split_once("pub trait GlobalAccess")
+        .and_then(|(_, rest)| rest.split_once('}'))
+        .is_some_and(|(declaration, _)| declaration.contains("Option<"))
+}
+
 fn unsupported<T>(reason: impl Into<String>) -> Result<T, CliError> {
     Err(CliError::Scaffold(reason.into()))
 }
@@ -243,6 +253,19 @@ fn inspect(root: &Path, resource: &Resource, broadcast: bool) -> Result<Applicat
                          it. Restore it or move your file aside"
                     ));
                 }
+            }
+            if (resource.scope == Scope::Global || broadcast)
+                && !global_access_returns_principal(&access)
+            {
+                return unsupported(format!(
+                    "`GlobalAccess::authorize` in {ACCESS_PATH} returns `Result<(), AccessDenied>`; \
+                     generated code now expects `Result<Option<PrincipalId>, AccessDenied>` (the \
+                     signed-in principal it admitted, `None` for an anonymous caller), so that \
+                     live-update streams limit each person rather than each address. Change the \
+                     trait, `DenyAll` and your own implementations (`Ok(())` becomes \
+                     `Ok(Some(principal_id))`, or `Ok(None)` for public access) and run the \
+                     scaffold again"
+                ));
             }
             true
         }

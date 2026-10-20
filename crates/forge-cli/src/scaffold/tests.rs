@@ -211,6 +211,34 @@ fn broadcast_needs_the_feature_and_an_intact_streams_module() {
 }
 
 #[test]
+fn an_access_module_whose_global_access_returns_no_principal_is_refused_with_instructions() {
+    let (_parent, root) = application(Database::Postgresql, true);
+    ok(&root, &event());
+    let access = fs::read_to_string(root.join(ACCESS_PATH)).unwrap_or_default();
+    let old = access.replace(
+        "Result<Option<PrincipalId>, AccessDenied>",
+        "Result<(), AccessDenied>",
+    );
+    assert_ne!(old, access);
+    fs::write(root.join(ACCESS_PATH), old).unwrap_or_else(|error| panic!("{error}"));
+
+    for refused in [
+        post(),
+        broadcasting(options("meeting", &["name:string"], Scope::Tenant)),
+    ] {
+        let reason = refusal(&root, &refused);
+        assert!(
+            reason.contains("Result<Option<PrincipalId>, AccessDenied>"),
+            "{reason}"
+        );
+    }
+    assert!(
+        ok(&root, &options("note", &["body:text"], Scope::Tenant)).reused_access,
+        "tenant scaffolds without live updates do not use GlobalAccess"
+    );
+}
+
+#[test]
 fn postgresql_global_post_matches_the_golden_output() {
     assert_golden("postgresql-post-global", Database::Postgresql, &[post()]);
 }

@@ -35,6 +35,9 @@ use forge::auth::{Session, UnixTimestamp};
 use forge::core::%%HTTP_TEST_CORE_IMPORTS%%;
 use forge::http::{HeaderMap, HeaderValue, Method, Request, Response, Router, StatusCode, header};
 use forge::security::Permission;
+%%if global%%
+use forge::security::PrincipalId;
+%%end%%
 %%if broadcast%%
 use forge::broadcast::Channel;
 %%end%%
@@ -197,8 +200,12 @@ struct AllowAll;
 
 #[async_trait]
 impl GlobalAccess for AllowAll {
-    async fn authorize(&self, _: &Request, _: &Permission) -> Result<(), AccessDenied> {
-        Ok(())
+    async fn authorize(
+        &self,
+        _: &Request,
+        _: &Permission,
+    ) -> Result<Option<PrincipalId>, AccessDenied> {
+        Ok(None)
     }
 }
 %%end%%
@@ -760,6 +767,82 @@ async fn streams_refuse_forged_unknown_and_unauthorized_subscriptions() -> TestR
     );
     Ok(())
 }
+%%if global%%
+
+/// Admits the principal named by the `x-principal` header, and callers
+/// without it as anonymous: a policy with signed-in and public readers.
+struct SignedInOrAnonymous;
+
+#[async_trait]
+impl GlobalAccess for SignedInOrAnonymous {
+    async fn authorize(
+        &self,
+        request: &Request,
+        _: &Permission,
+    ) -> Result<Option<PrincipalId>, AccessDenied> {
+        request
+            .headers()
+            .get("x-principal")
+            .map(|value| {
+                value
+                    .to_str()
+                    .ok()
+                    .and_then(|principal| principal.parse().ok())
+                    .ok_or(AccessDenied::Unauthenticated)
+            })
+            .transpose()
+    }
+}
+
+/// Opens the stream at `source` as `principal` (anonymous without one).
+/// Every test request comes from the same address, like browsers behind
+/// one reverse proxy.
+async fn subscribe_as(
+    harness: &Harness,
+    source: &str,
+    principal: Option<PrincipalId>,
+) -> Result<Response, Box<dyn Error>> {
+    let principal = principal.map(|principal| principal.to_string());
+    let headers: Vec<(&'static str, &str)> = principal
+        .iter()
+        .map(|principal| ("x-principal", principal.as_str()))
+        .collect();
+    Ok(harness
+        .router
+        .dispatch(request(Method::GET, source, &headers, "")?)
+        .await)
+}
+
+/// Signed-in viewers of the global channel each have their own stream limit,
+/// even from one address: behind a reverse proxy a per-address limit would
+/// refuse everyone once one person opened enough tabs.
+#[tokio::test]
+async fn signed_in_viewers_from_one_address_each_have_their_own_stream_limit() -> TestResult {
+    let harness = Harness::new(Arc::new(SignedInOrAnonymous))?;
+    let source = stream_source(
+        &harness
+            .streams
+            .source(&harness.channel()?)
+            .ok_or("signs")?,
+    )?;
+    let (first, second) = (PrincipalId::new(), PrincipalId::new());
+
+    let mut open = Vec::new();
+    for _ in 0..forge::broadcast::DEFAULT_MAX_PER_PRINCIPAL {
+        let stream = subscribe_as(&harness, &source, Some(first)).await?;
+        assert_eq!(stream.status(), StatusCode::OK);
+        open.push(stream);
+    }
+    let over = subscribe_as(&harness, &source, Some(first)).await?;
+    assert_eq!(over.status(), StatusCode::TOO_MANY_REQUESTS);
+
+    let other = subscribe_as(&harness, &source, Some(second)).await?;
+    assert_eq!(other.status(), StatusCode::OK, "another person has their own limit");
+    let anonymous = subscribe_as(&harness, &source, None).await?;
+    assert_eq!(anonymous.status(), StatusCode::OK, "anonymous viewers are counted by address");
+    Ok(())
+}
+%%end%%
 %%if tenant%%
 
 /// A tenant's stream never reaches another tenant: its token presented under

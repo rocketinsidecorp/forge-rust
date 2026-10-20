@@ -89,7 +89,13 @@ application says so, anonymous viewers. Denials are `401` or
 
 Generated applications reuse the resource's own access policy: a scaffold
 registers its channel with its `TenantAccess`/`GlobalAccess` and read
-permission; channels no resource registered are refused. Because tenant
+permission; channels no resource registered are refused. `GlobalAccess`
+returns the principal it admitted (`Option<PrincipalId>`), and the generated
+reader serves global channels to `StreamViewer::principal` when there is one,
+so signed-in viewers are limited per person, never by the address they share
+behind a proxy; only anonymous viewers of public resources are counted by
+address. (It returned `()` before; the scaffold refuses an older access
+module with the change to make.) Because tenant
 access in Forge-Rust is derived from the route (`/tenants/{tenant_id}/...`),
 tenant channels are served at `/tenants/{tenant_id}/streams` and global ones
 at `/streams` (Forge-Go: one `/streams` with the tenant in the request

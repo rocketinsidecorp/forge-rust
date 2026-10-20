@@ -182,7 +182,10 @@ cargo test
 The routes exist now but answer `403`: a global resource is wired with
 `DenyAll` until you choose who may use it. Replace it in `compose` with an
 implementation of `GlobalAccess`, for example one that admits signed-in
-operators with the generated `authenticate_request`:
+operators with the generated `authenticate_request`. It returns the principal
+it admitted (`Ok(None)` only for anonymous callers of a public resource), so
+that [live updates](#live-updates) limit each person's open streams rather
+than everyone behind one address:
 
 ```rust
 // src/adapters/http/access.rs (or a module of your own)
@@ -192,7 +195,11 @@ pub struct Operators {
 
 #[async_trait]
 impl GlobalAccess for Operators {
-    async fn authorize(&self, request: &Request, _: &Permission) -> Result<(), AccessDenied> {
+    async fn authorize(
+        &self,
+        request: &Request,
+        _: &Permission,
+    ) -> Result<Option<PrincipalId>, AccessDenied> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|elapsed| UnixTimestamp::from_secs(elapsed.as_secs()))
@@ -205,7 +212,7 @@ impl GlobalAccess for Operators {
             .map_err(|_| AccessDenied::Forbidden)?;
         // Your rule: may this principal read or change global rows?
         if is_operator(principal.principal_id()) {
-            Ok(())
+            Ok(Some(principal.principal_id()))
         } else {
             Err(AccessDenied::Forbidden)
         }
@@ -515,7 +522,9 @@ What protects a stream:
 - A tenant channel is never served to another tenant (`403 stream_forbidden`);
   the access policy decides first (`401`, `403`, `503`).
 - 16 open streams per principal (anonymous viewers per IP address, IPv6 per
-  `/64`) and 1 000 per tenant (`429 stream_limit`); 10 000 per process and
+  `/64`) and 1 000 per tenant (`429 stream_limit`). Generated streams count
+  global-channel viewers by the principal their `GlobalAccess` returns, so
+  signed-in people behind one proxy each have their own 16; 10 000 per process and
   1 000 per channel (`503 stream_unavailable`); 1 MiB per message.
 - A subscriber that falls 64 messages behind is dropped, never waited for;
   its browser reconnects. Streams end after 30 minutes (re-authorizing on
