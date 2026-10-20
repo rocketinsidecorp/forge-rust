@@ -357,8 +357,17 @@ Security behavior, all covered by the generated tests:
   the session the browser held;
 - a wrong organization, email or password, a disabled account and an
   inactive membership all answer the same; unknown logins still cost one
-  Argon2id hash; sign-in and reset attempts are throttled per account and
-  per socket peer (5 and 300 per 15 minutes, in process);
+  Argon2id hash; sign-in and reset attempts are throttled in process, per
+  15 minutes: 5 per login and source, 50 per login, 300 per source (IPv6
+  per /64);
+- logins are canonical (`forge::auth::CanonicalLogin`: trimmed, ASCII only,
+  lowercased); a non-ASCII address is an unknown account, so a look-alike
+  spelling can neither match nor get its own throttle count, and reset
+  links go to the login as stored, never as typed;
+- reset requests are handled by a bounded background queue owned by the
+  server's lifecycle, and the page never answers in less than 100 ms, so
+  timing does not tell whether an account exists; a reset submission is
+  checked for a known, unused, unexpired token before any Argon2id work;
 - reset tokens are 256-bit, single use, valid 15 minutes, bound to the
   account and tenant, stored as SHA-256 digests and never logged; the reset
   pages are `no-store` and `Referrer-Policy: no-referrer`;

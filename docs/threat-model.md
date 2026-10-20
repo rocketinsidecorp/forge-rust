@@ -219,7 +219,10 @@ commands, and the framework rules they rely on.
 
 | Threat | Control | Verification |
 | --- | --- | --- |
-| Online password guessing and credential stuffing | Attempts counted before any credential check per account (the login, whatever organization is typed, so rotating it does not reset the count) and per socket peer (`MemoryLoginThrottle`: 5 per account, 300 per source in 15 minutes); `429` with `Retry-After`; a full table refuses instead of evicting live counters; success clears only the account counter; Argon2id | `forge-auth` throttle tests; generated `attempts_are_throttled_even_with_the_right_password` |
+| Online password guessing and credential stuffing | Attempts counted before any credential check against the canonical login (whatever organization or letter case is typed), the source (socket peer, IPv6 per /64) and the pair: 5 per login and source, 50 per login, 300 per source in 15 minutes (`MemoryLoginThrottle`); `429` with `Retry-After`; success clears the pair and login counters, not the source; Argon2id | `forge-auth` throttle tests; generated `attempts_are_throttled_even_with_the_right_password`, `letter_case_and_unicode_variants_do_not_get_fresh_guesses` |
+| Throttle as a denial of service | One source cannot lock a login out for others (the tight limit is per login and source); a full table evicts the oldest idle counters instead of refusing everyone, and keeps blocking ones | `one_source_cannot_lock_a_login_out_for_other_sources`, `a_full_table_evicts_idle_counters_and_keeps_blocking_ones` |
+| Look-alike (Unicode) logins | `CanonicalLogin` refuses non-ASCII logins at the boundary (storage, lookup, throttle keys); reset links are delivered to the login as stored, never as typed | `forge-auth` login tests; `reset_links_go_to_the_stored_login_and_look_alikes_get_nothing` |
+| Timing oracle on reset requests and sign-in | Reset requests are queued to a bounded lifecycle-owned worker and answered after at least 100 ms; sign-in runs the tenant and membership lookups with random identifiers for malformed or unknown organizations; unknown reset tokens are refused before Argon2id | `reset_requests_take_the_same_minimum_time`, `sign_in_looks_up_a_membership_whatever_the_organization`, `unknown_reset_tokens_are_refused_before_hashing` |
 | Account and tenant enumeration | One `422` message for a wrong organization, email or password, a disabled account or an inactive membership; unknown logins still cost one Argon2id hash; reset requests answer the same `303` and flash whether or not the account exists or the link was delivered | `every_wrong_field_gets_the_same_answer`, `reset_requests_answer_the_same_whether_or_not_the_account_exists` |
 | Login CSRF and forged sign-out | Handlers refuse (`403`) unless `CsrfProtection` verified the request (`csrf_verified`); the sign-in form's token is issued before any session; sign-out also checks the session-bound CSRF token (ADR 0014) | `sign_in_without_the_csrf_token_is_forbidden`, `signing_out_needs_the_csrf_token_and_revokes_the_session` |
 | Session fixation and token planting | Sign-in issues a new server-side session and a new CSRF token in fresh cookies and revokes the session the browser held; sign-out and reset clear the session cookie and rotate the CSRF token | `signing_in_issues_a_fresh_session_and_csrf_token_and_returns_to_the_page`, `signing_in_again_revokes_the_previous_session` |
@@ -231,9 +234,14 @@ commands, and the framework rules they rely on.
 Residual risks: throttle counters live in one process (a restart or several
 replicas multiply the budget; a shared store is a follow-up); the source key
 is the socket peer, so clients behind one proxy share a budget and Forge does
-not trust `X-Forwarded-For`; a reset request for an existing account does
-more work (token insert, delivery) than for an unknown one, a timing
-difference bounded by the reset throttle; until a mailer adapter replaces
+not trust `X-Forwarded-For`; an attacker who controls 50 sources (or /64s)
+can still keep one known login throttled for 15 minutes at a time, and one
+with very many sources can fill the table with blocking counters, after
+which new attempts are refused until counters expire; a full reset queue
+drops requests (logged), so a flood can delay legitimate resets; the reset
+worker's database load still depends on whether accounts exist, observable
+only through server load; sign-in still does slightly more work (session
+issuance) when it succeeds; until a mailer adapter replaces
 `UndeliverablePasswordResets`, reset links are not delivered and the failure is
 only logged; MFA is not implemented; a session lasts 24 hours without
 idle expiry.

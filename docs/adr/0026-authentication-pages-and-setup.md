@@ -33,9 +33,12 @@ generator: the routes are application code the developer can read and
 change, not routes the framework mounts.
 
 - `forge-auth`: `LoginThrottle` and the bounded `MemoryLoginThrottle`
-  (SHA-256 keys per account and per socket peer; 5 and 300 attempts per 15
-  minutes; at most 20,000 keys, and a full table refuses new attempts rather
-  than evicting live counters); the `NewPassword` policy (12 characters,
+  (SHA-256 keys; per 15 minutes 5 attempts per login and source, 50 per
+  login, 300 per source, IPv6 counted per /64; at most 20,000 keys, and a
+  full table evicts the oldest counters that block nothing, refusing only
+  when every counter is blocking); `CanonicalLogin` (trimmed, ASCII only,
+  lowercased: the one form used for storage, lookup, throttling and
+  delivery; a non-ASCII login is an unknown account); the `NewPassword` policy (12 characters,
   at most 1024 bytes, no control characters); `PasswordResetToken` (256 bits
   from the OS CSPRNG, canonical hex, SHA-256 `PasswordResetTokenDigest`,
   redacted `Debug`); the `PasswordResetNotifier` port and its fail-closed
@@ -97,6 +100,14 @@ change, not routes the framework mounts.
   reset requests and reset submissions. The default is per process; a
   persistent shared throttle is a follow-up (there was no existing
   persistent pattern to follow).
+- **Reset requests are not timed by the account.** The page validates and
+  queues the request on a bounded `WorkQueue` (`Composition::work_queue`,
+  owned by the server's lifecycle, stopped at shutdown, full queue drops and
+  logs) and answers no sooner than 100 ms; the worker looks the account up,
+  issues the token and delivers it to the login as stored. Sign-in runs the
+  tenant and membership lookups with random identifiers when the
+  organization is malformed or unknown, and a reset submission checks the
+  token before Argon2id work.
 - **Reset delivery.** Forge has no mailer. The composition wires
   `UndeliverablePasswordResets`, which delivers nothing and returns
   `NotConfigured`; the failure is logged without the token and the page
