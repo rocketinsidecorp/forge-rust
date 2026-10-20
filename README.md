@@ -1,3 +1,5 @@
+<p align="center"><img src="crates/forge-cli/templates/app/assets/forge-rust-logo.svg" alt="Forge Rust — Rust Framework" width="280"></p>
+
 # Forge
 
 Forge is an opinionated Rust framework for long-lived services. It sets the
