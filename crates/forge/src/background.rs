@@ -118,8 +118,22 @@ impl JobsParts {
         }
     }
 
-    /// Builds the runtime over the runtime pool.
-    pub(crate) fn into_background(self, database: PgDatabase) -> Background {
+    /// Builds the runtime over the runtime pool, instrumented when telemetry
+    /// is on.
+    pub(crate) fn into_background(
+        self,
+        database: PgDatabase,
+        telemetry: Option<&forge_telemetry::Telemetry>,
+    ) -> Background {
+        let mut jobs = self.jobs;
+        if let Some(telemetry) = telemetry {
+            match telemetry.jobs() {
+                Ok(instrumentation) => {
+                    jobs.instrument(instrumentation);
+                }
+                Err(error) => warn!(%error, "job telemetry is not recorded"),
+            }
+        }
         #[cfg(feature = "events")]
         let dispatcher = self.events.and_then(|events| {
             let EventsSetup { publisher, settings } = events;
@@ -127,10 +141,18 @@ impl JobsParts {
                 warn!("App::events is declared but no composition hook set a publisher; the outbox will not be dispatched");
                 return None;
             };
-            Some(publisher(forge_events::postgres::PgOutboxStore::new(database.clone())).settings(settings))
+            let dispatcher = publisher(forge_events::postgres::PgOutboxStore::new(database.clone())).settings(settings);
+            Some(match telemetry.map(forge_telemetry::Telemetry::outbox) {
+                Some(Ok(instrumentation)) => dispatcher.instrument(instrumentation),
+                Some(Err(error)) => {
+                    warn!(%error, "outbox telemetry is not recorded");
+                    dispatcher
+                }
+                None => dispatcher,
+            })
         });
         Background {
-            jobs: self.jobs,
+            jobs,
             #[cfg(feature = "events")]
             dispatcher,
             database,

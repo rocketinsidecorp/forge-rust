@@ -29,6 +29,7 @@ mod compose;
 mod console;
 mod database;
 mod logging;
+mod observability;
 #[cfg(feature = "jobs")]
 mod operator;
 mod probe;
@@ -66,6 +67,10 @@ pub use forge_security as security;
 /// File storage, signed links and strict uploads (feature `storage`, ADR 0029).
 #[cfg(feature = "storage")]
 pub use forge_storage as storage;
+/// Traces, metrics and log export (ADR 0033): custom spans and
+/// application metrics through [`Composition::telemetry`]. Bootstrap and
+/// adapters only.
+pub use forge_telemetry as telemetry;
 pub use forge_tenancy as tenancy;
 /// Server-rendered views: HTML responses, CSRF protection, flash messages,
 /// digested assets, the import map and the Content-Security-Policy (feature

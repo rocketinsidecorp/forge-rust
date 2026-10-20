@@ -526,6 +526,7 @@ dependencies = [
  "forge-ratelimit",
  "forge-security",
  "forge-storage",
+ "forge-telemetry",
  "forge-tenancy",
  "forge-views",
  "rustix",

@@ -32,6 +32,7 @@ pub struct Composition<'a> {
     database: Option<DatabaseHandle>,
     workers: Vec<Worker>,
     shutdown: Cancellation,
+    telemetry: Option<forge_telemetry::Telemetry>,
     #[cfg(feature = "jobs")]
     jobs: Option<&'a mut forge_jobs::Jobs>,
     #[cfg(feature = "events")]
@@ -44,6 +45,7 @@ impl<'a> Composition<'a> {
         config: &'a AppConfig,
         database: Option<DatabaseHandle>,
         shutdown: Cancellation,
+        telemetry: Option<forge_telemetry::Telemetry>,
     ) -> Self {
         Self {
             router,
@@ -51,6 +53,7 @@ impl<'a> Composition<'a> {
             database,
             workers: Vec::new(),
             shutdown,
+            telemetry,
             #[cfg(feature = "jobs")]
             jobs: None,
             #[cfg(feature = "events")]
@@ -225,6 +228,17 @@ impl<'a> Composition<'a> {
         })
     }
 
+    /// The process telemetry (ADR 0033), `None` when
+    /// `FORGE_TELEMETRY_ENABLED=false`: register application metrics on
+    /// [`Telemetry::metrics`](forge_telemetry::Telemetry::metrics) and start
+    /// spans with [`Telemetry::tracer`](forge_telemetry::Telemetry::tracer),
+    /// parented by [`Request::trace_context`](forge_http::Request::trace_context).
+    /// Bootstrap and adapters only; domain and application code never see it.
+    #[must_use]
+    pub fn telemetry(&self) -> Option<&forge_telemetry::Telemetry> {
+        self.telemetry.as_ref()
+    }
+
     /// Returns the route table for registering application routes.
     pub fn router(&mut self) -> &mut Router {
         self.router
@@ -314,7 +328,14 @@ impl<'a> Composition<'a> {
     /// `forge::db::testing::TestDatabase::database`.
     #[must_use]
     pub fn for_testing(config: &'a AppConfig, router: &'a mut Router) -> Self {
-        Self::new(router, config, None, Cancellation::new())
+        Self::new(router, config, None, Cancellation::new(), None)
+    }
+
+    /// Makes `telemetry` available through [`Composition::telemetry`].
+    #[must_use]
+    pub fn with_telemetry(mut self, telemetry: forge_telemetry::Telemetry) -> Self {
+        self.telemetry = Some(telemetry);
+        self
     }
 
     /// Uses `shutdown` as the process shutdown signal, so a test can begin

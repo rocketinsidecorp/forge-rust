@@ -271,6 +271,22 @@ Environment:
   FORGE_STORAGE_MAX_UPLOAD_BYTES largest uploaded file (default: 524288)
   FORGE_STORAGE_LINK_TTL_SECS default signed link lifetime (default: 900)
   FORGE_STREAMS_KEY           base64 of 32+ bytes signing live-update stream names; required in production when streams are served
+  FORGE_TELEMETRY_ENABLED     false installs no tracing, metrics or log export (default: true)
+  FORGE_TELEMETRY_SERVICE_NAME    service.name (default: the application name)
+  FORGE_TELEMETRY_SERVICE_VERSION service.version (default: the application version)
+  FORGE_TELEMETRY_EXPORTER    none | otlp | log (spans and pushed metrics; log is refused in production; default: none)
+  FORGE_TELEMETRY_LOGS_EXPORTER   none | otlp (log records, in addition to stdout; default: none)
+  FORGE_TELEMETRY_LOGS_LEVEL  debug | info | warn | error, lowest exported level (default: info)
+  FORGE_TELEMETRY_OTLP_ENDPOINT   collector base URL; https required in production
+  FORGE_TELEMETRY_OTLP_HEADERS    name=value pairs, values percent-encoded and secret
+  FORGE_TELEMETRY_OTLP_TIMEOUT    export deadline, retries included, at most 1m (default: 10s)
+  FORGE_TELEMETRY_OTLP_COMPRESSION none | gzip (default: none)
+  FORGE_TELEMETRY_OTLP_ALLOW_PLAINTEXT true permits an http:// endpoint in production
+  FORGE_TELEMETRY_SAMPLE_RATIO    fraction of new traces sampled, 0 to 1 (default: 1)
+  FORGE_TELEMETRY_TRUST_TRACEPARENT true continues incoming traceparent (default: false)
+  FORGE_TELEMETRY_METRICS_ADDR    separate Prometheus listener serving GET /metrics (default: off)
+  FORGE_TELEMETRY_METRICS_PUBLIC  true confirms a non-loopback metrics address
+  FORGE_TELEMETRY_METRICS_INTERVAL OTLP metric push interval, at least 1s (default: 1m)
 
 Unknown FORGE_* variables are rejected at startup.
 "
