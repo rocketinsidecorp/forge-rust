@@ -175,6 +175,15 @@ forge generate scaffold post title:string body:text? published:boolean --global
 forge generate scaffold person name:string --tenant-scoped --plural people
 forge generate scaffold post title:string --global --dry-run
 forge generate scaffold event name:string starts_at:timestamp --tenant-scoped --broadcast  # live updates
+forge generate model book title:string 'pages:integer?' --global   # migration, entity, port, use cases, repository, tests
+forge generate controller pages index about_us --public            # read-only GET pages, views and tests
+forge generate controller reports monthly                          # guarded by reports:read (DenyAll until you decide)
+forge generate controller status_checks index --api                # JSON endpoints under /v1
+forge generate mailer user welcome:name,url password_reset         # typed emails, templates, /_mail/user previews
+forge generate job send_welcome user_id:uuid 'note:string?' --queue  # persistent PostgreSQL queue job
+forge destroy controller pages index about_us --public --dry-run   # what destroy would remove
+forge destroy controller pages index about_us --public             # removes only files still as generated
+forge rollback && forge destroy model book title:string 'pages:integer?' --global --migrations
 forge version                                  # the CLI version (also forge --version)
 forge doctor                                   # toolchain, FORGE_* settings, is the database server answering?
 forge doctor --json                            # versioned, secret-free report for scripts and CI
@@ -357,7 +366,17 @@ for how logs reach Loki and what the dashboard shows.
 
 Enable the `jobs` (and optionally `events`) feature of `forge`, declare them on
 the `App`, and register handlers in a composition hook. Generated applications
-do not include this wiring yet. Full guide: [docs/jobs.md](docs/jobs.md).
+do not include this wiring yet; `forge generate job` writes a typed job and
+prints exactly these steps ([generators](docs/generators.md#job)). Full guide:
+[docs/jobs.md](docs/jobs.md).
+
+```sh
+forge generate job send_welcome user_id:uuid 'note:string?' --queue
+# add the printed module lines, `register(composition.jobs()?)`, `.jobs(...)` and the
+# `jobs` feature, write `perform`, then:
+forge migrate && forge test
+cargo run -- jobs status
+```
 
 ```toml
 # Cargo.toml of the application (jobs and the outbox need PostgreSQL)
@@ -470,6 +489,11 @@ Kubernetes and systemd deployment is covered in
   digest-only persisted
   sessions, tenant membership persistence, append-only PostgreSQL audit storage,
   a health-ordered Compose database, and `forge generate migration <name>`.
+- `forge generate model|controller|mailer|job --queue` and `forge destroy`
+  ([generators](docs/generators.md), [ADR 0038](docs/adr/0038-generators-and-destroy.md)):
+  the rest of `rails g` in the hexagonal rings, with printed wiring, one owner
+  per permission, and a `rails d` that removes only files still identical to
+  what the generator writes and keeps migrations unless `--migrations`.
 - `forge generate scaffold <name> field:type... --global|--tenant-scoped`:
   migration, entity, port, use cases, SQLx repository, HTML handlers, views
   and tests for the application's backend, deny-by-default access, tenant
@@ -518,6 +542,17 @@ FORGE_MAIL_PREVIEW=true cargo run
 export FORGE_MAIL_URL='smtps://user:password@smtp.example.com:465'
 export FORGE_MAIL_FROM="Shop <no-reply@example.com>"
 export FORGE_AUTH_PASSWORD_RESET_URL=https://shop.example.com/passwords/edit
+```
+
+Generate a typed mailer with subject, text and HTML templates, previews and
+tests ([generators](docs/generators.md#mailer)):
+
+```sh
+forge generate mailer user welcome:name,url password_reset
+# add the printed module line and `fn compose` lines, then:
+forge test
+FORGE_MAIL_URL=file:tmp/mail FORGE_MAIL_FROM='Shop <shop@example.com>' FORGE_MAIL_PREVIEW=true forge dev
+# open http://127.0.0.1:3000/_mail/user
 ```
 
 Send your own email through the port:

@@ -46,6 +46,10 @@ operator commands.
 
 ## Define a job and its handler
 
+`forge generate job NAME [field:type...] --queue` writes the job, its
+handler, `register`, `enqueue` and tests, and prints the wiring below
+([generators](generators.md#job)). By hand:
+
 ```rust
 use std::time::Duration;
 

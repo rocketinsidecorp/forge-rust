@@ -18,7 +18,7 @@ the work is finished and waiting for its review; **Planned** means not started.
 | Multi-tenancy with database enforcement | (gems) | Done (PostgreSQL RLS) | Done (PostgreSQL RLS) |
 | TOTP MFA | (gems) | Done | Planned |
 | Persistent jobs, cron, outbox | Solid Queue | Done | Done (framework crates; `forge new` wiring planned) |
-| Mailer with previews | Action Mailer | Done | Done (`forge::mail`, password-reset emails, `/_mail` previews, [ADR 0035](adr/0035-mail.md); `forge generate mailer` with the generators in [forge-rust#15](https://github.com/rocketinsidecorp/forge-rust/issues/15)) |
+| Mailer with previews | Action Mailer | Done | Done (`forge::mail`, password-reset emails, `/_mail` previews, [ADR 0035](adr/0035-mail.md); `forge generate mailer`, [ADR 0038](adr/0038-generators-and-destroy.md)) |
 | Rate limiting | `rate_limit` | Done | Done |
 | Client address behind trusted proxies | `request.remote_ip`, `trusted_proxies` | Done (`FORGE_HTTP_TRUSTED_PROXIES`, ADR 0037) | Done (`FORGE_HTTP_TRUSTED_PROXIES`, ADR 0032; `forge deploy` sets it once ported) |
 | Cache | Solid Cache | Done | Done |
@@ -32,7 +32,8 @@ the work is finished and waiting for its review; **Planned** means not started.
 | Encrypted credentials, attribute encryption | `credentials:edit`, AR Encryption | In review | Planned |
 | i18n | I18n | Done (`config/locales/*.json`, `t`, CLDR plurals, `forge new --locale`, `forge i18n check`, Forge-Go ADR 0042) | Done (`config/locales/*.json`, `layout.i18n.t`, CLDR plurals, `forge new --locale`, `forge i18n check`, [ADR 0037](adr/0037-internationalization.md), [i18n](i18n.md)) |
 | OpenAPI from typed routes | — | Planned | Planned |
-| Controller, model and mailer generators | `rails g` | Planned | Planned |
+| Controller, model, mailer and job generators | `rails g` | Done (Forge-Go ADR 0041) | Done (`forge generate model\|controller\|mailer\|job --queue`, [ADR 0038](adr/0038-generators-and-destroy.md), [generators](generators.md)) |
+| Undo a generator | `rails d` | Done (`forge destroy`, Forge-Go ADR 0041) | Done (`forge destroy`, [ADR 0038](adr/0038-generators-and-destroy.md)) |
 | Continuous fuzzing, SBOM, signed images | — | Planned | Planned |
 | Published benchmarks | — | Planned | Planned |
 | Getting Started guide | Rails Guides | Planned | Planned |
@@ -76,7 +77,7 @@ the work is finished and waiting for its review; **Planned** means not started.
   `.env.development`/`.env.local` files in `forge dev` and the lifecycle
   commands together with generating them. Planned right after the generators
   ([forge-rust#15](https://github.com/rocketinsidecorp/forge-rust/issues/15)).
-  `forge inspect`, `destroy`, `deploy`, `logs`, `app` and `credentials`
+  `forge inspect`, `deploy`, `logs`, `app` and `credentials`
   stay "Planned" in the table above. Forge-Go reads the target
   database of `db create|drop` from `FORGE_DATABASE_URL` and the credentials
   from `FORGE_MIGRATION_DATABASE_URL`; Forge-Rust uses
