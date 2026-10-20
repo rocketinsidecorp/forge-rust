@@ -44,7 +44,10 @@ middleware trait, without tower.
    HTML-escaped unless passed as markup; a missing `_html` key is never
    markup.
 3. **CLDR 46 cardinal plural rules: Forge-Go's table and samples, one to
-   one** (`forge_i18n::plural_rule_for`, custom rules with
+   one**, including Arabic on n (`0.0`, `1.0`, `2.0` and `103.0` are zero,
+   one, two and few, `n % 100` exact past 2^53), Norwegian on `n = 1`, and
+   NaN and infinity as `other` in every locale through one guard in front of
+   built-in and custom rules (`forge_i18n::plural_rule_for`, custom rules with
    `Options::plural_rule`), including the explicit `zero` form and the
    fallback to `other`.
 4. **Negotiation: Forge-Go's order and limits.** Path prefix (opt-in),
@@ -118,6 +121,21 @@ middleware trait, without tower.
 - **Headers** are set by the negotiation layer for responses that used the
   binding, instead of by the renderer; `set_content_language` covers a
   translated response built another way.
+- **Path prefix and security layers.** Layers registered before
+  `LocaleNegotiation` see the prefixed path, so path-sensitive security
+  layers go after it (`Router::layer` runs in registration order), as in
+  Forge-Go's `App.Use` after the i18n middleware. The layer keeps the removed
+  segment as a request extension holding the locale's canonical name, read
+  with `forge_views::path_prefix` (Forge-Go: `i18n.PathPrefix`), and
+  `SignInRedirect` puts it back in `return_to` only when the result still
+  passes `return_path`.
+- **`LocaleNegotiation::negotiate` and `Vary`.** Decision: documented, not
+  marked. `negotiate` takes a request and returns a locale; it has no
+  response, so it cannot mark one, and a hidden side effect on a shared flag
+  would mark responses that never used the locale. A handler that branches on
+  it calls `set_content_language` (or adds the `Vary`) itself. Forge-Go's
+  `Translator.Negotiate` has the same gap and the same answer for now
+  (`SetHeaders` marks a response); the two stay in step.
 - **Path prefix and the raw path.** `http::Uri` keeps only the escaped
   path, which is what routing matches, so the locale segment is read from
   the escaped path: `/pt-BR%2F..%2Fadmin` has no locale segment and is left
@@ -155,7 +173,11 @@ middleware trait, without tower.
   "must not be blank") and the scaffold's Yes/No and RFC 3339 values are
   English, as in Forge-Go.
 - Mailer templates with the recipient's locale; a `locale_path` helper for
-  path-prefix applications; `forge destroy` (with the generators,
+  path-prefix applications (the sign-in return path already keeps the
+  prefix); `forge destroy` (with the generators,
   [forge-rust#15](https://github.com/rocketinsidecorp/forge-rust/issues/15)).
+- Nothing enforces that path-sensitive security layers are registered after
+  the negotiation layer (the same in Forge-Go); a typed layer order or a
+  start-up check would, and needs a design of its own.
 - Broadcast fragments render in the default locale for every subscriber, as
   in Forge-Go and Rails.
