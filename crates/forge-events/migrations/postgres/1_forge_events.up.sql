@@ -5,7 +5,8 @@
 -- The runtime role (`forge.runtime_role`, default `app_runtime`) may append
 -- events under row-level security and record processed events in the inbox;
 -- dispatching and the operator commands go through SECURITY DEFINER
--- functions.
+-- functions granted to the worker role (`forge.worker_role`, default: the
+-- runtime role).
 
 CREATE TABLE forge_outbox_events (
     id uuid PRIMARY KEY,
@@ -83,6 +84,21 @@ CREATE TABLE forge_inbox (
 
 CREATE INDEX forge_inbox_processed_idx ON forge_inbox (processed_at);
 
+-- Cross-tenant operations are refused inside a tenant-scoped (request
+-- serving) transaction: defense in depth against application code calling
+-- worker or operator functions on behalf of a tenant.
+CREATE FUNCTION forge_outbox_require_worker_scope()
+RETURNS void
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    IF nullif(current_setting('forge.tenant_id', true), '') IS NOT NULL THEN
+        RAISE EXCEPTION 'forge outbox functions are not available in a tenant-scoped transaction'
+            USING ERRCODE = '42501';
+    END IF;
+END;
+$$;
+
 -- Claims up to p_limit committed, due events in id (time) order. Expired
 -- leases go back to pending first, or to dead when p_max_attempts is spent.
 CREATE FUNCTION forge_outbox_claim(
@@ -105,6 +121,7 @@ SECURITY DEFINER
 AS $$
 #variable_conflict use_column
 BEGIN
+    PERFORM forge_outbox_require_worker_scope();
     IF p_limit IS NULL OR p_limit < 1 OR p_limit > 1000
         OR p_lease_ms IS NULL OR p_lease_ms < 1000 OR p_lease_ms > 86400000
         OR p_max_attempts IS NULL OR p_max_attempts < 1
@@ -156,6 +173,7 @@ RETURNS boolean
 LANGUAGE sql
 SECURITY DEFINER
 AS $$
+    SELECT forge_outbox_require_worker_scope();
     WITH done AS (
         UPDATE forge_outbox_events
         SET state = 'published',
@@ -182,6 +200,7 @@ RETURNS text
 LANGUAGE sql
 SECURITY DEFINER
 AS $$
+    SELECT forge_outbox_require_worker_scope();
     UPDATE forge_outbox_events
     SET state = CASE WHEN p_discard OR attempts >= p_max_attempts THEN 'dead' ELSE 'pending' END,
         available_at = now() + least(greatest(p_retry_in_ms, 0), 31536000000) * interval '1 millisecond',
@@ -198,6 +217,7 @@ RETURNS boolean
 LANGUAGE sql
 SECURITY DEFINER
 AS $$
+    SELECT forge_outbox_require_worker_scope();
     WITH released AS (
         UPDATE forge_outbox_events
         SET state = 'pending',
@@ -216,6 +236,7 @@ RETURNS boolean
 LANGUAGE sql
 SECURITY DEFINER
 AS $$
+    SELECT forge_outbox_require_worker_scope();
     WITH retried AS (
         UPDATE forge_outbox_events
         SET state = 'pending', attempts = 0, available_at = now()
@@ -237,6 +258,7 @@ RETURNS TABLE (
 LANGUAGE sql
 SECURITY DEFINER
 AS $$
+    SELECT forge_outbox_require_worker_scope();
     SELECT o.id, o.tenant_id, o.event_type, o.version, o.attempts, o.last_error
     FROM forge_outbox_events AS o
     WHERE o.state = 'dead' AND (p_before IS NULL OR o.id < p_before)
@@ -256,6 +278,7 @@ DECLARE
     deleted bigint;
     inbox_deleted bigint := 0;
 BEGIN
+    PERFORM forge_outbox_require_worker_scope();
     WITH doomed AS MATERIALIZED (
         SELECT o.id
         FROM forge_outbox_events AS o
@@ -291,10 +314,16 @@ REVOKE ALL ON TABLE forge_inbox FROM PUBLIC;
 DO $$
 DECLARE
     schema_name text := current_schema();
-    explicit_role text := nullif(current_setting('forge.runtime_role', true), '');
-    runtime_role text := coalesce(explicit_role, 'app_runtime');
+    explicit_runtime text := nullif(current_setting('forge.runtime_role', true), '');
+    explicit_worker text := nullif(current_setting('forge.worker_role', true), '');
+    runtime_role text := coalesce(explicit_runtime, 'app_runtime');
+    worker_role text;
+    grantee text;
     fn regprocedure;
 BEGIN
+    -- SECURITY DEFINER functions run with the owner's rights: pin their
+    -- search path to this schema (pg_temp last) and revoke the default
+    -- EXECUTE from PUBLIC.
     FOR fn IN
         SELECT p.oid::regprocedure
         FROM pg_proc AS p
@@ -305,32 +334,47 @@ BEGIN
         EXECUTE format('REVOKE ALL ON FUNCTION %s FROM PUBLIC', fn);
     END LOOP;
 
-    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = runtime_role) THEN
-        IF explicit_role IS NOT NULL THEN
-            RAISE EXCEPTION 'forge.runtime_role names a role that does not exist';
-        END IF;
-        RETURN;
+    IF explicit_runtime IS NOT NULL
+        AND NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = explicit_runtime)
+    THEN
+        RAISE EXCEPTION 'forge.runtime_role names a role that does not exist';
     END IF;
+    IF explicit_worker IS NOT NULL
+        AND NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = explicit_worker)
+    THEN
+        RAISE EXCEPTION 'forge.worker_role names a role that does not exist';
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = runtime_role) THEN
+        runtime_role := NULL;
+    END IF;
+    -- Without a separate worker role (`forge.worker_role`), the runtime role
+    -- also runs the workers and operator commands.
+    worker_role := coalesce(explicit_worker, runtime_role);
 
-    EXECUTE format('REVOKE ALL ON TABLE forge_outbox_events, forge_inbox FROM %I', runtime_role);
-    -- Append columns only: delivery state always starts from its defaults.
-    EXECUTE format('GRANT SELECT ON TABLE forge_outbox_events, forge_inbox TO %I', runtime_role);
-    EXECUTE format(
-        'GRANT INSERT (id, tenant_id, event_type, version, payload, occurred_at) '
-        'ON TABLE forge_outbox_events TO %I',
-        runtime_role
-    );
-    EXECUTE format('GRANT INSERT (consumer, event_id) ON TABLE forge_inbox TO %I', runtime_role);
-    FOR fn IN
-        SELECT p.oid::regprocedure
-        FROM pg_proc AS p
-        WHERE p.proname LIKE 'forge\_outbox\_%'
-          AND p.pronamespace = schema_name::regnamespace
-    LOOP
-        EXECUTE format('GRANT EXECUTE ON FUNCTION %s TO %I', fn, runtime_role);
+    FOREACH grantee IN ARRAY array_remove(ARRAY[runtime_role, worker_role], NULL) LOOP
+        EXECUTE format('REVOKE ALL ON TABLE forge_outbox_events, forge_inbox FROM %I', grantee);
+        -- Append columns only: delivery state always starts from its defaults.
+        EXECUTE format('GRANT SELECT ON TABLE forge_outbox_events, forge_inbox TO %I', grantee);
+        EXECUTE format(
+            'GRANT INSERT (id, tenant_id, event_type, version, payload, occurred_at) '
+            'ON TABLE forge_outbox_events TO %I',
+            grantee
+        );
+        EXECUTE format('GRANT INSERT (consumer, event_id) ON TABLE forge_inbox TO %I', grantee);
+        IF to_regclass('_forge_events_migrations') IS NOT NULL THEN
+            EXECUTE format('REVOKE ALL ON TABLE _forge_events_migrations FROM %I', grantee);
+        END IF;
     END LOOP;
-    IF to_regclass('_forge_events_migrations') IS NOT NULL THEN
-        EXECUTE format('REVOKE ALL ON TABLE _forge_events_migrations FROM %I', runtime_role);
+
+    IF worker_role IS NOT NULL THEN
+        FOR fn IN
+            SELECT p.oid::regprocedure
+            FROM pg_proc AS p
+            WHERE p.proname LIKE 'forge\_outbox\_%'
+              AND p.pronamespace = schema_name::regnamespace
+        LOOP
+            EXECUTE format('GRANT EXECUTE ON FUNCTION %s TO %I', fn, worker_role);
+        END LOOP;
     END IF;
 END
 $$;

@@ -6,5 +6,7 @@ DROP FUNCTION IF EXISTS forge_outbox_fail(uuid, uuid, text, bigint, integer, boo
 DROP FUNCTION IF EXISTS forge_outbox_published(uuid, uuid);
 DROP FUNCTION IF EXISTS forge_outbox_claim(integer, uuid, bigint, integer);
 
+DROP FUNCTION IF EXISTS forge_outbox_require_worker_scope();
+
 DROP TABLE IF EXISTS forge_inbox;
 DROP TABLE IF EXISTS forge_outbox_events;

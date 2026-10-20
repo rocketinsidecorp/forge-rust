@@ -257,21 +257,35 @@ every consumer must use the inbox. Any broker adapter can implement
 
 The schemas are embedded migrations with their own bookkeeping tables
 (`_forge_jobs_migrations`, `_forge_events_migrations`); `rollback` reverts
-only application migrations. They grant the runtime role (ADR 0011):
+only application migrations. Grants (ADR 0011):
 
-| Object | Runtime role |
-| --- | --- |
-| `forge_jobs`, `forge_outbox_events` | `SELECT, INSERT`, filtered by RLS to the transaction's tenant scope |
-| `forge_job_schedules`, `forge_inbox` | `SELECT, INSERT` (+ `UPDATE` on schedules) |
-| `forge_jobs_*`, `forge_outbox_*` functions | `EXECUTE` (claim, lease, ack, operator queries; `SECURITY DEFINER`, pinned `search_path`) |
-| bookkeeping tables | none |
+| Object | Runtime role (serves requests) | Worker role (runs `jobs work`, operator commands) |
+| --- | --- | --- |
+| `forge_jobs`, `forge_outbox_events` | `SELECT` and `INSERT` on the enqueue/append columns only, filtered by RLS to the transaction's tenant scope | same |
+| `forge_inbox` | `SELECT`, `INSERT (consumer, event_id)` | same |
+| `forge_job_schedules` | none (only through `forge_jobs_fire_tick`) | none |
+| `forge_jobs_*`, `forge_outbox_*` functions | `forge_jobs_complete` only | all (`SECURITY DEFINER`, pinned `search_path`) |
+| bookkeeping tables | none | none |
 
-The runtime role is `app_runtime` unless the database names another one
-before migrating:
+By default there is a single role, `app_runtime`, which then also gets the
+worker column. The worker functions are cross-tenant: claims return every
+tenant's payloads, `stats`/`dead` other tenants' metadata. They refuse to run
+in a transaction that carries `forge.tenant_id` (a request-serving scope),
+and a separate worker role keeps them away from the serving process
+entirely:
 
 ```sql
-ALTER DATABASE shop SET forge.runtime_role = 'shop_runtime';
+-- as the migration role, before `migrate`
+ALTER DATABASE shop SET forge.runtime_role = 'shop_runtime'; -- default app_runtime
+ALTER DATABASE shop SET forge.worker_role  = 'shop_worker';  -- default: the runtime role
+-- the worker role usually also needs the application's own table grants:
+-- GRANT shop_runtime TO shop_worker;
 ```
+
+Then run `serve` with `App::jobs(WorkerMode::Dedicated)` and the runtime
+role's `FORGE_DATABASE_URL`, and `jobs work` / the operator commands with
+the worker role's `FORGE_DATABASE_URL`. Both settings must name existing
+roles, or the migration fails.
 
 ## Tests
 

@@ -253,7 +253,9 @@ async fn schema_reverts_cleanly_and_grants_least_privilege() {
     }
     let definer: Vec<String> = sqlx::query_scalar(
         "SELECT proname::text FROM pg_proc
-         WHERE proname LIKE 'forge\\_jobs\\_%' AND (NOT prosecdef OR proconfig IS NULL)",
+         WHERE proname LIKE 'forge\\_jobs\\_%'
+           AND (proconfig IS NULL
+                OR (NOT prosecdef AND proname <> 'forge_jobs_require_worker_scope'))",
     )
     .fetch_all(db.admin().pool())
     .await
@@ -1196,5 +1198,90 @@ async fn the_database_enforces_enqueue_columns_payload_size_and_reserved_keys() 
         .await
         .expect("count");
     assert_eq!(total, 0);
+    db.cleanup().await.expect("cleanup");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs FORGE_TEST_DATABASE_URL"]
+async fn worker_functions_refuse_tenant_scope_and_can_be_split_from_the_runtime_role() {
+    let db = RlsTestDatabase::create_with_worker(&[migrator()])
+        .await
+        .expect(IGNORE);
+    let names = vec![Count::NAME.to_owned()];
+    let lease = Duration::from_secs(5);
+
+    // The request-serving runtime role enqueues but cannot claim or inspect.
+    let serving = PgJobStore::new(db.runtime().clone());
+    let first = serving
+        .enqueue(&Count { n: 1 }, EnqueueOptions::new())
+        .await
+        .expect("enqueue")
+        .id();
+    assert!(
+        serving
+            .claim("default", &names, 1, lease, LeaseToken::new())
+            .await
+            .is_err()
+    );
+    assert!(serving.stats().await.is_err());
+    assert!(serving.dead(10, None).await.is_err());
+
+    // Even the worker role is refused inside a tenant-scoped transaction.
+    let alpha = tenant_context();
+    for sql in [
+        "SELECT count(*) FROM forge_jobs_stats()",
+        "SELECT count(*) FROM forge_jobs_dead(10, NULL)",
+        "SELECT count(*) FROM forge_jobs_claim('default', ARRAY['test.count'], 1, '01a1567c-bf31-73d9-966c-0123456789ab', 5000)",
+        "SELECT count(*) FROM forge_jobs_prune(0, NULL, 10)",
+    ] {
+        let mut transaction = scoped(db.worker(), Some(&alpha)).await;
+        let refused = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql))
+            .fetch_one(transaction.connection())
+            .await;
+        assert!(refused.is_err(), "{sql} must be refused in tenant scope");
+    }
+
+    // The worker role claims; the runtime role still completes in its own
+    // transaction (complete_in) with the lease token.
+    let worker = PgJobStore::new(db.worker().clone());
+    let token = LeaseToken::new();
+    let claimed = worker
+        .claim("default", &names, 1, lease, token)
+        .await
+        .expect("claim");
+    assert_eq!(claimed[0].id, first);
+    let context = JobContext::new(
+        first,
+        Count::NAME,
+        "default",
+        1,
+        10,
+        None,
+        token,
+        Cancellation::new(),
+    );
+    let mut transaction = begin_job_transaction(db.runtime(), &context)
+        .await
+        .expect("begin");
+    complete_in(&mut transaction, &context)
+        .await
+        .expect("complete_in as runtime");
+    transaction.commit().await.expect("commit");
+
+    // A full runtime on the worker pool processes jobs.
+    let second = serving
+        .enqueue(&Count { n: 2 }, EnqueueOptions::new())
+        .await
+        .expect("enqueue")
+        .id();
+    let mut jobs = Jobs::new();
+    jobs.register(Counter::default()).expect("register");
+    jobs.settings(fast());
+    let (shutdown, handle) = spawn_runtime(jobs, db.worker());
+    wait_until("the worker role to run the job", || async {
+        job_row(&db, second).await.state == "completed"
+    })
+    .await;
+    stop(shutdown, handle).await;
     db.cleanup().await.expect("cleanup");
 }

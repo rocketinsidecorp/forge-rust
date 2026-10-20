@@ -11,5 +11,7 @@ DROP FUNCTION IF EXISTS forge_jobs_complete(uuid, uuid);
 DROP FUNCTION IF EXISTS forge_jobs_heartbeat(uuid[], uuid[], bigint);
 DROP FUNCTION IF EXISTS forge_jobs_claim(text, text[], integer, uuid, bigint);
 
+DROP FUNCTION IF EXISTS forge_jobs_require_worker_scope();
+
 DROP TABLE IF EXISTS forge_job_schedules;
 DROP TABLE IF EXISTS forge_jobs;

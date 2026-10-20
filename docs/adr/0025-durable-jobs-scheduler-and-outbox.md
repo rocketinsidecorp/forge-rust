@@ -59,15 +59,21 @@ queue; unbounded retention; payload data leaking into logs.
    `principal_id` for jobs) with an RLS policy equal to ADR 0011's: a
    transaction sees and writes exactly the rows of its
    `forge.tenant_id` scope (global rows when unset); a malformed setting
-   fails the statement. The runtime role has only `SELECT, INSERT` on these
-   tables. Cross-tenant operations (claim, heartbeat, complete, fail,
-   release, retry, discard, dead listing, stats, prune) are
-   `SECURITY DEFINER` functions owned by the schema owner, with `EXECUTE`
-   revoked from `PUBLIC`, granted to the runtime role, and `search_path`
+   fails the statement. The runtime role has only `SELECT` and
+   column-restricted `INSERT` on these tables (state, attempts and leases
+   always start from their defaults; payloads are capped at 256 KiB of
+   stored JSON text by a `CHECK`). Cross-tenant operations (claim,
+   heartbeat, complete, fail, release, retry, discard, dead listing, stats,
+   prune, schedule ticks) are `SECURITY DEFINER` functions owned by the
+   schema owner, with `EXECUTE` revoked from `PUBLIC` and `search_path`
    pinned to the schema with `pg_temp` last. They are the explicit
-   capability ADR 0011 requires for cross-tenant access; they expose state
-   transitions and metadata, never arbitrary reads (payloads leave the
-   database only through a claim).
+   capability ADR 0011 requires for cross-tenant access, and they are
+   cross-tenant reads: claims return payloads, `stats`/`dead` metadata.
+   They are granted to the worker role (`forge.worker_role`, default the
+   runtime role); with a separate worker role the request-serving runtime
+   role keeps only the lease-fenced `forge_jobs_complete`. All except
+   `forge_jobs_complete` refuse to run in a transaction carrying
+   `forge.tenant_id`.
 
 5. **Claiming, leases and fencing.** Workers claim due jobs of one queue and
    of the names they can run with `FOR UPDATE SKIP LOCKED`, in
@@ -155,9 +161,10 @@ queue; unbounded retention; payload data leaking into logs.
   tick across replicas; poison jobs end in an inspectable dead state.
 - The runtime role cannot read or modify other tenants' jobs through SQL,
   but the definer functions are a deliberate cross-tenant capability of the
-  runtime process: a compromised runtime can claim, retry or discard any
-  job. That matches the trust already placed in the process that sets
-  `forge.tenant_id`.
+  worker role: whoever holds it can read every payload and claim, retry or
+  discard any job. In the default single-role setup that is the
+  request-serving process; deployments that need stronger isolation run a
+  separate worker role and `WorkerMode::Dedicated`.
 - Tenant jobs run with the enqueuing tenant and principal reinstalled as RLS
   settings, but authorization is not re-evaluated at execution time: a
   membership revoked after enqueue does not stop an already enqueued job.

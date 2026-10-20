@@ -488,3 +488,37 @@ async fn the_database_enforces_append_columns_and_payload_size() {
     drop(transaction);
     db.cleanup().await.expect("cleanup");
 }
+
+#[tokio::test]
+#[ignore = "needs FORGE_TEST_DATABASE_URL"]
+async fn dispatcher_functions_refuse_tenant_scope_and_can_be_split_from_the_runtime_role() {
+    let db = RlsTestDatabase::create_with_worker(&[migrator()])
+        .await
+        .expect(IGNORE);
+    let mut transaction = db.runtime().begin().await.expect("begin");
+    append(&mut transaction, &InvoicePaid { invoice: 1 })
+        .await
+        .expect("append");
+    transaction.commit().await.expect("commit");
+    let lease = Duration::from_secs(5);
+    assert!(
+        PgOutboxStore::new(db.runtime().clone())
+            .claim(10, Uuid::now_v7(), lease, 3)
+            .await
+            .is_err(),
+        "the request-serving role cannot dispatch"
+    );
+    let alpha = tenant_context();
+    let mut scoped = begin_scoped(db.worker(), Some(&alpha)).await;
+    let refused = sqlx::query_scalar::<_, i64>("SELECT count(*) FROM forge_outbox_dead(10, NULL)")
+        .fetch_one(scoped.connection())
+        .await;
+    assert!(refused.is_err(), "refused in tenant scope");
+    drop(scoped);
+    let claimed = PgOutboxStore::new(db.worker().clone())
+        .claim(10, Uuid::now_v7(), lease, 3)
+        .await
+        .expect("worker claims");
+    assert_eq!(claimed.len(), 1);
+    db.cleanup().await.expect("cleanup");
+}
