@@ -487,7 +487,9 @@ editing or deleting an event in one browser appends, replaces or removes its
 row in the other, without a reload.
 
 By hand, with the `broadcast` feature of `forge` (on by default in
-`forge new` database applications):
+`forge new` database applications, so the scaffold needs no `Cargo.toml`
+edit; it compiles the API only and runs nothing until wired, see
+[cli](cli.md#the-forge-dependency)):
 
 ```rust
 use forge::broadcast::{Channel, EventStreams, Signer, StreamAccess, StreamViewer, publish};

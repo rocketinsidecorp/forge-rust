@@ -66,7 +66,17 @@ By default the generated `Cargo.toml` depends on `forge` from this repository at
 Git tag `v<cli version>`, so an application is created against the same
 framework version as the CLI that generated it. Full-stack applications enable
 the `forge` feature `views` and add `askama` plus a build dependency on
-`forge-views` (feature `build` only, from the same tag) for `build.rs`. Until a release tag such as
+`forge-views` (feature `build` only, from the same tag) for `build.rs`.
+Full-stack applications with a database also enable `broadcast` (live
+updates, [ADR 0031](adr/0031-live-updates-over-server-sent-events.md)), so
+that `forge generate scaffold --broadcast` works without editing
+`Cargo.toml`: like `views`, `forge new` chooses features once and the
+generators never edit existing files. The feature only compiles
+`forge::broadcast` and `Composition::broadcast`: nothing is served, no
+connection is opened and no task runs until the wiring printed by a
+`--broadcast` scaffold (`Streams::register`) is added. An application that
+will never broadcast may remove `"broadcast"` from the features; a later
+`--broadcast` scaffold then asks for it back. Until a release tag such as
 `v0.1.0` is pushed, that dependency cannot resolve. Use `--forge-path` with a
 local checkout in the meantime.
 
