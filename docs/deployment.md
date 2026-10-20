@@ -464,10 +464,15 @@ the host reach the application from a trusted address; the host is
 root-equivalent anyway. Every other container on `edge` is trusted too: keep
 untrusted services on another network.
 
-**Kubernetes**: list the ingress controller's pod CIDR (or the node CIDR for
-a `hostNetwork` controller) and make sure the controller appends or
-overwrites the header (ingress-nginx does; set `use-forwarded-headers` only
-when a trusted load balancer sits in front of it).
+**Kubernetes**: trust only the ingress controller, not the cluster's whole
+pod range: every pod inside a trusted range can choose its own
+`X-Forwarded-For`. Prefer the controller's fixed addresses (a dedicated
+node pool, or the node CIDR for a `hostNetwork` controller), and add a
+`NetworkPolicy` so that only the ingress controller can reach the
+application's port. Confirm that your controller appends or overwrites the
+header with the connecting address (check its documentation for your
+version; with ingress-nginx, enable `use-forwarded-headers` only when a
+trusted load balancer sits in front of it).
 
 Check what the application received without printing other variables:
 

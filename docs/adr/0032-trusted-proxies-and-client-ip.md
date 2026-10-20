@@ -65,8 +65,10 @@ one can carry an unsafe prefix. Prefixes are stored masked.
 `Server::new` builds it from `ServerConfig::trusted_proxies` and applies it
 to every request before the first `Middleware` layer runs;
 `Request::client_ip()` returns the result. The value lives in a private field
-that only `TrustedProxies::apply` sets, so no layer can overwrite it by
-inserting an extension. When no resolver ran (a `Router` dispatched without a
+that only `TrustedProxies::apply` sets, so a layer cannot forge it by
+inserting an extension. A layer can still call the public
+`TrustedProxies::apply` with another validated set and re-resolve, but the
+result is still the peer or a parsed entry of the header. When no resolver ran (a `Router` dispatched without a
 server, as tests do), `client_ip()` is the peer, the same as trusting nobody;
 `TrustedProxies` is also a `Middleware` for such harnesses.
 `Request::remote_addr()` keeps meaning the TCP peer.
