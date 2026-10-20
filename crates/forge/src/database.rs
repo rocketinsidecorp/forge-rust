@@ -483,6 +483,12 @@ mod commands {
         match database.migration_status(migrator).await {
             Ok(statuses) => {
                 let mut text = String::new();
+                if statuses
+                    .iter()
+                    .all(|status| status.state == forge_db::MigrationState::Pending)
+                {
+                    text.push_str("no migrations applied\n");
+                }
                 for status in statuses {
                     let name = status.description.replace(' ', "_");
                     text.push_str(&format!(
@@ -533,13 +539,13 @@ mod commands {
     }
 
     /// Why a drop needs `--force-production`, or `None` when it does not:
-    /// only a local database in development or test is unguarded.
-    fn protection(environment: Environment, url: &SecretString) -> Option<String> {
+    /// only a local database in development or test is unguarded. `local`
+    /// comes from the driver's reading of the URL, so a `host` query
+    /// parameter cannot make a remote server look local.
+    fn protection(environment: Environment, local: bool) -> Option<String> {
         match environment {
             Environment::Production => Some("FORGE_ENV is production".to_owned()),
-            Environment::Development | Environment::Test
-                if !forge_config::database_url::is_local(url) =>
-            {
+            Environment::Development | Environment::Test if !local => {
                 Some("the database server is not on this machine".to_owned())
             }
             Environment::Development | Environment::Test => None,
@@ -551,7 +557,15 @@ mod commands {
         command: DbCommand,
         environment: Environment,
     ) -> ExitCode {
-        let described = forge_config::database_url::describe(url);
+        // Every decision below is made on what the driver would connect to.
+        let target = match forge_db::target::<B>(url) {
+            Ok(target) => target,
+            Err(error) => {
+                write_stderr(&format!("error: {}\n", ErrorChain(&error)));
+                return ExitCode::FAILURE;
+            }
+        };
+        let described = target.describe().to_owned();
         let failed = |action: &str, error: &(dyn std::error::Error + 'static)| {
             write_stderr(&format!(
                 "error: could not {action} {described}: {}\n",
@@ -574,7 +588,7 @@ mod commands {
                 Err(error) => failed("look for", &error),
             },
             DbCommand::Drop { force_production } => {
-                if let Some(reason) = protection(environment, url)
+                if let Some(reason) = protection(environment, target.is_local())
                     && !force_production
                 {
                     write_stderr(&format!(
@@ -598,5 +612,58 @@ mod commands {
                 migration.version == version && migration.migration_type.is_up_migration()
             })
             .map_or("", |migration| migration.description.as_ref())
+    }
+    #[cfg(all(test, feature = "postgres"))]
+    mod tests {
+        use super::*;
+
+        fn guarded(environment: Environment, url: &str) -> Option<String> {
+            let target = forge_db::target::<forge_db::sqlx::Postgres>(&SecretString::new(url))
+                .expect("well formed");
+            protection(environment, target.is_local())
+        }
+
+        #[test]
+        fn a_drop_is_guarded_unless_the_driver_would_connect_to_this_machine() {
+            // Development and test are free only for a local server.
+            for url in [
+                "postgres://m:pw@localhost/shop",
+                "postgres://m:pw@127.0.0.1/shop",
+                "postgres:///shop?host=/var/run/postgresql",
+            ] {
+                assert_eq!(guarded(Environment::Development, url), None, "{url}");
+                assert_eq!(guarded(Environment::Test, url), None, "{url}");
+            }
+            // Query parameters that move the connection elsewhere do not hide it.
+            for url in [
+                "postgres://m:pw@localhost/shop?host=prod.db.internal",
+                "postgres://m:pw@localhost/shop?hostaddr=10.0.0.5",
+                "postgres:///shop?host=prod",
+                "postgres:///shop?host=",
+                "postgres://m:pw@db.internal/shop",
+            ] {
+                let reason = guarded(Environment::Development, url).expect(url);
+                assert!(reason.contains("not on this machine"), "{url}: {reason}");
+            }
+            // Production is guarded whatever the host.
+            assert!(guarded(Environment::Production, "postgres://m:pw@localhost/shop").is_some());
+        }
+
+        #[test]
+        fn a_database_name_override_cannot_reach_a_system_database() {
+            let url = SecretString::new("postgres://m:pw@localhost/shop?dbname=postgres");
+            let code = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime")
+                .block_on(run_admin_command::<forge_db::sqlx::Postgres>(
+                    &url,
+                    DbCommand::Drop {
+                        force_production: true,
+                    },
+                    Environment::Development,
+                ));
+            assert_eq!(code, ExitCode::FAILURE, "refused before any connection");
+        }
     }
 }

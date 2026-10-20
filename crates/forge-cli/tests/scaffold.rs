@@ -945,6 +945,36 @@ impl Drop for DropDatabase {
     }
 }
 
+/// Whether `table` exists in the public schema of database `name`.
+fn table_exists(admin: &str, name: &str, table: &str) -> bool {
+    let url = format!(
+        "{}/{name}",
+        admin.rsplit_once('/').map_or(admin, |(base, _)| base)
+    );
+    let table = table.to_owned();
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap_or_else(|error| panic!("{error}"));
+        runtime.block_on(async {
+            use forge_db::sqlx::Connection as _;
+
+            let mut connection = forge_db::sqlx::PgConnection::connect(&url)
+                .await
+                .unwrap_or_else(|error| panic!("connection: {error}"));
+            forge_db::sqlx::query_scalar::<_, Option<String>>("SELECT to_regclass($1)::text")
+                .bind(format!("public.{table}"))
+                .fetch_one(&mut connection)
+                .await
+                .unwrap_or_else(|error| panic!("{error}"))
+                .is_some()
+        })
+    })
+    .join()
+    .unwrap_or_else(|_| panic!("table_exists thread panicked"))
+}
+
 /// Whether `url`'s database exists, asked of the server directly.
 fn database_exists(admin: &str, name: &str) -> bool {
     let admin = admin.to_owned();
@@ -1044,6 +1074,18 @@ fn postgresql_application_runs_its_lifecycle_through_the_forge_cli() {
     // Nothing to inspect yet: the database is missing.
     let missing = run_unchecked(&root, forge, &["db", "status"], &environment, None);
     assert!(!missing.status.success(), "{}", output(&missing));
+
+    // An empty database: status reads without creating the migrations table.
+    run(&root, forge, &["db", "create"], &environment);
+    let empty = run(&root, forge, &["db", "status"], &environment);
+    let listing = String::from_utf8_lossy(&empty.stdout).into_owned();
+    assert!(listing.contains("no migrations applied"), "{listing}");
+    assert!(listing.contains("pending   1_forge_audit"), "{listing}");
+    assert!(
+        !table_exists(&admin, &name, "_sqlx_migrations"),
+        "status must not create the bookkeeping table"
+    );
+    run(&root, forge, &["db", "drop"], &environment);
 
     // prepare = create + migrate + seed for a missing database.
     let prepared = run(&root, forge, &["db", "prepare"], &environment);

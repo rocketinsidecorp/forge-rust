@@ -134,6 +134,13 @@ pub struct MigrationStatus {
     pub state: MigrationState,
 }
 
+/// Whether a failed statement says the table does not exist: PostgreSQL
+/// `42P01`, MySQL/MariaDB `42S02`, SQLite's "no such table".
+fn missing_table(error: &dyn sqlx::error::DatabaseError) -> bool {
+    matches!(error.code().as_deref(), Some("42P01" | "42S02"))
+        || error.message().starts_with("no such table")
+}
+
 /// Lists every migration of `migrator` and every applied version, ascending.
 pub(crate) async fn status<B: Backend>(
     pool: &Pool<B>,
@@ -149,15 +156,20 @@ async fn status_of<C: Migrate>(
     migrator: &Migrator,
 ) -> Result<Vec<MigrationStatus>, DbError> {
     check_reserved_versions(migrator)?;
-    connection
-        .ensure_migrations_table(&migrator.table_name)
-        .await?;
-    let applied: HashMap<i64, AppliedMigration> = connection
+    // Reading never creates the bookkeeping table: without it nothing is applied.
+    let applied: HashMap<i64, AppliedMigration> = match connection
         .list_applied_migrations(&migrator.table_name)
-        .await?
-        .into_iter()
-        .map(|migration| (migration.version, migration))
-        .collect();
+        .await
+    {
+        Ok(applied) => applied,
+        Err(MigrateError::Execute(sqlx::Error::Database(error))) if missing_table(&*error) => {
+            Vec::new()
+        }
+        Err(error) => return Err(error.into()),
+    }
+    .into_iter()
+    .map(|migration| (migration.version, migration))
+    .collect();
     let mut statuses: Vec<MigrationStatus> = migrator
         .iter()
         .filter(|migration| migration.migration_type.is_up_migration())

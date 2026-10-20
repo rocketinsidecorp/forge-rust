@@ -54,8 +54,9 @@ A directory is an application when its `Cargo.toml` has a `[package]` name and a
   (checksum differs: `migrate` refuses), `disabled` (a Forge feature no longer
   composed, tolerated by ADR 0030) or `missing` (unknown, fail-closed). Framework
   schemas with their own bookkeeping table (jobs, outbox) are listed too.
-  `Database::migration_status` creates the bookkeeping table when absent, like
-  `migrate`, instead of guessing at each engine's "no such table" error.
+  `Database::migration_status` only reads: when the bookkeeping table is absent
+  (PostgreSQL `42P01`, MySQL `42S02`, SQLite "no such table") nothing is applied,
+  the table is not created and the output starts with `no migrations applied`.
 - `rollback --steps N` (1 to 1000): reverts N application migrations, newest
   first, stopping at the first failure or when none is left. Framework
   migrations are never reverted, as before.
@@ -67,9 +68,23 @@ A directory is an application when its `Cargo.toml` has a `[package]` name and a
   another database. PostgreSQL drops use SQLx's forced drop (other sessions
   terminated). `db exists` exits 0 or 3, so `forge db prepare` can tell "missing"
   from a failure without parsing output.
-- `forge_config::database_url` (`describe`, `is_local`, `endpoint`,
-  `manageable_name`) is the single place that says anything about a URL
-  without leaking it; the application's messages and `forge doctor` use it.
+- What a URL names is decided on what the **driver** reads, never on the URL's
+  text. `forge_db::target::<B>(url)` parses with SQLx's own options parser
+  (`PgConnectOptions`, `MySqlConnectOptions`), so the `host`, `hostaddr`, `port`
+  and `dbname` query parameters of PostgreSQL, the `socket` parameter of MySQL
+  and the `PG*` environment defaults count. The name check (charset, system
+  databases) and the locality guard (`FORGE_ENV` aside, only a loopback host or
+  a socket path starting with `/` is local; a socket wins over a host, as it does
+  when connecting) run on those effective values, so
+  `postgres://m:pw@localhost/shop?host=prod` is a remote server and
+  `?dbname=postgres` is refused. A URL is **well formed** only when the `url`
+  crate parses it and no `@` follows its authority: an unescaped `/`, `?` or `#`
+  in a password ends the authority early and would leave part of the password
+  in a "host" or a database name, so such a URL is refused, with a message that
+  tells the user to percent-encode and never shows the URL.
+  `forge_config::database_url` (`describe`, `endpoint`, `is_well_formed`,
+  `validate_name`) applies the same rules for `forge doctor`, which has no
+  driver (it ignores `PG*` environment defaults).
 
 `db` joins the built-in command names: an application that registered its own
 `db` command must rename it, because it now fails like any other built-in name.
@@ -100,6 +115,13 @@ CLI passes `--force-production` to the application only after confirmation.
 The development Compose bootstrap gives `app_migrator` `CREATEDB`; `app_runtime`
 keeps `NOCREATEDB`. Without it `db reset` would drop the database and then fail
 to create it, leaving a container that only `docker compose down -v` repairs.
+A database made by `db reset` is not `init.sql`'s: the script's per-database
+statements (`REVOKE CONNECT ... FROM PUBLIC`, `GRANT CONNECT`, `ALTER DEFAULT
+PRIVILEGES ... TO app_runtime`) are not run again. Generated migrations grant
+the runtime role what it needs explicitly, so the application works, but
+`PUBLIC` can connect to the new database and tables you create by hand get no
+default privileges for `app_runtime`; to restore them run `docker compose down
+-v && docker compose up -d db`, or repeat those statements in `psql`.
 The role is development-only and creates only databases it then owns;
 [deployment](../deployment.md) still requires the runtime role to be unable to.
 
@@ -160,7 +182,7 @@ anything is wrong; `FORGE_ALLOW_DESTRUCTIVE` is not treated as an unknown key.
 
 No new package in `Cargo.lock`. `forge-cli` depends on workspace crates and
 entries it did not use before: `forge-config` (configuration and URL
-redaction), `serde_json` (Cargo's messages, `doctor --json`), `tokio` (the
+redaction, which now reads URLs with the `url` crate SQLx already locks), `serde_json` (Cargo's messages, `doctor --json`), `tokio` (the
 signal thread; features already unified in the workspace) and `rustix` with the
 `process` feature (signals to a process group; the entry's features were
 `fs` and `std`). See [dependency policy](../dependency-policy.md#cli-lifecycle-dependencies).

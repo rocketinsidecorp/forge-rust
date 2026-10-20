@@ -1709,12 +1709,14 @@ mod tests {
                 })
             };
 
-            // Status works before anything ran, and applies nothing.
+            // Status works before anything ran, applies nothing and does not
+            // even create the bookkeeping table.
             assert_eq!(
                 run(&["migrate", "status"]).await.expect("join"),
                 ExitCode::SUCCESS
             );
             assert!(!has_table(&url, "notes").await);
+            assert!(!has_table(&url, "_sqlx_migrations").await);
 
             assert_eq!(run(&["migrate"]).await.expect("join"), ExitCode::SUCCESS);
             assert!(has_table(&url, "labels").await);

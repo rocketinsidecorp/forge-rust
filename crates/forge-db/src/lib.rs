@@ -35,7 +35,7 @@ mod error;
 mod migrate;
 mod prune;
 
-pub use admin::{create_database, database_exists, drop_database};
+pub use admin::{Target, create_database, database_exists, drop_database, target};
 pub use backend::{Backend, RowsAffected};
 #[cfg(feature = "mysql")]
 pub use database::MySqlDatabase;

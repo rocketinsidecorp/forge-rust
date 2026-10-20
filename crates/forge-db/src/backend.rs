@@ -61,6 +61,11 @@ pub(crate) mod sealed {
             options
         }
 
+        /// What `url` really names once the driver has applied its query
+        /// overrides and environment defaults: the database, the server and
+        /// whether that is this machine. Never echoes the URL in an error.
+        fn endpoint(url: &str) -> Result<crate::admin::Endpoint, crate::DbError>;
+
         /// Adjusts the pool built from the common [`PoolSettings`]; the
         /// default keeps it.
         fn pool_options(url: &str, options: PoolOptions<Self>) -> PoolOptions<Self> {

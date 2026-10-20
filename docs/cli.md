@@ -649,13 +649,13 @@ CLI started outlives it.
 | `forge` | Runs | Notes |
 | --- | --- | --- |
 | `migrate` | `<app> migrate` | Needs `FORGE_MIGRATION_DATABASE_URL`. |
-| `migrate status` | `<app> migrate status` | One line per migration, `state version_name`: `applied`, `pending`, `modified` (file changed after it was applied; `migrate` refuses), `disabled` (a Forge feature you no longer compose) or `missing` (unknown to the application; `migrate` fails closed). Creates the bookkeeping table if it is absent, like `migrate`. |
+| `migrate status` | `<app> migrate status` | One line per migration, `state version_name`: `applied`, `pending`, `modified` (file changed after it was applied; `migrate` refuses), `disabled` (a Forge feature you no longer compose) or `missing` (unknown to the application; `migrate` fails closed). Only reads: without the bookkeeping table nothing is applied (the output starts with `no migrations applied`) and the table is not created. |
 | `rollback [--steps N]` | `<app> rollback [--steps N]` | N from 1 to 1000, default 1. Forge-owned migrations are never reverted ([ADR 0030](adr/0030-framework-migration-ownership.md)). Not guarded, like Forge-Go; `db rollback` is. |
 | `seed` | `<app> seed` | One transaction, idempotent. |
 | `setup --tenant SLUG --email EMAIL [--organization NAME] [--password-stdin]` | `<app> setup ...` | The password is prompted for with echo off (standard input stays your terminal), piped with `--password-stdin` or in `FORGE_SETUP_PASSWORD`; never an argument. |
 | `db create` | `<app> db create` | Prints `created ...` or `... already exists`. Uses `FORGE_MIGRATION_DATABASE_URL`, whose role must be allowed to create databases (PostgreSQL `CREATEDB`; the Compose `app_migrator` is). |
 | `db drop` | `<app> db drop` | Guarded, below. Prints `dropped ...` or `... does not exist`. |
-| `db reset` | `db drop`, then `db setup` | Guarded once, before the drop. |
+| `db reset` | `db drop`, then `db setup` | Guarded once, before the drop. Against the Compose container it does not re-run `docker/postgres/init.sql`'s per-database statements (`REVOKE CONNECT ... FROM PUBLIC`, `GRANT CONNECT`, `ALTER DEFAULT PRIVILEGES ... TO app_runtime`): the generated migrations grant the runtime role what it needs, but the new database lets `PUBLIC` connect and gives tables you create by hand no default privileges; `docker compose down -v && docker compose up -d db` restores the original. |
 | `db setup` | `db create`, `migrate`, `seed` | Stops at the first failure. |
 | `db prepare` | `db exists`; then `migrate`, or `db setup` when it is missing | `db exists` exits 3 for "missing", so a failure is never mistaken for it. |
 | `db migrate`, `db status`, `db seed` | as `migrate`, `migrate status`, `seed` | |
@@ -663,7 +663,7 @@ CLI started outlives it.
 
 The application's `db` subcommand is for scripts and containers too:
 `<app> db create|exists|drop [--force-production]`. `db exists` exits 0 when the
-database exists and 3 when it does not. Database names are limited to 1 to 63
+database exists and 3 when it does not. A URL with an unescaped `/`, `?`, `#` or `@` in the password is refused as malformed (percent-encode them), and the error never shows it. Database names are limited to 1 to 63
 letters, digits, `_`, `-` and `$`, and the engines' system databases
 (`postgres`, `template0`, `template1`, `mysql`, `information_schema`,
 `performance_schema`, `sys`) are never created or dropped. PostgreSQL drops
@@ -688,7 +688,9 @@ error). The CLI removes `FORGE_ALLOW_DESTRUCTIVE` from the environment it gives
 the application, which would refuse the unknown key. Because only the application
 sees the database URL, `<app> db drop` enforces the second half of the rule
 itself: it refuses `FORGE_ENV=production` and a server that is not on this machine
-(not loopback, `localhost` or a Unix socket) unless `--force-production` is
+(not loopback, `localhost` or a socket path starting with `/`, judged on what the
+driver would connect to after the `host`, `hostaddr`, `port`, `dbname` and
+`socket` query parameters) unless `--force-production` is
 passed, whether it is started by `forge` or directly in a container. The CLI
 passes `--force-production` on only after confirmation, and asks for it whenever
 you give the flag, even in development, because it cannot see the address.

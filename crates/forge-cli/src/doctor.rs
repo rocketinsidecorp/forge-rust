@@ -146,7 +146,17 @@ pub(crate) fn run(
                     }
                     .to_owned();
                     lines.push(format!("database: {}", database_url::describe(url)));
-                    lines.push(match reachability(url, directory, probes) {
+                    if !database_url::is_well_formed(url) {
+                        diagnostics.push(Diagnostic::error(
+                            "database.url_malformed",
+                            "FORGE_DATABASE_URL is malformed.",
+                            "Percent-encode `/`, `?`, `#` and `@` in the user name and password (for example `/` as %2F); the URL is not shown because it holds credentials.",
+                        ));
+                        lines.push(
+                            "database reachability: not checked (the URL is malformed)".to_owned(),
+                        );
+                    } else {
+                        lines.push(match reachability(url, directory, probes) {
                         Ok(text) => format!("database reachability: {text}"),
                         Err(reason) => {
                             diagnostics.push(Diagnostic::error(
@@ -156,7 +166,8 @@ pub(crate) fn run(
                             ));
                             format!("database reachability: unreachable ({reason})")
                         }
-                    });
+                        });
+                    }
                     if config.database.migration_url.is_none() {
                         lines.push(
                             "migration database: FORGE_MIGRATION_DATABASE_URL is not set (migrate, seed and setup need it)"
@@ -422,6 +433,31 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("error: `cargo` could not be run."), "{text}");
+    }
+
+    #[test]
+    fn a_malformed_database_url_is_an_error_that_shows_nothing_of_it() {
+        let probes = Fake::healthy();
+        for url in [
+            "postgres://admin:s3cr/et@db.internal/shop",
+            "postgres://admin:123/et@db.internal/shop",
+            "mysql://root:123?et@db.internal/shop",
+            "postgres://admin:123#et@db.internal/shop",
+        ] {
+            let (result, text) = report(false, &[("FORGE_DATABASE_URL", url)], &probes);
+            assert!(matches!(result, Err(CliError::Reported)), "{url}");
+            assert!(
+                text.contains("error: FORGE_DATABASE_URL is malformed."),
+                "{text}"
+            );
+            for word in ["admin", "root", "s3cr", "123", "et@", "db.internal"] {
+                assert!(!text.contains(word), "{word} leaked:\n{text}");
+            }
+            assert!(
+                probes.connected.borrow().is_empty(),
+                "no connection to a guessed host"
+            );
+        }
     }
 
     #[test]
