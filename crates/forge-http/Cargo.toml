@@ -11,6 +11,7 @@ repository.workspace = true
 [dependencies]
 bytes.workspace = true
 forge-config = { path = "../forge-config" }
+forge-openapi = { path = "../forge-openapi" }
 forge-telemetry = { path = "../forge-telemetry" }
 http.workspace = true
 http-body-util.workspace = true

@@ -703,6 +703,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "forge-config",
+ "forge-openapi",
  "forge-telemetry",
  "http",
  "http-body-util",

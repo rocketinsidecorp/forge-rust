@@ -42,6 +42,7 @@ mod client_ip;
 mod encoding;
 mod form;
 mod io;
+mod openapi;
 mod query;
 mod routing;
 
@@ -50,6 +51,10 @@ pub use forge_telemetry::{SpanContext, http::ServerInstrumentation};
 pub use form::{
     CSRF_FIELD_NAME, FORM_CONTENT_TYPE, FormError, FormErrorKind, MAX_FORM_FIELDS,
     METHOD_FIELD_NAME, RESERVED_FORM_FIELDS,
+};
+pub use openapi::{
+    CheckResponses, ContractFailure, Described, HealthReport, HealthStatus, OPENAPI_PATH, describe,
+    health_operation,
 };
 pub use query::{QueryError, QueryErrorKind};
 
@@ -90,7 +95,7 @@ pub struct Request {
 /// telemetry, which runs outside every layer. Private, so no layer can
 /// replace it.
 #[derive(Clone, Debug, Default)]
-struct MatchedRoute(Arc<OnceLock<Arc<str>>>);
+pub(crate) struct MatchedRoute(Arc<OnceLock<Arc<str>>>);
 
 impl Request {
     /// HTTP method.
@@ -469,6 +474,13 @@ impl PathParamError {
 pub trait Handler: Send + Sync + 'static {
     /// Handles one already-validated transport request.
     fn call(&self, request: Request) -> BoxHandlerFuture;
+
+    /// The route's OpenAPI description, when the handler carries one
+    /// ([`describe`], `forge::openapi::typed`). Undescribed routes are listed
+    /// as undocumented, never guessed at.
+    fn operation(&self) -> Option<&forge_openapi::Operation> {
+        None
+    }
 }
 
 impl<F, Fut> Handler for F
@@ -524,11 +536,18 @@ impl<'a> Next<'a> {
     }
 }
 
+/// A registered route and the description its handler carried.
+struct RegisteredRoute {
+    method: Method,
+    path: String,
+    operation: Option<Arc<forge_openapi::Operation>>,
+}
+
 /// Immutable route table once attached to a server.
 #[derive(Default)]
 pub struct Router {
     root: routing::Node,
-    routes: Vec<(Method, String)>,
+    routes: Vec<RegisteredRoute>,
     layers: Vec<Arc<dyn Middleware>>,
 }
 
@@ -537,7 +556,7 @@ impl fmt::Debug for Router {
         let mut routes: Vec<String> = self
             .routes
             .iter()
-            .map(|(method, path)| format!("{method} {path}"))
+            .map(|route| format!("{} {}", route.method, route.path))
             .collect();
         routes.sort_unstable();
         formatter
@@ -565,6 +584,7 @@ impl Router {
         handler: impl Handler,
     ) -> Result<&mut Self, RouteError> {
         let path = path.into();
+        let operation = handler.operation().cloned().map(Arc::new);
         let segments = routing::parse_pattern(&path)?;
         let params = segments
             .iter()
@@ -582,7 +602,11 @@ impl Router {
                 handler: Arc::new(handler),
             },
         )?;
-        self.routes.push((method, path));
+        self.routes.push(RegisteredRoute {
+            method,
+            path,
+            operation,
+        });
         Ok(self)
     }
 
@@ -599,16 +623,32 @@ impl Router {
     /// `GET /health`, `GET /health/live` and `GET /health/ready` answer `200`
     /// with `application/json` bodies `{"status":"ok"}`, `{"status":"live"}`
     /// and `{"status":"ready"}` respectively.
+    /// They are described in the OpenAPI document ([`health_operation`]).
     pub fn standard_health_routes(&mut self) -> Result<&mut Self, RouteError> {
-        self.route(Method::GET, "/health", |_| async {
-            static_json(StatusCode::OK, r#"{"status":"ok"}"#)
-        })?;
-        self.route(Method::GET, "/health/live", |_| async {
-            static_json(StatusCode::OK, r#"{"status":"live"}"#)
-        })?;
-        self.route(Method::GET, "/health/ready", |_| async {
-            static_json(StatusCode::OK, r#"{"status":"ready"}"#)
-        })
+        self.route(
+            Method::GET,
+            "/health",
+            describe(
+                |_| async { static_json(StatusCode::OK, r#"{"status":"ok"}"#) },
+                health_operation("/health", false),
+            ),
+        )?;
+        self.route(
+            Method::GET,
+            "/health/live",
+            describe(
+                |_| async { static_json(StatusCode::OK, r#"{"status":"live"}"#) },
+                health_operation("/health/live", false),
+            ),
+        )?;
+        self.route(
+            Method::GET,
+            "/health/ready",
+            describe(
+                |_| async { static_json(StatusCode::OK, r#"{"status":"ready"}"#) },
+                health_operation("/health/ready", false),
+            ),
+        )
     }
 
     /// Runs one request through the layers and the route table without a
