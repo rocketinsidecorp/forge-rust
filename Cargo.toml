@@ -26,8 +26,9 @@ members = [
     "crates/forge-tenancy",
     "crates/forge-views",
 ]
-# Examples are standalone applications, exactly as `forge new` generates them.
-exclude = ["examples"]
+# Examples are standalone applications, exactly as `forge new` generates them;
+# fuzz/ is a standalone cargo-fuzz package with its own lockfile (ADR 0043).
+exclude = ["examples", "fuzz"]
 resolver = "3"
 
 [workspace.package]

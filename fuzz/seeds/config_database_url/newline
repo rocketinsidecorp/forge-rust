@@ -1,0 +1,2 @@
+postgres://u:p@host/db
+SET role admin

@@ -35,7 +35,7 @@ the work is finished and waiting for its review; **Planned** means not started.
 | List the application's routes | `rails routes` | Done (`forge routes`, a source scan: literal `Handle`/`Resources` paths only, so the `/v1/<plural>` JSON routes of resources are missing) | Done (`forge routes`, runs the composed application: every HTML and JSON route with its source line, [CLI](cli.md#application-lifecycle-commands)) |
 | Controller, model, mailer and job generators | `rails g` | Done (Forge-Go ADR 0041) | Done (`forge generate model\|controller\|mailer\|job --queue`, [ADR 0038](adr/0038-generators-and-destroy.md), [generators](generators.md)) |
 | Undo a generator | `rails d` | Done (`forge destroy`, Forge-Go ADR 0041) | Done (`forge destroy`, [ADR 0038](adr/0038-generators-and-destroy.md)) |
-| Continuous fuzzing, SBOM, signed images | — | Planned | Planned |
+| Continuous fuzzing, SBOM, signed images | — | Done (`scripts/fuzz.sh`, `scripts/sbom.sh`, `release.yml`, Forge-Go ADR 0044) | In review (`scripts/fuzz.sh`, `scripts/sbom.sh`, signed forge-proxy image, SHA/digest pins enforced by `crates/forge/tests/supply_chain.rs`, [ADR 0043](adr/0043-continuous-fuzzing-sbom-signed-images.md), [supply chain](supply-chain.md)) |
 | Published benchmarks | — | Planned | Planned |
 | Getting Started guide | Rails Guides | Done (Forge-Go docs/GETTING_STARTED.md) | Planned |
 
@@ -152,6 +152,27 @@ the work is finished and waiting for its review; **Planned** means not started.
   Forge-Rust's command needs the configuration `serve` needs (a database URL
   for database applications) and builds the application first; Forge-Go's
   never executes application code.
+
+- Supply chain ([ADR 0043](adr/0043-continuous-fuzzing-sbom-signed-images.md),
+  [supply chain](supply-chain.md)): the workflows, pins, tag guard,
+  verification command and `scripts/fuzz.sh` interface match Forge-Go. Known
+  differences, each a tracked follow-up: (1) the release publishes only the
+  forge-proxy image for `linux/amd64`: hello-forge's path dependencies leave
+  its Docker context (the generated application's own Dockerfile is the
+  supported route), and an arm64 build under emulation takes hours, so a
+  cross-compiling Dockerfile or a native arm64 runner is needed first; (2)
+  binary SBOMs come from `cargo auditable` plus Syft for `linux/amd64`
+  only; (3) the generated application's CI and `release.yml` template, with
+  the `FORGE_RELEASE_IMAGES` opt-in and the CI SBOM artifact, are not ported
+  yet and `forge new` still writes unpinned actions (the template files are
+  edited by other pull requests; Forge-Go ported them in the same pull
+  request as the rest); (4) Forge-Go's fuzz targets for session tokens, pagination cursors,
+  UUID text and the `forge db` target are not ported; candidates in Rust are
+  `forge_storage` key parsing and signed links, `forge_broadcast` stream
+  tokens, `forge_core::Timestamp::parse` and the MFA key and backup-code
+  parsers. The Rust-only targets are `credentials_envelope`, `deploy_yaml`,
+  `proxy_*` and `mail_message`; (5) fuzzing found that `FORGE_DATABASE_URL`
+  accepts port 0 where Forge-Go refuses it ([supply chain](supply-chain.md#findings)).
 
 ## Review gate
 

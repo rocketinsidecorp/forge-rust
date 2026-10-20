@@ -1,0 +1,80 @@
+name: Fuzz
+
+# Continuous fuzzing: every night, each fuzz target runs for a longer time
+# than the 10 seconds CI gives it on a pull request, on its own runner. The
+# corpus each target grows is cached for the next night; a failing input is
+# uploaded as an artifact (fuzz-failures-<target>). Reproduce one locally by
+# downloading it and running
+#   cargo +"$(scripts/fuzz.sh -T)" fuzz run <target> path/to/crash-file
+# then move it to fuzz/seeds/<target>/ with the fix. See docs/supply-chain.md.
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      fuzztime:
+        description: Time per target, as scripts/fuzz.sh -t takes it (10m, 1h, 100000x)
+        required: false
+        default: 10m
+
+permissions:
+  contents: read
+
+jobs:
+  targets:
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.list.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: List the fuzz targets
+        id: list
+        run: echo "matrix=$(scripts/fuzz.sh -j)" >> "$GITHUB_OUTPUT"
+
+  fuzz:
+    name: ${{ matrix.id }}
+    needs: targets
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix:
+        include: ${{ fromJSON(needs.targets.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the pinned nightly toolchain
+        run: rustup toolchain install "$(scripts/fuzz.sh -T)" --profile minimal
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: fuzz
+          shared-key: fuzz-${{ hashFiles('scripts/fuzz.sh', 'fuzz/Cargo.lock') }}
+      - name: Install cargo-fuzz
+        run: command -v cargo-fuzz >/dev/null || cargo install cargo-fuzz --version 0.13.2 --locked
+      # The corpus is cached per target; the target directory above would only
+      # carry one target's corpus into the others'.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.id }}-${{ github.run_id }}
+          restore-keys: fuzz-corpus-${{ matrix.id }}-
+      - name: Fuzz
+        env:
+          TARGET: ${{ matrix.target }}
+          FUZZTIME: ${{ inputs.fuzztime || '10m' }}
+        run: scripts/fuzz.sh -t "$FUZZTIME" -r "^${TARGET}\$"
+      - name: Collect failing inputs
+        if: failure()
+        run: scripts/fuzz.sh -c "$RUNNER_TEMP/fuzz-failures"
+      - name: Upload failing inputs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fuzz-failures-${{ matrix.id }}
+          path: ${{ runner.temp }}/fuzz-failures
+          if-no-files-found: ignore
+          retention-days: 30

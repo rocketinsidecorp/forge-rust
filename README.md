@@ -903,6 +903,39 @@ let source = signer.turbo_stream_from(&Channel::for_tenant(tenant_id, "events")?
 forge::broadcast::publish(broker.as_ref(), &channel, &[TurboStreamAction::remove(target)]).await?;
 ```
 
+## Supply chain: fuzzing, SBOMs and signed images
+
+Fuzz targets for the parsers that face untrusted input (database and mail URLs,
+`config/deploy.yml`, the credentials file, `Accept-Language`, translation
+catalogs, mail addresses and headers, OpenAPI responses, forge-proxy's
+certificate times and deploy requests) run on every pull request and every
+night; the `forge` and `forge-proxy` binaries ship with CycloneDX and SPDX
+SBOMs; the forge-proxy image is signed keyless with cosign when a `v*` tag is
+pushed; every action and base image is pinned by commit or digest
+([ADR 0043](docs/adr/0043-continuous-fuzzing-sbom-signed-images.md),
+[supply chain guide](docs/supply-chain.md)).
+
+```sh
+# fuzzing needs a pinned nightly and cargo-fuzz, only for this (a C++ compiler too)
+rustup toolchain install "$(scripts/fuzz.sh -T)" --profile minimal
+cargo install cargo-fuzz --version 0.13.2 --locked
+scripts/fuzz.sh -l                          # list the targets
+scripts/fuzz.sh                             # every target, 10 s each (what CI runs)
+scripts/fuzz.sh -t 2m -r '^config_'         # the configuration targets, 2 minutes each
+
+# SBOMs of forge, forge-proxy and Cargo.lock (Docker, or SYFT=/path/to/syft)
+cargo install cargo-auditable --version 0.7.7 --locked
+scripts/sbom.sh dist/sbom                   # NAME.cdx.json (CycloneDX) and NAME.spdx.json (SPDX)
+jq -r '.components[] | "\(.name) \(.version)"' dist/sbom/forge-proxy.cdx.json
+
+# a maintainer cuts a release: signed ghcr.io/rocketinsidecorp/forge-proxy
+git tag v0.1.0 && git push origin v0.1.0
+# verify before you deploy (cosign v3 or later), then pin the digest in config/deploy.yml
+cosign verify ghcr.io/rocketinsidecorp/forge-proxy:v0.1.0 \
+  --certificate-identity-regexp '^https://github\.com/rocketinsidecorp/forge-rust/\.github/workflows/release\.yml@refs/tags/v' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
+
 ## Workspace layout
 
 ```text
@@ -935,8 +968,11 @@ crates/
 examples/
 └── hello-forge    # committed `forge new` output; standalone package (not a
                    # workspace member) with its own Cargo.lock; golden-tested
+fuzz/              # cargo-fuzz targets and seed corpora; standalone package with its own Cargo.lock
 scripts/
-└── e2e-generated-app.sh   # generated-app host + container end-to-end test
+├── e2e-generated-app.sh   # generated-app host + container end-to-end test
+├── fuzz.sh                # runs every fuzz target (nightly + cargo-fuzz)
+└── sbom.sh                # CycloneDX and SPDX SBOMs of forge, forge-proxy and Cargo.lock
 docs/              # architecture, ADRs, policies, CLI and deployment guides
 ```
 

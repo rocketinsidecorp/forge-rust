@@ -1,0 +1,46 @@
+name: Scorecard
+
+# OpenSSF Scorecard: a weekly check of the repository's supply-chain
+# practices (pinned dependencies, token permissions, branch protection,
+# fuzzing, signed releases, ...). Results stay in this repository: they are
+# not published to the Scorecard API and need no OIDC token. The JSON report
+# is kept as an artifact and summarized on the run page.
+on:
+  schedule:
+    - cron: "41 4 * * 1"
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  analysis:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: read # read workflow runs (Pinned-Dependencies, CI-Tests) in a private repository
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The action runs its own image, which its action.yaml names by tag
+      # (ghcr.io/ossf/scorecard-action:v2.5.0), not by digest: a residual risk
+      # listed in docs/supply-chain.md. The job holds read permissions only.
+      - uses: ossf/scorecard-action@fa7117db83c52d787ae5a89f350999701505d78e # v2.5.0
+        with:
+          results_file: scorecard.json
+          results_format: json
+          publish_results: false
+      - name: Summary
+        run: |
+          {
+            echo "## OpenSSF Scorecard: $(jq -r .score scorecard.json) / 10"
+            echo
+            echo "| Check | Score | Reason |"
+            echo "| --- | --- | --- |"
+            jq -r '.checks | sort_by(.score) | .[] | "| \(.name) | \(.score) | \(.reason) |"' scorecard.json
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: scorecard
+          path: scorecard.json
+          retention-days: 30

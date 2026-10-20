@@ -1,0 +1,161 @@
+# Coverage-guided fuzz targets for the parsers that face untrusted or
+# operator-supplied input (docs/supply-chain.md, ADR 0043).
+#
+# This is a standalone package with its own workspace and Cargo.lock, excluded
+# from the framework workspace like examples/: libfuzzer-sys (and the C++
+# libFuzzer it builds) never enters the framework's dependency graph, its
+# lockfile or any released binary, and `cargo-fuzz` needs a nightly toolchain
+# that the rest of the repository does not. Run it with scripts/fuzz.sh.
+#
+# Every target has a `bin` table at the end of this file: `cargo fuzz list`
+# (and so CI) discovers the targets from it. The tests/supply_chain.rs gate of
+# the `forge` crate fails when a file in fuzz_targets/ has no entry or no seed
+# corpus.
+[package]
+name = "forge-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+rust-version = "1.98.1"
+license = "MIT"
+description = "Fuzz targets of the Forge framework (not part of the framework workspace)"
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+# The only new third-party crate (with the `arbitrary` and `cc` it needs):
+# docs/dependency-policy.md, "Fuzzing".
+libfuzzer-sys = "0.4.13"
+
+forge-config = { path = "../crates/forge-config" }
+forge-credentials = { path = "../crates/forge-credentials" }
+forge-encryption = { path = "../crates/forge-encryption" }
+forge-http = { path = "../crates/forge-http" }
+forge-i18n = { path = "../crates/forge-i18n" }
+forge-mail = { path = "../crates/forge-mail" }
+forge-openapi = { path = "../crates/forge-openapi" }
+forge-proxy = { path = "../crates/forge-proxy" }
+forge-telemetry = { path = "../crates/forge-telemetry" }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+
+[lints.rust]
+# fuzz_target! expands to `unsafe extern "C"` glue, so unsafe_code is not
+# forbidden here; the targets themselves contain none.
+unused_must_use = "deny"
+
+[lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "config_database_url"
+path = "fuzz_targets/config_database_url.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "config_mail_url"
+path = "fuzz_targets/config_mail_url.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "config_trusted_proxies"
+path = "fuzz_targets/config_trusted_proxies.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "credentials_envelope"
+path = "fuzz_targets/credentials_envelope.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "deploy_yaml"
+path = "fuzz_targets/deploy_yaml.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "i18n_accept_language"
+path = "fuzz_targets/i18n_accept_language.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "i18n_canonical_locale"
+path = "fuzz_targets/i18n_canonical_locale.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "i18n_catalog"
+path = "fuzz_targets/i18n_catalog.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mail_message"
+path = "fuzz_targets/mail_message.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "openapi_validate_response"
+path = "fuzz_targets/openapi_validate_response.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "proxy_certificate_time"
+path = "fuzz_targets/proxy_certificate_time.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "proxy_deploy_request"
+path = "fuzz_targets/proxy_deploy_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "proxy_duration"
+path = "fuzz_targets/proxy_duration.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "proxy_timestamps"
+path = "fuzz_targets/proxy_timestamps.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "telemetry_trace_context"
+path = "fuzz_targets/telemetry_trace_context.rs"
+test = false
+doc = false
+bench = false

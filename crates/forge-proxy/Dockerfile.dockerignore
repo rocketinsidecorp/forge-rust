@@ -4,6 +4,7 @@
 **/target
 /docs
 /examples
+/fuzz
 /scripts
 **/.env
 **/.env.*

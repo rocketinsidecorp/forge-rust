@@ -1,0 +1,1 @@
+sqlite://data/app.db?mode=rwc
