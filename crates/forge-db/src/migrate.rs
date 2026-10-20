@@ -85,6 +85,115 @@ pub(crate) async fn apply_pending<B: Backend>(
     finish(connection, result).await
 }
 
+/// Where a migration stands relative to the database.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum MigrationState {
+    /// Recorded as applied, and the file is unchanged.
+    Applied,
+    /// Known to the application, not applied yet.
+    Pending,
+    /// Applied, but the migration file changed afterwards: `migrate` refuses
+    /// to continue until the change is undone.
+    Modified,
+    /// Applied by a Forge feature the application no longer composes
+    /// ([`FRAMEWORK_MIGRATIONS`]); tolerated.
+    Disabled,
+    /// Applied, but unknown to the application and not a framework
+    /// migration: `migrate` fails closed.
+    Missing,
+}
+
+impl MigrationState {
+    /// The lowercase word `migrate status` prints.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Applied => "applied",
+            Self::Pending => "pending",
+            Self::Modified => "modified",
+            Self::Disabled => "disabled",
+            Self::Missing => "missing",
+        }
+    }
+}
+
+/// One migration and its state, as [`Database::migration_status`] reports it.
+///
+/// [`Database::migration_status`]: crate::Database::migration_status
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct MigrationStatus {
+    /// The migration version.
+    pub version: i64,
+    /// The description SQLx derives from the file name (`create posts` for
+    /// `20261020000000_create_posts.up.sql`); empty for a version the
+    /// application does not know.
+    pub description: String,
+    /// Where it stands.
+    pub state: MigrationState,
+}
+
+/// Lists every migration of `migrator` and every applied version, ascending.
+pub(crate) async fn status<B: Backend>(
+    pool: &Pool<B>,
+    migrator: &Migrator,
+) -> Result<Vec<MigrationStatus>, DbError> {
+    let mut connection = pool.acquire().await?;
+    let result = status_of(&mut *connection, migrator).await;
+    finish(connection, result).await
+}
+
+async fn status_of<C: Migrate>(
+    connection: &mut C,
+    migrator: &Migrator,
+) -> Result<Vec<MigrationStatus>, DbError> {
+    check_reserved_versions(migrator)?;
+    connection
+        .ensure_migrations_table(&migrator.table_name)
+        .await?;
+    let applied: HashMap<i64, AppliedMigration> = connection
+        .list_applied_migrations(&migrator.table_name)
+        .await?
+        .into_iter()
+        .map(|migration| (migration.version, migration))
+        .collect();
+    let mut statuses: Vec<MigrationStatus> = migrator
+        .iter()
+        .filter(|migration| migration.migration_type.is_up_migration())
+        .map(|migration| MigrationStatus {
+            version: migration.version,
+            description: migration.description.to_string(),
+            state: match applied.get(&migration.version) {
+                None => MigrationState::Pending,
+                Some(existing) if existing.checksum == migration.checksum => {
+                    MigrationState::Applied
+                }
+                Some(_) => MigrationState::Modified,
+            },
+        })
+        .collect();
+    for version in applied.keys().copied() {
+        if migrator.version_exists(version) {
+            continue;
+        }
+        statuses.push(match framework_migration(version) {
+            Some(framework) => MigrationStatus {
+                version,
+                description: framework.description.to_owned(),
+                state: MigrationState::Disabled,
+            },
+            None => MigrationStatus {
+                version,
+                description: String::new(),
+                state: MigrationState::Missing,
+            },
+        });
+    }
+    statuses.sort_by_key(|status| status.version);
+    Ok(statuses)
+}
+
 /// Reverts the most recently applied migration within `scope`.
 pub(crate) async fn revert_latest<B: Backend>(
     pool: &Pool<B>,

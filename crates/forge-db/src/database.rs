@@ -218,6 +218,18 @@ impl<B: Backend> Database<B> {
         migrate::apply_pending(&self.pool, migrator).await
     }
 
+    /// Lists the migrations of `migrator`, and the applied versions it does
+    /// not contain, ascending, with their [`MigrationState`](crate::MigrationState).
+    ///
+    /// Like [`migrate`](Self::migrate) it creates the bookkeeping table when
+    /// it is missing, and it never applies or reverts anything.
+    pub async fn migration_status(
+        &self,
+        migrator: &Migrator,
+    ) -> Result<Vec<crate::MigrationStatus>, DbError> {
+        migrate::status(&self.pool, migrator).await
+    }
+
     /// Reverts the application's newest applied migration with its down
     /// migration and returns its version, or `None` when nothing is applied.
     ///

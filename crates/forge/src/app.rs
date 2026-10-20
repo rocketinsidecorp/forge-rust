@@ -26,7 +26,7 @@ use crate::{
     cli::JobsCommand,
 };
 use crate::{
-    cli::{self, Command},
+    cli::{self, Command, DbCommand},
     command::{CommandContext, CommandError, RegisteredCommand},
     compose::{ComposeError, ComposeHook, Composition},
     database::{DatabaseHandle, Declaration, MigrationCommand, UrlPurpose, register_health},
@@ -332,8 +332,14 @@ impl App {
             Ok(Command::Migrate) => {
                 self.checked(|app| app.run_database_command(DatabaseCommand::Migrate, load_config))
             }
-            Ok(Command::Rollback) => {
-                self.checked(|app| app.run_database_command(DatabaseCommand::Rollback, load_config))
+            Ok(Command::MigrationStatus) => {
+                self.checked(|app| app.run_database_command(DatabaseCommand::Status, load_config))
+            }
+            Ok(Command::Rollback { steps }) => self.checked(|app| {
+                app.run_database_command(DatabaseCommand::Rollback { steps }, load_config)
+            }),
+            Ok(Command::Db(command)) => {
+                self.checked(|app| app.run_db_command(command, load_config))
             }
             Ok(Command::Version) => write_stdout(&format!("{} {}\n", self.name, self.version)),
             Ok(Command::Help) => write_stdout(&cli::usage(self.name, &self.summaries())),
@@ -511,6 +517,47 @@ impl App {
         }
     }
 
+    /// `db create|exists|drop`: server-level administration of the declared
+    /// database, with the migration credential.
+    fn run_db_command(
+        mut self,
+        command: DbCommand,
+        load_config: impl FnOnce() -> Result<AppConfig, ConfigError>,
+    ) -> ExitCode {
+        let config = match load_config() {
+            Ok(config) => config,
+            Err(error) => return config_error(&error),
+        };
+        let Some(declaration) = self.declarations.pop() else {
+            write_stderr(
+                "error: `db` commands need a declared database \
+                 (App::postgres, App::mysql or App::sqlite)\n",
+            );
+            return ExitCode::FAILURE;
+        };
+        let url = match declaration.validate(&config.database, UrlPurpose::Migration) {
+            Ok(url) => url.clone(),
+            Err(error) => return config_error(&error),
+        };
+        let runtime = match tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                write_stderr(&format!(
+                    "error: failed to start async runtime: {}\n",
+                    ErrorChain(&error)
+                ));
+                return ExitCode::FAILURE;
+            }
+        };
+        let code =
+            runtime.block_on(declaration.run_admin_command(&url, command, config.environment));
+        runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
+        code
+    }
+
     fn run_database_command(
         mut self,
         command: DatabaseCommand,
@@ -557,7 +604,8 @@ impl App {
         if let Some(declaration) = declaration {
             let migration = match command {
                 DatabaseCommand::Migrate => MigrationCommand::Migrate,
-                DatabaseCommand::Rollback => MigrationCommand::Rollback,
+                DatabaseCommand::Status => MigrationCommand::Status,
+                DatabaseCommand::Rollback { steps } => MigrationCommand::Rollback { steps },
             };
             #[cfg(feature = "jobs")]
             let framework = match (command, self.jobs) {
@@ -573,10 +621,18 @@ impl App {
             return code;
         }
 
-        // Applications written before `App::postgres`: their own handlers.
+        // Applications written before `App::postgres`: their own handlers,
+        // which know neither `migrate status` nor several rollback steps.
         let handler = match command {
             DatabaseCommand::Migrate => self.migrate,
-            DatabaseCommand::Rollback => self.rollback,
+            DatabaseCommand::Rollback { steps: 1 } => self.rollback,
+            DatabaseCommand::Status | DatabaseCommand::Rollback { .. } => {
+                write_stderr(
+                    "error: `migrate status` and `rollback --steps` need a declared database \
+                     (App::postgres, App::mysql or App::sqlite)\n",
+                );
+                return ExitCode::FAILURE;
+            }
         };
         let Some(handler) = handler else {
             write_stderr("error: database migrations are not configured for this application\n");
@@ -1010,14 +1066,16 @@ fn compose(
 #[derive(Clone, Copy)]
 enum DatabaseCommand {
     Migrate,
-    Rollback,
+    Status,
+    Rollback { steps: u32 },
 }
 
 impl DatabaseCommand {
     const fn as_str(self) -> &'static str {
         match self {
             Self::Migrate => "migrate",
-            Self::Rollback => "rollback",
+            Self::Status => "migrate status",
+            Self::Rollback { .. } => "rollback",
         }
     }
 }
@@ -1218,7 +1276,7 @@ fn config_error(error: &(dyn Error + 'static)) -> ExitCode {
 }
 
 /// Writes to stdout; a closed pipe yields a failure code instead of a panic.
-fn write_stdout(text: &str) -> ExitCode {
+pub(crate) fn write_stdout(text: &str) -> ExitCode {
     let mut stdout = io::stdout().lock();
     match stdout
         .write_all(text.as_bytes())
@@ -1230,7 +1288,7 @@ fn write_stdout(text: &str) -> ExitCode {
 }
 
 /// Best-effort stderr write; there is nowhere left to report a failure.
-fn write_stderr(text: &str) {
+pub(crate) fn write_stderr(text: &str) {
     let mut stderr = io::stderr().lock();
     if stderr.write_all(text.as_bytes()).is_err() {
         return;
@@ -1634,6 +1692,127 @@ mod tests {
             assert_eq!(run("rollback").await.expect("join"), ExitCode::SUCCESS);
             assert!(!table_exists(&url).await);
             assert_eq!(run("rollback").await.expect("join"), ExitCode::SUCCESS);
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn status_lists_migrations_and_rollback_steps_revert_several() {
+            let directory = tempfile::tempdir().expect("tempdir");
+            let url = url(&directory);
+            let run = |arguments: &'static [&'static str]| {
+                let url = url.clone();
+                tokio::task::spawn_blocking(move || {
+                    App::new("demo")
+                        .sqlite(sqlx::migrate!("tests/migrations/sqlite_steps"))
+                        .run_with(args(arguments), || {
+                            config_with(&[("FORGE_MIGRATION_DATABASE_URL", url.as_str())])
+                        })
+                })
+            };
+
+            // Status works before anything ran, and applies nothing.
+            assert_eq!(
+                run(&["migrate", "status"]).await.expect("join"),
+                ExitCode::SUCCESS
+            );
+            assert!(!has_table(&url, "notes").await);
+
+            assert_eq!(run(&["migrate"]).await.expect("join"), ExitCode::SUCCESS);
+            assert!(has_table(&url, "labels").await);
+            assert_eq!(
+                run(&["migrate", "status"]).await.expect("join"),
+                ExitCode::SUCCESS
+            );
+
+            assert_eq!(
+                run(&["rollback", "--steps", "2"]).await.expect("join"),
+                ExitCode::SUCCESS
+            );
+            assert!(!has_table(&url, "labels").await && !has_table(&url, "tags").await);
+            assert!(has_table(&url, "notes").await, "the oldest is kept");
+
+            // More steps than migrations stops at the last one.
+            assert_eq!(
+                run(&["rollback", "--steps", "5"]).await.expect("join"),
+                ExitCode::SUCCESS
+            );
+            assert!(!has_table(&url, "notes").await);
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn db_commands_create_check_and_drop_with_a_production_guard() {
+            let directory = tempfile::tempdir().expect("tempdir");
+            let url = url(&directory);
+            let file = directory.path().join("app.db");
+            let run = |arguments: &'static [&'static str], environment: &'static str| {
+                let url = url.clone();
+                tokio::task::spawn_blocking(move || {
+                    App::new("demo")
+                        .sqlite(migrations())
+                        .run_with(args(arguments), || {
+                            config_with(&[
+                                ("FORGE_ENV", environment),
+                                ("FORGE_MIGRATION_DATABASE_URL", url.as_str()),
+                            ])
+                        })
+                })
+            };
+
+            assert_eq!(
+                run(&["db", "exists"], "development").await.expect("join"),
+                ExitCode::from(crate::database::EXIT_DATABASE_MISSING)
+            );
+            assert_eq!(
+                run(&["db", "create"], "development").await.expect("join"),
+                ExitCode::SUCCESS
+            );
+            assert!(file.exists());
+            assert_eq!(
+                run(&["db", "create"], "development").await.expect("join"),
+                ExitCode::SUCCESS,
+                "creating twice is not an error"
+            );
+            assert_eq!(
+                run(&["db", "exists"], "development").await.expect("join"),
+                ExitCode::SUCCESS
+            );
+
+            // Production refuses without --force-production, and changes nothing.
+            assert_eq!(
+                run(&["db", "drop"], "production").await.expect("join"),
+                ExitCode::FAILURE
+            );
+            assert!(file.exists());
+            assert_eq!(
+                run(&["db", "drop", "--force-production"], "production")
+                    .await
+                    .expect("join"),
+                ExitCode::SUCCESS
+            );
+            assert!(!file.exists());
+            assert_eq!(
+                run(&["db", "drop"], "development").await.expect("join"),
+                ExitCode::SUCCESS,
+                "dropping a missing database is not an error"
+            );
+        }
+
+        #[test]
+        fn db_commands_need_a_declared_database_and_a_matching_url() {
+            let undeclared = App::new("demo").run_with(args(&["db", "create"]), no_config);
+            assert_eq!(undeclared, ExitCode::FAILURE);
+            let missing = App::new("demo")
+                .sqlite(migrations())
+                .run_with(args(&["db", "create"]), no_config);
+            assert_eq!(missing, ExitCode::from(EXIT_CONFIG));
+            let legacy = App::new("demo")
+                .migrations(
+                    |_| async { Ok::<(), io::Error>(()) },
+                    |_| async { Ok::<(), io::Error>(()) },
+                )
+                .run_with(args(&["migrate", "status"]), || {
+                    config_with(&[("FORGE_MIGRATION_DATABASE_URL", "sqlite:x.db")])
+                });
+            assert_eq!(legacy, ExitCode::FAILURE);
         }
 
         /// Regression (rocketinsidecorp/forge-rust#10): with the shipped

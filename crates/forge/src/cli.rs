@@ -13,8 +13,15 @@ pub(crate) enum Command {
     Healthcheck,
     /// Apply all pending embedded database migrations.
     Migrate,
-    /// Revert the latest reversible database migration.
-    Rollback,
+    /// List every migration and whether it is applied, without applying any.
+    MigrationStatus,
+    /// Revert the latest `steps` reversible database migrations.
+    Rollback {
+        /// How many migrations to revert, at least one.
+        steps: u32,
+    },
+    /// Server-level administration of the application's database.
+    Db(DbCommand),
     /// Print name and version.
     Version,
     /// Print usage.
@@ -27,12 +34,28 @@ pub(crate) enum Command {
     Jobs(JobsCommand),
 }
 
+/// `db` subcommand.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DbCommand {
+    /// Create the database unless it exists.
+    Create,
+    /// Drop the database and everything in it.
+    Drop {
+        /// The caller confirmed a drop outside development and test, or of a
+        /// server that is not on this machine.
+        force_production: bool,
+    },
+    /// Exit 0 when the database exists and 3 when it does not.
+    Exists,
+}
+
 /// Names of the built-in commands, which applications cannot replace.
 pub(crate) const BUILT_IN: &[&str] = &[
     "serve",
     "healthcheck",
     "migrate",
     "rollback",
+    "db",
     "version",
     "help",
     "jobs",
@@ -66,6 +89,9 @@ pub(crate) enum JobsCommand {
     RetryEvent(forge_events::EventId),
 }
 
+/// Most migrations one `rollback --steps` reverts.
+const MAX_ROLLBACK_STEPS: u32 = 1000;
+
 /// Default number of dead jobs or events listed.
 #[cfg(feature = "jobs")]
 const DEFAULT_LIST_LIMIT: u16 = 50;
@@ -83,11 +109,9 @@ pub(crate) enum UsageError {
     #[error("arguments must be valid UTF-8")]
     NotUnicode,
     /// A required argument is missing.
-    #[cfg(feature = "jobs")]
     #[error("missing {0}")]
     MissingArgument(&'static str),
     /// An argument is not a valid value.
-    #[cfg(feature = "jobs")]
     #[error("invalid {what}: {value:?}")]
     InvalidArgument {
         /// What was expected.
@@ -109,8 +133,19 @@ pub(crate) fn parse(
         Some(arg) => match arg.to_str() {
             Some("serve") => Command::Serve,
             Some("healthcheck") => Command::Healthcheck,
-            Some("migrate") => Command::Migrate,
-            Some("rollback") => Command::Rollback,
+            Some("migrate") => match args.next() {
+                None => Command::Migrate,
+                Some(argument) if argument.to_str() == Some("status") => Command::MigrationStatus,
+                Some(argument) => {
+                    return Err(UsageError::UnexpectedArgument(
+                        argument.to_string_lossy().into_owned(),
+                    ));
+                }
+            },
+            Some("rollback") => Command::Rollback {
+                steps: parse_steps(&mut args)?,
+            },
+            Some("db") => Command::Db(parse_db(&mut args)?),
             Some("version" | "--version" | "-V") => Command::Version,
             Some("help" | "--help" | "-h") => Command::Help,
             #[cfg(feature = "jobs")]
@@ -138,6 +173,58 @@ pub(crate) fn parse(
         ));
     }
     Ok(command)
+}
+
+/// `[--steps N]` after `rollback`; one step by default.
+fn parse_steps(args: &mut impl Iterator<Item = OsString>) -> Result<u32, UsageError> {
+    let Some(flag) = args.next() else {
+        return Ok(1);
+    };
+    let flag = flag.to_string_lossy().into_owned();
+    let value = if flag == "--steps" {
+        args.next()
+            .map(|value| value.to_string_lossy().into_owned())
+            .ok_or(UsageError::MissingArgument("--steps value"))?
+    } else if let Some(value) = flag.strip_prefix("--steps=") {
+        value.to_owned()
+    } else {
+        return Err(UsageError::UnexpectedArgument(flag));
+    };
+    match value.parse::<u32>() {
+        Ok(steps @ 1..=MAX_ROLLBACK_STEPS) => Ok(steps),
+        _ => Err(UsageError::InvalidArgument {
+            what: "--steps (1-1000)",
+            value,
+        }),
+    }
+}
+
+/// `create`, `exists` or `drop [--force-production]` after `db`.
+fn parse_db(args: &mut impl Iterator<Item = OsString>) -> Result<DbCommand, UsageError> {
+    let Some(subcommand) = args.next() else {
+        return Err(UsageError::MissingArgument(
+            "db command (create, drop, exists)",
+        ));
+    };
+    match subcommand.to_str() {
+        Some("create") => Ok(DbCommand::Create),
+        Some("exists") => Ok(DbCommand::Exists),
+        Some("drop") => match args.next() {
+            None => Ok(DbCommand::Drop {
+                force_production: false,
+            }),
+            Some(flag) if flag.to_str() == Some("--force-production") => Ok(DbCommand::Drop {
+                force_production: true,
+            }),
+            Some(other) => Err(UsageError::UnexpectedArgument(
+                other.to_string_lossy().into_owned(),
+            )),
+        },
+        _ => Err(UsageError::UnknownCommand(format!(
+            "db {}",
+            subcommand.to_string_lossy()
+        ))),
+    }
 }
 
 #[cfg(feature = "jobs")]
@@ -242,7 +329,12 @@ Commands:
   serve        Run the HTTP server (default)
   healthcheck  Probe GET /health/live on the configured address; exit 0 when healthy
   migrate      Apply all pending embedded database migrations
-  rollback     Revert the latest reversible database migration
+  migrate status               List every migration as applied, pending, modified, disabled or missing
+  rollback     Revert the latest reversible database migration (--steps N reverts N)
+  db create    Create the database of FORGE_MIGRATION_DATABASE_URL unless it exists
+  db exists    Exit 0 when that database exists, 3 when it does not
+  db drop      Drop that database; outside development and test, or for a server that is not
+               on this machine, only with --force-production
 {commands}  version      Print the application name and version (also --version, -V)
   help         Print this help (also --help, -h)
 {jobs}
@@ -345,7 +437,10 @@ mod tests {
             Ok(Command::Healthcheck)
         );
         assert_eq!(parse_builtin(args(&["migrate"])), Ok(Command::Migrate));
-        assert_eq!(parse_builtin(args(&["rollback"])), Ok(Command::Rollback));
+        assert_eq!(
+            parse_builtin(args(&["rollback"])),
+            Ok(Command::Rollback { steps: 1 })
+        );
         for alias in ["version", "--version", "-V"] {
             assert_eq!(
                 parse_builtin(args(&[alias])),
@@ -356,6 +451,87 @@ mod tests {
         for alias in ["help", "--help", "-h"] {
             assert_eq!(parse_builtin(args(&[alias])), Ok(Command::Help), "{alias}");
         }
+    }
+
+    #[test]
+    fn migrate_status_and_rollback_steps_parse_and_validate() {
+        assert_eq!(
+            parse_builtin(args(&["migrate", "status"])),
+            Ok(Command::MigrationStatus)
+        );
+        assert_eq!(
+            parse_builtin(args(&["migrate", "now"])),
+            Err(UsageError::UnexpectedArgument("now".to_owned()))
+        );
+        assert_eq!(
+            parse_builtin(args(&["rollback", "--steps", "3"])),
+            Ok(Command::Rollback { steps: 3 })
+        );
+        assert_eq!(
+            parse_builtin(args(&["rollback", "--steps=2"])),
+            Ok(Command::Rollback { steps: 2 })
+        );
+        for bad in ["0", "1001", "-1", "x", ""] {
+            assert!(
+                matches!(
+                    parse_builtin(args(&["rollback", "--steps", bad])),
+                    Err(UsageError::InvalidArgument { .. })
+                ),
+                "{bad:?}"
+            );
+        }
+        assert_eq!(
+            parse_builtin(args(&["rollback", "--steps"])),
+            Err(UsageError::MissingArgument("--steps value"))
+        );
+        assert_eq!(
+            parse_builtin(args(&["rollback", "3"])),
+            Err(UsageError::UnexpectedArgument("3".to_owned()))
+        );
+        assert_eq!(
+            parse_builtin(args(&["rollback", "--steps", "2", "x"])),
+            Err(UsageError::UnexpectedArgument("x".to_owned()))
+        );
+    }
+
+    #[test]
+    fn db_subcommands_parse_and_validate() {
+        assert_eq!(
+            parse_builtin(args(&["db", "create"])),
+            Ok(Command::Db(DbCommand::Create))
+        );
+        assert_eq!(
+            parse_builtin(args(&["db", "exists"])),
+            Ok(Command::Db(DbCommand::Exists))
+        );
+        assert_eq!(
+            parse_builtin(args(&["db", "drop"])),
+            Ok(Command::Db(DbCommand::Drop {
+                force_production: false
+            }))
+        );
+        assert_eq!(
+            parse_builtin(args(&["db", "drop", "--force-production"])),
+            Ok(Command::Db(DbCommand::Drop {
+                force_production: true
+            }))
+        );
+        assert!(matches!(
+            parse_builtin(args(&["db"])),
+            Err(UsageError::MissingArgument(_))
+        ));
+        assert!(matches!(
+            parse_builtin(args(&["db", "reset"])),
+            Err(UsageError::UnknownCommand(_))
+        ));
+        assert!(matches!(
+            parse_builtin(args(&["db", "drop", "--yes"])),
+            Err(UsageError::UnexpectedArgument(_))
+        ));
+        assert!(matches!(
+            parse_builtin(args(&["db", "create", "--force-production"])),
+            Err(UsageError::UnexpectedArgument(_))
+        ));
     }
 
     #[test]

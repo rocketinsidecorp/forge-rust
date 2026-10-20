@@ -47,7 +47,7 @@ pub(crate) mod sealed {
     use super::{ConnectOptions, Migrate};
 
     /// Per-backend behavior behind [`super::Backend`].
-    pub trait Hooks: sqlx::Database<Connection: Migrate> {
+    pub trait Hooks: sqlx::Database<Connection: Migrate> + sqlx::migrate::MigrateDatabase {
         /// The engine this backend implements.
         const SCHEME: DatabaseScheme;
 
