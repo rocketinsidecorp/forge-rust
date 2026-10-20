@@ -187,6 +187,12 @@ pub(crate) enum Command {
         #[arg(long, value_name = "FILE")]
         check: Option<std::path::PathBuf>,
     },
+    /// Print every route of the application as a table (METHOD, PATH, ACTION,
+    /// SOURCE) by running its `routes` command: HTML and JSON
+    /// routes alike, with the source line that registered each. It composes
+    /// the application without listening, so it needs the configuration
+    /// `serve` needs.
+    Routes,
     /// Encrypted per-environment credentials in
     /// config/credentials/ENV.json.enc (like `rails credentials:edit`, ADR
     /// 0041). The key is FORGE_MASTER_KEY or config/credentials/ENV.key.

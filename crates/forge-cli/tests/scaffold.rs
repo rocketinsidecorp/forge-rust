@@ -1428,6 +1428,142 @@ fn stdout(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
+/// `forge routes` end to end: a PostgreSQL application with a public HTML
+/// controller, a JSON controller and a scaffold lists every route (HTML,
+/// `/v1` JSON and Forge's own), sorted like Forge-Go's table, each naming
+/// the source line that registered it. The application is composed, not
+/// served, so no database has to run.
+#[test]
+#[ignore = "slow: builds generated applications; run with --ignored"]
+fn postgresql_application_lists_every_route_with_forge_routes() {
+    let forge = env!("CARGO_BIN_EXE_forge");
+    let parent = tempfile::tempdir().unwrap_or_else(|error| panic!("{error}"));
+    let forge_path = workspace().join("crates/forge");
+    let forge_path = forge_path.to_string_lossy();
+    run(
+        parent.path(),
+        forge,
+        &[
+            "new",
+            "routes-postgresql",
+            "--skip-docker",
+            "--skip-ci",
+            "--skip-lockfile",
+            "--forge-path",
+            &forge_path,
+        ],
+        &[],
+    );
+    let root = parent.path().join("routes-postgresql");
+    for (generator, arguments) in [
+        (
+            "controller",
+            &["pages", "index", "about_us", "--public"][..],
+        ),
+        ("controller", &["reports", "monthly", "--api"]),
+        ("scaffold", &["article", "title:string", "--tenant-scoped"]),
+    ] {
+        let mut command = vec!["generate", generator];
+        command.extend_from_slice(arguments);
+        let printed = stdout(&run(&root, forge, &command, &[]));
+        apply_wiring(&root, &printed);
+    }
+    run(&root, "cargo", &["generate-lockfile", "--quiet"], &[]);
+
+    // The application composes with the configuration `serve` needs.
+    let refused = run_unchecked(&root, forge, &["routes"], &[], None);
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("FORGE_DATABASE_URL"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    let environment = [(
+        "FORGE_DATABASE_URL",
+        "postgres://app:secret@127.0.0.1:1/routes",
+    )];
+    let output = run(&root, forge, &["routes"], &environment);
+    let table = stdout(&output);
+    assert!(!table.contains("secret"), "{table}");
+
+    let mut lines = table.lines();
+    let header: Vec<&str> = lines
+        .next()
+        .unwrap_or_default()
+        .split_whitespace()
+        .collect();
+    assert_eq!(header, ["METHOD", "PATH", "ACTION", "SOURCE"], "{table}");
+    let rows: Vec<Vec<&str>> = lines
+        .by_ref()
+        .take_while(|line| !line.is_empty())
+        .map(|line| line.split_whitespace().collect())
+        .collect();
+    assert!(
+        rows.iter().all(|row| row.len() >= 4 && row[2] == "-"),
+        "{table}"
+    );
+    let listed =
+        |method: &str, path: &str| rows.iter().any(|row| row[0] == method && row[1] == path);
+    for (method, path) in [
+        // Forge's own routes.
+        ("GET", "/health"),
+        ("GET", "/health/live"),
+        ("GET", "/health/ready"),
+        ("GET", "/openapi.json"),
+        // The welcome page and the sign-in pages.
+        ("GET", "/"),
+        ("GET", "/session/new"),
+        ("POST", "/session"),
+        // The public HTML controller.
+        ("GET", "/pages"),
+        ("GET", "/pages/about_us"),
+        // The JSON routes, which Forge-Go's source scan does not see.
+        ("GET", "/v1/status"),
+        ("GET", "/v1/reports/monthly"),
+    ] {
+        assert!(
+            listed(method, path),
+            "{method} {path} is not listed:\n{table}"
+        );
+    }
+    assert!(
+        listed("GET", "/tenants/{tenant_id}/articles"),
+        "the scaffold's pages are listed:\n{table}"
+    );
+    // Sorted by path, then method.
+    let order: Vec<(&str, &str)> = rows.iter().map(|row| (row[1], row[0])).collect();
+    let mut sorted = order.clone();
+    sorted.sort_unstable();
+    assert_eq!(order, sorted, "{table}");
+    // Forge's routes say so; the application's name the line that registered them.
+    for row in &rows {
+        let source = row[3..].join(" ");
+        if source.starts_with("forge (built in") {
+            continue;
+        }
+        let (file, line) = source
+            .rsplit_once(':')
+            .unwrap_or_else(|| panic!("{source} is not file:line"));
+        let text =
+            fs::read_to_string(root.join(file)).unwrap_or_else(|error| panic!("{file}: {error}"));
+        let line: usize = line
+            .parse()
+            .unwrap_or_else(|error| panic!("{source}: {error}"));
+        assert!(
+            text.lines()
+                .nth(line - 1)
+                .is_some_and(|code| code.contains("route(")),
+            "{source} does not register a route:\n{table}"
+        );
+    }
+    let footer: String = lines.collect::<Vec<_>>().join("\n");
+    assert!(footer.starts_with("Scope: every route"), "{table}");
+
+    // Arguments are a usage error, like the other lifecycle commands.
+    let extra = run_unchecked(&root, forge, &["routes", "--json"], &environment, None);
+    assert_eq!(extra.status.code(), Some(2));
+}
+
 /// `forge generate model|controller|mailer|job` and `forge destroy` end to
 /// end (ADR 0038): a PostgreSQL application gets a model, a tenant-scoped
 /// scaffold, a controller that reuses the model's permission, a public and

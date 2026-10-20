@@ -25,6 +25,8 @@ pub(crate) enum Command {
     Db(DbCommand),
     /// Print, write or check the OpenAPI document.
     OpenApi(OpenApiOutput),
+    /// Print the routes of the composed application.
+    Routes,
     /// Print name and version.
     Version,
     /// Print usage.
@@ -71,6 +73,7 @@ pub(crate) const BUILT_IN: &[&str] = &[
     "rollback",
     "db",
     "openapi",
+    "routes",
     "version",
     "help",
     "jobs",
@@ -162,6 +165,7 @@ pub(crate) fn parse(
             },
             Some("db") => Command::Db(parse_db(&mut args)?),
             Some("openapi") => Command::OpenApi(parse_openapi(&mut args)?),
+            Some("routes") => Command::Routes,
             Some("version" | "--version" | "-V") => Command::Version,
             Some("help" | "--help" | "-h") => Command::Help,
             #[cfg(feature = "jobs")]
@@ -382,6 +386,8 @@ Commands:
                on this machine, only with --force-production
   openapi      Print the OpenAPI document; --output FILE writes it, --check FILE exits 1
                when FILE is out of date (logs go to standard error)
+  routes       Print every route of the composed application as a table: METHOD, PATH,
+               ACTION and the source line that registered it (logs go to standard error)
 {commands}  version      Print the application name and version (also --version, -V)
   help         Print this help (also --help, -h)
 {jobs}
@@ -481,6 +487,16 @@ mod tests {
             Err(UsageError::UnexpectedArgument("--check".to_owned()))
         );
         assert!(BUILT_IN.contains(&"openapi"));
+    }
+
+    #[test]
+    fn routes_takes_no_arguments() {
+        assert_eq!(parse_builtin(args(&["routes"])), Ok(Command::Routes));
+        assert_eq!(
+            parse_builtin(args(&["routes", "--json"])),
+            Err(UsageError::UnexpectedArgument("--json".to_owned()))
+        );
+        assert!(BUILT_IN.contains(&"routes"));
     }
 
     #[test]
@@ -735,6 +751,7 @@ mod tests {
             "healthcheck",
             "migrate",
             "rollback",
+            "routes",
             "version",
             "help",
         ] {

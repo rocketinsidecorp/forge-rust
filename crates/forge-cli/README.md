@@ -19,6 +19,7 @@ forge db create | drop | reset | setup | prepare | migrate | rollback | status |
                                  database lifecycle, like Rails' db:* tasks
 forge openapi [--output FILE | --check FILE]
                                  the application's OpenAPI 3.1 document (ADR 0039)
+forge routes                     every route (HTML and JSON) with the line that registered it
 ```
 
 `forge new` creates a standalone Cargo package with Forge's hexagonal module

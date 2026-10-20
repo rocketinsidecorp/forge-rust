@@ -166,12 +166,13 @@ anything is wrong; `FORGE_ALLOW_DESTRUCTIVE` is not treated as an unknown key.
 
 ### Not ported, and why
 
-- `forge routes` and `forge inspect`: Forge-Go scans the source for literal
-  `Handle` calls. Rust routes are registered by closures, helper functions and
-  composition hooks with computed paths (`format!("{collection}/new")`), so a
-  scan would be wrong. An accurate listing needs the application's composition
-  and therefore its configuration; it is an application subcommand
-  (`Router::routes()` plus a built-in `routes`) tracked in
+- `forge inspect`: Forge-Go scans the source for literal `Handle` calls. Rust
+  routes are registered by closures, helper functions and composition hooks
+  with computed paths (`format!("{collection}/new")`), so a scan would be wrong.
+  An accurate listing needs the application's composition and therefore its
+  configuration. `forge routes` is now an application subcommand
+  (`Router::routes()` plus a built-in `routes`, which composes the application
+  without listening, like `openapi`); `inspect` is tracked in
   [Rails parity](../rails-parity.md#parity-follow-ups).
 - `db schema:dump|schema:load|console`: they run `pg_dump`, `psql` and friends
   with the credential. They need application subcommands that pass it through

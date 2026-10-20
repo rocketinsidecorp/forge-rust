@@ -233,6 +233,8 @@ forge deploy prune                             # stopped containers beyond retai
 forge logs -f --role web --grep ERROR          # every host, lines prefixed host|
 forge app exec migrate status                  # one-off container of the deployed image
 forge app shell --image busybox:1.37           # debug sidecar (distroless has no shell)
+forge routes                                   # every route, HTML and JSON: METHOD, PATH, ACTION, SOURCE
+forge routes | grep /v1                        # filter it like `rails routes | grep`
 cargo run -- healthcheck                       # application binary: serve, healthcheck, version, help,
 cargo run -- migrate                           #   migrate [status], rollback [--steps N], db create|exists|drop,
 cargo run -- seed                              #   setup, seed, openapi: what the forge commands above run
@@ -516,7 +518,7 @@ Kubernetes and systemd deployment is covered in
 - An OpenAPI 3.1 document of the JSON routes (`GET /v1/status` and the
   health routes) at `/openapi.json` in development and test, and a
   `tests/openapi.rs` contract test ([ADR 0039](docs/adr/0039-openapi-from-typed-routes.md)).
-- Binary subcommands: `serve` (default), `healthcheck`, `openapi`, `migrate`,
+- Binary subcommands: `serve` (default), `healthcheck`, `openapi`, `routes`, `migrate`,
   `rollback`, `seed` (database applications), `setup` (full-stack
   PostgreSQL), `jobs` (applications that declare `App::jobs`), `version`,
   `help`.

@@ -10,6 +10,7 @@ use std::{
     fmt,
     future::Future,
     net::{IpAddr, SocketAddr},
+    panic::Location,
     pin::Pin,
     sync::{Arc, OnceLock},
     time::Duration,
@@ -554,6 +555,20 @@ struct RegisteredRoute {
     method: Method,
     path: String,
     operation: Option<Arc<forge_openapi::Operation>>,
+    source: &'static Location<'static>,
+}
+
+/// One route of a [`Router`], as listed by [`Router::routes`].
+#[derive(Clone, Copy, Debug)]
+pub struct RouteInfo<'a> {
+    /// The HTTP method.
+    pub method: &'a Method,
+    /// The pattern as registered, such as `/posts/{id}`.
+    pub path: &'a str,
+    /// The source line of the [`Router::route`] call that registered it
+    /// (`file()` is as the compiler saw it, relative to the package's
+    /// workspace for the application's own files).
+    pub source: &'static Location<'static>,
 }
 
 /// Immutable route table once attached to a server.
@@ -590,6 +605,8 @@ impl Router {
     /// Registers a route and rejects duplicate or ambiguous method/pattern
     /// pairs. Whole path segments may be named captures such as `{id}`.
     /// Static segments take precedence over capture segments during dispatch.
+    /// The call site is kept for [`Router::routes`].
+    #[track_caller]
     pub fn route(
         &mut self,
         method: Method,
@@ -619,8 +636,19 @@ impl Router {
             method,
             path,
             operation,
+            source: Location::caller(),
         });
         Ok(self)
+    }
+
+    /// Every registered route, in registration order, with the source line
+    /// that registered it. This is what `forge routes` prints.
+    pub fn routes(&self) -> impl ExactSizeIterator<Item = RouteInfo<'_>> {
+        self.routes.iter().map(|route| RouteInfo {
+            method: &route.method,
+            path: &route.path,
+            source: route.source,
+        })
     }
 
     /// Adds a [`Middleware`] layer that runs before routing for every request,
@@ -1582,6 +1610,50 @@ mod tests {
             .expect_err("duplicate route must fail");
 
         assert!(matches!(error, RouteError::Duplicate { .. }));
+    }
+
+    #[test]
+    fn routes_lists_every_registration_with_its_call_site() {
+        let mut router = Router::new();
+        let first = line!() + 2;
+        router
+            .route(Method::GET, "/posts/{id}", |_| async {
+                Response::empty(StatusCode::OK)
+            })
+            .expect("route must register");
+        let second = line!() + 2;
+        router
+            .route(Method::POST, "/posts", |_| async {
+                Response::empty(StatusCode::CREATED)
+            })
+            .expect("route must register");
+        // A refused registration is not listed.
+        assert!(
+            router
+                .route(Method::POST, "/posts", |_| async {
+                    Response::empty(StatusCode::OK)
+                })
+                .is_err()
+        );
+
+        let routes: Vec<_> = router
+            .routes()
+            .map(|route| {
+                (
+                    route.method.as_str(),
+                    route.path,
+                    route.source.file(),
+                    route.source.line(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            routes,
+            [
+                ("GET", "/posts/{id}", file!(), first),
+                ("POST", "/posts", file!(), second),
+            ]
+        );
     }
 
     #[test]
