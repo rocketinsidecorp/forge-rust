@@ -973,6 +973,16 @@ fn write_application(
         )?;
     }
 
+    // Encrypted development credentials (ADR 0041): a random key in
+    // config/credentials/development.key (0600, git- and docker-ignored by
+    // the templates) and the encrypted development.json.enc with a
+    // data-encryption key ring for attribute encryption.
+    let credentials = root.join(forge_credentials::DEFAULT_DIR);
+    forge_credentials::init(&credentials, "development").map_err(|error| CliError::WriteFile {
+        path: credentials.clone(),
+        source: std::io::Error::other(error.to_string()),
+    })?;
+
     Ok(())
 }
 
@@ -1216,6 +1226,58 @@ mod tests {
             .unwrap_or_else(|error| panic!("{relative} should be readable: {error}"))
     }
 
+    /// Like Forge-Go's `forge new`: a development key (0600, ignored by git
+    /// and Docker) and an encrypted file holding an encryption key ring.
+    #[test]
+    fn new_applications_get_development_credentials() {
+        for database in [Database::Postgresql, Database::Sqlite3, Database::Disabled] {
+            let parent = tempfile::tempdir().expect("temporary directory should be available");
+            let root = create_application(
+                parent.path(),
+                &NewApplication {
+                    database,
+                    ..options("shop")
+                },
+            )
+            .expect("generation succeeds");
+            let dir = root.join("config/credentials");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+
+                let mode = fs::metadata(dir.join("development.key"))
+                    .expect("key file")
+                    .permissions()
+                    .mode();
+                assert_eq!(mode & 0o777, 0o600);
+            }
+            let store = forge_credentials::open(
+                "development",
+                forge_credentials::Options::default()
+                    .with_dir(&dir)
+                    .with_lookup(|_| None),
+            )
+            .expect("the generated key opens the generated file");
+            assert!(store.exists());
+            store
+                .key_ring(&["encryption"])
+                .expect("an encryption key ring");
+            assert!(read(&root, ".gitignore").contains("/config/credentials/*.key"));
+            assert!(read(&root, ".dockerignore").contains("config/credentials/*.key"));
+            let readme = read(&root, "README.md");
+            assert!(
+                readme.contains("forge credentials edit") && readme.contains("FORGE_MASTER_KEY")
+            );
+            let key = read(&root, "config/credentials/development.key");
+            for (relative, content) in snapshot(&root) {
+                assert!(
+                    !String::from_utf8_lossy(&content).contains(key.trim()),
+                    "the credentials key appears in {relative}"
+                );
+            }
+        }
+    }
+
     /// Reads every file below `root` except build outputs and the lockfile.
     fn snapshot(root: &Path) -> BTreeMap<String, Vec<u8>> {
         fn visit(root: &Path, directory: &Path, files: &mut BTreeMap<String, Vec<u8>>) {
@@ -1227,7 +1289,11 @@ mod tests {
                     .expect("path is below root")
                     .to_string_lossy()
                     .replace('\\', "/");
-                if relative == "target" || relative == "Cargo.lock" {
+                // The development credentials are random on every run.
+                if relative == "target"
+                    || relative == "Cargo.lock"
+                    || relative.starts_with("config/credentials/development.")
+                {
                     continue;
                 }
                 if path.is_dir() {
