@@ -1586,7 +1586,8 @@ mod tests {
         assert!(bootstrap.contains(".command(\"setup\", setup::SUMMARY, setup::run)"));
         assert!(bootstrap.contains(".command(\"seed\", seeds::SUMMARY, seeds::run)"));
         assert!(bootstrap.contains("crate::adapters::http::authentication::routes("));
-        assert!(bootstrap.contains("forge::auth::UndeliverablePasswordResets"));
+        assert!(bootstrap.contains("forge::mail::password_reset_notifier("));
+        assert!(bootstrap.contains("forge::mail::PreviewHandler::new("));
         assert!(read(&root, "src/infrastructure/mod.rs").contains("pub mod accounts;"));
         assert!(read(&root, "src/adapters/http/mod.rs").contains("pub mod authentication;"));
         assert!(read(&root, "src/adapters/http/views/mod.rs").contains("pub mod authentication;"));

@@ -211,8 +211,9 @@ fn wiring() -> Result<String, CliError> {
          Then apply the migration and create the first owner:\n\n    \
          FORGE_MIGRATION_DATABASE_URL=... cargo run -- migrate\n    \
          FORGE_MIGRATION_DATABASE_URL=... cargo run -- setup --tenant acme --email owner@example.com\n\n  \
-         Reset links are not delivered until a PasswordResetNotifier replaces\n  \
-         forge::auth::UndeliverablePasswordResets (the page answers the same either way).\n  \
+         Reset links are emailed once FORGE_MAIL_URL, FORGE_MAIL_FROM and\n  \
+         FORGE_AUTH_PASSWORD_RESET_URL are set (the `mail` feature of `forge`, on with\n  \
+         `views`); until then nothing is delivered and the page answers the same.\n  \
          They go only to the login the credential store returns: if\n  \
          src/infrastructure/auth/mod.rs predates this generator, select `login` in\n  \
          `find_by_login` and add `.with_login(login)` to the credential, as `forge new`\n  \

@@ -103,8 +103,9 @@ pub struct AuthenticationPorts {
     pub memberships: Arc<dyn MembershipStore>,
     pub tenants: Arc<dyn TenantDirectory>,
     pub resets: Arc<dyn PasswordResetStore>,
-    /// Delivers reset links. `forge::auth::UndeliverablePasswordResets`
-    /// (the generated default until a mailer is wired) delivers nothing.
+    /// Delivers reset links: `forge::mail::PasswordResetMailer` when mail is
+    /// configured, otherwise `forge::auth::UndeliverablePasswordResets`,
+    /// which delivers nothing (see `forge::mail::password_reset_notifier`).
     pub notifier: Arc<dyn PasswordResetNotifier>,
     pub audit: Arc<dyn AuditSink>,
     /// Sign-in attempts per account and source.

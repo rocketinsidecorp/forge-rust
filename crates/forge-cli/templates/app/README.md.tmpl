@@ -170,9 +170,48 @@ cargo run
 `--password-stdin`, or `FORGE_SETUP_PASSWORD`; never an argument), needs at
 least 12 characters, and refuses once a tenant exists. The owner gets the
 `owner` role; tenant-scoped scaffolds grant it their permissions and send
-signed-out browsers to the sign-in page. Password-reset links are not
-delivered until a `PasswordResetNotifier` for your mail provider replaces
-`forge::auth::UndeliverablePasswordResets` in `src/bootstrap/mod.rs`.
+signed-out browsers to the sign-in page.
+
+### Password-reset emails
+
+Reset links are emailed once outgoing mail is configured; until then the
+reset page answers the same and delivers nothing. In development, write the
+emails to `.eml` files:
+
+```bash
+export FORGE_MAIL_URL=file:tmp/mail
+export FORGE_MAIL_FROM="%%APP_NAME%% <no-reply@example.com>"
+export FORGE_AUTH_PASSWORD_RESET_URL=http://localhost:3000/passwords/edit
+cargo run
+# request a reset at http://127.0.0.1:3000/passwords/new?tenant=acme,
+# then open the link in the newest tmp/mail/*.eml
+```
+
+Preview the email in the browser without sending anything (development and
+test only):
+
+```bash
+FORGE_MAIL_PREVIEW=true cargo run
+# open http://127.0.0.1:3000/_mail
+```
+
+In production use your SMTP server: STARTTLS on 587 with `smtp://`, implicit
+TLS on 465 with `smtps://` (percent-encode `@`, `:` and `/` in the password).
+Certificates are always verified; a private relay's CA goes in
+`FORGE_MAIL_TLS_CA_FILE`.
+
+```bash
+export FORGE_MAIL_URL='smtps://user:password@smtp.example.com:465'
+export FORGE_MAIL_FROM="%%APP_NAME%% <no-reply@example.com>"
+export FORGE_AUTH_PASSWORD_RESET_URL=https://app.example.com/passwords/edit
+```
+
+`src/bootstrap/mod.rs` wires `forge::mail::password_reset_notifier` from
+these variables; `FORGE_MAIL_URL` without `FORGE_AUTH_PASSWORD_RESET_URL`
+stops the application at startup. Send your own email through the
+`forge::mail::Sender` port that `forge::mail::from_config` builds, and test
+it with `forge::mail::testing::Recorder` (see the Forge mail guide,
+`docs/mail.md`).
 %%end%%
 
 %%end%%

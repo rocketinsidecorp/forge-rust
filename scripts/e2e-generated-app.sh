@@ -487,6 +487,19 @@ if otlp_error="$(FORGE_TELEMETRY_EXPORTER=otlp FORGE_TELEMETRY_OTLP_ENDPOINT="ht
 fi
 [[ "$otlp_error" == *"FORGE_TELEMETRY_OTLP_ENDPOINT"* && "$otlp_error" != *"sk-e2e-secret"* ]] \
   || fail "OTLP endpoint errors must not echo the endpoint"
+if mail_error="$(FORGE_ENV=production FORGE_MAIL_URL="smtp://mailer:sk-mail-secret@smtp.example.com:587" \
+  FORGE_MAIL_FROM="App <app@example.com>" FORGE_MAIL_ALLOW_PLAINTEXT=true "$app_bin" healthcheck 2>&1)"; then
+  fail "production must refuse plaintext SMTP with remote credentials"
+fi
+[[ "$mail_error" == *"FORGE_MAIL_ALLOW_PLAINTEXT"* && "$mail_error" != *"sk-mail-secret"* ]] \
+  || fail "mail configuration errors must not echo the URL"
+if FORGE_ENV=production FORGE_MAIL_PREVIEW=true "$app_bin" healthcheck 2>/dev/null; then
+  fail "production must refuse FORGE_MAIL_PREVIEW"
+fi
+if FORGE_ENV=production FORGE_MAIL_URL="file:tmp/mail" FORGE_MAIL_FROM="app@example.com" \
+  "$app_bin" healthcheck 2>/dev/null; then
+  fail "production must refuse the development file mail sender"
+fi
 kill -TERM "$server_pid"
 status=0
 wait "$server_pid" || status=$?

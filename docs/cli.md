@@ -366,8 +366,9 @@ tests/authentication_postgres.rs            setup and reset tokens against TestD
 It refuses to overwrite any of them (or an existing
 `*_forge_authentication.up.sql`), never edits an existing file and prints
 the wiring: four `pub mod` lines, the statements to append to `fn compose`
-(the stores, Argon2id, two `MemoryLoginThrottle`s, the fail-closed
-`UndeliverablePasswordResets` notifier and the audit sink) and the
+(the stores, Argon2id, two `MemoryLoginThrottle`s, the reset notifier from
+`forge::mail::password_reset_notifier`, the `/_mail` reset-email preview and
+the audit sink) and the
 `.command("setup", setup::SUMMARY, setup::run)` line for `fn run`.
 `--dry-run` prints the same without writing. Applications created with
 `--api`, `-d none`, MySQL, MariaDB or SQLite are refused with the reason:
@@ -405,12 +406,15 @@ Security behavior, all covered by the generated tests:
 - `SignInRedirect` sends a browser that gets `401` from an access policy to
   `/session/new?return_to=<page>`; JSON clients keep the `401`.
 
-Reset links are delivered by a `forge::auth::PasswordResetNotifier`. Forge
-has no mailer yet, so the generated composition uses
-`UndeliverablePasswordResets`, which delivers nothing and reports
-`NotConfigured` (logged, never shown): the page answers the same, and
-replacing the notifier in `compose` with an adapter for your mail provider
-enables delivery. MFA (TOTP) is not provided yet.
+Reset links are delivered by a `forge::auth::PasswordResetNotifier`: the
+generated composition calls `forge::mail::password_reset_notifier`, which
+emails them through the sender `FORGE_MAIL_URL` selects once
+`FORGE_MAIL_URL`, `FORGE_MAIL_FROM` and `FORGE_AUTH_PASSWORD_RESET_URL` are
+set, and otherwise returns `UndeliverablePasswordResets`, which delivers
+nothing and reports `NotConfigured` (logged, never shown); the page answers
+the same either way ([mail](mail.md#password-reset-emails)). With
+`FORGE_MAIL_PREVIEW=true` in development the email is previewed at
+`/_mail/password_reset`. MFA (TOTP) is not provided yet.
 
 ## `forge generate scaffold`
 
