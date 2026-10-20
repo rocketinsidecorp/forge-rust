@@ -13,6 +13,7 @@ members = [
     "crates/forge-jobs",
     "crates/forge-ratelimit",
     "crates/forge-security",
+    "crates/forge-storage",
     "crates/forge-tenancy",
     "crates/forge-views",
 ]
@@ -36,10 +37,12 @@ bytes = "1.12.1"
 clap = { version = "4.6.7", features = ["derive"] }
 cookie = { version = "0.18.2", default-features = false, features = ["percent-encode"] }
 getrandom = "0.4.3"
+hmac = { version = "0.13.0", default-features = false }
 http = "1.5.0"
 http-body-util = "0.1.5"
 hyper = { version = "1.11.1", features = ["http1", "server"] }
 hyper-util = { version = "0.1.21", features = ["tokio"] }
+rustix = { version = "1.1.5", default-features = false, features = ["fs", "std"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 sha2 = { version = "0.11.0", default-features = false }

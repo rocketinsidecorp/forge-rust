@@ -696,6 +696,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "forge-storage"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64",
+ "bytes",
+ "forge-config",
+ "forge-http",
+ "forge-storage",
+ "hmac",
+ "rustix",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "subtle",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "forge-tenancy"
 version = "0.1.0"
 dependencies = [
