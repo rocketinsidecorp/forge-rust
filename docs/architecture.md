@@ -122,6 +122,7 @@ forge/
 │   ├── forge-cache         # cache port and adapters (implemented, ADR 0028)
 │   ├── forge-ratelimit     # fixed-window limiter, stores, HTTP middleware (ADR 0027)
 │   ├── forge-storage       # storage port, disk adapter, signed links, uploads (ADR 0029)
+│   ├── forge-broadcast     # live updates: Turbo Streams over SSE, LISTEN/NOTIFY fanout (ADR 0031)
 │   ├── forge-telemetry     # OpenTelemetry lifecycle and context
 │   ├── forge-openapi       # contract/schema projection
 │   ├── forge-ai            # provider and controlled execution ports
@@ -339,6 +340,15 @@ composition:
   only for raster images), and accepts uploads through a strict bounded
   multipart parser with a mandatory allow-list on the sniffed type. See
   [ADR 0029](adr/0029-file-storage.md) and [storage](storage.md).
+- `forge-broadcast` pushes Turbo Streams to open pages over Server-Sent Events.
+  It lives in the HTTP adapter ring (it depends on `forge-http` and
+  `forge-views`); domain and application code never see it. Stream names are
+  HMAC-signed capabilities, tenant channels are served only to a viewer
+  authorized in that tenant, brokers start no tasks and drop slow subscribers,
+  the PostgreSQL listener is a lifecycle worker, and every stream ends when
+  shutdown begins (`Composition::shutdown_started`). See
+  [ADR 0031](adr/0031-live-updates-over-server-sent-events.md) and
+  [views](views.md#live-updates).
 
 ### Jobs and events
 

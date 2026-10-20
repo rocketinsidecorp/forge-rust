@@ -26,6 +26,7 @@ fn options(name: &str, fields: &[&str], scope: Scope) -> ScaffoldOptions {
         fields: fields.iter().map(|field| (*field).to_owned()).collect(),
         scope,
         plural: None,
+        broadcast: false,
         dry_run: false,
     }
 }
@@ -133,6 +134,107 @@ fn assert_golden(case: &str, database: Database, scaffolds: &[ScaffoldOptions]) 
         drift.is_empty(),
         "scaffold output differs from tests/fixtures/scaffold/{case} in {drift:?}; run \
          `FORGE_BLESS=1 cargo test -p forge-cli` and review the diff"
+    );
+}
+
+fn broadcasting(mut options: ScaffoldOptions) -> ScaffoldOptions {
+    options.broadcast = true;
+    options
+}
+
+#[test]
+fn postgresql_broadcasting_scaffolds_match_the_golden_output() {
+    assert_golden(
+        "postgresql-broadcast",
+        Database::Postgresql,
+        &[broadcasting(event()), broadcasting(post())],
+    );
+}
+
+#[test]
+fn the_streams_module_is_written_once_and_reused() {
+    let (_parent, root) = application(Database::Sqlite3, true);
+
+    let plain = ok(&root, &post());
+    assert!(!plain.created.iter().any(|path| path == STREAMS_PATH));
+    assert!(!root.join("templates/posts/_row.html").exists());
+    assert!(!plain.wiring.contains("Streams::register"));
+
+    let first = ok(&root, &broadcasting(event()));
+    assert!(first.created.iter().any(|path| path == STREAMS_PATH));
+    assert!(
+        first
+            .created
+            .iter()
+            .any(|path| path == "templates/events/_row.html")
+    );
+    assert!(!first.reused_streams);
+    assert!(first.wiring.contains("pub mod streams;"));
+    // SQLite has no LISTEN/NOTIFY: the wiring says so and stays in process.
+    assert!(
+        first.wiring.contains("Fanout::InProcess"),
+        "{}",
+        first.wiring
+    );
+    assert!(!first.wiring.contains("Fanout::Postgres"));
+    assert!(first.wiring.contains("&streams,"));
+
+    let mut note = options("note", &["body:text"], Scope::Global);
+    note.broadcast = true;
+    let second = ok(&root, &note);
+    assert!(!second.created.iter().any(|path| path == STREAMS_PATH));
+    assert!(second.reused_streams);
+    assert!(!second.wiring.contains("Streams::register"));
+    assert!(!second.wiring.contains("pub mod streams;"));
+    assert!(second.wiring.contains("&streams,"));
+}
+
+#[test]
+fn broadcast_needs_the_feature_and_an_intact_streams_module() {
+    let (_parent, root) = application(Database::Postgresql, true);
+    let manifest = fs::read_to_string(root.join("Cargo.toml")).unwrap_or_default();
+    fs::write(
+        root.join("Cargo.toml"),
+        manifest.replace(", \"broadcast\"", ""),
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
+    assert!(refusal(&root, &broadcasting(post())).contains("`broadcast` feature"));
+    assert!(
+        ok(&root, &post()).wiring.contains("posts"),
+        "plain scaffolds still work"
+    );
+
+    let (_parent, root) = application(Database::Postgresql, true);
+    fs::create_dir_all(root.join("src/adapters/http")).unwrap_or_else(|error| panic!("{error}"));
+    fs::write(root.join(STREAMS_PATH), "//! mine\n").unwrap_or_else(|error| panic!("{error}"));
+    assert!(refusal(&root, &broadcasting(post())).contains("pub struct Streams"));
+}
+
+#[test]
+fn an_access_module_whose_global_access_returns_no_principal_is_refused_with_instructions() {
+    let (_parent, root) = application(Database::Postgresql, true);
+    ok(&root, &event());
+    let access = fs::read_to_string(root.join(ACCESS_PATH)).unwrap_or_default();
+    let old = access.replace(
+        "Result<Option<PrincipalId>, AccessDenied>",
+        "Result<(), AccessDenied>",
+    );
+    assert_ne!(old, access);
+    fs::write(root.join(ACCESS_PATH), old).unwrap_or_else(|error| panic!("{error}"));
+
+    for refused in [
+        post(),
+        broadcasting(options("meeting", &["name:string"], Scope::Tenant)),
+    ] {
+        let reason = refusal(&root, &refused);
+        assert!(
+            reason.contains("Result<Option<PrincipalId>, AccessDenied>"),
+            "{reason}"
+        );
+    }
+    assert!(
+        ok(&root, &options("note", &["body:text"], Scope::Tenant)).reused_access,
+        "tenant scaffolds without live updates do not use GlobalAccess"
     );
 }
 

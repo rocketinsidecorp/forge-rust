@@ -119,7 +119,7 @@ pub fn prefers_html(request: &Request) -> bool {
 }
 
 /// An RFC 9110 quality value in thousandths, `None` when malformed.
-fn quality(value: &str) -> Option<u16> {
+pub(crate) fn quality(value: &str) -> Option<u16> {
     let (whole, fraction) = value.split_once('.').unwrap_or((value, ""));
     if fraction.len() > 3 || !fraction.bytes().all(|byte| byte.is_ascii_digit()) {
         return None;

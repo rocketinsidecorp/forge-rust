@@ -442,6 +442,10 @@ impl App {
             }
         };
 
+        // One shutdown signal for the whole process: cancelled when shutdown
+        // begins (a signal, or the server or job runtime failing). Composed
+        // adapters see it through `Composition::shutdown_started`.
+        let shutdown = Cancellation::new();
         // SQLx pools and the adapters composed around them need a Tokio
         // context even before the first request arrives.
         let composed = {
@@ -453,6 +457,7 @@ impl App {
                 compose_hooks,
                 declaration.zip(url),
                 jobs_slot,
+                &shutdown,
             )
         };
         let (router, database, workers, jobs_slot) = match composed {
@@ -463,9 +468,14 @@ impl App {
         #[cfg(feature = "jobs")]
         let background = background.filter(|_| run_jobs_in_serve);
 
-        let result = runtime.block_on(serve_until_signal(
-            name, version, config, router, database, workers, background,
-        ));
+        let composed = Composed {
+            router,
+            database,
+            workers,
+            background,
+            shutdown,
+        };
+        let result = runtime.block_on(serve_until_signal(name, version, config, composed));
         runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
 
         match result {
@@ -693,6 +703,9 @@ impl App {
             };
         }
 
+        // `jobs work` serves no HTTP; composed adapters that watch for
+        // shutdown see this signal end with the process.
+        let shutdown = Cancellation::new();
         let composed = {
             let _guard = runtime.enter();
             compose(
@@ -702,6 +715,7 @@ impl App {
                 self.compose_hooks,
                 Some((declaration, &url)),
                 Some(JobsParts::new(jobs)),
+                &shutdown,
             )
         };
         // Composition workers belong to the HTTP server's lifecycle (they
@@ -717,6 +731,7 @@ impl App {
         let name = self.name;
         let result = runtime.block_on(async move {
             let result = work_until_signal(name, background).await;
+            shutdown.cancel();
             if let Some(database) = database {
                 database.close().await;
             }
@@ -799,6 +814,7 @@ fn compose(
     hooks: Vec<ComposeHook>,
     declared: Option<(Declaration, &forge_config::SecretString)>,
     jobs: JobsSlot,
+    shutdown: &Cancellation,
 ) -> Result<(Router, Option<DatabaseHandle>, Vec<Worker>, JobsSlot), ExitCode> {
     #[cfg_attr(not(feature = "jobs"), allow(unused_mut))]
     let mut jobs = jobs;
@@ -821,7 +837,8 @@ fn compose(
     };
     let mut workers = Vec::new();
     if !hooks.is_empty() {
-        let mut composition = Composition::new(&mut router, config, database.clone());
+        let mut composition =
+            Composition::new(&mut router, config, database.clone(), shutdown.clone());
         #[cfg(feature = "jobs")]
         if let Some(parts) = jobs.as_mut() {
             composition.attach_jobs(parts);
@@ -884,17 +901,30 @@ enum ServeError {
     Background(#[source] BackgroundError),
 }
 
-async fn serve_until_signal(
-    name: &'static str,
-    version: &'static str,
-    config: AppConfig,
+/// What `serve` runs: the composed application and its shutdown signal.
+struct Composed {
     router: Router,
     database: Option<DatabaseHandle>,
     workers: Vec<Worker>,
     background: BackgroundSlot,
+    shutdown: Cancellation,
+}
+
+async fn serve_until_signal(
+    name: &'static str,
+    version: &'static str,
+    config: AppConfig,
+    composed: Composed,
 ) -> Result<(), ServeError> {
+    let Composed {
+        router,
+        database,
+        workers,
+        background,
+        shutdown,
+    } = composed;
     let workers = RunningWorkers::start(workers);
-    let result = serve(name, version, config, router, background).await;
+    let result = serve(name, version, config, router, background, shutdown).await;
     // Workers stop after the server drained, before the pool closes.
     workers.stop().await;
     if let Some(database) = database {
@@ -909,6 +939,7 @@ async fn serve(
     config: AppConfig,
     router: Router,
     background: BackgroundSlot,
+    shutdown: Cancellation,
 ) -> Result<(), ServeError> {
     let signal = signal::shutdown_signal().map_err(ServeError::Signal)?;
     let bind = config.server.bind;
@@ -929,7 +960,6 @@ async fn serve(
 
     // One shutdown for the server and the job runtime: a signal, or either
     // of them failing, stops both.
-    let shutdown = Cancellation::new();
     let server = async {
         let stop = shutdown.clone();
         let result = Server::new(config.server, router)
@@ -1549,6 +1579,7 @@ mod tests {
                 vec![hook],
                 Some((Declaration::Sqlite(forge_db::Migrator::DEFAULT), url)),
                 JobsSlot::default(),
+                &Cancellation::new(),
             )
             .expect("composition succeeds");
             assert!(format!("{router:?}").contains("GET /composed"));
@@ -1568,6 +1599,7 @@ mod tests {
                     vec![hook],
                     Some((Declaration::Sqlite(forge_db::Migrator::DEFAULT), url)),
                     JobsSlot::default(),
+                    &Cancellation::new(),
                 );
                 assert_eq!(outcome.err(), Some(ExitCode::FAILURE));
             }
@@ -1643,7 +1675,7 @@ mod tests {
             }
             let config = AppConfig::default();
             let mut router = Router::new();
-            let mut composition = Composition::new(&mut router, &config, None);
+            let mut composition = Composition::new(&mut router, &config, None, Cancellation::new());
             assert!(matches!(
                 composition.jobs(),
                 Err(ComposeError::JobsNotDeclared)
@@ -1813,6 +1845,7 @@ mod tests {
                     &runtime_url,
                 )),
                 Some(JobsParts::new(declaration)),
+                &Cancellation::new(),
             )
             .expect("composition");
             let background = background_for(slot, database.as_ref()).expect("background");

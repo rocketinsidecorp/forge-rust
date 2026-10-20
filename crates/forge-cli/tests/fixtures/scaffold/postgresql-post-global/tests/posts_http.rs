@@ -15,6 +15,7 @@ use async_trait::async_trait;
 use forge::core::Version;
 use forge::http::{HeaderMap, HeaderValue, Method, Request, Response, Router, StatusCode, header};
 use forge::security::Permission;
+use forge::security::PrincipalId;
 
 type TestResult = Result<(), Box<dyn Error>>;
 
@@ -107,8 +108,12 @@ struct AllowAll;
 
 #[async_trait]
 impl GlobalAccess for AllowAll {
-    async fn authorize(&self, _: &Request, _: &Permission) -> Result<(), AccessDenied> {
-        Ok(())
+    async fn authorize(
+        &self,
+        _: &Request,
+        _: &Permission,
+    ) -> Result<Option<PrincipalId>, AccessDenied> {
+        Ok(None)
     }
 }
 

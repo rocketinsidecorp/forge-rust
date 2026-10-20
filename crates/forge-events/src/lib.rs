@@ -341,9 +341,11 @@ mod tests {
             envelope("billing.paid", 2, r#"{"secret":"x"}"#).decode::<Paid>(),
             Err(EventsError::Decode)
         ));
+        // Look for the payload's key, not its value: "42" can also appear in
+        // the UUIDv7 id or the timestamp the envelope prints.
         let debug = format!("{paid:?}");
         assert!(
-            debug.contains("billing.paid") && !debug.contains("42"),
+            debug.contains("billing.paid") && !debug.contains("cents"),
             "{debug}"
         );
     }

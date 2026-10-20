@@ -12,7 +12,7 @@ use std::{
 use bytes::Bytes;
 use forge_config::ServerConfig;
 pub use http::{Extensions, HeaderMap, HeaderValue, Method, StatusCode, Uri, header};
-use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
+use http_body_util::{BodyExt, LengthLimitError, Limited};
 use hyper::{
     body::{Body as _, Incoming},
     service::service_fn,
@@ -29,8 +29,12 @@ use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, info_span, warn};
 use uuid::Uuid;
 
+use crate::body::{OutgoingBody, ResponseBody};
+
+mod body;
 mod encoding;
 mod form;
+mod io;
 mod query;
 mod routing;
 
@@ -43,6 +47,12 @@ pub use query::{QueryError, QueryErrorKind};
 /// Pause after a failed `accept` so transient errors such as `EMFILE` do not
 /// turn the accept loop into a busy loop.
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(50);
+/// The shortest time a response write may make no progress before the
+/// connection is ended (the stalled-write guard). The guard is the request
+/// timeout, but never less than this, so lowering `FORGE_REQUEST_TIMEOUT_SECS`
+/// for a fast API does not cut off clients that read a large download or an
+/// event stream slowly; those are only disconnected when they stop reading.
+const MIN_WRITE_STALL_TIMEOUT: Duration = Duration::from_secs(30);
 const JSON_CONTENT_TYPE: &str = "application/json";
 
 type BoxHandlerFuture = Pin<Box<dyn Future<Output = Response> + Send + 'static>>;
@@ -217,12 +227,33 @@ impl Request {
 }
 
 /// Framework-owned HTTP response.
-#[derive(Debug)]
+///
+/// The body is either buffered ([`Response::new`]) or streamed
+/// ([`Response::stream`]), for long-lived responses such as Server-Sent
+/// Events.
 pub struct Response {
     status: StatusCode,
     headers: HeaderMap,
-    body: Bytes,
+    body: ResponseBody,
 }
+
+impl fmt::Debug for Response {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut debug = formatter.debug_struct("Response");
+        debug
+            .field("status", &self.status)
+            .field("headers", &self.headers);
+        match &self.body {
+            ResponseBody::Full(bytes) => debug.field("body", bytes),
+            ResponseBody::Stream(_) => debug.field("body", &"<stream>"),
+        };
+        debug.finish()
+    }
+}
+
+/// The body of a streamed response before its first chunk (and the body
+/// [`Response::body`] reports for streamed responses).
+static EMPTY_BODY: Bytes = Bytes::from_static(b"");
 
 impl Response {
     /// Creates a response with a status and raw body.
@@ -231,7 +262,64 @@ impl Response {
         Self {
             status,
             headers: HeaderMap::new(),
-            body: body.into(),
+            body: ResponseBody::Full(body.into()),
+        }
+    }
+
+    /// Creates a response whose body is produced while it is being sent.
+    ///
+    /// Starting from `state`, the server calls `step` for each chunk: it
+    /// returns the chunk and the next state, or `None` to end the body.
+    /// Chunks are written (with chunked transfer encoding) as soon as they
+    /// are produced; empty chunks are skipped (after 32 in a row the body
+    /// yields to the scheduler, so a step that never produces data does not
+    /// hold a worker thread). `step` runs on the
+    /// connection's task, so the body is owned by the connection: it stops
+    /// when the client disconnects, when a write makes no progress for the
+    /// request timeout or 30 seconds, whichever is longer
+    /// (the peer stopped reading), or when shutdown aborts
+    /// connections after the grace period. A body that should end on
+    /// graceful shutdown must watch a cancellation signal of its own.
+    ///
+    /// ```
+    /// use forge_http::{Response, StatusCode};
+    ///
+    /// let response = Response::stream(StatusCode::OK, 0_u8, |count| async move {
+    ///     (count < 3).then(|| (bytes::Bytes::from(format!("tick {count}\n")), count + 1))
+    /// });
+    /// assert!(response.is_stream());
+    /// ```
+    pub fn stream<S, F, Fut>(status: StatusCode, state: S, step: F) -> Self
+    where
+        S: Send + 'static,
+        F: FnMut(S) -> Fut + Send + 'static,
+        Fut: Future<Output = Option<(Bytes, S)>> + Send + 'static,
+    {
+        Self {
+            status,
+            headers: HeaderMap::new(),
+            body: ResponseBody::Stream(Box::new(body::Unfold::new(state, step))),
+        }
+    }
+
+    /// Whether the body is streamed ([`Response::stream`]).
+    #[must_use]
+    pub fn is_stream(&self) -> bool {
+        matches!(self.body, ResponseBody::Stream(_))
+    }
+
+    /// Takes the next chunk of the body: the whole body once for a buffered
+    /// response, each produced chunk for a streamed one, then `None`.
+    ///
+    /// For in-process consumers and tests that read a response without a
+    /// network connection, like [`Router::dispatch`].
+    pub async fn next_chunk(&mut self) -> Option<Bytes> {
+        match &mut self.body {
+            ResponseBody::Full(bytes) if bytes.is_empty() => None,
+            ResponseBody::Full(bytes) => Some(std::mem::take(bytes)),
+            ResponseBody::Stream(source) => {
+                std::future::poll_fn(|context| source.poll_chunk(context)).await
+            }
         }
     }
 
@@ -270,10 +358,14 @@ impl Response {
         self.status
     }
 
-    /// Returns the response body.
+    /// Returns the buffered response body; empty for a streamed response
+    /// (read those with [`Response::next_chunk`]).
     #[must_use]
     pub fn body(&self) -> &Bytes {
-        &self.body
+        match &self.body {
+            ResponseBody::Full(bytes) => bytes,
+            ResponseBody::Stream(_) => &EMPTY_BODY,
+        }
     }
 }
 
@@ -554,6 +646,8 @@ pub enum RouteError {
 pub struct Server {
     config: ServerConfig,
     router: Arc<Router>,
+    /// [`MIN_WRITE_STALL_TIMEOUT`]; lowered only by tests.
+    min_write_stall: Duration,
 }
 
 impl Server {
@@ -563,6 +657,7 @@ impl Server {
         Self {
             config,
             router: Arc::new(router),
+            min_write_stall: MIN_WRITE_STALL_TIMEOUT,
         }
     }
 
@@ -680,6 +775,7 @@ impl Server {
         let router = Arc::clone(&self.router);
         let max_body_bytes = self.config.max_body_bytes;
         let request_timeout = self.config.request_timeout;
+        let write_stall = write_stall_timeout(request_timeout, self.min_write_stall);
         connections.spawn(async move {
             serve_connection(
                 stream,
@@ -687,6 +783,7 @@ impl Server {
                 router,
                 max_body_bytes,
                 request_timeout,
+                write_stall,
                 cancellation,
             )
             .await;
@@ -694,6 +791,12 @@ impl Server {
             drop(permit);
         });
     }
+}
+
+/// How long a response write may make no progress: the request timeout, but
+/// at least `floor` ([`MIN_WRITE_STALL_TIMEOUT`]).
+fn write_stall_timeout(request_timeout: Duration, floor: Duration) -> Duration {
+    request_timeout.max(floor)
 }
 
 fn log_connection_result(completed: Result<(), JoinError>) {
@@ -708,6 +811,7 @@ async fn serve_connection(
     router: Arc<Router>,
     max_body_bytes: usize,
     request_timeout: Duration,
+    write_stall: Duration,
     cancellation: CancellationToken,
 ) {
     let service = service_fn(move |request| {
@@ -719,6 +823,10 @@ async fn serve_connection(
             request_timeout,
         )
     });
+    // A write that makes no progress for `write_stall` (the request timeout,
+    // at least 30 seconds) means the peer stopped reading; end the connection
+    // rather than hold its slot. Slow writes that progress never trip it.
+    let stream = io::StallTimeout::new(stream, write_stall);
     let connection = hyper::server::conn::http1::Builder::new()
         .timer(TokioTimer::new())
         .header_read_timeout(request_timeout)
@@ -746,7 +854,7 @@ async fn handle_request(
     router: Arc<Router>,
     max_body_bytes: usize,
     request_timeout: Duration,
-) -> Result<hyper::Response<Full<Bytes>>, Infallible> {
+) -> Result<hyper::Response<OutgoingBody>, Infallible> {
     let request_id = Uuid::now_v7();
     let method = request.method().clone();
     let path = request.uri().path().to_owned();
@@ -820,8 +928,8 @@ async fn collect_body(body: Incoming, max_body_bytes: usize) -> Result<Bytes, Bo
     }
 }
 
-fn to_hyper_response(response: Response, request_id: Uuid) -> hyper::Response<Full<Bytes>> {
-    let mut outgoing = hyper::Response::new(Full::new(response.body));
+fn to_hyper_response(response: Response, request_id: Uuid) -> hyper::Response<OutgoingBody> {
+    let mut outgoing = hyper::Response::new(OutgoingBody::from(response.body));
     *outgoing.status_mut() = response.status;
     *outgoing.headers_mut() = response.headers;
     let request_id = HeaderValue::from_str(&request_id.to_string())
@@ -932,7 +1040,7 @@ mod tests {
 
         // The inner layer rewrote POST to DELETE before the route table ran.
         assert_eq!(response.status, StatusCode::OK);
-        assert_eq!(response.body, "inner");
+        assert_eq!(response.body(), &"inner");
         let traced: Vec<_> = response
             .headers
             .get_all("x-trace")
@@ -1012,7 +1120,7 @@ mod tests {
         let response = router.dispatch(request(Method::GET, "/customers")).await;
 
         assert_eq!(response.status, StatusCode::OK);
-        assert_eq!(response.body, "customers");
+        assert_eq!(response.body(), &"customers");
     }
 
     #[tokio::test]
@@ -1037,7 +1145,7 @@ mod tests {
             .await;
 
         assert_eq!(response.status, StatusCode::OK);
-        assert_eq!(response.body, id.to_string());
+        assert_eq!(response.body(), &id.to_string());
     }
 
     #[tokio::test]
@@ -1058,7 +1166,7 @@ mod tests {
             .dispatch(request(Method::GET, "/products/caf%C3%A9%2Btea"))
             .await;
 
-        assert_eq!(response.body, "café+tea");
+        assert_eq!(response.body(), &"café+tea");
     }
 
     #[tokio::test]
@@ -1084,7 +1192,7 @@ mod tests {
             .dispatch(request(Method::GET, "/customers/new"))
             .await;
 
-        assert_eq!(response.body, "new-customer");
+        assert_eq!(response.body(), &"new-customer");
     }
 
     #[tokio::test]
@@ -1276,7 +1384,7 @@ mod tests {
             let response = router.dispatch(request(Method::GET, path)).await;
 
             assert_eq!(response.status, StatusCode::OK, "{path}");
-            assert_eq!(response.body, body, "{path}");
+            assert_eq!(response.body(), &body, "{path}");
             assert_eq!(
                 response.headers[header::CONTENT_TYPE],
                 "application/json",
@@ -1293,12 +1401,15 @@ mod tests {
 
     impl TestServer {
         async fn start(config: ServerConfig, router: Router) -> Self {
+            Self::start_server(Server::new(config, router)).await
+        }
+
+        async fn start_server(server: Server) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0")
                 .await
                 .expect("test listener must bind");
             let addr = listener.local_addr().expect("listener has an address");
             let (shutdown, signal) = oneshot::channel::<()>();
-            let server = Server::new(config, router);
             let handle = tokio::spawn(server.serve(listener, async {
                 // A dropped sender also means shutdown.
                 let _ = signal.await;
@@ -1570,5 +1681,219 @@ mod tests {
         // Grace is 30 s; `stop` requires completion well before that.
         server.stop().await;
         drop(holder);
+    }
+
+    /// A streamed body of `count` numbered lines, one every `pause`.
+    fn counting(count: u8, pause: Duration) -> Response {
+        Response::stream(StatusCode::OK, 0_u8, move |sent| async move {
+            if sent == count {
+                return None;
+            }
+            tokio::time::sleep(pause).await;
+            Some((Bytes::from(format!("line {sent}\n")), sent + 1))
+        })
+    }
+
+    #[tokio::test]
+    async fn streamed_bodies_are_read_chunk_by_chunk_in_process() {
+        let mut buffered = Response::new(StatusCode::OK, "whole");
+        assert!(!buffered.is_stream());
+        assert_eq!(buffered.next_chunk().await.as_deref(), Some(&b"whole"[..]));
+        assert_eq!(buffered.next_chunk().await, None);
+
+        let mut streamed = counting(3, Duration::ZERO);
+        assert!(streamed.is_stream());
+        assert!(streamed.body().is_empty());
+        assert!(format!("{streamed:?}").contains("<stream>"));
+        let mut chunks = Vec::new();
+        while let Some(chunk) = streamed.next_chunk().await {
+            chunks.push(String::from_utf8_lossy(&chunk).into_owned());
+        }
+        assert_eq!(chunks, ["line 0\n", "line 1\n", "line 2\n"]);
+        assert_eq!(streamed.next_chunk().await, None);
+    }
+
+    #[tokio::test]
+    async fn empty_chunks_are_skipped() {
+        let mut response = Response::stream(StatusCode::OK, 0_u8, |step| async move {
+            match step {
+                0 | 2 => Some((Bytes::new(), step + 1)),
+                1 => Some((Bytes::from_static(b"x"), step + 1)),
+                _ => None,
+            }
+        });
+
+        assert_eq!(response.next_chunk().await.as_deref(), Some(&b"x"[..]));
+        assert_eq!(response.next_chunk().await, None);
+    }
+
+    #[test]
+    fn a_step_that_only_returns_empty_chunks_does_not_starve_other_tasks() {
+        // On a single-threaded runtime, a body that spun without yielding
+        // would keep the other task from ever running. The verdict comes
+        // through a channel so that a regression fails instead of hanging.
+        let (verdict, outcome) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .expect("runtime must build");
+            runtime.block_on(async {
+                let mut empty =
+                    Response::stream(StatusCode::OK, (), |()| async { Some((Bytes::new(), ())) });
+                let reader = tokio::spawn(async move { empty.next_chunk().await });
+                let other = tokio::spawn(async { "ran" });
+                let ran = other.await.expect("the other task must not panic");
+                reader.abort();
+                let _ = verdict.send(ran);
+            });
+        });
+
+        assert_eq!(
+            outcome.recv_timeout(CLIENT_TIMEOUT),
+            Ok("ran"),
+            "an always-empty body must yield to other tasks"
+        );
+    }
+
+    #[tokio::test]
+    async fn streamed_bodies_are_sent_with_chunked_encoding() {
+        let mut router = Router::new();
+        router
+            .route(Method::GET, "/count", |_| async {
+                counting(3, Duration::from_millis(20))
+            })
+            .expect("route must register");
+        let server = TestServer::start(test_config(Duration::from_secs(10)), router).await;
+
+        let response = exchange(
+            server.addr,
+            "GET /count HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+
+        assert!(response.starts_with("HTTP/1.1 200 "), "{response}");
+        assert!(
+            response
+                .to_ascii_lowercase()
+                .contains("transfer-encoding: chunked"),
+            "{response}"
+        );
+        for line in ["line 0", "line 1", "line 2"] {
+            assert!(response.contains(line), "{response}");
+        }
+        server.stop().await;
+    }
+
+    /// Records whether the value was dropped.
+    struct DropFlag(Arc<std::sync::atomic::AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// A router whose `GET /flood` streams an endless body far larger than
+    /// the socket buffers; `dropped` turns true when the body is dropped.
+    fn flood(dropped: &Arc<std::sync::atomic::AtomicBool>) -> Router {
+        let mut router = Router::new();
+        let flag = Arc::clone(dropped);
+        router
+            .route(Method::GET, "/flood", move |_| {
+                let guard = DropFlag(Arc::clone(&flag));
+                async move {
+                    Response::stream(StatusCode::OK, guard, |guard| async move {
+                        Some((Bytes::from(vec![b'x'; 64 * 1024]), guard))
+                    })
+                }
+            })
+            .expect("route must register");
+        router
+    }
+
+    #[test]
+    fn the_write_stall_guard_is_the_request_timeout_but_at_least_30_seconds() {
+        assert_eq!(MIN_WRITE_STALL_TIMEOUT, Duration::from_secs(30));
+        for (request_timeout, guard) in [(1, 30), (29, 30), (30, 30), (31, 31), (120, 120)] {
+            assert_eq!(
+                write_stall_timeout(
+                    Duration::from_secs(request_timeout),
+                    MIN_WRITE_STALL_TIMEOUT
+                ),
+                Duration::from_secs(guard),
+                "{request_timeout}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_short_request_timeout_does_not_disconnect_a_slow_reader() {
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // The request timeout is far shorter than the pause below, but the
+        // stalled-write guard keeps its 30 second floor.
+        let server =
+            TestServer::start(test_config(Duration::from_millis(100)), flood(&dropped)).await;
+        let addr = server.addr;
+
+        let (paused, received) = tokio::task::spawn_blocking(move || {
+            let mut stream = connect(addr);
+            stream
+                .write_all(b"GET /flood HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                .expect("request must be written");
+            // Not reading: the socket buffers fill and the server's writes
+            // stall for ten request timeouts.
+            std::thread::sleep(Duration::from_secs(1));
+            let mut buffer = vec![0_u8; 64 * 1024];
+            let mut received = 0;
+            while received < 4 << 20 {
+                let read = stream.read(&mut buffer).expect("the stream must stay open");
+                assert_ne!(read, 0, "the server must not end the stream");
+                received += read;
+            }
+            (stream, received)
+        })
+        .await
+        .expect("client task must not panic");
+
+        assert!(received >= 4 << 20);
+        assert!(
+            !dropped.load(std::sync::atomic::Ordering::SeqCst),
+            "a slow but live reader must keep its stream"
+        );
+        drop(paused);
+        server.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_client_that_stops_reading_a_stream_is_disconnected() {
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut server = Server::new(test_config(Duration::from_millis(300)), flood(&dropped));
+        // Without the 30 second floor, so the test does not wait for it.
+        server.min_write_stall = Duration::ZERO;
+        let server = TestServer::start_server(server).await;
+        let addr = server.addr;
+
+        // The client sends its request and never reads the response.
+        let client = tokio::task::spawn_blocking(move || {
+            let mut stream = connect(addr);
+            stream
+                .write_all(b"GET /flood HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                .expect("request must be written");
+            stream
+        })
+        .await
+        .expect("client task must not panic");
+
+        let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
+        while !dropped.load(std::sync::atomic::Ordering::SeqCst) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "a stalled stream must be dropped"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        drop(client);
+        server.stop().await;
     }
 }

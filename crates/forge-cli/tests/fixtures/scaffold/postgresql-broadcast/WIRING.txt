@@ -1,0 +1,113 @@
+
+Forge did not edit any existing file. Wire the resource by hand:
+
+  1. Declare the new modules (each in the listed file, keeping `mod` lines sorted):
+
+       src/domain/entities/mod.rs             pub mod event;
+       src/application/ports/mod.rs           pub mod event_repository;
+       src/application/use_cases/mod.rs       pub mod events;
+       src/infrastructure/database/mod.rs     pub mod events;
+       src/adapters/http/mod.rs               pub mod access;
+       src/adapters/http/mod.rs               pub mod streams;
+       src/adapters/http/mod.rs               pub mod events;
+       src/adapters/http/views/mod.rs         pub mod events;
+
+  2. In src/bootstrap/mod.rs, at the end of `fn compose`, before `Ok(())`:
+
+    // events: tenant-scoped, under /tenants/{tenant_id}/events. RBAC denies
+    // every role `policy` does not name: the `owner` role (`setup` gives it to
+    // the first member) may read and write; grant other tenant roles here.
+    let mut policy = forge::security::RbacPolicy::new();
+    let owner = forge::security::Role::new("owner").map_err(forge::ComposeError::other)?;
+    for permission in [
+        crate::application::use_cases::events::READ_PERMISSION,
+        crate::application::use_cases::events::WRITE_PERMISSION,
+    ] {
+        let permission =
+            forge::security::Permission::new(permission).map_err(forge::ComposeError::other)?;
+        policy.allow(owner.clone(), permission);
+    }
+    let pool = composition.postgres()?.pool().clone();
+    let access = crate::adapters::http::access::SessionTenantAccess::new(
+        std::sync::Arc::new(crate::infrastructure::auth::PostgresSessionStore::new(
+            pool.clone(),
+        )),
+        std::sync::Arc::new(crate::infrastructure::tenancy::PgMembershipStore::new(pool)),
+        policy,
+    );
+    // Live updates (--broadcast), once for every broadcasting resource. On
+    // PostgreSQL every replica hears every change (LISTEN/NOTIFY); production
+    // needs FORGE_STREAMS_KEY (`openssl rand -base64 32`, the same everywhere).
+    let streams =
+        crate::adapters::http::streams::Streams::register(composition, forge::Fanout::Postgres)?;
+    let events = crate::application::use_cases::events::EventService::new(std::sync::Arc::new(
+        crate::infrastructure::database::events::PgEventRepository::new(
+            composition.postgres()?.clone(),
+        ),
+    ));
+    crate::adapters::http::events::routes(
+        composition.router(),
+        &site,
+        events,
+        std::sync::Arc::new(access),
+        &streams,
+    )?;
+
+  Every route asks the access policy for `events:read` or `events:write`
+  first; src/adapters/http/access.rs explains the deny-by-default choice.
+  Live updates: create, update and delete publish to the `events` channel of the tenant, and
+  the index page subscribes; a stream is served only to callers the same policy
+  grants `events:read` (src/adapters/http/streams.rs).
+  Permissions match exactly: index and show need `events:read`, new, create,
+  edit, update and delete need `events:write`. Signed-out browsers are sent
+  to /session/new (the sign-in pages of `forge new` or
+  `forge generate authentication`). To allow a read-only tenant role, add after
+  `let mut policy`, for example:
+
+    let viewer = forge::security::Role::new("viewer").map_err(forge::ComposeError::other)?;
+    let read =
+        forge::security::Permission::new(crate::application::use_cases::events::READ_PERMISSION)
+            .map_err(forge::ComposeError::other)?;
+    policy.allow(viewer, read);
+
+  Then apply the migration (`cargo run -- migrate` with FORGE_MIGRATION_DATABASE_URL)
+  and run `cargo test` (repository tests on a database server need
+  `cargo test -- --include-ignored` and FORGE_TEST_* URLs, see docs/database.md).
+
+Forge did not edit any existing file. Wire the resource by hand:
+
+  1. Declare the new modules (each in the listed file, keeping `mod` lines sorted):
+
+       src/domain/entities/mod.rs             pub mod post;
+       src/application/ports/mod.rs           pub mod post_repository;
+       src/application/use_cases/mod.rs       pub mod posts;
+       src/infrastructure/database/mod.rs     pub mod posts;
+       src/adapters/http/mod.rs               pub mod posts;
+       src/adapters/http/views/mod.rs         pub mod posts;
+
+  2. In src/bootstrap/mod.rs, at the end of `fn compose`, before `Ok(())`:
+
+    // posts: global. DenyAll refuses every request until you decide who may
+    // use them: implement GlobalAccess (src/adapters/http/access.rs).
+    let posts = crate::application::use_cases::posts::PostService::new(std::sync::Arc::new(
+        crate::infrastructure::database::posts::PgPostRepository::new(
+            composition.postgres()?.clone(),
+        ),
+    ));
+    crate::adapters::http::posts::routes(
+        composition.router(),
+        &site,
+        posts,
+        std::sync::Arc::new(crate::adapters::http::access::DenyAll),
+        &streams,
+    )?;
+
+  Every route asks the access policy for `posts:read` or `posts:write`
+  first; src/adapters/http/access.rs explains the deny-by-default choice.
+  Live updates: create, update and delete publish to the `posts` channel, and
+  the index page subscribes; a stream is served only to callers the same policy
+  grants `posts:read` (src/adapters/http/streams.rs).
+
+  Then apply the migration (`cargo run -- migrate` with FORGE_MIGRATION_DATABASE_URL)
+  and run `cargo test` (repository tests on a database server need
+  `cargo test -- --include-ignored` and FORGE_TEST_* URLs, see docs/database.md).

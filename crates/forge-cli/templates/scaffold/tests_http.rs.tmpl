@@ -8,6 +8,9 @@ use std::error::Error;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use app::adapters::http::access::{AccessDenied, DenyAll, %%ACCESS_TRAIT%%};
+%%if broadcast%%
+use app::adapters::http::streams::Streams;
+%%end%%
 use app::application::ports::%%RESOURCE%%_repository::{
     %%TYPE%%Page, %%TYPE%%Repository, %%TYPE%%StoreError,
 };
@@ -32,6 +35,12 @@ use forge::auth::{Session, UnixTimestamp};
 use forge::core::%%HTTP_TEST_CORE_IMPORTS%%;
 use forge::http::{HeaderMap, HeaderValue, Method, Request, Response, Router, StatusCode, header};
 use forge::security::Permission;
+%%if global%%
+use forge::security::PrincipalId;
+%%end%%
+%%if broadcast%%
+use forge::broadcast::Channel;
+%%end%%
 %%if tenant%%
 use forge::security::{PrincipalId, RbacPolicy, Role};
 use forge::tenancy::{Membership, TenantContext, TenantId};
@@ -191,8 +200,12 @@ struct AllowAll;
 
 #[async_trait]
 impl GlobalAccess for AllowAll {
-    async fn authorize(&self, _: &Request, _: &Permission) -> Result<(), AccessDenied> {
-        Ok(())
+    async fn authorize(
+        &self,
+        _: &Request,
+        _: &Permission,
+    ) -> Result<Option<PrincipalId>, AccessDenied> {
+        Ok(None)
     }
 }
 %%end%%
@@ -255,9 +268,12 @@ struct Harness {
     router: Router,
 %%if timestamp%%
     repository: Arc<InMemory%%TYPES%%>,
-%%if tenant%%
+%%end%%
+%%if harness_tenant%%
     tenant: TenantId,
 %%end%%
+%%if broadcast%%
+    streams: Arc<Streams>,
 %%end%%
     collection: String,
 }
@@ -267,11 +283,21 @@ impl Harness {
         let repository = Arc::new(InMemory%%TYPES%%::default());
         let mut router = Router::new();
         let site = app::adapters::http::site(&mut router)?;
+%%if broadcast%%
+        let config = forge::config::AppConfig::default();
+        let streams = Streams::register(
+            &mut forge::Composition::for_testing(&config, &mut router),
+            forge::Fanout::InProcess,
+        )?;
+%%end%%
         app::adapters::http::%%RESOURCES%%::routes(
             &mut router,
             &site,
             %%TYPE%%Service::new(Arc::<InMemory%%TYPES%%>::clone(&repository)),
             access,
+%%if broadcast%%
+            &streams,
+%%end%%
         )?;
 %%if tenant%%
         let tenant = TenantId::new();
@@ -284,9 +310,12 @@ impl Harness {
             router,
 %%if timestamp%%
             repository,
-%%if tenant%%
+%%end%%
+%%if harness_tenant%%
             tenant,
 %%end%%
+%%if broadcast%%
+            streams,
 %%end%%
             collection,
         })
@@ -598,4 +627,253 @@ async fn use_cases_check_the_grant_of_the_tenant_context() -> TestResult {
     ));
     Ok(())
 }
+%%end%%
+%%if broadcast%%
+
+impl Harness {
+    /// The channel of the %%NOUN%% pages.
+    fn channel(&self) -> Result<Channel, Box<dyn Error>> {
+%%if tenant%%
+        Ok(Channel::for_tenant(self.tenant, "%%RESOURCES%%")?)
+%%end%%
+%%if global%%
+        Ok(Channel::global("%%RESOURCES%%")?)
+%%end%%
+    }
+}
+
+/// The URL of the `<turbo-stream-source>` a page renders.
+fn stream_source(page: &str) -> Result<String, Box<dyn Error>> {
+    const OPEN: &str = "<turbo-stream-source src=\"";
+    let start = page.find(OPEN).ok_or("the page subscribes")? + OPEN.len();
+    let end = start + page[start..].find('"').ok_or("the attribute is closed")?;
+    Ok(page[start..end].replace("&amp;", "&"))
+}
+
+/// The next chunk of an event stream (published before it is read).
+async fn next_event(stream: &mut Response) -> Result<String, Box<dyn Error>> {
+    let chunk = stream.next_chunk().await.ok_or("the stream ended")?;
+    Ok(String::from_utf8(chunk.to_vec())?)
+}
+
+/// `--broadcast`: the index subscribes, and create, update and delete reach
+/// the open stream as Turbo Streams with nothing specific to the person who
+/// made the change.
+#[tokio::test]
+async fn changes_are_broadcast_to_open_lists() -> TestResult {
+    let harness = Harness::allowing()?;
+    let token = harness.csrf_token().await?;
+    let index = body(&harness.get(&harness.collection).await?)?;
+    let source = stream_source(&index)?;
+%%if tenant%%
+    let streams_path = format!("/tenants/{}/streams?stream=", harness.tenant);
+%%end%%
+%%if global%%
+    let streams_path = "/streams?stream=".to_owned();
+%%end%%
+    assert!(source.starts_with(&streams_path), "{source}");
+    assert!(index.contains("<tr id=\"%%RESOURCES%%_empty\">"), "{index}");
+
+    let mut stream = harness.get(&source).await?;
+    assert_eq!(stream.status(), StatusCode::OK);
+    assert_eq!(
+        stream.headers().get(header::CONTENT_TYPE).map(HeaderValue::as_bytes),
+        Some(&b"text/event-stream; charset=utf-8"[..])
+    );
+    assert_eq!(next_event(&mut stream).await?, "retry: 3000\n: connected\n\n");
+
+    let member = harness.create(&token).await?;
+    let id = member.rsplit('/').next().ok_or("an id")?.to_owned();
+    let created = next_event(&mut stream).await?;
+    assert!(
+        created.contains(
+            "data: <turbo-stream action=\"remove\" target=\"%%RESOURCES%%_empty\"></turbo-stream>"
+        ),
+        "{created}"
+    );
+    assert!(
+        created.contains(&format!(
+            "data: <turbo-stream action=\"append\" target=\"%%RESOURCES%%\"><template><tr id=\"%%RESOURCE%%_{id}\">"
+        )),
+        "{created}"
+    );
+    assert!(created.contains(&member), "{created}");
+    assert!(!created.contains(&token) && !created.contains("csrf"), "{created}");
+    let index = body(&harness.get(&harness.collection).await?)?;
+    assert!(index.contains(&format!("<tr id=\"%%RESOURCE%%_{id}\">")), "{index}");
+
+    let updated = harness
+        .submit(&member, &token, &format!("{VALID}&_method=patch&version=1"))
+        .await?;
+    assert_eq!(updated.status(), StatusCode::SEE_OTHER);
+    let replaced = next_event(&mut stream).await?;
+    assert!(
+        replaced.starts_with(&format!(
+            "data: <turbo-stream action=\"replace\" target=\"%%RESOURCE%%_{id}\"><template>"
+        )),
+        "{replaced}"
+    );
+
+    let deleted = harness
+        .submit(&member, &token, "_method=delete&version=2")
+        .await?;
+    assert_eq!(deleted.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        next_event(&mut stream).await?,
+        format!(
+            "data: <turbo-stream action=\"remove\" target=\"%%RESOURCE%%_{id}\"></turbo-stream>\ndata: \n\n"
+        )
+    );
+    Ok(())
+}
+
+/// Streams fail closed: a forged token, a channel no resource registered and
+/// a caller the access policy refuses get `403`, and nothing is subscribed.
+#[tokio::test]
+async fn streams_refuse_forged_unknown_and_unauthorized_subscriptions() -> TestResult {
+    let harness = Harness::allowing()?;
+    let source = stream_source(
+        &harness
+            .streams
+            .source(&harness.channel()?)
+            .ok_or("signs")?,
+    )?;
+    let path = source
+        .split_once('?')
+        .map(|(path, _)| path.to_owned())
+        .ok_or("a stream URL")?;
+    let unknown = stream_source(
+        &harness
+            .streams
+            .source(&Channel::global("unregistered")?)
+            .ok_or("signs")?,
+    )?;
+
+    for uri in [format!("{path}?stream=forged"), path.clone(), unknown] {
+        let refused = harness.get(&uri).await?;
+        assert_eq!(refused.status(), StatusCode::FORBIDDEN, "{uri}");
+    }
+
+    let denied = Harness::new(Arc::new(DenyAll))?;
+    let denied_source = stream_source(
+        &denied
+            .streams
+            .source(&denied.channel()?)
+            .ok_or("signs")?,
+    )?;
+    assert_eq!(
+        denied.get(&denied_source).await?.status(),
+        StatusCode::FORBIDDEN
+    );
+    Ok(())
+}
+%%if global%%
+
+/// Admits the principal named by the `x-principal` header, and callers
+/// without it as anonymous: a policy with signed-in and public readers.
+struct SignedInOrAnonymous;
+
+#[async_trait]
+impl GlobalAccess for SignedInOrAnonymous {
+    async fn authorize(
+        &self,
+        request: &Request,
+        _: &Permission,
+    ) -> Result<Option<PrincipalId>, AccessDenied> {
+        request
+            .headers()
+            .get("x-principal")
+            .map(|value| {
+                value
+                    .to_str()
+                    .ok()
+                    .and_then(|principal| principal.parse().ok())
+                    .ok_or(AccessDenied::Unauthenticated)
+            })
+            .transpose()
+    }
+}
+
+/// Opens the stream at `source` as `principal` (anonymous without one).
+/// Every test request comes from the same address, like browsers behind
+/// one reverse proxy.
+async fn subscribe_as(
+    harness: &Harness,
+    source: &str,
+    principal: Option<PrincipalId>,
+) -> Result<Response, Box<dyn Error>> {
+    let principal = principal.map(|principal| principal.to_string());
+    let headers: Vec<(&'static str, &str)> = principal
+        .iter()
+        .map(|principal| ("x-principal", principal.as_str()))
+        .collect();
+    Ok(harness
+        .router
+        .dispatch(request(Method::GET, source, &headers, "")?)
+        .await)
+}
+
+/// Signed-in viewers of the global channel each have their own stream limit,
+/// even from one address: behind a reverse proxy a per-address limit would
+/// refuse everyone once one person opened enough tabs.
+#[tokio::test]
+async fn signed_in_viewers_from_one_address_each_have_their_own_stream_limit() -> TestResult {
+    let harness = Harness::new(Arc::new(SignedInOrAnonymous))?;
+    let source = stream_source(
+        &harness
+            .streams
+            .source(&harness.channel()?)
+            .ok_or("signs")?,
+    )?;
+    let (first, second) = (PrincipalId::new(), PrincipalId::new());
+
+    let mut open = Vec::new();
+    for _ in 0..forge::broadcast::DEFAULT_MAX_PER_PRINCIPAL {
+        let stream = subscribe_as(&harness, &source, Some(first)).await?;
+        assert_eq!(stream.status(), StatusCode::OK);
+        open.push(stream);
+    }
+    let over = subscribe_as(&harness, &source, Some(first)).await?;
+    assert_eq!(over.status(), StatusCode::TOO_MANY_REQUESTS);
+
+    let other = subscribe_as(&harness, &source, Some(second)).await?;
+    assert_eq!(other.status(), StatusCode::OK, "another person has their own limit");
+    let anonymous = subscribe_as(&harness, &source, None).await?;
+    assert_eq!(anonymous.status(), StatusCode::OK, "anonymous viewers are counted by address");
+    Ok(())
+}
+%%end%%
+%%if tenant%%
+
+/// A tenant's stream never reaches another tenant: its token presented under
+/// another tenant's path (where that tenant's member is authorized) is
+/// refused, and another tenant's channel hears nothing of the change.
+#[tokio::test]
+async fn broadcasts_stay_in_their_tenant() -> TestResult {
+    let harness = Harness::allowing()?;
+    let token = harness.csrf_token().await?;
+    let source = stream_source(&body(&harness.get(&harness.collection).await?)?)?;
+    let other = TenantId::new();
+    let elsewhere = source.replace(&harness.tenant.to_string(), &other.to_string());
+    assert_ne!(elsewhere, source);
+
+    let refused = harness.get(&elsewhere).await?;
+    assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+
+    let mut other_list = harness
+        .streams
+        .broker()
+        .subscribe(&Channel::for_tenant(other, "%%RESOURCES%%")?)?;
+    let mut own_list = harness.streams.broker().subscribe(&harness.channel()?)?;
+    harness.create(&token).await?;
+    assert!(own_list.next().await.is_ok(), "the tenant's own list hears it");
+    let quiet = tokio::select! {
+        biased;
+        received = other_list.next() => received.is_err(),
+        () = std::future::ready(()) => true,
+    };
+    assert!(quiet, "another tenant's list hears nothing");
+    Ok(())
+}
+%%end%%
 %%end%%

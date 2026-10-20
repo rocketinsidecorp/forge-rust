@@ -1,0 +1,61 @@
+<form action="{{ action }}" method="post">
+  {{ csrf_field|safe }}
+  {% if let Some(method) = method %}<input type="hidden" name="_method" value="{{ method }}">{% endif %}
+  {% if let Some(version) = version %}<input type="hidden" name="version" value="{{ version }}">{% endif %}
+  {% if let Some(message) = errors.get("base") %}<p class="flash flash-alert" role="alert">{{ message }}</p>{% endif %}
+  <div>
+    <label for="event_name">Name</label>
+    <input type="text" id="event_name" name="name" value="{{ form.name }}" maxlength="255">
+    {% if let Some(message) = errors.get("name") %}<p class="flash flash-alert" role="alert">Name {{ message }}</p>{% endif %}
+  </div>
+  <div>
+    <label for="event_notes">Notes</label>
+    <textarea id="event_notes" name="notes" rows="6">{{ form.notes }}</textarea>
+    {% if let Some(message) = errors.get("notes") %}<p class="flash flash-alert" role="alert">Notes {{ message }}</p>{% endif %}
+  </div>
+  <div>
+    <label for="event_starts_at">Starts at (UTC)</label>
+    <input type="datetime-local" id="event_starts_at" name="starts_at" value="{{ form.starts_at }}" step="1">
+    {% if let Some(message) = errors.get("starts_at") %}<p class="flash flash-alert" role="alert">Starts at {{ message }}</p>{% endif %}
+  </div>
+  <div>
+    <label for="event_ends_at">Ends at (UTC)</label>
+    <input type="datetime-local" id="event_ends_at" name="ends_at" value="{{ form.ends_at }}" step="1">
+    {% if let Some(message) = errors.get("ends_at") %}<p class="flash flash-alert" role="alert">Ends at {{ message }}</p>{% endif %}
+  </div>
+  <div>
+    <label for="event_capacity">Capacity</label>
+    <input type="number" id="event_capacity" name="capacity" value="{{ form.capacity }}" step="1">
+    {% if let Some(message) = errors.get("capacity") %}<p class="flash flash-alert" role="alert">Capacity {{ message }}</p>{% endif %}
+  </div>
+  <div>
+    <label for="event_attendees">Attendees</label>
+    <input type="number" id="event_attendees" name="attendees" value="{{ form.attendees }}" step="1">
+    {% if let Some(message) = errors.get("attendees") %}<p class="flash flash-alert" role="alert">Attendees {{ message }}</p>{% endif %}
+  </div>
+  <div>
+    <label for="event_public">Public</label>
+    <input type="checkbox" id="event_public" name="public" value="true"{% if form.public %} checked{% endif %}>
+    {% if let Some(message) = errors.get("public") %}<p class="flash flash-alert" role="alert">Public {{ message }}</p>{% endif %}
+  </div>
+  <div>
+    <label for="event_featured">Featured</label>
+    <select id="event_featured" name="featured">
+      <option value="">Not set</option>
+      <option value="true"{% if form.featured == "true" %} selected{% endif %}>Yes</option>
+      <option value="false"{% if form.featured == "false" %} selected{% endif %}>No</option>
+    </select>
+    {% if let Some(message) = errors.get("featured") %}<p class="flash flash-alert" role="alert">Featured {{ message }}</p>{% endif %}
+  </div>
+  <div>
+    <label for="event_venue">Venue</label>
+    <input type="text" id="event_venue" name="venue" value="{{ form.venue }}" spellcheck="false" autocomplete="off">
+    {% if let Some(message) = errors.get("venue") %}<p class="flash flash-alert" role="alert">Venue {{ message }}</p>{% endif %}
+  </div>
+  <div>
+    <label for="event_organizer">Organizer</label>
+    <input type="text" id="event_organizer" name="organizer" value="{{ form.organizer }}" spellcheck="false" autocomplete="off">
+    {% if let Some(message) = errors.get("organizer") %}<p class="flash flash-alert" role="alert">Organizer {{ message }}</p>{% endif %}
+  </div>
+  <button type="submit">{{ submit }}</button>
+</form>

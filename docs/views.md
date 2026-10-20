@@ -170,8 +170,9 @@ forge generate scaffold post title:string body:text published:boolean --global
 It creates the migration pair, `Post` with its validation rules,
 `PostRepository` (port), `PostService` (use cases), the SQLx repository,
 handlers, view models, six templates and two test files, then prints the
-wiring. Add the printed `pub mod` lines to the ring modules and the printed
-statements to the end of `compose` in `src/bootstrap/mod.rs`, then:
+wiring (add `--broadcast` for [live updates](#live-updates)). Add the
+printed `pub mod` lines to the ring modules and the printed statements to the
+end of `compose` in `src/bootstrap/mod.rs`, then:
 
 ```sh
 cargo run -- migrate     # with FORGE_MIGRATION_DATABASE_URL
@@ -181,7 +182,10 @@ cargo test
 The routes exist now but answer `403`: a global resource is wired with
 `DenyAll` until you choose who may use it. Replace it in `compose` with an
 implementation of `GlobalAccess`, for example one that admits signed-in
-operators with the generated `authenticate_request`:
+operators with the generated `authenticate_request`. It returns the principal
+it admitted (`Ok(None)` only for anonymous callers of a public resource), so
+that [live updates](#live-updates) limit each person's open streams rather
+than everyone behind one address:
 
 ```rust
 // src/adapters/http/access.rs (or a module of your own)
@@ -191,7 +195,11 @@ pub struct Operators {
 
 #[async_trait]
 impl GlobalAccess for Operators {
-    async fn authorize(&self, request: &Request, _: &Permission) -> Result<(), AccessDenied> {
+    async fn authorize(
+        &self,
+        request: &Request,
+        _: &Permission,
+    ) -> Result<Option<PrincipalId>, AccessDenied> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|elapsed| UnixTimestamp::from_secs(elapsed.as_secs()))
@@ -204,7 +212,7 @@ impl GlobalAccess for Operators {
             .map_err(|_| AccessDenied::Forbidden)?;
         // Your rule: may this principal read or change global rows?
         if is_operator(principal.principal_id()) {
-            Ok(())
+            Ok(Some(principal.principal_id()))
         } else {
             Err(AccessDenied::Forbidden)
         }
@@ -447,6 +455,92 @@ let response = turbo_stream(&[row, removed]);   // text/vnd.turbo-stream.html
   `from_view` renders an Askama view so user data inside the template is
   escaped. The template string passed to `new` is trusted, already-rendered
   HTML.
+- Answer a form submission with streams only when Turbo asked for them:
+
+  ```rust
+  if forge::views::turbo_stream_requested(&request) {
+      return forge::views::turbo_stream_with_status(StatusCode::UNPROCESSABLE_ENTITY, &[errors]);
+  }
+  forge::views::see_other("/products")?   // browsers, `*/*` and API clients
+  ```
+
+  `turbo_stream_requested` needs the `Accept` header to name
+  `text/vnd.turbo-stream.html` itself with a non-zero quality (Turbo adds it
+  to every form submission); stream responses carry `Vary: Accept`.
+
+## Live updates
+
+Pages update when someone else changes the data they show, like Rails'
+`turbo_stream_from` with Action Cable broadcasts, over Server-Sent Events
+([ADR 0031](adr/0031-live-updates-over-server-sent-events.md), the same names,
+token format and limits as Forge-Go). The fastest way is the scaffold:
+
+```sh
+forge generate scaffold event name:string starts_at:timestamp --tenant-scoped --broadcast
+forge generate scaffold note body:text --global --broadcast
+export FORGE_STREAMS_KEY=$(openssl rand -base64 32)   # required in production, same on every replica
+cargo run                                             # open /tenants/<tenant id>/events in two browsers
+```
+
+Add the printed wiring (it includes `Streams::register` once). Creating,
+editing or deleting an event in one browser appends, replaces or removes its
+row in the other, without a reload.
+
+By hand, with the `broadcast` feature of `forge` (on by default in
+`forge new` database applications, so the scaffold needs no `Cargo.toml`
+edit; it compiles the API only and runs nothing until wired, see
+[cli](cli.md#the-forge-dependency)):
+
+```rust
+use forge::broadcast::{Channel, EventStreams, Signer, StreamAccess, StreamViewer, publish};
+
+// Composition root: broker, signer, endpoint.
+let broker = composition.broadcast(forge::Fanout::Postgres)?;      // or Fanout::InProcess
+let signer = Arc::new(Signer::from_config(composition.config())?); // FORGE_STREAMS_KEY
+EventStreams::new(broker.clone(), signer.clone(), Arc::new(MyAccess))
+    .register(composition.router(), "/streams")?;
+
+// A page subscribes (render `|safe`): <turbo-stream-source src="/streams?stream=...">
+let channel = Channel::for_tenant(context.tenant_id(), "products")?;
+let source = signer.turbo_stream_from(&channel)?;
+
+// After the change is stored, every subscriber receives the actions.
+publish(broker.as_ref(), &channel, &[TurboStreamAction::remove(dom_id(id, "product")?)]).await?;
+```
+
+`MyAccess` implements `StreamAccess`: it authenticates the request and
+returns `StreamViewer::member(&tenant_context)` for a tenant channel (built by
+`TenantContext::authorize`, so it needs a session, an active membership and a
+grant), `StreamViewer::principal(id)` or, for public global channels only,
+`StreamViewer::anonymous()`. The handler then requires a tenant channel's
+tenant to be the viewer's.
+
+What protects a stream:
+
+- The channel name in the page is signed (HMAC-SHA256 with
+  `FORGE_STREAMS_KEY`, expiring after 24 hours); a browser cannot subscribe to
+  a channel it was not rendered. Forged, tampered and expired tokens all get
+  `403 stream_invalid`.
+- A tenant channel is never served to another tenant (`403 stream_forbidden`);
+  the access policy decides first (`401`, `403`, `503`).
+- 16 open streams per principal (anonymous viewers per IP address, IPv6 per
+  `/64`) and 1 000 per tenant (`429 stream_limit`). Generated streams count
+  global-channel viewers by the principal their `GlobalAccess` returns, so
+  signed-in people behind one proxy each have their own 16; 10 000 per process and
+  1 000 per channel (`503 stream_unavailable`); 1 MiB per message.
+- A subscriber that falls 64 messages behind is dropped, never waited for;
+  its browser reconnects. Streams end after 30 minutes (re-authorizing on
+  reconnect) and as soon as shutdown begins.
+- Broadcast fragments are rendered without a request, so they carry no CSRF
+  token or per-user content.
+
+Delivery is at most once, without replay: a browser that was offline sees the
+change on its next page load. Generated pages wait at most 2 seconds for the
+broker (`PUBLISH_TIMEOUT` in `src/adapters/http/streams.rs`), then log the
+update as failed, so a busy database pool never fails the stored change. `Fanout::Postgres` reaches every replica through
+`LISTEN/NOTIFY` (256 KiB per message); MySQL, MariaDB and SQLite refuse it and
+use `Fanout::InProcess`, which reaches the browsers connected to this process
+only. Behind a proxy, see [deployment](deployment.md#live-updates-behind-a-proxy).
 
 ## Assets
 
@@ -570,5 +664,5 @@ those rules.
 
 MFA and user management pages, JSON scaffolds and `forge generate controller`, development-mode
 asset serving from disk, `forge assets precompile`, `forge dev`, multipart
-forms and file uploads, per-response CSRF token masking, and Turbo Streams over
-SSE/WebSockets (Phase 4).
+forms and file uploads, per-response CSRF token masking, WebSocket transport,
+replay of missed live updates and presence.

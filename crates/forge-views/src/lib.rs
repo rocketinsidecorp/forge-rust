@@ -5,8 +5,10 @@
 //!
 //! - [`html`] / [`html_with_status`]: render an Askama view as an HTML
 //!   response (auto-escaped; failures become an opaque `500`).
-//! - [`see_other`], [`turbo_stream`], [`TurboStreamAction`], [`DomId`],
-//!   [`dom_id`]: Turbo-compatible redirects and stream responses.
+//! - [`see_other`], [`turbo_stream`], [`turbo_stream_with_status`],
+//!   [`turbo_stream_requested`], [`TurboStreamAction`], [`DomId`],
+//!   [`dom_id`]: Turbo-compatible redirects and stream responses (live
+//!   updates over Server-Sent Events are in `forge-broadcast`).
 //! - [`AssetSet`] with [`build::embed_assets`]: content-digested assets
 //!   embedded in the binary and served from exact manifest entries only.
 //! - [`ImportMap`]: bare module specifiers mapped to digested URLs, with the
@@ -95,6 +97,7 @@ pub use sign_in::{
 };
 #[cfg(feature = "runtime")]
 pub use turbo::{
-    DomId, DomIdError, RedirectError, StreamAction, TurboStreamAction, TurboStreamError, dom_id,
-    see_other, see_other_to_origin, turbo_stream,
+    DomId, DomIdError, RedirectError, StreamAction, TURBO_STREAM_MEDIA_TYPE, TurboStreamAction,
+    TurboStreamError, dom_id, see_other, see_other_to_origin, turbo_stream, turbo_stream_html,
+    turbo_stream_requested, turbo_stream_with_status,
 };

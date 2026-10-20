@@ -1,0 +1,22 @@
+<form action="{{ action }}" method="post">
+  {{ csrf_field|safe }}
+  {% if let Some(method) = method %}<input type="hidden" name="_method" value="{{ method }}">{% endif %}
+  {% if let Some(version) = version %}<input type="hidden" name="version" value="{{ version }}">{% endif %}
+  {% if let Some(message) = errors.get("base") %}<p class="flash flash-alert" role="alert">{{ message }}</p>{% endif %}
+  <div>
+    <label for="post_title">Title</label>
+    <input type="text" id="post_title" name="title" value="{{ form.title }}" maxlength="255">
+    {% if let Some(message) = errors.get("title") %}<p class="flash flash-alert" role="alert">Title {{ message }}</p>{% endif %}
+  </div>
+  <div>
+    <label for="post_body">Body</label>
+    <textarea id="post_body" name="body" rows="6">{{ form.body }}</textarea>
+    {% if let Some(message) = errors.get("body") %}<p class="flash flash-alert" role="alert">Body {{ message }}</p>{% endif %}
+  </div>
+  <div>
+    <label for="post_published">Published</label>
+    <input type="checkbox" id="post_published" name="published" value="true"{% if form.published %} checked{% endif %}>
+    {% if let Some(message) = errors.get("published") %}<p class="flash flash-alert" role="alert">Published {{ message }}</p>{% endif %}
+  </div>
+  <button type="submit">{{ submit }}</button>
+</form>

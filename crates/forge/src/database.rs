@@ -233,6 +233,19 @@ impl fmt::Debug for DatabaseHandle {
 }
 
 impl DatabaseHandle {
+    /// The backend of this pool.
+    #[cfg(feature = "broadcast")]
+    pub(crate) fn scheme(&self) -> DatabaseScheme {
+        match *self {
+            #[cfg(feature = "postgres")]
+            Self::Postgres(_) => DatabaseScheme::Postgres,
+            #[cfg(feature = "mysql")]
+            Self::MySql(_) => DatabaseScheme::MySql,
+            #[cfg(feature = "sqlite")]
+            Self::Sqlite(_) => DatabaseScheme::Sqlite,
+        }
+    }
+
     /// Pings whichever backend this is.
     pub(crate) async fn ping(&self) -> Result<(), DbError> {
         match *self {

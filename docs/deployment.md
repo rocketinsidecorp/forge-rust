@@ -120,7 +120,7 @@ from env files, Kubernetes manifests and unit files.
 | --- | --- | --- |
 | `FORGE_ENV` | `development` | `development`, `test` or `production`. Selects safety-sensitive defaults such as the log format. |
 | `FORGE_BIND` | `127.0.0.1:3000` | Listen socket address. The container image sets `0.0.0.0:3000`. |
-| `FORGE_REQUEST_TIMEOUT_SECS` | `30` | Maximum time for one request, including reading the request body. |
+| `FORGE_REQUEST_TIMEOUT_SECS` | `30` | Maximum time for one request, including reading the request body. A response write that makes no progress for this long (at least 30 seconds) ends the connection. |
 | `FORGE_SHUTDOWN_GRACE_SECS` | `15` | Drain deadline for in-flight requests after SIGTERM/SIGINT. |
 | `FORGE_MAX_BODY_BYTES` | `1048576` | Maximum request body size in bytes. |
 | `FORGE_MAX_CONNECTIONS` | `10000` | Maximum concurrent connections. Extra connections wait for a slot (backpressure) instead of being served without bound. |
@@ -138,6 +138,7 @@ from env files, Kubernetes manifests and unit files.
 | `FORGE_STORAGE_SIGNING_KEY` | none | HMAC key of signed links: unpadded base64url of 32 to 1024 random bytes. Redacted. **Required in `production` whenever `FORGE_STORAGE_ROOT` is set**; there is no default key. |
 | `FORGE_STORAGE_MAX_UPLOAD_BYTES` | `524288` | Largest uploaded file, at most `1073741824`; when storage is configured it must not exceed `FORGE_MAX_BODY_BYTES`. |
 | `FORGE_STORAGE_LINK_TTL_SECS` | `900` | Default lifetime of signed links, `1` to `604800`. |
+| `FORGE_STREAMS_KEY` | none | HMAC key of signed live-update stream names: base64 (standard or URL-safe, padded or not) of at least 32 random bytes, as `openssl rand -base64 32` prints; the same on every replica. Redacted. **Required in `production` by applications that serve live updates** (`scaffold --broadcast`); development and test use a random per-process key ([views](views.md#live-updates)). |
 
 Logs go to standard output, and the platform (Docker, Kubernetes, journald)
 collects them. The HTTP layer also enforces a header-read timeout and adds
@@ -380,3 +381,53 @@ reverse proxy or load balancer in front of the loopback bind. If you use an
 
 See also the [CLI reference](cli.md), [threat model](threat-model.md) and
 [test strategy](test-strategy.md).
+
+## Live updates behind a proxy
+
+Live updates (`forge generate scaffold --broadcast`, [ADR 0031](adr/0031-live-updates-over-server-sent-events.md))
+are long-lived `text/event-stream` responses on `/streams` and
+`/tenants/{tenant_id}/streams`. A reverse proxy must not buffer them (Forge
+sends `X-Accel-Buffering: no` for nginx) and its idle timeout must exceed the
+20 second heartbeat. Each open stream holds one connection slot
+(`FORGE_MAX_CONNECTIONS`); streams end after 30 minutes and when shutdown
+begins, and a client that stops reading is disconnected once a write makes no
+progress for `FORGE_REQUEST_TIMEOUT_SECS` or 30 seconds, whichever is longer
+(the floor keeps a short API request timeout from cutting off slow but live
+downloads and streams). With several replicas on
+PostgreSQL, the generated wiring fans updates out with `LISTEN/NOTIFY`, which
+holds one database connection per replica and does not work through
+PgBouncer in transaction pooling mode. Set the same `FORGE_STREAMS_KEY` on
+every replica:
+
+```sh
+export FORGE_STREAMS_KEY=$(openssl rand -base64 32)
+```
+
+Terminate HTTP/2 at the proxy: over HTTP/1.1 a browser opens at most 6
+connections per origin and every open page holds one for its stream. Stream
+limits (16 per signed-in person, 1 000 per tenant, 10 000 in all) are counted
+per process, and a client that vanishes without closing its connection keeps
+its slot until a write fails, at most until the 30 minute maximum age
+([ADR 0031](adr/0031-live-updates-over-server-sent-events.md#accepted-residuals-and-capacity-edges)).
+
+### Rotating the stream signing key
+
+Generated applications sign stream names with `FORGE_STREAMS_KEY` only.
+Rotating it invalidates the stream URL of every page already open: on its
+next reconnect (at the latest after 30 minutes) such a page gets `403` and
+stops updating live until it is reloaded. Nothing else breaks, and pages
+loaded afterwards work. Rotate during a quiet period:
+
+```sh
+export FORGE_STREAMS_KEY=$(openssl rand -base64 32)   # the new key, on every replica
+# redeploy every replica with it; replicas with different keys refuse each other's pages
+```
+
+To keep open pages working across a rotation, build the signer yourself in
+`src/adapters/http/streams.rs` with
+`forge::broadcast::Signer::new(&new_key, &[&old_key])`, which signs with the
+new key and still verifies the old one, keep the old key for at least the
+token lifetime (24 hours), then remove it. A `FORGE_STREAMS_PREVIOUS_KEYS`
+setting will come to Forge-Rust and Forge-Go together
+([parity follow-ups](rails-parity.md#parity-follow-ups)).
+

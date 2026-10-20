@@ -5,10 +5,11 @@ use std::{fmt, str::FromStr};
 
 use askama::Template;
 use forge_core::Id;
-use forge_http::{HeaderValue, Response, StatusCode, Uri, header};
+use forge_http::{HeaderValue, Request, Response, StatusCode, Uri, header};
 use thiserror::Error;
 
 /// The media type Turbo requires for stream responses.
+pub const TURBO_STREAM_MEDIA_TYPE: &str = "text/vnd.turbo-stream.html";
 const TURBO_STREAM_CONTENT_TYPE: &str = "text/vnd.turbo-stream.html; charset=utf-8";
 
 /// Maximum length of a [`DomId`], in bytes.
@@ -230,6 +231,18 @@ impl TurboStreamAction {
     }
 }
 
+/// The markup of `actions`, in order: one `<turbo-stream>` element per
+/// action, each followed by a newline. It is the body of a Turbo Stream
+/// response and the payload of a broadcast.
+#[must_use]
+pub fn turbo_stream_html(actions: &[TurboStreamAction]) -> String {
+    let mut body = String::new();
+    for action in actions {
+        action.render_into(&mut body);
+    }
+    body
+}
+
 /// A `200 OK` Turbo Stream response (`text/vnd.turbo-stream.html`) carrying
 /// `actions` in order.
 ///
@@ -247,16 +260,75 @@ impl TurboStreamAction {
 /// ```
 #[must_use]
 pub fn turbo_stream(actions: &[TurboStreamAction]) -> Response {
-    let mut body = String::new();
-    for action in actions {
-        action.render_into(&mut body);
-    }
-    let mut response = Response::new(StatusCode::OK, body);
+    turbo_stream_with_status(StatusCode::OK, actions)
+}
+
+/// A Turbo Stream response with `status`, for example `422` for a form that
+/// failed validation (Turbo applies stream responses to form submissions
+/// with any status). It varies by `Accept`, because the same URL answers
+/// HTML or a redirect to clients that did not ask for a stream (see
+/// [`turbo_stream_requested`]).
+#[must_use]
+pub fn turbo_stream_with_status(status: StatusCode, actions: &[TurboStreamAction]) -> Response {
+    let mut response = Response::new(status, turbo_stream_html(actions));
     response.headers_mut().insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static(TURBO_STREAM_CONTENT_TYPE),
     );
     response
+        .headers_mut()
+        .append(header::VARY, HeaderValue::from_static("accept"));
+    response
+}
+
+/// Whether the client asked for a Turbo Stream response: its `Accept`
+/// header names `text/vnd.turbo-stream.html` itself with a non-zero
+/// quality. Turbo adds it to every form submission; browser navigations,
+/// `*/*` and API clients do not, so they get the HTML page or redirect.
+///
+/// ```
+/// use forge_http::{HeaderMap, HeaderValue, Method, Request};
+///
+/// let mut headers = HeaderMap::new();
+/// headers.insert(
+///     "accept",
+///     HeaderValue::from_static("text/vnd.turbo-stream.html, text/html, application/xhtml+xml"),
+/// );
+/// let request = Request::new_for_test(
+///     Method::POST,
+///     "/products".parse().expect("uri"),
+///     headers,
+///     bytes::Bytes::new(),
+///     "127.0.0.1:4000".parse().expect("address"),
+///     uuid::Uuid::now_v7(),
+/// );
+/// assert!(forge_views::turbo_stream_requested(&request));
+/// ```
+#[must_use]
+pub fn turbo_stream_requested(request: &Request) -> bool {
+    request
+        .headers()
+        .get_all(header::ACCEPT)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .any(|range| {
+            let mut parts = range.split(';');
+            let media = parts.next().unwrap_or_default().trim();
+            if !media.eq_ignore_ascii_case(TURBO_STREAM_MEDIA_TYPE) {
+                return false;
+            }
+            let quality = parts
+                .filter_map(|parameter| {
+                    let (name, value) = parameter.split_once('=')?;
+                    name.trim()
+                        .eq_ignore_ascii_case("q")
+                        .then(|| crate::sign_in::quality(value.trim()))
+                })
+                .next_back()
+                .unwrap_or(Some(1000));
+            quality.is_some_and(|quality| quality > 0)
+        })
 }
 
 // -------------------------------------------------------------- redirects
@@ -533,6 +605,60 @@ mod tests {
 
         assert!(!body.contains("<img"), "{body}");
         assert!(body.contains("&#60;img"), "{body}");
+    }
+
+    #[test]
+    fn stream_responses_take_a_status_and_vary_by_accept() {
+        let removal = TurboStreamAction::remove(id("row_1"));
+
+        let response = turbo_stream_with_status(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            std::slice::from_ref(&removal),
+        );
+
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(header_of(&response, "vary"), Some("accept"));
+        assert_eq!(
+            text(&response),
+            turbo_stream_html(std::slice::from_ref(&removal))
+        );
+        assert_eq!(
+            turbo_stream_html(&[removal]),
+            "<turbo-stream action=\"remove\" target=\"row_1\"></turbo-stream>\n"
+        );
+    }
+
+    #[test]
+    fn only_an_explicit_accept_asks_for_a_stream() {
+        use crate::test_support::request_with;
+        use forge_http::Method;
+
+        for accept in [
+            "text/vnd.turbo-stream.html, text/html, application/xhtml+xml",
+            "TEXT/VND.TURBO-STREAM.HTML",
+            "text/html, text/vnd.turbo-stream.html;q=0.5",
+        ] {
+            let request = request_with(Method::POST, "/", &[("accept", accept)]);
+            assert!(turbo_stream_requested(&request), "{accept}");
+        }
+        for accept in [
+            "*/*",
+            "text/*",
+            "text/html",
+            "application/json",
+            "text/vnd.turbo-stream.html;q=0",
+            "text/vnd.turbo-stream.html;q=0.000",
+            "text/vnd.turbo-stream.html;q=bogus",
+            "text/vnd.turbo-stream.htmlx",
+        ] {
+            let request = request_with(Method::POST, "/", &[("accept", accept)]);
+            assert!(!turbo_stream_requested(&request), "{accept}");
+        }
+        assert!(!turbo_stream_requested(&request_with(
+            Method::POST,
+            "/",
+            &[]
+        )));
     }
 
     #[test]

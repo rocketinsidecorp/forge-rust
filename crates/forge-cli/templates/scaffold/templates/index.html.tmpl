@@ -2,6 +2,26 @@
 
 {% block content %}
 <h1>%%LABELS%%</h1>
+%%if broadcast%%
+{% if let Some(stream_source) = stream_source %}{{ stream_source|safe }}{% endif %}
+<p><a href="{{ new_path }}">New %%NOUN%%</a></p>
+<table>
+  <thead>
+    <tr>
+%%INDEX_HEADERS%%
+      <th scope="col">Actions</th>
+    </tr>
+  </thead>
+  <tbody id="%%RESOURCES%%">
+    {% for row in rows %}
+    {% include "%%RESOURCES%%/_row.html" %}
+    {% else %}
+    <tr id="%%RESOURCES%%_empty"><td>No %%NOUNS%% yet.</td></tr>
+    {% endfor %}
+  </tbody>
+</table>
+%%end%%
+%%if !broadcast%%
 <p><a href="{{ new_path }}">New %%NOUN%%</a></p>
 {% if rows.is_empty() %}
 <p>No %%NOUNS%% yet.</p>
@@ -23,6 +43,7 @@
   </tbody>
 </table>
 {% endif %}
+%%end%%
 {% if let Some(next_path) = next_path %}
 <p><a href="{{ next_path }}">Next page</a></p>
 {% endif %}

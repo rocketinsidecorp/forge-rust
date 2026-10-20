@@ -3,6 +3,7 @@
 use std::{error::Error, fmt, future::Future};
 
 use forge_config::AppConfig;
+use forge_core::Cancellation;
 use forge_http::{RouteError, Router};
 use thiserror::Error;
 
@@ -30,6 +31,7 @@ pub struct Composition<'a> {
     config: &'a AppConfig,
     database: Option<DatabaseHandle>,
     workers: Vec<Worker>,
+    shutdown: Cancellation,
     #[cfg(feature = "jobs")]
     jobs: Option<&'a mut forge_jobs::Jobs>,
     #[cfg(feature = "events")]
@@ -41,12 +43,14 @@ impl<'a> Composition<'a> {
         router: &'a mut Router,
         config: &'a AppConfig,
         database: Option<DatabaseHandle>,
+        shutdown: Cancellation,
     ) -> Self {
         Self {
             router,
             config,
             database,
             workers: Vec::new(),
+            shutdown,
             #[cfg(feature = "jobs")]
             jobs: None,
             #[cfg(feature = "events")]
@@ -131,6 +135,94 @@ impl<'a> Composition<'a> {
         self.events
             .as_deref_mut()
             .ok_or(ComposeError::EventsNotDeclared)
+    }
+
+    /// A signal cancelled when the process starts shutting down: before the
+    /// HTTP server drains its connections and before workers are told to
+    /// stop.
+    ///
+    /// Long-lived responses (such as the event streams of
+    /// `forge::broadcast`) end on it, so that open connections do not hold
+    /// up the drain until the grace period. The returned value is a child:
+    /// cancelling it never stops the application.
+    #[must_use]
+    pub fn shutdown_started(&self) -> Cancellation {
+        self.shutdown.child()
+    }
+
+    /// Builds the broker that live updates are published to (feature
+    /// `broadcast`, ADR 0031). It closes, ending every open event stream,
+    /// when shutdown begins.
+    ///
+    /// - [`Fanout::InProcess`] reaches the subscribers of this process only,
+    ///   on any backend (or none).
+    /// - [`Fanout::Postgres`] also reaches every other replica over
+    ///   PostgreSQL `LISTEN/NOTIFY`, and registers the listener as a worker
+    ///   of the lifecycle. It needs `App::postgres`; MySQL, MariaDB and
+    ///   SQLite applications are refused with
+    ///   [`forge_broadcast::BroadcastError::UnsupportedBackend`] rather than
+    ///   emulated.
+    ///
+    /// Call it once and share the broker.
+    #[cfg(feature = "broadcast")]
+    pub fn broadcast(
+        &mut self,
+        fanout: Fanout,
+    ) -> Result<std::sync::Arc<dyn forge_broadcast::Broker>, ComposeError> {
+        use std::sync::Arc;
+
+        let local = forge_broadcast::MemoryBroker::new(
+            forge_broadcast::MemoryOptions::default(),
+            &self.shutdown,
+        )
+        .map_err(ComposeError::other)?;
+        match fanout {
+            Fanout::InProcess => Ok(Arc::new(local)),
+            Fanout::Postgres => {
+                let Some(database) = &self.database else {
+                    return Err(ComposeError::DatabaseNotDeclared {
+                        requested: "postgres",
+                    });
+                };
+                forge_broadcast::ensure_fanout_supported(database.scheme())
+                    .map_err(ComposeError::other)?;
+                self.postgres_fanout(local)
+            }
+        }
+    }
+
+    /// The `LISTEN/NOTIFY` broker over the declared PostgreSQL pool, with its
+    /// listener registered as a lifecycle worker.
+    #[cfg(all(feature = "broadcast", feature = "postgres"))]
+    fn postgres_fanout(
+        &mut self,
+        local: forge_broadcast::MemoryBroker,
+    ) -> Result<std::sync::Arc<dyn forge_broadcast::Broker>, ComposeError> {
+        let broker = forge_broadcast::postgres::PgBroker::new(
+            self.postgres()?.clone(),
+            local,
+            forge_broadcast::postgres::PgOptions::default(),
+        )
+        .map_err(ComposeError::other)?;
+        let listener = broker.clone();
+        self.worker("broadcast-listener", move |_stopped| async move {
+            // Returns when the broker closes, as shutdown begins.
+            listener.listen().await;
+        });
+        Ok(std::sync::Arc::new(broker))
+    }
+
+    /// Without the `postgres` feature there is no PostgreSQL pool to fan out
+    /// over.
+    #[cfg(all(feature = "broadcast", not(feature = "postgres")))]
+    #[allow(clippy::unused_self)]
+    fn postgres_fanout(
+        &mut self,
+        _local: forge_broadcast::MemoryBroker,
+    ) -> Result<std::sync::Arc<dyn forge_broadcast::Broker>, ComposeError> {
+        Err(ComposeError::DatabaseNotDeclared {
+            requested: "postgres",
+        })
     }
 
     /// Returns the route table for registering application routes.
@@ -222,7 +314,15 @@ impl<'a> Composition<'a> {
     /// `forge::db::testing::TestDatabase::database`.
     #[must_use]
     pub fn for_testing(config: &'a AppConfig, router: &'a mut Router) -> Self {
-        Self::new(router, config, None)
+        Self::new(router, config, None, Cancellation::new())
+    }
+
+    /// Uses `shutdown` as the process shutdown signal, so a test can begin
+    /// shutdown by cancelling it.
+    #[must_use]
+    pub fn with_shutdown(mut self, shutdown: Cancellation) -> Self {
+        self.shutdown = shutdown;
+        self
     }
 
     /// Starts the registered workers on the current Tokio runtime, as
@@ -282,6 +382,18 @@ impl fmt::Debug for Composition<'_> {
             .field("workers", &self.workers.len())
             .finish_non_exhaustive()
     }
+}
+
+/// Where live updates published through [`Composition::broadcast`] reach
+/// (feature `broadcast`).
+#[cfg(feature = "broadcast")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Fanout {
+    /// The subscribers of this process only. Any backend; enough for one
+    /// replica.
+    InProcess,
+    /// Every replica, over PostgreSQL `LISTEN/NOTIFY` (PostgreSQL only).
+    Postgres,
 }
 
 /// A composition hook failed; startup is aborted with exit code 1.
@@ -374,6 +486,98 @@ mod tests {
                 requested: "sqlite"
             })
         ));
+    }
+
+    #[cfg(all(feature = "testing", feature = "broadcast"))]
+    #[tokio::test]
+    async fn the_in_process_broker_closes_when_shutdown_begins() -> Result<(), Box<dyn Error>> {
+        let config = AppConfig::default();
+        let mut router = Router::new();
+        let shutdown = Cancellation::new();
+        let mut composition =
+            Composition::for_testing(&config, &mut router).with_shutdown(shutdown.clone());
+        let started = composition.shutdown_started();
+        let broker = composition.broadcast(Fanout::InProcess)?;
+        let channel = forge_broadcast::Channel::global("posts")?;
+        let mut subscription = broker.subscribe(&channel)?;
+
+        // Cancelling the handed-out child never stops the application.
+        composition.shutdown_started().cancel();
+        assert!(!shutdown.is_cancelled() && !started.is_cancelled());
+
+        shutdown.cancel();
+        assert!(started.is_cancelled());
+        assert_eq!(
+            subscription.next().await,
+            Err(forge_broadcast::SubscriptionEnd::Closed)
+        );
+        assert!(broker.subscribe(&channel).is_err());
+        Ok(())
+    }
+
+    #[cfg(all(feature = "testing", feature = "broadcast"))]
+    #[test]
+    fn postgres_fanout_needs_a_postgres_database() {
+        let config = AppConfig::default();
+        let mut router = Router::new();
+        let mut composition = Composition::for_testing(&config, &mut router);
+
+        assert!(matches!(
+            composition.broadcast(Fanout::Postgres),
+            Err(ComposeError::DatabaseNotDeclared {
+                requested: "postgres"
+            })
+        ));
+    }
+
+    #[cfg(all(feature = "testing", feature = "broadcast", feature = "sqlite"))]
+    #[tokio::test]
+    async fn postgres_fanout_is_refused_on_sqlite_not_emulated() -> Result<(), Box<dyn Error>> {
+        let config = AppConfig::default();
+        let mut router = Router::new();
+        let test =
+            forge_db::testing::TestDatabase::<forge_db::sqlx::Sqlite>::create_empty().await?;
+        let mut composition =
+            Composition::for_testing(&config, &mut router).with_sqlite(test.database().clone());
+
+        let refused = composition
+            .broadcast(Fanout::Postgres)
+            .err()
+            .ok_or("SQLite must be refused")?;
+        let reason = refused
+            .source()
+            .map(ToString::to_string)
+            .unwrap_or_default();
+        assert!(reason.contains("requires PostgreSQL"), "{reason}");
+        assert!(reason.contains("refused rather than emulated"), "{reason}");
+        assert!(composition.broadcast(Fanout::InProcess).is_ok());
+        assert_eq!(composition.workers.len(), 0);
+        test.cleanup().await?;
+        Ok(())
+    }
+
+    #[cfg(all(feature = "testing", feature = "broadcast", feature = "postgres"))]
+    #[tokio::test]
+    async fn postgres_fanout_registers_its_listener_as_a_worker() -> Result<(), Box<dyn Error>> {
+        let config = AppConfig::default();
+        let mut router = Router::new();
+        // A lazy pool never connects here: only the wiring is checked.
+        let url = forge_config::SecretString::new("postgres://app:secret@127.0.0.1:1/app");
+        let database = forge_db::PgDatabase::connect_lazy(&url)?;
+        let shutdown = Cancellation::new();
+        let mut composition = Composition::for_testing(&config, &mut router)
+            .with_postgres(database)
+            .with_shutdown(shutdown.clone());
+
+        let _broker = composition.broadcast(Fanout::Postgres)?;
+
+        assert_eq!(composition.workers.len(), 1);
+        assert_eq!(composition.workers[0].name, "broadcast-listener");
+        // The listener returns once shutdown begins, so stopping is prompt.
+        let workers = composition.start_workers();
+        shutdown.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(5), workers.stop()).await?;
+        Ok(())
     }
 
     #[cfg(all(feature = "testing", feature = "sqlite"))]

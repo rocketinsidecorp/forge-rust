@@ -8,7 +8,10 @@ use std::{
     time::Duration,
 };
 
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use base64::{
+    Engine as _,
+    engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD},
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -37,6 +40,11 @@ const DEFAULT_STORAGE_MAX_UPLOAD_BYTES: u64 = 512 << 10;
 const MAX_STORAGE_MAX_UPLOAD_BYTES: u64 = 1 << 30;
 const DEFAULT_STORAGE_LINK_TTL_SECS: u64 = 900;
 const MAX_STORAGE_LINK_TTL_SECS: u64 = 7 * 24 * 3600;
+/// Shortest decoded stream-signing key (`FORGE_STREAMS_KEY`), in bytes: an
+/// HMAC-SHA256 key as long as the digest.
+pub const STREAMS_KEY_MIN_BYTES: usize = 32;
+const STREAMS_KEY_CONTRACT: &str = "base64 (standard or URL-safe, padded or not) of at least 32 \
+     random bytes, such as `openssl rand -base64 32` prints";
 /// Bounds of the decoded storage signing key, in bytes.
 pub const STORAGE_SIGNING_KEY_BYTES: std::ops::RangeInclusive<usize> = 32..=1024;
 const DATABASE_URL_CONTRACT: &str =
@@ -70,6 +78,7 @@ pub const KNOWN_KEYS: &[&str] = &[
     "FORGE_STORAGE_SIGNING_KEY",
     "FORGE_STORAGE_MAX_UPLOAD_BYTES",
     "FORGE_STORAGE_LINK_TTL_SECS",
+    "FORGE_STREAMS_KEY",
 ];
 
 /// The owner password the `setup` command of generated applications reads
@@ -431,6 +440,49 @@ fn decode_signing_key(value: &str) -> Result<Vec<u8>, ConfigError> {
     Ok(bytes)
 }
 
+/// Live-update stream settings (`forge-broadcast`).
+///
+/// The key signs the channel names pages subscribe to. It is optional here:
+/// only an application that serves live updates needs it, and the
+/// broadcast signer refuses to start without it in production (development
+/// and test then use a random per-process key).
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct StreamsConfig {
+    /// HMAC key of signed stream names as base64 (standard or URL-safe,
+    /// padded or not) of at least [`STREAMS_KEY_MIN_BYTES`] random bytes
+    /// (`FORGE_STREAMS_KEY`), shared by every replica. Redacted in
+    /// diagnostics.
+    pub key: Option<SecretString>,
+}
+
+impl StreamsConfig {
+    /// Decodes the configured key, or `None` when none is set. The error
+    /// never contains the key.
+    pub fn key_bytes(&self) -> Result<Option<Vec<u8>>, ConfigError> {
+        self.key
+            .as_ref()
+            .map(|key| decode_streams_key(key.expose()))
+            .transpose()
+    }
+}
+
+/// Decodes `FORGE_STREAMS_KEY` like Forge-Go does: any of the four base64
+/// alphabets/paddings, at least [`STREAMS_KEY_MIN_BYTES`] bytes.
+fn decode_streams_key(value: &str) -> Result<Vec<u8>, ConfigError> {
+    let value = value.trim();
+    let bytes = [STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD]
+        .iter()
+        .find_map(|engine| engine.decode(value).ok());
+    match bytes {
+        Some(bytes) if bytes.len() >= STREAMS_KEY_MIN_BYTES => Ok(bytes),
+        _ => Err(ConfigError::InvalidValue {
+            key: "FORGE_STREAMS_KEY",
+            value: REDACTED.to_owned(),
+            expected: STREAMS_KEY_CONTRACT,
+        }),
+    }
+}
+
 /// Complete process configuration.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -448,6 +500,8 @@ pub struct AppConfig {
     pub cache: CacheConfig,
     /// File storage settings.
     pub storage: StorageConfig,
+    /// Live-update stream settings.
+    pub streams: StreamsConfig,
 }
 
 impl AppConfig {
@@ -550,7 +604,7 @@ impl AppConfig {
     }
 }
 
-/// Reads the rate limit, cache and storage keys.
+/// Reads the rate limit, cache, storage and streams keys.
 fn apply_services(
     lookup: &impl Fn(&str) -> Option<String>,
     config: &mut AppConfig,
@@ -613,6 +667,11 @@ fn apply_services(
             1..=MAX_STORAGE_MAX_UPLOAD_BYTES,
             "an integer from 1 to 1073741824",
         )?;
+    }
+    if let Some(value) = lookup("FORGE_STREAMS_KEY") {
+        // Validates the key; the rejected value is a secret and never echoed.
+        decode_streams_key(&value)?;
+        config.streams.key = Some(SecretString::new(value.trim()));
     }
     if let Some(value) = lookup("FORGE_STORAGE_LINK_TTL_SECS") {
         config.storage.link_ttl = Duration::from_secs(parse_bounded(
@@ -1105,6 +1164,7 @@ mod tests {
             "dGhpcy1pcy1hLTMyLWJ5dGUtc2lnbmluZy1rZXktISE",
             "10",
             "60",
+            "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=",
         ];
         let pairs: Vec<(&str, &str)> = KNOWN_KEYS.iter().copied().zip(values).collect();
         assert_eq!(pairs.len(), KNOWN_KEYS.len());
@@ -1230,6 +1290,47 @@ mod tests {
                 .expect("serializes")
                 .contains(KEY_32)
         );
+    }
+
+    #[test]
+    fn streams_key_accepts_every_base64_form_of_32_bytes_and_is_never_echoed() {
+        // `openssl rand -base64 32` output, and the same bytes in the other
+        // three alphabet/padding forms Forge-Go accepts.
+        let standard = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=";
+        for key in [
+            standard,
+            "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY",
+            "-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_8=",
+            "-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_-_8",
+            "+/+/+/+/+/+/+/+/+/+/+/+/+/+/+/+/+/+/+/+/+/8=",
+        ] {
+            let config = load(&[("FORGE_STREAMS_KEY", key)]).expect(key);
+            let bytes = config.streams.key_bytes().expect("decodes").expect("set");
+            assert_eq!(bytes.len(), 32, "{key}");
+            assert!(!format!("{config:?}").contains(key));
+            assert!(
+                !serde_json::to_string(&config)
+                    .expect("serializes")
+                    .contains(key)
+            );
+        }
+        // 31 bytes, not base64, empty.
+        for bad in [
+            "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZQ==",
+            "not base64!",
+            "",
+        ] {
+            let error = load(&[("FORGE_STREAMS_KEY", bad)]).expect_err("bad key");
+            let text = error.to_string();
+            assert!(text.contains("FORGE_STREAMS_KEY"), "{text}");
+            assert!(text.contains("[REDACTED]"), "{text}");
+            assert!(bad.is_empty() || !text.contains(bad), "{text}");
+        }
+        // Optional everywhere: the broadcast signer decides what a missing
+        // key means.
+        let production = load(&[("FORGE_ENV", "production")]).expect("no key needed here");
+        assert_eq!(production.streams.key, None);
+        assert_eq!(production.streams.key_bytes(), Ok(None));
     }
 
     #[test]

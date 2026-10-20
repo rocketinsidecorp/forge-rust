@@ -133,6 +133,20 @@ The generator only creates files; it prints the `pub mod` lines and the
 `compose` statements (in `src/bootstrap/mod.rs`) that wire the resource. Its
 routes answer `403` until you choose who may use them in
 `src/adapters/http/access.rs`.
+
+Add `--broadcast` for live updates: open index pages apply every create,
+update and delete over Server-Sent Events (Turbo Streams). Production needs
+the stream signing key, the same on every replica:
+
+```bash
+forge generate scaffold event name:string starts_at:timestamp --tenant-scoped --broadcast
+export FORGE_STREAMS_KEY=$(openssl rand -base64 32)
+```
+
+That is why `Cargo.toml` enables the `broadcast` feature of `forge`: it only
+compiles the live-update code, and nothing is served, connected or started
+until you add the printed `Streams::register` wiring. If this application
+will never broadcast, you may remove `"broadcast"` from the features.
 %%end%%
 %%if authentication%%
 

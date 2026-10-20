@@ -77,6 +77,8 @@ const PORT: &str = scaffold_template!("port.rs.tmpl");
 const SERVICE: &str = scaffold_template!("service.rs.tmpl");
 const REPOSITORY: &str = scaffold_template!("repository.rs.tmpl");
 const ACCESS: &str = scaffold_template!("access.rs.tmpl");
+const STREAMS: &str = scaffold_template!("streams.rs.tmpl");
+const ROW_PARTIAL: &str = scaffold_template!("templates/_row.html.tmpl");
 const HTTP: &str = scaffold_template!("http.rs.tmpl");
 const VIEWS: &str = scaffold_template!("views.rs.tmpl");
 const TESTS_HTTP: &str = scaffold_template!("tests_http.rs.tmpl");
@@ -101,6 +103,18 @@ const PAGES: &[(&str, &str)] = &[
 
 /// The shared access-policy module, written by the first scaffold.
 pub(crate) const ACCESS_PATH: &str = "src/adapters/http/access.rs";
+/// The shared live-update module, written by the first `--broadcast`
+/// scaffold.
+pub(crate) const STREAMS_PATH: &str = "src/adapters/http/streams.rs";
+
+/// What `--broadcast` adds.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct Broadcast {
+    /// The pages publish their changes and the index subscribes.
+    pub(crate) enabled: bool,
+    /// Write the shared streams module (the first broadcasting scaffold).
+    pub(crate) streams_module: bool,
+}
 
 /// One file to write, relative to the application root.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -117,8 +131,9 @@ pub(crate) fn files(
     backend: Backend,
     migration: &str,
     access: bool,
+    broadcast: Broadcast,
 ) -> Vec<File> {
-    let renderer = Renderer::new(resource, backend);
+    let renderer = Renderer::new(resource, backend, broadcast.enabled);
     let singular = &resource.singular;
     let plural = &resource.plural;
     let (up, down) = renderer.migration();
@@ -145,10 +160,16 @@ pub(crate) fn files(
     if access {
         files.push(renderer.file(ACCESS_PATH.to_owned(), ACCESS));
     }
+    if broadcast.enabled && broadcast.streams_module {
+        files.push(renderer.file(STREAMS_PATH.to_owned(), STREAMS));
+    }
     files.push(renderer.file(format!("src/adapters/http/{plural}.rs"), HTTP));
     files.push(renderer.file(format!("src/adapters/http/views/{plural}.rs"), VIEWS));
     for (page, template) in PAGES {
         files.push(renderer.file(format!("templates/{plural}/{page}"), template));
+    }
+    if broadcast.enabled {
+        files.push(renderer.file(format!("templates/{plural}/_row.html"), ROW_PARTIAL));
     }
     files.push(renderer.file(format!("tests/{plural}_http.rs"), TESTS_HTTP));
     files.push(renderer.file(format!("tests/{plural}_repository.rs"), TESTS_REPOSITORY));
@@ -158,14 +179,16 @@ pub(crate) fn files(
 struct Renderer<'a> {
     resource: &'a Resource,
     backend: Backend,
+    broadcast: bool,
     variables: Vec<(&'static str, String)>,
 }
 
 impl<'a> Renderer<'a> {
-    fn new(resource: &'a Resource, backend: Backend) -> Self {
+    fn new(resource: &'a Resource, backend: Backend, broadcast: bool) -> Self {
         let mut renderer = Self {
             resource,
             backend,
+            broadcast,
             variables: Vec::new(),
         };
         renderer.variables = renderer.variables();
@@ -199,6 +222,10 @@ impl<'a> Renderer<'a> {
             // The HTTP tests build attributes for the tenant grant test and
             // the sub-second timestamp test.
             "http_attributes" => self.tenant() || self.has(FieldType::Timestamp),
+            "broadcast" => self.broadcast,
+            // The HTTP test harness keeps the tenant of its routes when a
+            // test needs it.
+            "harness_tenant" => self.tenant() && (self.has(FieldType::Timestamp) || self.broadcast),
             _ => false,
         };
         let variables: Vec<(&str, &str)> = self
@@ -258,6 +285,11 @@ impl<'a> Renderer<'a> {
             ("context, ", "&context", "&context, ")
         } else {
             ("", "", "")
+        };
+        let context_param = if tenant {
+            "context: &TenantContext, "
+        } else {
+            ""
         };
         let authorize = |permission: &str| {
             if tenant {
@@ -322,6 +354,24 @@ impl<'a> Renderer<'a> {
                 },
             ),
             ("%%CONTEXT_ARG_REF%%", context_arg_ref.to_owned()),
+            ("%%CONTEXT_PARAM%%", context_param.to_owned()),
+            (
+                "%%CONTEXT_NAME%%",
+                if tenant { "context" } else { "" }.to_owned(),
+            ),
+            (
+                "%%BROADCAST_SCOPE_DOC%%",
+                if tenant {
+                    " of the authorized tenant"
+                } else {
+                    ""
+                }
+                .to_owned(),
+            ),
+            (
+                "%%SCOPE%%",
+                if tenant { "tenant" } else { "global" }.to_owned(),
+            ),
             ("%%CONTEXT_ARG%%", context_arg.to_owned()),
             ("%%CONTEXT_REF%%", context_ref.to_owned()),
             (

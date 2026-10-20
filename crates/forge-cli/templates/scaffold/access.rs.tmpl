@@ -17,7 +17,10 @@
 //!   tenant, so tenant roles cannot authorize them. Implement
 //!   [`GlobalAccess`] with your own rule (for example signed-in operators)
 //!   and replace [`DenyAll`] in `src/bootstrap/mod.rs`; that replacement is
-//!   the explicit decision to open the routes.
+//!   the explicit decision to open the routes. It returns the signed-in
+//!   principal it admitted (`None` only for anonymous callers of a public
+//!   resource), so live-update streams limit each person's connections
+//!   rather than every caller behind one address.
 //!
 //! A refused request without a valid session answers `401`. In applications
 //! with the sign-in pages (`forge new` on PostgreSQL, or
@@ -31,7 +34,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use forge::auth::{SessionStore, UnixTimestamp};
 use forge::http::{Request, Response, StatusCode};
-use forge::security::{Permission, RbacPolicy};
+use forge::security::{Permission, PrincipalId, RbacPolicy};
 use forge::tenancy::{MembershipStore, TenantContext, TenantId};
 
 use crate::infrastructure::security::{RequestAuthError, authenticate_request, enforce_csrf};
@@ -68,8 +71,17 @@ impl AccessDenied {
 #[async_trait]
 pub trait GlobalAccess: Send + Sync {
     /// Allows `request` to use `permission`, or refuses it.
-    async fn authorize(&self, request: &Request, permission: &Permission)
-    -> Result<(), AccessDenied>;
+    ///
+    /// On success, returns the signed-in principal making the request, or
+    /// `None` for an anonymous caller of a public resource. Live-update
+    /// streams count a principal's open streams against that principal and
+    /// anonymous ones by client address, which every caller behind one
+    /// reverse proxy shares: return the principal whenever there is one.
+    async fn authorize(
+        &self,
+        request: &Request,
+        permission: &Permission,
+    ) -> Result<Option<PrincipalId>, AccessDenied>;
 }
 
 /// Authorizes requests to a tenant-scoped resource.
@@ -90,7 +102,11 @@ pub struct DenyAll;
 
 #[async_trait]
 impl GlobalAccess for DenyAll {
-    async fn authorize(&self, _: &Request, _: &Permission) -> Result<(), AccessDenied> {
+    async fn authorize(
+        &self,
+        _: &Request,
+        _: &Permission,
+    ) -> Result<Option<PrincipalId>, AccessDenied> {
         Err(AccessDenied::Forbidden)
     }
 }

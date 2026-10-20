@@ -3,7 +3,7 @@
 - Status: Accepted
 - Date: 2026-10-14
 - Refines: [ADR 0009](0009-rails-style-generated-delivery-assets.md)
-- Refined by: [ADR 0023](0023-form-csrf-flash-and-method-override.md) (form CSRF, flash, method override), [ADR 0024](0024-scaffold-generator.md) (scaffold generator)
+- Refined by: [ADR 0023](0023-form-csrf-flash-and-method-override.md) (form CSRF, flash, method override), [ADR 0024](0024-scaffold-generator.md) (scaffold generator), [ADR 0031](0031-live-updates-over-server-sent-events.md) (live updates over Server-Sent Events)
 - Decision owner: project owner (2026-10-14: "siga igual o Rails com views")
 
 ## Context

@@ -251,6 +251,36 @@ is reported as passed only when the recorded command exits successfully.
 See [architecture](architecture.md), [performance targets](performance-targets.md),
 and [dependency policy](dependency-policy.md).
 
+## Live updates tests
+
+`forge-broadcast` (ADR 0031) mirrors the Forge-Go negative tests:
+
+- **Tokens:** round trips, byte-for-byte equality with tokens Forge-Go
+  printed, forged/tampered/foreign-key/oversized/padded tokens invalid, expiry
+  at the exact second (an expired forgery stays invalid), key rotation,
+  `FORGE_STREAMS_KEY` required in production only and never echoed.
+- **Handler:** one identical `403` for every invalid token, `401`/`403`/`503`
+  from the access policy, another tenant (member, principal or anonymous)
+  refused, per-principal and per-tenant caps with `Retry-After`, anonymous
+  viewers per address with IPv6 `/64` and IPv4-mapped IPv6, a full broker,
+  shutdown ending open streams, heartbeats and the maximum age, a slow
+  subscriber dropped, SSE framing that cannot be broken out of.
+- **Transport:** `forge-http` sends streamed bodies chunked, disconnects a
+  real client that stops reading, keeps a slow reader that pauses for ten
+  request timeouts (the 30 second stalled-write floor); a real server drains at once when shutdown
+  begins although a stream is open (`crates/forge/tests/broadcast.rs`).
+- **PostgreSQL fanout** (`--include-ignored` with `FORGE_TEST_DATABASE_URL`):
+  two brokers on one database deliver once to each replica (multi-chunk
+  messages included), oversized messages are refused, `publish_in` delivers
+  only on commit, malformed and foreign notifications are ignored, and a
+  terminated listener connection is re-established. Non-PostgreSQL backends
+  are refused (`postgres_fanout_is_refused_on_sqlite_not_emulated`).
+- **Generated applications:** `forge generate scaffold --broadcast` output
+  is golden-tested; the generated tests cover the broadcasts, forged/unknown/
+  unauthorized subscriptions, tenant isolation and the production key; the
+  scaffold end-to-end test opens a real stream on the running PostgreSQL
+  application (`401` signed out, `200` signed in) and receives a create.
+
 ## Rate limiting, cache and storage tests
 
 Each of `forge-ratelimit`, `forge-cache` and `forge-storage` ships its

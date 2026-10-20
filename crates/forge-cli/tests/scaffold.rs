@@ -1,6 +1,7 @@
 //! `forge generate scaffold` end to end: generate a PostgreSQL, a SQLite and
 //! a MySQL application, scaffold a global and a tenant-scoped resource in
-//! each, apply the printed wiring exactly as printed, and run the
+//! each (the tenant-scoped one and a second global one with `--broadcast`
+//! live updates), apply the printed wiring exactly as printed, and run the
 //! application's own gates: `cargo fmt --check`, Clippy with warnings denied
 //! and `cargo test`.
 //!
@@ -50,7 +51,11 @@ const EVENT: &[&str] = &[
     "venue:uuid",
     "organizer:uuid?",
     "--tenant-scoped",
+    "--broadcast",
 ];
+/// A second broadcasting resource: it reuses the streams module the event
+/// scaffold wrote.
+const NOTE: &[&str] = &["note", "body:text", "--global", "--broadcast"];
 
 fn workspace() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
@@ -253,7 +258,7 @@ fn scaffolded(database: &str) -> (tempfile::TempDir, PathBuf) {
         &[],
     );
     let root = parent.path().join(&name);
-    for scaffold in [POST, EVENT] {
+    for scaffold in [POST, EVENT, NOTE] {
         let mut arguments = vec!["generate", "scaffold"];
         arguments.extend_from_slice(scaffold);
         let dry = {
@@ -332,6 +337,10 @@ fn sqlite_application_with_scaffolds_passes_its_gates() {
         "another_tenant_or_a_malformed_tenant_is_forbidden ... ok",
         "a_suspended_membership_is_forbidden ... ok",
         "a_role_without_the_grant_is_forbidden ... ok",
+        "changes_are_broadcast_to_open_lists ... ok",
+        "streams_refuse_forged_unknown_and_unauthorized_subscriptions ... ok",
+        "broadcasts_stay_in_their_tenant ... ok",
+        "production_refuses_to_start_without_a_signing_key ... ok",
     ] {
         assert!(tests.contains(test), "{test}\n{tests}");
     }
@@ -415,6 +424,9 @@ fn postgresql_application_with_scaffolds_passes_its_gates_and_migrations_revert(
         migrate("migrate");
         assert_eq!(table("posts").await.as_deref(), Some("posts"));
         assert_eq!(table("events").await.as_deref(), Some("events"));
+        assert_eq!(table("notes").await.as_deref(), Some("notes"));
+        assert!(migrate("rollback").contains("create notes"));
+        assert_eq!(table("notes").await, None);
         assert!(migrate("rollback").contains("create events"));
         assert_eq!(table("events").await, None);
         assert!(migrate("rollback").contains("create posts"));
@@ -554,6 +566,48 @@ impl Browser {
         self.cookie("__Host-forge_csrf")
             .unwrap_or_else(|| panic!("no CSRF cookie in {:?}", self.cookies))
     }
+
+    /// Opens an event stream like `EventSource` and returns the connection
+    /// once its headers and first event arrived, with what was read.
+    fn open_stream(&self, port: u16, path: &str) -> (TcpStream, String) {
+        let mut stream = TcpStream::connect(("127.0.0.1", port))
+            .unwrap_or_else(|error| panic!("connect: {error}"));
+        stream
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap_or_else(|error| panic!("{error}"));
+        let cookies: Vec<String> = self
+            .cookies
+            .iter()
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect();
+        let request = format!(
+            "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAccept: text/event-stream\r\n\
+             Cookie: {}\r\n\r\n",
+            cookies.join("; ")
+        );
+        stream
+            .write_all(request.as_bytes())
+            .unwrap_or_else(|error| panic!("send: {error}"));
+        let mut received = String::new();
+        read_until(&mut stream, &mut received, "\r\n\r\n");
+        if received.starts_with("HTTP/1.1 200 ") {
+            read_until(&mut stream, &mut received, ": connected");
+        }
+        (stream, received)
+    }
+}
+
+/// Reads from `stream` until `marker` arrived; panics at the end of the
+/// stream.
+fn read_until(stream: &mut TcpStream, received: &mut String, marker: &str) {
+    let mut buffer = [0_u8; 4096];
+    while !received.contains(marker) {
+        let read = stream
+            .read(&mut buffer)
+            .unwrap_or_else(|error| panic!("receive {marker:?}: {error}\n{received}"));
+        assert!(read > 0, "the stream ended before {marker:?}:\n{received}");
+        received.push_str(&String::from_utf8_lossy(&buffer[..read]));
+    }
 }
 
 fn form_encode(value: &str) -> String {
@@ -669,6 +723,29 @@ fn sign_in_use_a_tenant_scaffold_and_sign_out(root: &Path, binary: &str, url: &s
 
     let index = browser.request(port, "GET", &events, None);
     assert_eq!(index.status, 200, "{}", index.body);
+    // --broadcast: the index subscribes; the signed-in owner's stream is
+    // open (PostgreSQL LISTEN/NOTIFY fanout) and a signed-out client's is not.
+    let source = index
+        .body
+        .split("<turbo-stream-source src=\"")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .unwrap_or_else(|| panic!("the index subscribes: {}", index.body))
+        .replace("&amp;", "&");
+    assert!(
+        source.starts_with(&format!("/tenants/{tenant}/streams?stream=")),
+        "{source}"
+    );
+    let (_, refused) = Browser::default().open_stream(port, &source);
+    assert!(refused.starts_with("HTTP/1.1 401 "), "{refused}");
+    let (mut live, mut received) = browser.open_stream(port, &source);
+    assert!(received.starts_with("HTTP/1.1 200 "), "{received}");
+    assert!(
+        received
+            .to_ascii_lowercase()
+            .contains("content-type: text/event-stream"),
+        "{received}"
+    );
     let create = format!(
         "csrf_token={}&name=Launch&starts_at=2026-01-02T03%3A04%3A05&capacity=42&public=true&\
          venue=67e55044-10b1-426f-9247-bb680e5fe0c8",
@@ -681,6 +758,9 @@ fn sign_in_use_a_tenant_scaffold_and_sign_out(root: &Path, binary: &str, url: &s
     let show = browser.request(port, "GET", &shown, None);
     assert_eq!(show.status, 200);
     assert!(show.body.contains("Launch"));
+    read_until(&mut live, &mut received, "target=\"events\"><template>");
+    assert!(received.contains("Launch"), "{received}");
+    drop(live);
 
     let csrf = browser.csrf();
     let signed_out = browser.request(
