@@ -121,6 +121,11 @@ pub(crate) enum GenerateCommand {
         /// Plural name when the English rules get it wrong.
         #[arg(long, value_name = "PLURAL")]
         plural: Option<String>,
+        /// Live updates: the pages publish every create, update and delete
+        /// as Turbo Streams, and open index pages apply them over
+        /// Server-Sent Events (needs FORGE_STREAMS_KEY in production).
+        #[arg(long)]
+        broadcast: bool,
         /// List the files that would be created and the wiring, without
         /// writing anything.
         #[arg(long)]

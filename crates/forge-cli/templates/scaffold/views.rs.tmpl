@@ -9,6 +9,10 @@ use super::Layout;
 
 /// A %%NOUN%% ready for display.
 pub struct %%TYPE%%Row {
+%%if broadcast%%
+    /// `id` of the row element, the target of live updates.
+    pub dom_id: String,
+%%end%%
     pub show_path: String,
     pub edit_path: String,
 %%ROW_STRUCT_FIELDS%%
@@ -29,7 +33,23 @@ pub struct %%TYPE%%Index<'a> {
     pub new_path: String,
     pub rows: Vec<%%TYPE%%Row>,
     pub next_path: Option<String>,
+%%if broadcast%%
+    /// `<turbo-stream-source>` of the live updates, `None` when signing
+    /// failed (the page then does not update live).
+    pub stream_source: Option<String>,
+%%end%%
 }
+%%if broadcast%%
+
+/// `templates/%%RESOURCES%%/_row.html` alone: the content of a live update.
+/// It is rendered without a request and reaches every subscriber, so it
+/// holds nothing specific to one viewer (no CSRF token).
+#[derive(Template)]
+#[template(path = "%%RESOURCES%%/_row.html")]
+pub struct %%TYPE%%RowFragment {
+    pub row: %%TYPE%%Row,
+}
+%%end%%
 
 /// `templates/%%RESOURCES%%/show.html`, with the delete form.
 #[derive(Template)]

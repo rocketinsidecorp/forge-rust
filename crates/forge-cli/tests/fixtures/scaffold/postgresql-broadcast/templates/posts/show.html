@@ -1,0 +1,23 @@
+{% extends "layouts/application.html" %}
+
+{% block content %}
+<h1>Post</h1>
+<dl>
+  <dt>Title</dt>
+  <dd>{{ post.title }}</dd>
+  <dt>Body</dt>
+  <dd>{{ post.body }}</dd>
+  <dt>Published</dt>
+  <dd>{{ post.published }}</dd>
+</dl>
+<p>
+  <a href="{{ post.edit_path }}">Edit</a>
+  <a href="{{ back_path }}">Back to posts</a>
+</p>
+<form action="{{ post.show_path }}" method="post" data-turbo-confirm="Delete this post?">
+  {{ csrf_field|safe }}
+  <input type="hidden" name="_method" value="delete">
+  <input type="hidden" name="version" value="{{ version }}">
+  <button type="submit">Delete post</button>
+</form>
+{% endblock %}

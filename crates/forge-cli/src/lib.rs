@@ -100,6 +100,7 @@ fn execute(
                 tenant_scoped,
                 global: _,
                 plural,
+                broadcast,
                 dry_run,
             } => {
                 let options = ScaffoldOptions {
@@ -111,6 +112,7 @@ fn execute(
                         Scope::Global
                     },
                     plural,
+                    broadcast,
                     dry_run,
                 };
                 let version = generate::migration_version()?;
@@ -121,6 +123,10 @@ fn execute(
                 }
                 if outcome.reused_access {
                     writeln!(output, "  {:<12} src/adapters/http/access.rs", "reuse")
+                        .map_err(CliError::Output)?;
+                }
+                if outcome.reused_streams {
+                    writeln!(output, "  {:<12} src/adapters/http/streams.rs", "reuse")
                         .map_err(CliError::Output)?;
                 }
                 write!(output, "{}", outcome.wiring).map_err(CliError::Output)

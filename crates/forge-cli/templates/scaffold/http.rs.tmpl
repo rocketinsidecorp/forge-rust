@@ -17,6 +17,12 @@
 //! layer applies the override after checking the token. Invalid input is
 //! shown again with `422`, a stale version with `409`, success redirects
 //! with `303` and a flash notice.
+%%if broadcast%%
+//!
+//! Live updates (`--broadcast`): after a change is stored the pages publish
+//! Turbo Streams to the `%%RESOURCES%%` channel%%BROADCAST_SCOPE_DOC%%, and the
+//! index page subscribes to it (see `crate::adapters::http::streams`).
+%%end%%
 
 use std::future::Future;
 use std::sync::Arc;
@@ -29,12 +35,20 @@ use forge::security::Permission;
 use forge::tenancy::TenantContext;
 %%end%%
 use forge::views::{BASE_FIELD, FieldErrors, Flash, csrf_field, csrf_token, see_other};
+%%if broadcast%%
+use forge::broadcast::Channel;
+use forge::views::{StreamAction, TurboStreamAction, dom_id};
+%%end%%
 
 %%if tenant%%
 use crate::adapters::http::access::{AccessDenied, TenantAccess};
 %%end%%
 %%if global%%
 use crate::adapters::http::access::GlobalAccess;
+%%end%%
+%%if broadcast%%
+use crate::adapters::http::streams::Streams;
+use crate::adapters::http::views::%%RESOURCES%%::%%TYPE%%RowFragment;
 %%end%%
 use crate::adapters::http::views::Site;
 use crate::adapters::http::views::%%RESOURCES%%::{
@@ -59,6 +73,9 @@ struct %%TYPE%%Routes {
     access: Arc<dyn %%ACCESS_TRAIT%%>,
     read: Permission,
     write: Permission,
+%%if broadcast%%
+    streams: Arc<Streams>,
+%%end%%
 }
 
 /// Registers the %%NOUN%% routes. `access` decides who may call them (see
@@ -68,13 +85,29 @@ pub fn routes(
     site: &Arc<Site>,
     service: %%TYPE%%Service,
     access: Arc<dyn %%ACCESS_TRAIT%%>,
+%%if broadcast%%
+    streams: &Arc<Streams>,
+%%end%%
 ) -> Result<(), ComposeError> {
+%%if broadcast%%
+    let read = Permission::new(READ_PERMISSION).map_err(ComposeError::other)?;
+    // A stream of this channel is served to whoever the index may serve.
+    streams.allow_%%SCOPE%%("%%RESOURCES%%", Arc::clone(&access), read.clone());
+%%end%%
     let state = Arc::new(%%TYPE%%Routes {
         site: Arc::clone(site),
         service,
         access,
+%%if broadcast%%
+        read,
+%%end%%
+%%if !broadcast%%
         read: Permission::new(READ_PERMISSION).map_err(ComposeError::other)?,
+%%end%%
         write: Permission::new(WRITE_PERMISSION).map_err(ComposeError::other)?,
+%%if broadcast%%
+        streams: Arc::clone(streams),
+%%end%%
     });
     let collection = "%%COLLECTION_PATTERN%%";
     let member = "%%COLLECTION_PATTERN%%/{id}";
@@ -155,6 +188,9 @@ async fn index(state: Arc<%%TYPE%%Routes>, request: Request) -> Response {
                 .map(|%%RESOURCE%%| row(&collection, %%RESOURCE%%))
                 .collect(),
             next_path: page.next.map(|next| format!("{collection}?after={next}")),
+%%if broadcast%%
+            stream_source: channel(%%CONTEXT_REF%%).and_then(|channel| state.streams.source(&channel)),
+%%end%%
         }),
         Err(error) => failure(&state, &request, &collection, error),
     }
@@ -222,10 +258,21 @@ async fn create(state: Arc<%%TYPE%%Routes>, request: Request) -> Response {
         }
     };
     match state.service.create(%%CONTEXT_ARG_REF%%attributes).await {
+%%if broadcast%%
+        Ok(%%RESOURCE%%) => {
+            publish_created(&state, %%CONTEXT_ARG_REF%%&collection, &%%RESOURCE%%).await;
+            redirect(
+                &format!("{collection}/{}", %%RESOURCE%%.id()),
+                Flash::new().with_notice("%%LABEL%% was successfully created."),
+            )
+        }
+%%end%%
+%%if !broadcast%%
         Ok(%%RESOURCE%%) => redirect(
             &format!("{collection}/{}", %%RESOURCE%%.id()),
             Flash::new().with_notice("%%LABEL%% was successfully created."),
         ),
+%%end%%
         Err(%%TYPE%%Error::Invalid(violations)) => render_new(
             &state,
             &request,
@@ -300,10 +347,21 @@ async fn update(state: Arc<%%TYPE%%Routes>, request: Request) -> Response {
         .update(%%CONTEXT_ARG_REF%%id, expected, attributes)
         .await
     {
+%%if broadcast%%
+        Ok(%%RESOURCE%%) => {
+            publish_updated(&state, %%CONTEXT_ARG_REF%%&collection, &%%RESOURCE%%).await;
+            redirect(
+                &format!("{collection}/{}", %%RESOURCE%%.id()),
+                Flash::new().with_notice("%%LABEL%% was successfully updated."),
+            )
+        }
+%%end%%
+%%if !broadcast%%
         Ok(%%RESOURCE%%) => redirect(
             &format!("{collection}/{}", %%RESOURCE%%.id()),
             Flash::new().with_notice("%%LABEL%% was successfully updated."),
         ),
+%%end%%
         Err(%%TYPE%%Error::Invalid(violations)) => render_form_page(
             &state,
             &request,
@@ -357,10 +415,21 @@ async fn destroy(state: Arc<%%TYPE%%Routes>, request: Request) -> Response {
         return redirect(&member, Flash::new().with_alert(alert));
     };
     match state.service.delete(%%CONTEXT_ARG_REF%%id, expected).await {
+%%if broadcast%%
+        Ok(()) => {
+            publish_deleted(&state, %%CONTEXT_ARG_REF%%id).await;
+            redirect(
+                &collection,
+                Flash::new().with_notice("%%LABEL%% was successfully deleted."),
+            )
+        }
+%%end%%
+%%if !broadcast%%
         Ok(()) => redirect(
             &collection,
             Flash::new().with_notice("%%LABEL%% was successfully deleted."),
         ),
+%%end%%
         Err(%%TYPE%%Error::Conflict) => redirect(&member, Flash::new().with_alert(STALE_DELETE)),
         Err(error) => failure(&state, &request, &collection, error),
     }
@@ -405,6 +474,9 @@ fn form_values(%%RESOURCE%%: &%%TYPE%%) -> %%TYPE%%FormValues {
 fn row(collection: &str, %%RESOURCE%%: &%%TYPE%%) -> %%TYPE%%Row {
     let show_path = format!("{collection}/{}", %%RESOURCE%%.id());
     %%TYPE%%Row {
+%%if broadcast%%
+        dom_id: format!("%%RESOURCE%%_{}", %%RESOURCE%%.id()),
+%%end%%
         edit_path: format!("{show_path}/edit"),
         show_path,
 %%ENTITY_TO_ROW%%
@@ -579,6 +651,69 @@ fn path_id(request: &Request) -> Option<%%TYPE%%Id> {
     request.path_param_as("id").ok()
 }
 
+%%if broadcast%%
+%%if tenant%%
+/// The channel the %%NOUN%% pages publish to and subscribe to: the
+/// `%%RESOURCES%%` channel of the authorized tenant, so another tenant's
+/// pages never hear of a change.
+fn channel(context: &TenantContext) -> Option<Channel> {
+    Channel::for_tenant(context.tenant_id(), "%%RESOURCES%%").ok()
+}
+%%end%%
+%%if global%%
+/// The channel the %%NOUN%% pages publish to and subscribe to, shared by
+/// everyone the access policy lets read %%NOUNS%%.
+fn channel() -> Option<Channel> {
+    Channel::global("%%RESOURCES%%").ok()
+}
+%%end%%
+
+/// Shows a new %%NOUN%% in every open list (appended: lists are oldest
+/// first) and removes the "no %%NOUNS%% yet" row.
+async fn publish_created(state: &%%TYPE%%Routes, %%CONTEXT_PARAM%%collection: &str, %%RESOURCE%%: &%%TYPE%%) {
+    let item = row(collection, %%RESOURCE%%);
+    state
+        .streams
+        .publish(channel(%%CONTEXT_NAME%%), || {
+            Ok(vec![
+                TurboStreamAction::remove(forge::views::DomId::new("%%RESOURCES%%_empty")?),
+                TurboStreamAction::from_view(
+                    StreamAction::Append,
+                    forge::views::DomId::new("%%RESOURCES%%")?,
+                    &%%TYPE%%RowFragment { row: item },
+                )?,
+            ])
+        })
+        .await;
+}
+
+/// Replaces the %%NOUN%%'s row in every open list.
+async fn publish_updated(state: &%%TYPE%%Routes, %%CONTEXT_PARAM%%collection: &str, %%RESOURCE%%: &%%TYPE%%) {
+    let item = row(collection, %%RESOURCE%%);
+    let id = %%RESOURCE%%.id();
+    state
+        .streams
+        .publish(channel(%%CONTEXT_NAME%%), || {
+            Ok(vec![TurboStreamAction::from_view(
+                StreamAction::Replace,
+                dom_id(id, "%%RESOURCE%%")?,
+                &%%TYPE%%RowFragment { row: item },
+            )?])
+        })
+        .await;
+}
+
+/// Removes the %%NOUN%%'s row from every open list.
+async fn publish_deleted(state: &%%TYPE%%Routes, %%CONTEXT_PARAM%%id: %%TYPE%%Id) {
+    state
+        .streams
+        .publish(channel(%%CONTEXT_NAME%%), || {
+            Ok(vec![TurboStreamAction::remove(dom_id(id, "%%RESOURCE%%")?)])
+        })
+        .await;
+}
+
+%%end%%
 %%if tenant%%
 /// `/tenants/<tenant id>/%%RESOURCES%%` of the authorized tenant (never the
 /// raw path, which only selected the membership to check).

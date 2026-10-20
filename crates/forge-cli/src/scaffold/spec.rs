@@ -231,9 +231,10 @@ const RESERVED_LOCALS: &[&str] = &[
 ];
 
 /// Plural names that would collide with framework routes or generated
-/// modules (`/health`, `/assets`, `/tenants/{tenant_id}/...`,
-/// `adapters::http::views` and `adapters::http::access`).
-const RESERVED_PLURALS: &[&str] = &["access", "assets", "health", "tenants", "views"];
+/// modules (`/health`, `/assets`, `/streams`, `/tenants/{tenant_id}/...`,
+/// `adapters::http::views`, `adapters::http::access` and
+/// `adapters::http::streams`).
+const RESERVED_PLURALS: &[&str] = &["access", "assets", "health", "streams", "tenants", "views"];
 
 /// Parses `NAME field:type[?]...` plus the scope flags into a [`Resource`].
 pub(crate) fn parse(
@@ -586,6 +587,7 @@ mod tests {
             "assets",
             "views",
             "access",
+            "streams",
             "tenants",
             "forge_posts",
         ] {

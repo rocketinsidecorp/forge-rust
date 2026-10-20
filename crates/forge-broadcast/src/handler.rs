@@ -158,6 +158,7 @@ pub fn peer_address(request: &Request) -> String {
 /// maximum connection age passes; the browser then reconnects, which runs
 /// every check again. A client that stops reading is disconnected by the
 /// HTTP server's stalled-write timeout.
+#[derive(Clone)]
 pub struct EventStreams {
     broker: Arc<dyn Broker>,
     signer: Arc<Signer>,

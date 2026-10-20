@@ -17,6 +17,7 @@ use std::process::{Command, Stdio};
 
 pub(crate) use render::Backend;
 pub(crate) use render::File;
+use render::{Broadcast, STREAMS_PATH};
 pub(crate) use spec::Scope;
 
 use crate::CliError;
@@ -31,6 +32,7 @@ pub(crate) struct ScaffoldOptions {
     pub(crate) fields: Vec<String>,
     pub(crate) scope: Scope,
     pub(crate) plural: Option<String>,
+    pub(crate) broadcast: bool,
     pub(crate) dry_run: bool,
 }
 
@@ -41,6 +43,8 @@ pub(crate) struct Outcome {
     pub(crate) created: Vec<String>,
     /// Whether the shared access module already existed and was reused.
     pub(crate) reused_access: bool,
+    /// Whether the shared streams module already existed and was reused.
+    pub(crate) reused_streams: bool,
     /// The wiring instructions to print.
     pub(crate) wiring: String,
 }
@@ -50,6 +54,7 @@ pub(crate) struct Outcome {
 struct Application {
     backend: Backend,
     access_exists: bool,
+    streams_exists: bool,
 }
 
 /// Generates the scaffold in the application at `root`. `migration` is the
@@ -66,12 +71,17 @@ pub(crate) fn generate(
         options.plural.as_deref(),
     )
     .map_err(|invalid| CliError::Scaffold(invalid.to_string()))?;
-    let application = inspect(root, &resource)?;
+    let application = inspect(root, &resource, options.broadcast)?;
+    let broadcast = Broadcast {
+        enabled: options.broadcast,
+        streams_module: options.broadcast && !application.streams_exists,
+    };
     let mut files = render::files(
         &resource,
         application.backend,
         migration,
         !application.access_exists,
+        broadcast,
     );
     refuse_collisions(root, &resource, &files)?;
     for file in files.iter_mut().filter(|file| file.path.ends_with(".rs")) {
@@ -82,6 +92,7 @@ pub(crate) fn generate(
         &resource,
         application.backend,
         !application.access_exists,
+        broadcast,
     )?;
     if !options.dry_run {
         write_all(root, &files)?;
@@ -89,6 +100,7 @@ pub(crate) fn generate(
     Ok(Outcome {
         created: files.iter().map(|file| file.path.clone()).collect(),
         reused_access: application.access_exists,
+        reused_streams: options.broadcast && application.streams_exists,
         wiring,
     })
 }
@@ -137,7 +149,7 @@ fn read(root: &Path, relative: &str) -> Option<String> {
 
 /// Detects the backend and shape from the files `forge new` generated and
 /// refuses applications the scaffold cannot serve.
-fn inspect(root: &Path, resource: &Resource) -> Result<Application, CliError> {
+fn inspect(root: &Path, resource: &Resource, broadcast: bool) -> Result<Application, CliError> {
     let Some(manifest) = read(root, "Cargo.toml") else {
         return unsupported(format!(
             "no Cargo.toml in {}; run `forge generate scaffold` in the root of an application \
@@ -235,9 +247,39 @@ fn inspect(root: &Path, resource: &Resource) -> Result<Application, CliError> {
             true
         }
     };
+    let streams_exists = match read(root, STREAMS_PATH) {
+        Some(streams) if broadcast => {
+            for item in [
+                "pub struct Streams",
+                "pub fn allow_tenant",
+                "pub fn allow_global",
+            ] {
+                if !streams.contains(item) {
+                    return unsupported(format!(
+                        "{STREAMS_PATH} exists but has no `{item}`; generated routes depend on \
+                         it. Restore it or move your file aside"
+                    ));
+                }
+            }
+            true
+        }
+        Some(_) => true,
+        None => false,
+    };
+    if broadcast {
+        let forge = dependency("forge").unwrap_or_default();
+        if !forge.contains("\"broadcast\"") {
+            return unsupported(
+                "--broadcast needs the `broadcast` feature of the forge dependency, which \
+                 `forge new` now enables: add \"broadcast\" to the features of `forge` in \
+                 Cargo.toml (see \"Live updates\" in docs/views.md)",
+            );
+        }
+    }
     Ok(Application {
         backend,
         access_exists,
+        streams_exists,
     })
 }
 
@@ -314,6 +356,7 @@ fn wiring(
     resource: &Resource,
     backend: Backend,
     new_access: bool,
+    broadcast: Broadcast,
 ) -> Result<String, CliError> {
     let singular = &resource.singular;
     let plural = &resource.plural;
@@ -329,6 +372,9 @@ fn wiring(
     ];
     if new_access {
         declarations.push(("src/adapters/http/mod.rs", "access".to_owned()));
+    }
+    if broadcast.streams_module {
+        declarations.push(("src/adapters/http/mod.rs", "streams".to_owned()));
     }
     declarations.push(("src/adapters/http/mod.rs", plural.clone()));
     declarations.push(("src/adapters/http/views/mod.rs", plural.clone()));
@@ -381,6 +427,31 @@ fn wiring(
         ));
         "std::sync::Arc::new(crate::adapters::http::access::DenyAll)"
     };
+    if broadcast.streams_module {
+        let fanout = if backend == Backend::Postgresql {
+            "    // Live updates (--broadcast), once for every broadcasting resource. On\n    \
+             // PostgreSQL every replica hears every change (LISTEN/NOTIFY); production\n    \
+             // needs FORGE_STREAMS_KEY (`openssl rand -base64 32`, the same everywhere).\n    \
+             let streams =\n        \
+             crate::adapters::http::streams::Streams::register(composition, forge::Fanout::Postgres)?;\n"
+                .to_owned()
+        } else {
+            format!(
+                "    // Live updates (--broadcast), once for every broadcasting resource. {}\n    \
+                 // has no LISTEN/NOTIFY: updates reach the pages served by this process only.\n    \
+                 // Production needs FORGE_STREAMS_KEY (`openssl rand -base64 32`).\n    \
+                 let streams =\n        \
+                 crate::adapters::http::streams::Streams::register(composition, forge::Fanout::InProcess)?;\n",
+                backend.label()
+            )
+        };
+        code.push_str(&fanout);
+    }
+    let streams_argument = if broadcast.enabled {
+        "        &streams,\n"
+    } else {
+        ""
+    };
     code.push_str(&format!(
         "    let {plural} = crate::application::use_cases::{plural}::{type_name}Service::new(\n        \
          std::sync::Arc::new(\n            \
@@ -393,7 +464,8 @@ fn wiring(
          composition.router(),\n        \
          &site,\n        \
          {plural},\n        \
-         {access},\n    \
+         {access},\n\
+         {streams_argument}    \
          )?;\n"
     ));
 
@@ -412,6 +484,18 @@ fn wiring(
         "\n  Every route asks the access policy for `{plural}:read` or `{plural}:write`\n  \
          first; src/adapters/http/access.rs explains the deny-by-default choice.\n"
     ));
+    if broadcast.enabled {
+        out.push_str(&format!(
+            "  Live updates: create, update and delete publish to the `{plural}` channel{}, and\n  \
+             the index page subscribes; a stream is served only to callers the same policy\n  \
+             grants `{plural}:read` (src/adapters/http/streams.rs).\n",
+            if resource.scope == Scope::Tenant {
+                " of the tenant"
+            } else {
+                ""
+            }
+        ));
+    }
     if backend == Backend::Postgresql && tenant {
         out.push_str(&format!(
             "  Permissions match exactly: index and show need `{plural}:read`, new, create,\n  \

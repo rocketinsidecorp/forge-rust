@@ -1,0 +1,253 @@
+//! Live updates of the HTML pages (ADR 0031), shared by every resource
+//! generated with `forge generate scaffold ... --broadcast`: the pages publish
+//! Turbo Streams after each change, and every open page that subscribed
+//! receives them over Server-Sent Events.
+//!
+//! Who may subscribe is decided three times, all failing closed:
+//!
+//! 1. The page renders a `<turbo-stream-source>` whose URL carries the channel
+//!    name signed with `FORGE_STREAMS_KEY` (HMAC-SHA256, expiring): a browser
+//!    cannot ask for a channel it was not rendered.
+//! 2. The resource's own access policy runs with the resource's read
+//!    permission (`<plural>:read`), exactly as for its index page. A channel
+//!    no resource registered is refused.
+//! 3. A tenant channel is only served at `/tenants/{tenant_id}/streams` to a
+//!    member authorized in that very tenant: another tenant's member never
+//!    receives it, whatever the token says.
+//!
+//! Delivery is best effort and at most once: a browser that was disconnected
+//! misses what was published meanwhile and sees it on its next page load.
+//! Streams end when shutdown begins, after 30 minutes (the browser
+//! reconnects, which checks access again), or when a browser stops reading.
+//! `FORGE_STREAMS_KEY` (`openssl rand -base64 32`, the same on every replica)
+//! is required in production.
+
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
+
+use async_trait::async_trait;
+use forge::broadcast::{
+    BroadcastError, Broker, Channel, DEFAULT_STREAMS_PATH, EventStreams, Signer, StreamAccess,
+    StreamDenied, StreamViewer,
+};
+use forge::core::{ErrorCategory, ForgeError};
+use forge::http::Request;
+use forge::security::Permission;
+use forge::views::{DomIdError, TurboStreamAction, TurboStreamError};
+use forge::{ComposeError, Composition, Fanout};
+
+use crate::adapters::http::access::{AccessDenied, GlobalAccess, TenantAccess};
+
+/// Where tenant channels are served; global channels use `/streams`.
+pub const TENANT_PATH: &str = "/tenants/{tenant_id}/streams";
+
+/// What the HTML adapters publish to and render subscriptions from.
+pub struct Streams {
+    broker: Arc<dyn Broker>,
+    signer: Arc<Signer>,
+    readers: Arc<Readers>,
+}
+
+impl Streams {
+    /// Builds the broker (`fanout`) and the signer (`FORGE_STREAMS_KEY`), and
+    /// mounts `GET /streams` and `GET /tenants/{tenant_id}/streams`. Call it
+    /// once; every broadcasting resource shares the result.
+    pub fn register(
+        composition: &mut Composition<'_>,
+        fanout: Fanout,
+    ) -> Result<Arc<Self>, ComposeError> {
+        let signer = Arc::new(Signer::from_config(composition.config()).map_err(ComposeError::other)?);
+        let broker = composition.broadcast(fanout)?;
+        let readers = Arc::new(Readers::default());
+        let events = EventStreams::new(
+            Arc::clone(&broker),
+            Arc::clone(&signer),
+            Arc::<Readers>::clone(&readers),
+        );
+        events
+            .clone()
+            .register(composition.router(), DEFAULT_STREAMS_PATH)?;
+        events.register(composition.router(), TENANT_PATH)?;
+        Ok(Arc::new(Self {
+            broker,
+            signer,
+            readers,
+        }))
+    }
+
+    /// Lets callers whom `access` grants `permission` (the resource's read
+    /// permission) subscribe to the tenant channels named `name`.
+    pub fn allow_tenant(&self, name: &str, access: Arc<dyn TenantAccess>, permission: Permission) {
+        self.readers.allow(name, Reader::Tenant(access, permission));
+    }
+
+    /// Lets callers whom `access` grants `permission` subscribe to the
+    /// global channel `name`.
+    pub fn allow_global(&self, name: &str, access: Arc<dyn GlobalAccess>, permission: Permission) {
+        self.readers.allow(name, Reader::Global(access, permission));
+    }
+
+    /// The broker, for publishing from elsewhere (a job, for example).
+    pub fn broker(&self) -> &Arc<dyn Broker> {
+        &self.broker
+    }
+
+    /// `<turbo-stream-source>` for `channel`, rendered `|safe` by a page the
+    /// viewer is authorized to read. `None` (logged) if signing fails, and
+    /// the page then simply does not update live.
+    pub fn source(&self, channel: &Channel) -> Option<String> {
+        let path = match channel.tenant() {
+            Some(tenant) => format!("/tenants/{tenant}/streams"),
+            None => DEFAULT_STREAMS_PATH.to_owned(),
+        };
+        match self.signer.turbo_stream_from_path(&path, channel) {
+            Ok(source) => Some(source),
+            Err(error) => {
+                report(StreamFailure::Publish(error));
+                None
+            }
+        }
+    }
+
+    /// Publishes the actions `build` returns to `channel`. The change is
+    /// already stored, so a failure is logged and never fails the request.
+    /// The actions reach every subscriber: render them from views that take
+    /// no request (no CSRF token, nothing about the current user).
+    pub async fn publish(
+        &self,
+        channel: Option<Channel>,
+        build: impl FnOnce() -> Result<Vec<TurboStreamAction>, StreamFailure>,
+    ) {
+        let Some(channel) = channel else {
+            return;
+        };
+        let outcome = match build() {
+            Ok(actions) => forge::broadcast::publish(self.broker.as_ref(), &channel, &actions)
+                .await
+                .map_err(StreamFailure::Publish),
+            Err(error) => Err(error),
+        };
+        if let Err(error) = outcome {
+            report(error);
+        }
+    }
+}
+
+/// Why a live update was not sent.
+#[derive(Debug, thiserror::Error)]
+pub enum StreamFailure {
+    /// A stream target is not a valid DOM id.
+    #[error("invalid stream target")]
+    Target(#[from] DomIdError),
+    /// A stream template failed to render.
+    #[error("stream template failed to render")]
+    Render(#[from] TurboStreamError),
+    /// The broker refused the message.
+    #[error("broadcast failed")]
+    Publish(#[from] BroadcastError),
+}
+
+fn report(error: StreamFailure) {
+    forge::web::report(
+        &ForgeError::new(
+            ErrorCategory::Infrastructure,
+            "live_update_failed",
+            "a live update could not be sent",
+        )
+        .with_source(error),
+    );
+}
+
+/// Who may read which channel: registered by the resources, deny by default.
+#[derive(Default)]
+struct Readers {
+    by_name: RwLock<HashMap<String, Reader>>,
+}
+
+enum Reader {
+    Tenant(Arc<dyn TenantAccess>, Permission),
+    Global(Arc<dyn GlobalAccess>, Permission),
+}
+
+impl Clone for Reader {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Tenant(access, permission) => Self::Tenant(Arc::clone(access), permission.clone()),
+            Self::Global(access, permission) => Self::Global(Arc::clone(access), permission.clone()),
+        }
+    }
+}
+
+impl Readers {
+    fn allow(&self, name: &str, reader: Reader) {
+        if let Ok(mut by_name) = self.by_name.write() {
+            by_name.insert(name.to_owned(), reader);
+        }
+    }
+}
+
+#[async_trait]
+impl StreamAccess for Readers {
+    async fn authorize(
+        &self,
+        request: &Request,
+        channel: &Channel,
+    ) -> Result<StreamViewer, StreamDenied> {
+        let reader = self
+            .by_name
+            .read()
+            .map_err(|_| StreamDenied::Unavailable)?
+            .get(channel.name())
+            .cloned();
+        match (reader, channel.tenant()) {
+            // The access policy authorizes the tenant of the route; the
+            // stream handler then requires it to be the channel's tenant.
+            (Some(Reader::Tenant(access, permission)), Some(_)) => access
+                .authorize(request, &permission)
+                .await
+                .map(|context| StreamViewer::member(&context))
+                .map_err(denied),
+            (Some(Reader::Global(access, permission)), None) => access
+                .authorize(request, &permission)
+                .await
+                .map(|()| StreamViewer::anonymous())
+                .map_err(denied),
+            _ => Err(StreamDenied::Forbidden),
+        }
+    }
+}
+
+fn denied(denied: AccessDenied) -> StreamDenied {
+    match denied {
+        AccessDenied::Unauthenticated => StreamDenied::Unauthenticated,
+        AccessDenied::Forbidden => StreamDenied::Forbidden,
+        AccessDenied::Unavailable => StreamDenied::Unavailable,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::error::Error;
+
+    use forge::config::{AppConfig, Environment};
+    use forge::http::Router;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn production_refuses_to_start_without_a_signing_key() -> Result<(), Box<dyn Error>> {
+        let production = AppConfig {
+            environment: Environment::Production,
+            ..AppConfig::default()
+        };
+        let mut router = Router::new();
+        let mut composition = Composition::for_testing(&production, &mut router);
+        assert!(Streams::register(&mut composition, Fanout::InProcess).is_err());
+
+        let development = AppConfig::default();
+        let mut router = Router::new();
+        let mut composition = Composition::for_testing(&development, &mut router);
+        assert!(Streams::register(&mut composition, Fanout::InProcess).is_ok());
+        Ok(())
+    }
+}

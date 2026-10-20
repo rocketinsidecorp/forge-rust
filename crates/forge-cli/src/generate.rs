@@ -80,6 +80,11 @@ impl Database {
         };
         if views {
             features.push("views");
+            // Live updates for `forge generate scaffold --broadcast`; every
+            // scaffold needs a database.
+            if self != Self::Disabled {
+                features.push("broadcast");
+            }
         }
         if testing {
             features.push("testing");
@@ -1133,7 +1138,7 @@ mod tests {
         assert!(postgres_init.contains("CREATE ROLE app_runtime"));
         assert!(postgres_init.contains("NOBYPASSRLS"));
         assert!(manifest.contains(&format!(
-            "forge = {{ git = \"https://github.com/rocketinsidecorp/forge-rust\", tag = \"v{FORGE_VERSION}\", features = [\"views\"] }}"
+            "forge = {{ git = \"https://github.com/rocketinsidecorp/forge-rust\", tag = \"v{FORGE_VERSION}\", features = [\"views\", \"broadcast\"] }}"
         )));
         assert!(manifest.contains(&format!(
             "forge-views = {{ git = \"https://github.com/rocketinsidecorp/forge-rust\", tag = \"v{FORGE_VERSION}\", default-features = false, features = [\"build\"] }}"
@@ -1277,10 +1282,9 @@ mod tests {
     fn postgresql_is_the_default_backend_with_default_features() {
         let (_parent, root) = generate(Database::Postgresql, true);
 
-        assert!(
-            read(&root, "Cargo.toml")
-                .contains("forge = { path = \"../forge/crates/forge\", features = [\"views\"] }")
-        );
+        assert!(read(&root, "Cargo.toml").contains(
+            "forge = { path = \"../forge/crates/forge\", features = [\"views\", \"broadcast\"] }"
+        ));
         assert!(read(&root, "Cargo.toml").contains("\"postgres\", \"runtime-tokio\""));
         assert!(read(&root, "src/bootstrap/mod.rs").contains(".postgres(sqlx::migrate!())"));
         assert!(read(&root, "compose.yaml").contains("postgres:18.6-trixie@sha256:"));
@@ -1297,7 +1301,7 @@ mod tests {
 
         let manifest = read(&root, "Cargo.toml");
         assert!(manifest.contains(
-            "forge = { path = \"../forge/crates/forge\", default-features = false, features = [\"mysql\", \"views\"] }"
+            "forge = { path = \"../forge/crates/forge\", default-features = false, features = [\"mysql\", \"views\", \"broadcast\"] }"
         ));
         assert!(manifest.contains("\"mysql\", \"runtime-tokio\""));
         assert!(!manifest.contains("\"postgres\""));
@@ -1321,7 +1325,9 @@ mod tests {
         let (_parent, root) = generate(Database::Mariadb, true);
 
         let manifest = read(&root, "Cargo.toml");
-        assert!(manifest.contains("default-features = false, features = [\"mysql\", \"views\"]"));
+        assert!(manifest.contains(
+            "default-features = false, features = [\"mysql\", \"views\", \"broadcast\"]"
+        ));
         assert!(manifest.contains("\"mysql\", \"runtime-tokio\""));
         assert!(read(&root, "src/bootstrap/mod.rs").contains(".mysql(sqlx::migrate!())"));
         let compose = read(&root, "compose.yaml");
@@ -1341,7 +1347,7 @@ mod tests {
 
         let manifest = read(&root, "Cargo.toml");
         assert!(manifest.contains(
-            "forge = { path = \"../forge/crates/forge\", features = [\"sqlite\", \"views\"] }"
+            "forge = { path = \"../forge/crates/forge\", features = [\"sqlite\", \"views\", \"broadcast\"] }"
         ));
         assert!(manifest.contains("\"sqlite\", \"runtime-tokio\""));
         assert!(read(&root, "src/bootstrap/mod.rs").contains(".sqlite(sqlx::migrate!())"));
@@ -1532,10 +1538,9 @@ mod tests {
         let root = create_application(parent.path(), &options).expect("generation should succeed");
 
         let manifest = read(&root, "Cargo.toml");
-        assert!(
-            manifest
-                .contains("forge = { path = \"../forge/crates/forge\", features = [\"views\"] }")
-        );
+        assert!(manifest.contains(
+            "forge = { path = \"../forge/crates/forge\", features = [\"views\", \"broadcast\"] }"
+        ));
         assert!(manifest.contains(
             "forge-views = { path = \"../forge/crates/forge-views\", default-features = false, features = [\"build\"] }"
         ));
@@ -1595,7 +1600,12 @@ mod tests {
                 manifest
                     .contains("tokio = { version = \"1.53.1\", features = [\"macros\", \"rt\"] }")
             );
-            assert!(manifest.contains("\"views\"]"), "{database:?}");
+            assert_eq!(
+                manifest.contains("\"views\", \"broadcast\"]"),
+                database.is_enabled(),
+                "{database:?}: live updates need a database (every scaffold does)"
+            );
+            assert!(manifest.contains("\"views\""), "{database:?}");
 
             let build = read(&root, "build.rs");
             assert!(build.contains("embed_assets_with_crate_path(\"assets\", \"forge::views\")"));
@@ -1612,8 +1622,7 @@ mod tests {
             ));
             assert!(!bootstrap.contains(".routes("));
             assert_eq!(
-                manifest.contains("features = [\"views\", \"testing\"]")
-                    || manifest.contains("\"views\", \"testing\"] }"),
+                manifest.contains("\"views\", \"broadcast\", \"testing\"] }"),
                 database.is_enabled(),
                 "{database:?}: TestDatabase dev-dependency"
             );
