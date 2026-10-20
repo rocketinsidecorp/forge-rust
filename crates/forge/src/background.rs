@@ -197,7 +197,7 @@ impl Background {
         // `forge new` declares jobs before the application has any, so an
         // empty registry is the normal starting point, not a mistake.
         if self.jobs.is_empty() {
-            info!("no job handler is registered yet; only finished jobs are pruned");
+            info!("no job handler is registered yet");
         }
         let store = PgJobStore::new(self.database.clone());
         let jobs = async {

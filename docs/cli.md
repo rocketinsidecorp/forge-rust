@@ -229,7 +229,7 @@ shop/
 ├── Cargo.toml               # package `shop`, lib `app`, deps: forge, serde, askama, SQLx + auth mechanism crates
 ├── Dockerfile               # omitted with --skip-docker
 ├── README.md                # starts with the Forge Rust logo
-├── compose.yaml             # omitted with --skip-docker; 127.0.0.1:3000, stop_grace_period 20s
+├── compose.yaml             # omitted with --skip-docker; 127.0.0.1:3000, stop_grace_period 35s
 ├── compose.observability.yaml  # omitted with --skip-docker; opt-in overlay: collector, Prometheus, Tempo, Loki, Grafana
 ├── docker/                   # omitted with --skip-docker
 │   └── postgres/
