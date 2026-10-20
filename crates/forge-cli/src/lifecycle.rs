@@ -1,5 +1,5 @@
 //! The application lifecycle commands: `migrate`, `rollback`, `seed`,
-//! `setup` and `forge db ...`, like Rails' `db:*` tasks.
+//! `setup` and `forge db ...`, like Rails' `db:*` tasks, and `openapi`.
 //!
 //! Every command delegates to the generated application's own subcommands
 //! (`<app> migrate`, `<app> db create`, ...), so development and production
@@ -84,6 +84,11 @@ impl<A: Application> Lifecycle<'_, A> {
     }
 
     /// `forge seed`.
+    /// `forge openapi [--output FILE | --check FILE]`.
+    pub(crate) fn openapi(&mut self, arguments: &[String]) -> Result<(), CliError> {
+        self.call_with("openapi", &[], arguments)
+    }
+
     pub(crate) fn seed(&mut self) -> Result<(), CliError> {
         self.call(&["seed"])
     }

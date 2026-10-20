@@ -354,6 +354,38 @@ fn lifecycle_commands_refuse_directories_that_are_not_forge_applications() {
 }
 
 #[test]
+fn openapi_runs_the_applications_command_with_absolute_files() {
+    let fixture = Fixture::new(FAKE_APP);
+    for arguments in [
+        &["openapi"][..],
+        &["openapi", "--output", "openapi.json"],
+        &["openapi", "--check", "openapi.json"],
+    ] {
+        let output = fixture.run(arguments);
+        assert!(output.status.success(), "{arguments:?}: {}", stderr(&output));
+    }
+    let file = fixture
+        .project()
+        .canonicalize()
+        .expect("project")
+        .join("openapi.json");
+    assert_eq!(
+        fixture.app_calls(),
+        [
+            "openapi".to_owned(),
+            format!("openapi --output {}", file.display()),
+            format!("openapi --check {}", file.display()),
+        ]
+    );
+    let failed = fixture
+        .command(&["openapi", "--check", "openapi.json"])
+        .env("APP_EXIT", "1")
+        .output()
+        .expect("forge runs");
+    assert_eq!(failed.status.code(), Some(1), "{}", stderr(&failed));
+}
+
+#[test]
 fn argument_errors_are_usage_errors() {
     let fixture = Fixture::new(FAKE_APP);
     for arguments in [
@@ -366,6 +398,7 @@ fn argument_errors_are_usage_errors() {
         &["dev", "--poll-interval", "10ms"],
         &["dev", "--poll-interval", "fast"],
         &["dev", "--debounce", "2m"],
+        &["openapi", "--output", "a.json", "--check", "b.json"],
     ] {
         let output = fixture.run(arguments);
         assert_eq!(
