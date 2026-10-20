@@ -190,17 +190,17 @@ fn parse_time(tag: u8, text: &str) -> Option<i64> {
     let text = text.strip_suffix('Z')?;
     let (year, rest) = match tag {
         UTC_TIME if text.len() == 12 => {
-            let short: i64 = text[..2].parse().ok()?;
+            let short: i64 = text.get(..2)?.parse().ok()?;
             (
                 if short >= 50 {
                     1900 + short
                 } else {
                     2000 + short
                 },
-                &text[2..],
+                text.get(2..)?,
             )
         }
-        GENERALIZED_TIME if text.len() == 14 => (text[..4].parse().ok()?, &text[4..]),
+        GENERALIZED_TIME if text.len() == 14 => (text.get(..4)?.parse().ok()?, text.get(4..)?),
         _ => return None,
     };
     if !rest.bytes().all(|b| b.is_ascii_digit()) {
@@ -220,6 +220,14 @@ fn parse_time(tag: u8, text: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn multi_byte_characters_in_times_are_parse_failures_not_panics() {
+        // 12 and 14 bytes before the `Z`, with a two-byte character across
+        // the year boundary: a malformed certificate must not stop the proxy.
+        assert_eq!(parse_time(UTC_TIME, "2é123123595Z"), None);
+        assert_eq!(parse_time(GENERALIZED_TIME, "202é123123595Z"), None);
+    }
 
     #[test]
     fn lengths_use_the_shortest_form() {

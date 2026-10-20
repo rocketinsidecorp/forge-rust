@@ -274,9 +274,9 @@ fn parse_date(text: &str) -> Option<(i64, u32, u32)> {
     if bytes.len() != 10 || bytes[4] != b'-' || bytes[7] != b'-' {
         return None;
     }
-    let year = i64::from(digits(&text[0..4])?);
-    let month = digits(&text[5..7])?;
-    let day = digits(&text[8..10])?;
+    let year = i64::from(digits(text.get(0..4)?)?);
+    let month = digits(text.get(5..7)?)?;
+    let day = digits(text.get(8..10)?)?;
     if !(1..=12).contains(&month) || day < 1 || day > days_in_month(year, month) {
         return None;
     }
@@ -288,13 +288,15 @@ fn parse_clock(text: &str) -> Option<(u32, u32, u32, &str)> {
     if bytes.len() < 8 || bytes[2] != b':' || bytes[5] != b':' {
         return None;
     }
-    let hour = digits(&text[0..2])?;
-    let minute = digits(&text[3..5])?;
-    let second = digits(&text[6..8])?;
+    // `get`, not indexing: a multi-byte character makes these offsets fall
+    // inside it, which must be a parse failure, not a panic.
+    let hour = digits(text.get(0..2)?)?;
+    let minute = digits(text.get(3..5)?)?;
+    let second = digits(text.get(6..8)?)?;
     if hour > 23 || minute > 59 || second > 59 {
         return None;
     }
-    Some((hour, minute, second, &text[8..]))
+    Some((hour, minute, second, text.get(8..)?))
 }
 
 fn parse_fraction(text: &str) -> Option<(u32, &str)> {
@@ -326,12 +328,12 @@ fn parse_offset(text: &str, colon: bool) -> Option<i32> {
         if bytes.len() != 6 || bytes[3] != b':' {
             return None;
         }
-        (digits(&text[1..3])?, digits(&text[4..6])?)
+        (digits(text.get(1..3)?)?, digits(text.get(4..6)?)?)
     } else {
         if bytes.len() != 5 {
             return None;
         }
-        (digits(&text[1..3])?, digits(&text[3..5])?)
+        (digits(text.get(1..3)?)?, digits(text.get(3..5)?)?)
     };
     if hours > 23 || minutes > 59 {
         return None;
@@ -383,6 +385,15 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn multi_byte_characters_are_parse_failures_not_panics() {
+        // Byte lengths and separators match, so the offsets 8 and 3 fall
+        // inside the two-byte character: only `get` keeps them from
+        // panicking.
+        assert_eq!(parse_clock("12:34:5é"), None);
+        assert_eq!(parse_offset("+0é0", false), None);
+    }
 
     #[test]
     fn formats_and_parses_rfc3339() {
