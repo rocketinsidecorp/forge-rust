@@ -26,7 +26,8 @@ fn workflows() -> Vec<(String, String)> {
         .unwrap_or_else(|error| panic!("{}: {error}", directory.display()))
         .filter_map(Result::ok)
         .map(|entry| entry.file_name().to_string_lossy().into_owned())
-        .filter(|name| name.ends_with(".yml"))
+        // `.yaml` workflows run too: none may escape the gate.
+        .filter(|name| name.ends_with(".yml") || name.ends_with(".yaml"))
         .map(|name| {
             let relative = format!(".github/workflows/{name}");
             (name, relative)
@@ -108,11 +109,21 @@ fn image_references<'a>(text: &'a str, prefix: &str) -> Vec<&'a str> {
 fn actions_are_pinned_by_commit_with_their_version_in_a_comment() {
     for (name, relative) in workflows() {
         for (number, line) in read(&relative).lines().enumerate() {
-            let trimmed = line.trim_start().trim_start_matches("- ").trim_start();
-            let Some(value) = trimmed.strip_prefix("uses:") else {
+            // Every spelling of the key: `uses:`, `- uses:`, `"uses":`, `uses :`.
+            let trimmed = line
+                .trim_start()
+                .trim_start_matches('-')
+                .trim_start()
+                .trim_start_matches(['"', '\''])
+                .trim_start();
+            let Some(value) = trimmed.strip_prefix("uses").and_then(|rest| {
+                rest.trim_start_matches(['"', '\''])
+                    .trim_start()
+                    .strip_prefix(':')
+            }) else {
                 continue;
             };
-            let value = value.trim();
+            let value = value.trim().trim_matches(['"', '\'']);
             let (reference, comment) = value
                 .split_once(" #")
                 .map_or((value, ""), |(reference, rest)| (reference.trim(), rest));
@@ -133,14 +144,29 @@ fn actions_are_pinned_by_commit_with_their_version_in_a_comment() {
 fn workflow_containers_are_pinned_by_digest() {
     for (name, relative) in workflows() {
         for (number, line) in read(&relative).lines().enumerate() {
-            let Some(image) = line.trim().strip_prefix("image:") else {
+            // A service `image:`, and the `container: <image>` shorthand.
+            // `- image:` is a matrix entry (release.yml), not a container.
+            let trimmed = line.trim();
+            let Some(image) = trimmed
+                .strip_prefix("image:")
+                .or_else(|| trimmed.strip_prefix("container:"))
+            else {
                 continue;
             };
+            let image = image
+                .split_once(" #")
+                .map_or(image, |(code, _)| code)
+                .trim()
+                .trim_matches(['"', '\'']);
+            if image.is_empty() {
+                // `container:` opening a mapping; its `image:` line is checked.
+                continue;
+            }
             assert!(
-                has_digest(image.trim()),
+                has_digest(image),
                 "{name}:{}: service image `{}` must be pinned by digest",
                 number + 1,
-                image.trim()
+                image
             );
         }
     }
@@ -243,15 +269,45 @@ fn permissions_are_least_privilege_and_secrets_stay_out_of_pull_requests() {
             "{name}: pull_request_target runs fork code with secrets"
         );
         assert!(
-            !text.contains("write-all") && !text.contains("contents: write"),
-            "{name}: write access to the repository contents"
+            !text.contains("write-all"),
+            "{name}: write access to everything"
         );
         let release = name == "release.yml";
+        // The release job's `id-token` and `packages` are the only scopes any
+        // workflow may write; checks, statuses, contents, actions... stay read.
+        for (number, line) in text.lines().enumerate() {
+            let line = line.split_once(" #").map_or(line, |(code, _)| code);
+            let Some((scope, access)) = line.trim().split_once(':') else {
+                continue;
+            };
+            if access.trim().trim_matches(['"', '\'']) != "write" {
+                continue;
+            }
+            let scope = scope.trim().trim_matches(['"', '\'']);
+            assert!(
+                release && matches!(scope, "id-token" | "packages"),
+                "{name}:{}: `{scope}: write` is not allowed",
+                number + 1
+            );
+        }
         for permission in ["id-token: write", "packages: write"] {
             let count = text.matches(permission).count();
             assert!(
                 (release && count == 1) || (!release && count == 0),
                 "{name}: `{permission}` appears {count} times"
+            );
+        }
+        // No workflow hands its secrets on wholesale or by computed name.
+        for forbidden in [
+            "secrets[",
+            "secrets)",
+            "secrets }",
+            "secrets}",
+            "secrets: inherit",
+        ] {
+            assert!(
+                !text.contains(forbidden),
+                "{name}: `{forbidden}` reaches secrets outside the reviewed list"
             );
         }
         // The only secret any workflow reads is the release job's token.
