@@ -1,0 +1,60 @@
+Date: Wed, 14 Oct 2026 18:04:05 +0000
+From: "Forge App" <app@example.com>
+To: "Alice" <alice@example.org>
+Subject: Your receipt
+Message-ID: <01a13b95-f208-7242-8242-424242424242@example.com>
+MIME-Version: 1.0
+Content-Type: multipart/mixed;
+ boundary=forge-202122232425262728292a2b2c2d2e2f
+
+--forge-202122232425262728292a2b2c2d2e2f
+Content-Type: multipart/alternative; boundary=forge-101112131415161718191a1b1c1d1e1f
+
+--forge-101112131415161718191a1b1c1d1e1f
+Content-Transfer-Encoding: quoted-printable
+Content-Type: text/plain; charset=utf-8
+
+See the attached receipt.
+
+--forge-101112131415161718191a1b1c1d1e1f
+Content-Type: multipart/related; boundary=forge-000102030405060708090a0b0c0d0e0f
+
+--forge-000102030405060708090a0b0c0d0e0f
+Content-Transfer-Encoding: quoted-printable
+Content-Type: text/html; charset=utf-8
+
+<p><img src=3D"cid:logo@forge"> See the attached receipt.</p>
+
+--forge-000102030405060708090a0b0c0d0e0f
+Content-Disposition: inline; filename=logo.png
+Content-Id: <logo@forge>
+Content-Transfer-Encoding: base64
+Content-Type: image/png; name=logo.png
+
+iVBORw0KGgo=
+
+--forge-000102030405060708090a0b0c0d0e0f--
+
+
+--forge-101112131415161718191a1b1c1d1e1f--
+
+
+--forge-202122232425262728292a2b2c2d2e2f
+Content-Disposition: attachment; filename*=utf-8''relat%C3%B3rio%20final.pdf
+Content-Transfer-Encoding: base64
+Content-Type: application/pdf; name*=utf-8''relat%C3%B3rio%20final.pdf
+
+JVBERi0xLjcgZm9yZ2UgZ29sZGVuIGF0dGFjaG1lbnQgYnl0ZXMgJVBERi0xLjcgZm9yZ2UgZ29s
+ZGVuIGF0dGFjaG1lbnQgYnl0ZXMgJVBERi0xLjcgZm9yZ2UgZ29sZGVuIGF0dGFjaG1lbnQgYnl0
+ZXMgJVBERi0xLjcgZm9yZ2UgZ29sZGVuIGF0dGFjaG1lbnQgYnl0ZXMgJVBERi0xLjcgZm9yZ2Ug
+Z29sZGVuIGF0dGFjaG1lbnQgYnl0ZXMg
+
+--forge-202122232425262728292a2b2c2d2e2f
+Content-Disposition: attachment; filename=notes.txt
+Content-Transfer-Encoding: base64
+Content-Type: application/octet-stream; name=notes.txt
+
+cGxhaW4gbm90ZXM=
+
+--forge-202122232425262728292a2b2c2d2e2f--
+

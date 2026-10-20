@@ -18,6 +18,7 @@ forge-db = { path = "../forge-db" }
 forge-events = { path = "../forge-events", optional = true }
 forge-http = { path = "../forge-http" }
 forge-jobs = { path = "../forge-jobs", optional = true }
+forge-mail = { path = "../forge-mail", optional = true }
 forge-cache = { path = "../forge-cache", optional = true }
 forge-ratelimit = { path = "../forge-ratelimit", optional = true }
 forge-storage = { path = "../forge-storage", optional = true }
@@ -48,9 +49,13 @@ postgres = [
 mysql = ["forge-db/mysql", "forge-ratelimit?/mysql", "forge-cache?/mysql"]
 sqlite = ["forge-db/sqlite", "forge-ratelimit?/sqlite", "forge-cache?/sqlite"]
 # `Composition::for_testing` and `forge::db::testing::TestDatabase`.
-testing = ["forge-db/testing", "forge-jobs?/testing"]
+testing = ["forge-db/testing", "forge-jobs?/testing", "forge-mail?/testing"]
 # Server-rendered views (ADR 0022): `forge::views` and `forge::web::html`.
-views = ["dep:forge-views"]
+# Full-stack applications get the mailer too, like Rails' Action Mailer.
+views = ["dep:forge-views", "mail"]
+# Email (ADR 0035): `forge::mail`, the SMTP, file and test senders, askama
+# templates, previews and the password reset mailer.
+mail = ["dep:forge-mail"]
 # Durable PostgreSQL jobs, workers and cron schedules (ADR 0025):
 # `forge::jobs`, `App::jobs` and the `jobs` subcommands.
 jobs = ["postgres", "dep:forge-jobs"]

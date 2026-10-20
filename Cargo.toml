@@ -12,6 +12,7 @@ members = [
     "crates/forge-events",
     "crates/forge-http",
     "crates/forge-jobs",
+    "crates/forge-mail",
     "crates/forge-ratelimit",
     "crates/forge-security",
     "crates/forge-storage",

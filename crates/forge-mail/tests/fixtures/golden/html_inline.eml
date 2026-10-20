@@ -1,0 +1,37 @@
+Date: Wed, 14 Oct 2026 18:04:05 +0000
+From: "Forge App" <app@example.com>
+To: "Alice" <alice@example.org>
+Subject:
+ =?utf-8?b?PT91dGYtOD9xP25vdCBhbiBlbmNvZGVkIHdvcmQ/PSBidXQgdGV4dA==?=
+Message-ID: <01a13b95-f208-7242-8242-424242424242@example.com>
+MIME-Version: 1.0
+Content-Type: multipart/related;
+ boundary=forge-000102030405060708090a0b0c0d0e0f
+
+--forge-000102030405060708090a0b0c0d0e0f
+Content-Transfer-Encoding: quoted-printable
+Content-Type: text/html; charset=utf-8
+
+<img src=3D"cid:a"><img src=3D"cid:b">
+
+--forge-000102030405060708090a0b0c0d0e0f
+Content-Disposition: inline; filename=a.png
+Content-Id: <a>
+Content-Transfer-Encoding: base64
+Content-Type: image/png; name=a.png
+
+iVBORw0KGgo=
+
+--forge-000102030405060708090a0b0c0d0e0f
+Content-Disposition: inline; filename=b.gif
+Content-Id: <b>
+Content-Transfer-Encoding: base64
+Content-Type: image/gif; name=b.gif
+
+AAECA/8AAQID/wABAgP/AAECA/8AAQID/wABAgP/AAECA/8AAQID/wABAgP/AAECA/8AAQID/wAB
+AgP/AAECA/8AAQID/wABAgP/AAECA/8AAQID/wABAgP/AAECA/8AAQID/wABAgP/AAECA/8AAQID
+/wABAgP/AAECA/8AAQID/wABAgP/AAECA/8AAQID/wABAgP/AAECA/8AAQID/wABAgP/AAECA/8A
+AQID/wABAgP/AAECA/8AAQID/wABAgP/AAECA/8=
+
+--forge-000102030405060708090a0b0c0d0e0f--
+

@@ -1,0 +1,42 @@
+Date: Wed, 14 Oct 2026 18:04:05 +0000
+From: =?utf-8?b?Wm/DqywgSW5jLg==?= <billing@Example.COM>
+Reply-To: "Support \"Team\"" <support@example.com>
+To: =?utf-8?q?Jo=C3=A3o_da_Silva?= <joao@example.com.br>, bob@example.org
+Cc:
+ =?utf-8?q?Caf=C3=A9_=C3=9Cn=C3=AFc=C3=B6d=C3=A9_=C3=91ame_That_Is_Rather_?=
+ =?utf-8?q?Long_Indeed?= <cafe@example.net>
+Subject:
+ =?utf-8?q?Sua_fatura_de_outubro_est=C3=A1_dispon=C3=ADvel_=E2=80=94_refer?=
+ =?utf-8?q?=C3=AAncia_2026/10,_vencimento_em_30_dias,_obrigado_pela_prefer?=
+ =?utf-8?q?=C3=AAncia?=
+Message-ID: <01a13b95-f208-7242-8242-424242424242@example.com>
+MIME-Version: 1.0
+Auto-Submitted: auto-generated
+List-Unsubscribe: <https://example.com/unsubscribe/42?token=abc>
+References: <a@example.com> <b@example.com> <c@example.com> <d@example.com>
+ <e@example.com>
+Content-Type: multipart/alternative;
+ boundary=forge-000102030405060708090a0b0c0d0e0f
+
+--forge-000102030405060708090a0b0c0d0e0f
+Content-Transfer-Encoding: quoted-printable
+Content-Type: text/plain; charset=utf-8
+
+Ol=C3=A1 Jo=C3=A3o,
+
+Sua fatura est=C3=A1 pronta: total =3D R$ 10,00.
+Linha com espa=C3=A7o no fim=20
+.linha com ponto
+longa longa longa longa longa longa longa longa longa longa longa longa lon=
+ga longa longa longa longa longa longa longa longa longa longa longa longa =
+longa longa longa longa longa=20
+
+--forge-000102030405060708090a0b0c0d0e0f
+Content-Transfer-Encoding: quoted-printable
+Content-Type: text/html; charset=utf-8
+
+<p>Ol=C3=A1 <strong>Jo=C3=A3o</strong></p>
+<p>Total =3D R$ 10,00</p>
+
+--forge-000102030405060708090a0b0c0d0e0f--
+
