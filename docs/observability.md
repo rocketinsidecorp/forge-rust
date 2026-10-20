@@ -314,9 +314,89 @@ Outside containers bind it to `127.0.0.1`. In a container bind it to
 confirm that with `FORGE_TELEMETRY_METRICS_PUBLIC=true`, and do not publish
 the port to the internet.
 
-A preconfigured local stack (Collector, Prometheus, Tempo, Loki, Grafana with
-a dashboard), as Forge-Go generates with `compose.observability.yaml`, is the
-second part of rocketinsidecorp/forge-rust#13 and not generated yet.
+## Local stack: Grafana, Prometheus, Tempo and Loki
+
+`forge new` generates `compose.observability.yaml` and an `observability/`
+directory that run an OpenTelemetry Collector, Prometheus, Tempo, Loki and
+Grafana next to the application, already wired
+([ADR 0034](adr/0034-local-observability-stack.md), the port of Forge-Go's
+ADR 0038 and 0040: same files, services, images and digests, variables and
+commands). It is opt-in: the default `docker compose up` does not start it,
+and `--skip-docker` omits it with the rest of the container assets.
+
+```bash
+export GRAFANA_ADMIN_PASSWORD="$(openssl rand -base64 18)"   # required; or put it in .env
+docker compose -f compose.yaml -f compose.observability.yaml up --build
+curl http://127.0.0.1:3000/
+# Grafana: http://127.0.0.1:3001 (user admin) opens the "Forge application" dashboard
+# Prometheus: http://127.0.0.1:9090
+# compose interpolates the whole file, so GRAFANA_ADMIN_PASSWORD must be set for down too
+docker compose -f compose.yaml -f compose.observability.yaml down      # add -v to delete the data
+```
+
+| Signal | Path | Where to look in Grafana |
+| ------ | ---- | ------------------------ |
+| Traces | app, OTLP to the collector, then Tempo | Explore, Tempo; the dashboard's "Recent traces" |
+| Metrics | app, OTLP to the collector, then Prometheus's OTLP receiver (`service.name` becomes the `job` label) | The dashboard; Explore, Prometheus |
+| Logs | app, OTLP to the collector (`FORGE_TELEMETRY_LOGS_EXPORTER=otlp`), then Loki's OTLP endpoint | The dashboard's "Application logs"; Explore, Loki |
+
+Traces and logs are linked both ways: a span's "Logs for this span" opens Loki
+filtered by its trace ID, and the `trace_id` of a log record is a link to the
+trace. Log records carry `trace_id` and `span_id` when they are logged inside
+a request, job attempt or outbox delivery (see [Logs](#logs)); lines logged
+outside them, such as startup, have none. Loki receives the records
+on its OTLP endpoint: the message is the line, `service.name` is the
+`service_name` label, and `trace_id`, `span_id`, the severity
+(`detected_level`) and the event's fields are structured metadata, so filter
+with `{service_name="shop"} | trace_id="..."`. The collector does no parsing.
+Output that bypasses `tracing` is only in `docker compose logs`.
+
+The overlay sets only existing variables on the `app` service:
+`FORGE_TELEMETRY_SERVICE_NAME` (the application name, quoted so names such as
+`null` or `yes` stay strings), `FORGE_TELEMETRY_EXPORTER=otlp`,
+`FORGE_TELEMETRY_LOGS_EXPORTER=otlp`,
+`FORGE_TELEMETRY_OTLP_ENDPOINT=http://otel-collector:4318`, a 15 s
+`FORGE_TELEMETRY_METRICS_INTERVAL` and, because the image runs with
+`FORGE_ENV=production` (which requires `https`) and the collector is reached
+only over the compose network, `FORGE_TELEMETRY_OTLP_ALLOW_PLAINTEXT=true`.
+A test loads them through `AppConfig::from_vars` with the image's
+environment. Metrics are pushed, so no metrics port is opened on the app.
+
+Every published port binds `127.0.0.1`: Grafana (`GRAFANA_PORT`, default
+**3001**, because the generated `compose.yaml` publishes the app on 3000;
+Forge-Go's app uses 8080 and its Grafana 3000), Prometheus (`PROMETHEUS_PORT`,
+9090) and the collector's OTLP/HTTP (4318, so an application started with
+`cargo run` can export to it). Tempo and Loki publish nothing. Grafana has no
+default password and no anonymous access, nothing is sent off the machine,
+configuration is mounted read-only and images are pinned by version and
+digest (the generated Dependabot configuration covers the compose files). To
+export from `cargo run` while the stack runs:
+
+```bash
+FORGE_TELEMETRY_SERVICE_NAME=shop FORGE_TELEMETRY_EXPORTER=otlp \
+FORGE_TELEMETRY_LOGS_EXPORTER=otlp FORGE_TELEMETRY_OTLP_ENDPOINT=http://127.0.0.1:4318 \
+cargo run
+```
+
+The dashboard ("Forge application", the Grafana home page, filtered by a
+`service` variable) has Forge-Go's layout, with panels only for metrics in the
+catalogue above (a test enforces it):
+
+| Row | Panels | Metrics |
+| --- | ------ | ------- |
+| Service overview | requests per second, 5xx ratio, p95 latency, active requests | `http_server_request_duration_seconds`, `http_server_active_requests` |
+| HTTP server | rate and p95 by route, latency percentiles, responses by status class | `http_server_request_duration_seconds` |
+| Database connection pool | connections by state against the limit, utilization | `db_client_connection_count`, `db_client_connection_max` |
+| Process and Tokio runtime | tasks and workers, global queue depth, CPU, memory, threads and file descriptors | `tokio_*`, `process_*` (Linux) |
+| Background work | queue jobs per second and p95, outbox deliveries | `forge_queue_job_duration_seconds`, `forge_outbox_dispatch_duration_seconds` |
+| Telemetry health | spans and log records dropped, export errors, series overflows | `forge_telemetry_*` |
+| Logs and traces | log volume by level, application logs, recent traces | Loki, Tempo |
+
+Forge-Go's database operation panels (`db_client_operation_duration`), pool
+wait panels, Go runtime row and scheduler series are not there: Forge-Rust
+does not export those metrics (see [Differences from
+Forge-Go](#differences-from-forge-go)). The stack keeps seven days of data in
+named volumes and is meant for development, not production.
 
 ## Propagation and sampling
 

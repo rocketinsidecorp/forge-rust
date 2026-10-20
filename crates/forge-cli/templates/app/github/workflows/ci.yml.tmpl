@@ -43,6 +43,10 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: docker/setup-buildx-action@v3
+      - name: Validate the observability overlay
+        env:
+          GRAFANA_ADMIN_PASSWORD: ci-only-not-a-secret
+        run: docker compose -f compose.yaml -f compose.observability.yaml config --quiet
       - name: Build image
         uses: docker/build-push-action@v6
         with:

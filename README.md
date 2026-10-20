@@ -29,7 +29,7 @@ results.
 | 2 | PostgreSQL, migrations, transaction contracts, repositories | Behavior implemented; CI runner gate still blocked |
 | 3 | Authentication, authorization, tenancy, RLS, audit | Implemented for PostgreSQL (sign-in pages, setup, RBAC, RLS, audit); MFA, reset delivery and other backends pending |
 | 4 | PostgreSQL jobs, cron scheduler, outbox, idempotent consumers | Library implemented and tested (`forge` features `jobs`, `events`); `forge new` wiring pending |
-| 5 | Traces, metrics, correlated logs (OTLP, Prometheus) | Implemented ([ADR 0033](docs/adr/0033-telemetry.md)); local Grafana stack pending |
+| 5 | Traces, metrics, correlated logs (OTLP, Prometheus) | Implemented ([ADR 0033](docs/adr/0033-telemetry.md)); generated local Grafana, Prometheus, Tempo and Loki stack ([ADR 0034](docs/adr/0034-local-observability-stack.md)) |
 | 6+ | OpenAPI, AI, hardening | Design only |
 
 See the [delivery sequence](docs/architecture.md#delivery-sequence-and-exit-criteria).
@@ -273,6 +273,33 @@ handler parents its spans with `request.trace_context()`. Queues are bounded
 (a full queue drops and counts, requests never wait) and telemetry is
 flushed last at shutdown, within `FORGE_SHUTDOWN_GRACE_SECS`.
 
+#### Grafana, Prometheus, Tempo and Loki, preconfigured
+
+Every generated application with Docker includes an opt-in observability
+stack (`compose.observability.yaml` and `observability/`), the same files and
+commands as Forge-Go: an OpenTelemetry Collector, Prometheus, Tempo (traces),
+Loki (logs) and Grafana with the data sources, trace-to-log links and a
+starter dashboard (requests, connection pool, process and Tokio runtime,
+jobs, outbox, logs, traces) provisioned; the app's logs reach Loki over OTLP.
+Everything stays on your machine and every port is bound to `127.0.0.1`
+([ADR 0034](docs/adr/0034-local-observability-stack.md)).
+
+```sh
+forge new shop && cd shop
+export GRAFANA_ADMIN_PASSWORD="$(openssl rand -base64 18)"   # required; or put it in .env
+docker compose -f compose.yaml -f compose.observability.yaml up --build
+curl http://127.0.0.1:3000/
+# Grafana http://127.0.0.1:3001 (user admin; 3001 because the app has 3000):
+# dashboard "Forge application", Explore > Tempo (traces), Explore > Loki (logs);
+# Prometheus http://127.0.0.1:9090
+# compose interpolates the whole file, so GRAFANA_ADMIN_PASSWORD must be set for down too
+docker compose -f compose.yaml -f compose.observability.yaml down      # add -v to delete the data
+```
+
+The default `docker compose up` does not start it. See
+[observability](docs/observability.md#local-stack-grafana-prometheus-tempo-and-loki)
+for how logs reach Loki and what the dashboard shows.
+
 > **Before the first tag:** generated applications depend on `forge` through the
 > Git tag `v<cli version>` (for example `v0.1.0`). Until that tag is pushed, the
 > dependency cannot resolve and `cargo run` fails in a freshly generated app.
@@ -415,9 +442,11 @@ Kubernetes and systemd deployment is covered in
 - HTTP defaults: request and header-read timeouts, a body size limit, bounded
   connections, `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`,
   and UUIDv7 `x-request-id`.
-- A multi-stage `Dockerfile`, `.dockerignore`, `compose.yaml` and a
+- A multi-stage `Dockerfile`, `.dockerignore`, `compose.yaml`, the opt-in
+  observability overlay (`compose.observability.yaml` and `observability/`:
+  Collector, Prometheus, Tempo, Loki, Grafana) and a
   `tests/container.rs` test that keeps the Dockerfile's Rust version in sync
-  with `rust-toolchain.toml` (skip all four with `--skip-docker`), plus `.github/workflows/ci.yml` and `.github/dependabot.yml`
+  with `rust-toolchain.toml` (skip all of them with `--skip-docker`), plus `.github/workflows/ci.yml` and `.github/dependabot.yml`
   (skip with `--skip-ci`).
 
 ## Rate limiting, caching and file storage

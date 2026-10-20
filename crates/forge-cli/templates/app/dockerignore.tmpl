@@ -9,6 +9,9 @@
 /Dockerfile
 /.dockerignore
 /compose.yaml
+# Local observability stack configuration; not part of the application image.
+/compose.observability.yaml
+/observability
 /README.md
 # The builder image pins the same toolchain through RUST_VERSION;
 # tests/container.rs fails when the two versions drift apart.

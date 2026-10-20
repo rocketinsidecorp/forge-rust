@@ -97,6 +97,51 @@ redacted everywhere. Register application metrics and spans through
 In a container, bind the metrics listener to `0.0.0.0:9464`, confirm it with
 `FORGE_TELEMETRY_METRICS_PUBLIC=true`, and do not publish that port.
 
+### Observability stack: Grafana, Prometheus, Tempo and Loki
+
+`compose.observability.yaml` adds a preconfigured stack to the compose
+project: an OpenTelemetry Collector, Prometheus (metrics), Tempo (traces),
+Loki (logs) and Grafana with the data sources and a starter dashboard already
+provisioned. It is opt-in: `docker compose up` does not start it. Everything
+stays on your machine and every published port is bound to `127.0.0.1`.
+
+```bash
+# 1. Start it (Grafana refuses to start without an admin password you choose)
+export GRAFANA_ADMIN_PASSWORD="$(openssl rand -base64 18)"   # or put it in .env
+docker compose -f compose.yaml -f compose.observability.yaml up --build
+
+# 2. Generate some data
+curl http://127.0.0.1:3000/
+
+# 3. Open Grafana: http://127.0.0.1:3001, user admin, the password above
+#    Dashboards > "Forge application"  request rate, latency, errors, connection pool, process and Tokio runtime, jobs, outbox, logs, traces
+#    Explore > Tempo                   traces; "Logs for this span" opens the matching log lines
+#    Explore > Loki                    logs; a trace_id links to its trace
+#    Explore > Prometheus              metrics, also at http://127.0.0.1:9090
+
+# 4. Stop it (keeps the data); add -v to delete traces, logs and metrics too
+# compose interpolates the whole file, so GRAFANA_ADMIN_PASSWORD must be set for down too
+docker compose -f compose.yaml -f compose.observability.yaml down
+```
+
+The app sends traces, metrics and logs to the collector over OTLP (the
+overlay sets `FORGE_TELEMETRY_EXPORTER=otlp`, `FORGE_TELEMETRY_LOGS_EXPORTER=otlp`
+and, because the image runs in `production` and the collector is on the
+compose network, `FORGE_TELEMETRY_OTLP_ALLOW_PLAINTEXT=true`), which forwards
+them to Tempo, Prometheus and Loki. Grafana is on host port 3001 because the
+app uses 3000; set `GRAFANA_PORT` or `PROMETHEUS_PORT` to use other ports. The
+app logs what it or the framework logs (startup, errors, your `tracing` calls);
+each line logged inside a request carries `trace_id` and `span_id`, which is
+what ties logs and traces together. Output that does not go through `tracing`
+(a crash's stack trace, `println!`) is only in `docker compose logs`. The stack
+keeps seven days of data and is meant for development, not production. To
+export from an app started with `cargo run` while the stack runs:
+
+```bash
+FORGE_TELEMETRY_SERVICE_NAME=hello-forge FORGE_TELEMETRY_EXPORTER=otlp \
+  FORGE_TELEMETRY_LOGS_EXPORTER=otlp FORGE_TELEMETRY_OTLP_ENDPOINT=http://127.0.0.1:4318 cargo run
+```
+
 ## Container
 
 ```bash

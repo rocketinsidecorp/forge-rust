@@ -20,6 +20,10 @@ clap.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+# tests/observability.rs loads the generated stack's app settings with the
+# framework's own configuration loader and parses the dashboard JSON.
+forge-config = { path = "../forge-config" }
+serde_json.workspace = true
 # tests/scaffold.rs provisions a PostgreSQL database for migrate/rollback.
 forge-db = { path = "../forge-db", features = ["postgres", "testing"] }
 tempfile.workspace = true

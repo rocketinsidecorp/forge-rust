@@ -17,7 +17,8 @@ digested assets, Turbo and Stimulus, CSRF-protected forms; `--api` for JSON
 only) and, by default, the delivery assets a production service needs:
 
 - `Dockerfile` (multi-stage, locked build, distroless non-root runtime,
-  self-probing `HEALTHCHECK`), `.dockerignore` and `compose.yaml`;
+  self-probing `HEALTHCHECK`), `.dockerignore`, `compose.yaml` and the opt-in
+  local observability stack (`compose.observability.yaml`, `observability/`);
 - `.github/workflows/ci.yml` (fmt, clippy, tests, image build and smoke test)
   and `.github/dependabot.yml`.
 

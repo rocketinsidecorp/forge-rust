@@ -32,6 +32,10 @@ pub enum CliError {
         path: PathBuf,
         source: io::Error,
     },
+    ReadDirectory {
+        path: PathBuf,
+        source: io::Error,
+    },
     SpawnCargo {
         command: &'static str,
         source: io::Error,
@@ -79,6 +83,9 @@ impl fmt::Display for CliError {
             Self::WriteFile { path, source } => {
                 write!(formatter, "could not write `{}`: {source}", path.display())
             }
+            Self::ReadDirectory { path, source } => {
+                write!(formatter, "could not read `{}`: {source}", path.display())
+            }
             Self::SpawnCargo { command, source } => {
                 write!(formatter, "could not run `cargo {command}`: {source}")
             }
@@ -98,6 +105,7 @@ impl std::error::Error for CliError {
             | Self::Output(error)
             | Self::CreateDirectory { source: error, .. }
             | Self::WriteFile { source: error, .. }
+            | Self::ReadDirectory { source: error, .. }
             | Self::SpawnCargo { source: error, .. } => Some(error),
             Self::Clock(error) => Some(error),
             Self::InvalidApplicationName { .. }

@@ -320,6 +320,34 @@ const TEMPLATES: &[Template] = &[
     template!(Group::Docker, "Dockerfile" => "Dockerfile.tmpl"),
     template!(Group::Docker, ".dockerignore" => "dockerignore.tmpl"),
     template!(Group::Docker, "compose.yaml" => "compose.yaml.tmpl"),
+    // The local observability stack (ADR 0034): an overlay for compose.yaml
+    // and the configuration it mounts read-only into its containers.
+    template!(
+        Group::Docker,
+        "compose.observability.yaml" => "compose.observability.yaml.tmpl"
+    ),
+    template!(
+        Group::Docker,
+        "observability/otel-collector.yaml" => "observability/otel-collector.yaml.tmpl"
+    ),
+    template!(
+        Group::Docker,
+        "observability/prometheus.yml" => "observability/prometheus.yml.tmpl"
+    ),
+    template!(Group::Docker, "observability/tempo.yaml" => "observability/tempo.yaml.tmpl"),
+    template!(Group::Docker, "observability/loki.yaml" => "observability/loki.yaml.tmpl"),
+    template!(
+        Group::Docker,
+        "observability/grafana/provisioning/datasources/datasources.yaml" => "observability/grafana/provisioning/datasources/datasources.yaml.tmpl"
+    ),
+    template!(
+        Group::Docker,
+        "observability/grafana/provisioning/dashboards/dashboards.yaml" => "observability/grafana/provisioning/dashboards/dashboards.yaml.tmpl"
+    ),
+    template!(
+        Group::Docker,
+        "observability/grafana/dashboards/forge-application.json" => "observability/grafana/dashboards/forge-application.json.tmpl"
+    ),
     template!(Group::Docker, "tests/container.rs" => "tests/container.rs.tmpl"),
     template!(Group::Ci, ".github/workflows/ci.yml" => "github/workflows/ci.yml.tmpl"),
     template!(Group::Ci, ".github/dependabot.yml" => "github/dependabot.yml.tmpl"),
@@ -429,18 +457,77 @@ const RESERVED_MODULES: &[(&str, &str)] = &[
     ),
 ];
 
-/// A positive, time-sortable migration version: nanoseconds since the Unix
-/// epoch.
-pub(crate) fn migration_version() -> Result<String, CliError> {
-    let elapsed = SystemTime::now()
+/// Versions of the migrations Forge crates record in the application's
+/// migration table (`forge_db::FRAMEWORK_MIGRATIONS`, ADR 0030). They are
+/// reserved: the migrator refuses an application migration that uses one
+/// with another description. Kept equal to the `forge-db` list by a unit
+/// test, so the CLI does not link SQLx.
+const RESERVED_MIGRATION_VERSIONS: &[u128] = &[20_261_019_000_000, 20_261_019_000_100];
+
+const NANOS_PER_SECOND: u128 = 1_000_000_000;
+
+/// A positive, time-sortable migration version for the application at
+/// `root`: nanoseconds since the Unix epoch, moved to the next free second
+/// while the version is taken, either by a migration already in
+/// `migrations/` or by a reserved framework version
+/// ([`RESERVED_MIGRATION_VERSIONS`]).
+pub(crate) fn migration_version(root: &Path) -> Result<String, CliError> {
+    next_migration_version(root, SystemTime::now())
+}
+
+fn next_migration_version(root: &Path, now: SystemTime) -> Result<String, CliError> {
+    let mut version = now
         .duration_since(UNIX_EPOCH)
-        .map_err(CliError::Clock)?;
-    Ok(elapsed.as_nanos().to_string())
+        .map_err(CliError::Clock)?
+        .as_nanos();
+    let taken = existing_migration_versions(&root.join("migrations"))?;
+    while taken.contains(&version) || RESERVED_MIGRATION_VERSIONS.contains(&version) {
+        version += NANOS_PER_SECOND;
+    }
+    Ok(version.to_string())
+}
+
+/// The numeric version prefixes of the files in `migrations` (none when the
+/// directory does not exist yet).
+fn existing_migration_versions(migrations: &Path) -> Result<Vec<u128>, CliError> {
+    let entries = match fs::read_dir(migrations) {
+        Ok(entries) => entries,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(source) => {
+            return Err(CliError::ReadDirectory {
+                path: migrations.to_path_buf(),
+                source,
+            });
+        }
+    };
+    let mut versions = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|source| CliError::ReadDirectory {
+            path: migrations.to_path_buf(),
+            source,
+        })?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if let Some((prefix, _)) = name.split_once('_')
+            && let Ok(version) = prefix.parse::<u128>()
+        {
+            versions.push(version);
+        }
+    }
+    Ok(versions)
 }
 
 pub(crate) fn create_migration(root: &Path, name: &str) -> Result<(PathBuf, PathBuf), CliError> {
+    create_migration_at(root, name, SystemTime::now())
+}
+
+fn create_migration_at(
+    root: &Path,
+    name: &str,
+    now: SystemTime,
+) -> Result<(PathBuf, PathBuf), CliError> {
     let normalized = normalize_migration_name(name)?;
-    let version = migration_version()?;
+    let version = next_migration_version(root, now)?;
     let migrations = root.join("migrations");
     fs::create_dir_all(&migrations).map_err(|source| CliError::CreateDirectory {
         path: migrations.clone(),
@@ -723,6 +810,9 @@ fn write_application(
                 },
             );
             write_file(&root.join(template.path), &content)?;
+            if template.path.starts_with(OBSERVABILITY_DIRECTORY) {
+                make_world_readable(root, template.path)?;
+            }
         }
     }
     for file in BINARY_FILES {
@@ -746,6 +836,44 @@ fn write_application(
         )?;
     }
 
+    Ok(())
+}
+
+/// The directory of the observability stack's configuration, bind-mounted
+/// into containers that run as other users.
+const OBSERVABILITY_DIRECTORY: &str = "observability/";
+
+/// Makes `relative` (a file below [`OBSERVABILITY_DIRECTORY`]) readable, and
+/// its directories traversable, by every user whatever the umask: the
+/// stack's containers (Grafana, Prometheus, ...) read these bind mounts as
+/// their own users. The files hold no secrets.
+#[cfg(unix)]
+fn make_world_readable(root: &Path, relative: &str) -> Result<(), CliError> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let set = |path: &Path, mode: u32| {
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).map_err(|source| {
+            CliError::WriteFile {
+                path: path.to_path_buf(),
+                source,
+            }
+        })
+    };
+    let file = root.join(relative);
+    set(&file, 0o644)?;
+    let mut directory = file.parent();
+    while let Some(path) = directory {
+        if path == root {
+            break;
+        }
+        set(path, 0o755)?;
+        directory = path.parent();
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn make_world_readable(_root: &Path, _relative: &str) -> Result<(), CliError> {
     Ok(())
 }
 
@@ -1028,6 +1156,56 @@ mod tests {
     }
 
     #[test]
+    fn reserved_migration_versions_match_the_framework_list() {
+        let framework: Vec<u128> = forge_db::FRAMEWORK_MIGRATIONS
+            .iter()
+            .map(|migration| u128::try_from(migration.version).expect("positive version"))
+            .collect();
+        assert_eq!(RESERVED_MIGRATION_VERSIONS, framework.as_slice());
+    }
+
+    /// A framework migration's version is reserved: the migrator refuses an
+    /// application migration with that version and another description, so a
+    /// migration generated at that instant moves to the next free second,
+    /// past the application's own migrations too (forge-rust#18).
+    #[test]
+    fn generated_migrations_skip_reserved_and_existing_versions() {
+        let reserved = RESERVED_MIGRATION_VERSIONS[0];
+        let clock =
+            UNIX_EPOCH + std::time::Duration::from_nanos(u64::try_from(reserved).expect("fits"));
+        let root = tempfile::tempdir().expect("temporary directory should be available");
+
+        for (name, seconds_later) in [("first", 1), ("second", 2)] {
+            let (up, down) =
+                create_migration_at(root.path(), name, clock).expect("migration is created");
+            let version = reserved + seconds_later * NANOS_PER_SECOND;
+            assert_eq!(
+                up.file_name().and_then(|name| name.to_str()),
+                Some(format!("{version}_{name}.up.sql").as_str())
+            );
+            assert_eq!(
+                down.file_name().and_then(|name| name.to_str()),
+                Some(format!("{version}_{name}.down.sql").as_str())
+            );
+        }
+
+        // No reserved version can be generated, whichever instant the clock
+        // reads, and a free instant is used as it is.
+        for reserved in RESERVED_MIGRATION_VERSIONS {
+            let clock = UNIX_EPOCH
+                + std::time::Duration::from_nanos(u64::try_from(*reserved).expect("fits"));
+            let version = next_migration_version(root.path(), clock).expect("version");
+            let version: u128 = version.parse().expect("numeric version");
+            assert!(!RESERVED_MIGRATION_VERSIONS.contains(&version), "{version}");
+        }
+        let free = UNIX_EPOCH + std::time::Duration::from_nanos(1_760_832_000_000_000_007);
+        assert_eq!(
+            next_migration_version(root.path(), free).expect("version"),
+            "1760832000000000007"
+        );
+    }
+
+    #[test]
     fn rejects_unsafe_migration_names() {
         for name in ["", "../users", "1users", "users/roles", "café"] {
             assert!(normalize_migration_name(name).is_err(), "accepted {name}");
@@ -1186,6 +1364,8 @@ mod tests {
             "Dockerfile",
             ".dockerignore",
             "compose.yaml",
+            "compose.observability.yaml",
+            "observability",
             "tests/container.rs",
             ".github",
         ] {

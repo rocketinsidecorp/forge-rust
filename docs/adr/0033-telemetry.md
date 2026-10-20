@@ -3,6 +3,7 @@
 - Status: Accepted
 - Date: 2026-10-20
 - Parity: Forge-Go ADR 0034 ("Dependency-free telemetry speaking OpenTelemetry protocols") and ADR 0040 ("OTLP log export, Go runtime metrics and connection pool metrics"); part 1 of [forge-rust#13](https://github.com/rocketinsidecorp/forge-rust/issues/13)
+- Refined by: [ADR 0034](0034-local-observability-stack.md) (the generated local observability stack, part 2)
 
 ## Context
 

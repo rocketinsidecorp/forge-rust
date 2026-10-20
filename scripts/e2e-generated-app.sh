@@ -6,8 +6,9 @@
 # full-stack HTML page (layout, CSP, CSRF, digested Hotwire assets) and check
 # the quality gates of an --api application. The Docker path also creates the
 # first owner with `setup`, signs in and out through the generated pages, and
-# checks the authentication tables' runtime privileges. Builds honor
-# CARGO_TARGET_DIR.
+# checks the authentication tables' runtime privileges, then validates the
+# observability overlay (compose.observability.yaml) and smoke-tests the
+# stack with loopback requests only. Builds honor CARGO_TARGET_DIR.
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -17,6 +18,7 @@ unset FORGE_E2E_SKIP_DOCKER
 app_name="forge-e2e-app"
 app_dir="$work_dir/$app_name"
 server_pid=""
+overlay_started=0
 
 log() { printf '\n==> %s\n' "$*"; }
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
@@ -24,6 +26,10 @@ fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 cleanup() {
   if [[ -n "$server_pid" ]] && kill -0 "$server_pid" 2>/dev/null; then
     kill -KILL "$server_pid" 2>/dev/null || true
+  fi
+  if [[ "$overlay_started" == 1 ]]; then
+    (cd "$app_dir" && docker compose -f compose.yaml -f compose.observability.yaml \
+      down --volumes --remove-orphans >/dev/null 2>&1) || true
   fi
   if [[ -f "$app_dir/compose.yaml" ]] && command -v docker >/dev/null 2>&1; then
     (cd "$app_dir" && docker compose down --volumes --remove-orphans >/dev/null 2>&1) || true
@@ -540,5 +546,62 @@ docker compose stop --timeout 20 app >/dev/null
 app_container="$(docker compose ps --quiet --all app)"
 exit_code="$(docker inspect --format '{{.State.ExitCode}}' "$app_container")"
 [[ "$exit_code" == 0 ]] || { docker compose logs app >&2; fail "docker stop should exit 0, got $exit_code"; }
+
+log "Validating the observability overlay"
+# A throwaway credential for this run only.
+export GRAFANA_ADMIN_PASSWORD="e2e-only-not-a-secret"
+overlay=(-f compose.yaml -f compose.observability.yaml)
+docker compose "${overlay[@]}" config --quiet || fail "the overlay must be a valid compose file"
+if env -u GRAFANA_ADMIN_PASSWORD docker compose "${overlay[@]}" config --quiet >/dev/null 2>&1; then
+  fail "the overlay must refuse to start without GRAFANA_ADMIN_PASSWORD"
+fi
+env -u GRAFANA_ADMIN_PASSWORD docker compose config --quiet \
+  || fail "the default stack must not need GRAFANA_ADMIN_PASSWORD"
+if docker compose config --services | grep -E 'grafana|prometheus|tempo|loki|otel-collector'; then
+  fail "the default compose.yaml must not include the observability stack"
+fi
+
+log "Smoke-testing the observability stack"
+overlay_started=1
+docker compose "${overlay[@]}" up --detach --build --wait >/dev/null
+# Retries "$@" for up to 90 s, sending a request each time so there is
+# telemetry to find.
+wait_for_stack() {
+  local what="$1"
+  shift
+  for _ in $(seq 1 45); do
+    if "$@" >/dev/null 2>&1; then
+      echo "ok: $what"
+      return 0
+    fi
+    curl --silent --output /dev/null --max-time 2 "http://127.0.0.1:3000/" || true
+    sleep 2
+  done
+  docker compose "${overlay[@]}" logs --no-color --tail 200 >&2 || true
+  fail "timed out waiting for: $what"
+}
+grafana() { curl --silent --fail --user "admin:$GRAFANA_ADMIN_PASSWORD" "$@"; }
+prometheus_has() {
+  curl --silent --fail --get http://127.0.0.1:9090/api/v1/query --data-urlencode "query=$1" \
+    | grep -q '"result":\[{'
+}
+wait_for_stack "grafana is up" grafana http://127.0.0.1:3001/api/health
+[[ "$(curl --silent --output /dev/null --write-out '%{http_code}' http://127.0.0.1:3001/api/datasources)" == 401 ]] \
+  || fail "anonymous Grafana access must be refused"
+for source in prometheus tempo loki; do
+  wait_for_stack "$source data source is healthy" \
+    grafana "http://127.0.0.1:3001/api/datasources/uid/$source/health"
+done
+wait_for_stack "the dashboard is provisioned" grafana http://127.0.0.1:3001/api/dashboards/uid/forge-app
+wait_for_stack "request metrics reach Prometheus" \
+  prometheus_has "http_server_request_duration_seconds_count{job=\"$app_name\"}"
+wait_for_stack "Tokio runtime metrics reach Prometheus" prometheus_has "tokio_task_count{job=\"$app_name\"}"
+wait_for_stack "traces reach Tempo" sh -c "curl --silent --fail --user 'admin:$GRAFANA_ADMIN_PASSWORD' \
+  'http://127.0.0.1:3001/api/datasources/proxy/uid/tempo/api/search?limit=5' | grep -q traceID"
+wait_for_stack "logs reach Loki" sh -c "curl --silent --fail --user 'admin:$GRAFANA_ADMIN_PASSWORD' --get \
+  'http://127.0.0.1:3001/api/datasources/proxy/uid/loki/loki/api/v1/query_range' \
+  --data-urlencode 'query={service_name=\"$app_name\"}' | grep -q '\"result\":\[{'"
+docker compose "${overlay[@]}" down --volumes >/dev/null
+overlay_started=0
 
 log "All end-to-end checks passed"
