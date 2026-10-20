@@ -92,6 +92,34 @@ pub enum CliError {
     /// `forge credentials` failed; the message names paths and key ids,
     /// never a key or a credential value.
     Credentials(String),
+    /// `forge deploy`, `forge logs` or `forge app` failed, with the
+    /// command's exit code (docs/cli.md).
+    Deploy {
+        message: String,
+        code: u8,
+    },
+}
+
+impl From<crate::deploy::DeployError> for CliError {
+    fn from(error: crate::deploy::DeployError) -> Self {
+        Self::Deploy {
+            code: error.exit_code(),
+            message: error.message,
+        }
+    }
+}
+
+impl CliError {
+    /// The process exit code: 1, or the deploy commands' documented codes
+    /// (3 lock held, 4 unhealthy and reverted, 5 migration failed, 6 hook
+    /// failed, 7 inconsistent).
+    #[must_use]
+    pub fn exit_code(&self) -> u8 {
+        match self {
+            Self::Deploy { code, .. } => *code,
+            _ => 1,
+        }
+    }
 }
 
 impl fmt::Display for CliError {
@@ -178,6 +206,7 @@ impl fmt::Display for CliError {
             Self::Reported => formatter.write_str("checks failed"),
             Self::I18n(reason) | Self::Credentials(reason) => formatter.write_str(reason),
             Self::TranslationsMissing => formatter.write_str("translations are missing"),
+            Self::Deploy { message, .. } => formatter.write_str(message),
         }
     }
 }
@@ -213,6 +242,7 @@ impl std::error::Error for CliError {
             | Self::I18n(_)
             | Self::Credentials(_)
             | Self::TranslationsMissing
+            | Self::Deploy { .. }
             | Self::CargoFailed { .. } => None,
         }
     }

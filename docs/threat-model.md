@@ -572,6 +572,50 @@ of `forge new`. Guides: [credentials](credentials.md), [encryption](encryption.m
 | Oversized or hostile input | D | Plaintexts 1 MiB, files 2 MiB, key files 4 KiB, at most 8 keys; sizes checked before decoding | `documents_are_one_object_without_duplicates`, `tampering_truncation_and_wrong_keys_fail_closed` |
 | Memory disclosure | I | Key material, derived keys, decrypted plaintexts and the store's strings are zeroized on drop. **Residual:** `ring` key schedules, application copies, swap and core dumps | unit tests of redacted `Debug`; zeroization is by construction (`Zeroizing`) |
 
+## Deployment review
+
+Review date: 2026-10-20 ([ADR 0042](adr/0042-forge-deploy.md), port of
+Forge-Go ADR 0030). Scope: `forge deploy`, `forge logs`, `forge app`
+(`forge-cli`, `src/deploy`), the `forge-proxy` crate and image, and the files
+they read (`config/deploy.yml`, `.forge/secrets`, `.forge/hooks/*`). Guide:
+[deployment](deployment.md#forge-deploy).
+
+Trust boundaries: the operator's machine (configuration, secrets file, local
+environment, hooks) is trusted; deploy hosts are reached over SSH with
+verified host keys and run Docker as the deploy user (root-equivalent);
+clients reach only forge-proxy's ports 80 and 443; the proxy's control socket
+is reachable only through `docker exec`; the ACME CA is reached over verified
+HTTPS.
+
+| Threat | STRIDE | Control | Verification |
+| --- | --- | --- | --- |
+| A configuration value injects options or shell syntax into ssh or a remote command | T, E | Local processes run from argument vectors, never a shell; the host follows `--`; hosts, images, service, role, volume, environment and build-arg names are validated against Forge-Go's patterns; every value in a remote script is one single-quoted word | `parse_rejects_invalid_configurations` (option, `;`, `$(...)` and newline injections), `ssh_refuses_invalid_hosts_before_starting_ssh`, `ssh_argv_matches_forge_go_and_never_relaxes_host_keys`, `quoted_words_survive_a_real_shell`, `invalid_versions_are_refused`, `deploys_over_real_ssh` (`it's quoted` reaches the container intact) |
+| A man in the middle impersonates a host | S | Host keys always verified (no option relaxes `StrictHostKeyChecking`); `BatchMode=yes`; the operator's `known_hosts` and agent | `ssh_argv_matches_forge_go_and_never_relaxes_host_keys`, the real-sshd test runs with `StrictHostKeyChecking yes` |
+| Secrets in argv, `ps`, dry runs, progress, errors or streamed output | I | Secrets reach hosts on stdin only and land in `0600` env files written with `umask 077` and an atomic rename; `.forge/secrets` must be `0600`, has no command substitution and errors never echo values; every printed line and error passes a redactor of all values of 4+ characters | `fails_closed_without_echoing_values`, `remote_errors_are_redacted_on_every_runner_path`, the golden plans (no secret), `deploys_over_real_ssh` (no secret in any docker argv or progress line; env file mode `0600`) |
+| A failed health check leaves hosts on mixed versions, or an interrupted deploy is reported as success | T | The switch is all-or-nothing: previous containers keep running until every host passed; on failure every switched host is routed back and new containers removed (exit 4); a failed revert or an interruption exits 7 | `unhealthy_host_reverts_every_switched_host`, `revert_failure_is_inconsistent`, `interrupted_switch_is_inconsistent_without_revert`, `deploys_over_real_ssh` |
+| A failed migration or hook still switches traffic | T | Migration failure exits 5 before any container starts; a failing or non-executable hook exits 6 before the next step; the lock is released on every path | `migration_failure_aborts_before_any_switch`, `failing_hook_aborts_before_remote_changes` |
+| Two operators deploy at once | T | An atomic `mkdir` lock on every host with holder and message; held locks exit 3 and are never released for someone else without `--force` | `held_lock_is_reported_and_partial_locks_released`, `lock_release_refuses_someone_elses_lock_without_force`, `deploys_over_real_ssh` |
+| A client spoofs its address or scheme through the proxy | S | Inbound `Forwarded`, `X-Forwarded-*` and `X-Real-IP` are dropped; `X-Forwarded-For` is the connecting address only; the application trusts it only from the forge network | `forwarded_headers_are_set_and_spoofed_ones_dropped`, `proxied_role_trusts_the_forge_network_unless_configured` |
+| Slow or oversized requests exhaust the application | D | 413 over `max_body_bytes`; bodies up to 1 MiB read completely within 30 s before contacting the application; larger bodies need data every 30 s; `response_timeout` for response headers; bounded connections, tunnels and control requests | `request_body_limits`, `slow_chunked_body_is_cut_off_at_the_deadline`, `chunked_bodies_are_buffered_or_streamed` |
+| A switch drops or misroutes requests | D | Targets are swapped atomically; in-flight leases are drained before the deploy returns; a retired target is never used | `switch_under_concurrent_load_drops_no_requests`, `deploy_drains_in_flight_requests_before_returning`, `drain_timeout_reports_remaining_requests`, `request_racing_a_retired_target_gets_503`, `upgrade_through_proxy` |
+| An unhealthy container receives traffic | D | `healthy_count` consecutive passes within `deploy_timeout` before the switch; otherwise the previous target keeps serving and the proxy exits 4 | `unhealthy_target_is_rejected_and_previous_keeps_serving`, `health_gate_requires_consecutive_passes` |
+| Anyone on the network reconfigures the proxy | E | No network control surface: a Unix socket in a `0700` directory, socket `0600`; strict JSON with unknown fields refused | `control_socket_and_state_persistence`, `client_commands` |
+| A tampered or foreign state file reroutes traffic after a restart | T | The state file is written atomically `0600`; an unreadable, unknown-version or invalid state stops the proxy instead of routing from it | `control_socket_and_state_persistence` |
+| A certificate is issued or served for a host the operator did not configure, or a wrong certificate is presented | S, T | Certificates only for hosts of TLS services; handshakes for other hosts or before issuance fail; HTTP-01 answers only for TLS hosts; the key and chain must match; ACME over verified HTTPS (plain HTTP only on loopback); account and certificate files `0600` in a `0700` cache | `certificates_are_served_only_for_tls_hosts`, `acme_obtains_caches_and_reuses_a_certificate` (every JWS signature and nonce verified, CSR verified by `openssl`), `run_serves_and_shuts_down` |
+| Tokens in access logs | I | Access logs record the path without its query string | `access_log_omits_the_query` |
+
+Residual risks: the deploy user's Docker access is root-equivalent on each
+host; `docker inspect` on a host shows container environments, secrets
+included; streamed output redaction catches only exact values; with
+`migrate.enabled`, the migrate role's long-running containers hold
+`FORGE_MIGRATION_DATABASE_URL` when it is listed for that role (ADR 0042,
+follow-up for both frameworks); the ACME client is tested against an in-test
+CA, not Let's Encrypt; repeated issuance failures back off up to an hour but
+can still exhaust Let's Encrypt's rate limits for a misconfigured host;
+interactive sessions (`forge app shell`, `exec --interactive`) are not
+filtered; `forge-proxy` must be referenced by digest to be sure every host
+runs the reviewed build (`setup` warns otherwise).
+
 ## Review cadence
 
 Update this model when adding a trust boundary, privileged capability, protocol,

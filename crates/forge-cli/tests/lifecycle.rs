@@ -113,6 +113,7 @@ fn forge_command() -> Command {
         "FORGE_TEST_DATABASE_URL",
         "FORGE_TEST_MYSQL_URL",
         "FORGE_TEST_MARIADB_URL",
+        "FORGE_TEST_REQUIRE_SSHD",
     ] {
         command.env_remove(name);
     }

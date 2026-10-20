@@ -69,6 +69,7 @@ struct Manager {
 /// HTTPS for one proxy.
 pub struct Tls {
     manager: Arc<Manager>,
+    config: Arc<rustls::ServerConfig>,
 }
 
 impl std::fmt::Debug for Tls {
@@ -118,44 +119,34 @@ impl Tls {
             &crate::der::generate_p256()?,
             &settings.email,
         )?;
-        let challenges = server.enable_challenges();
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let manager = Arc::new(Manager {
+            server: server.clone(),
+            settings,
+            provider: Arc::clone(&provider),
+            certificates: RwLock::new(HashMap::new()),
+            failures: Mutex::new(HashMap::new()),
+            challenges: server.enable_challenges(),
+        });
+        let mut config = rustls::ServerConfig::builder_with_provider(provider)
+            .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
+            .map_err(|error| format!("tls configuration: {error}"))?
+            .with_no_client_auth()
+            .with_cert_resolver(Arc::new(Resolver {
+                manager: Arc::clone(&manager),
+            }));
+        config.alpn_protocols = vec![b"http/1.1".to_vec()];
         Ok(Self {
-            manager: Arc::new(Manager {
-                server,
-                settings,
-                provider: Arc::new(rustls::crypto::ring::default_provider()),
-                certificates: RwLock::new(HashMap::new()),
-                failures: Mutex::new(HashMap::new()),
-                challenges,
-            }),
+            manager,
+            config: Arc::new(config),
         })
     }
 
     /// The handshake side.
-    ///
-    /// # Panics
-    ///
-    /// Never: the protocol versions are supported by the ring provider.
     #[must_use]
     pub fn acceptor(&self) -> TlsAccept {
-        let config =
-            rustls::ServerConfig::builder_with_provider(Arc::clone(&self.manager.provider))
-                .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
-                .map(|builder| {
-                    builder
-                        .with_no_client_auth()
-                        .with_cert_resolver(Arc::new(Resolver {
-                            manager: Arc::clone(&self.manager),
-                        }))
-                });
-        let mut config = match config {
-            Ok(config) => config,
-            // The ring provider supports both versions; unreachable.
-            Err(error) => unreachable!("rustls rejected TLS 1.2/1.3 with ring: {error}"),
-        };
-        config.alpn_protocols = vec![b"http/1.1".to_vec()];
         TlsAccept {
-            acceptor: tokio_rustls::TlsAcceptor::from(Arc::new(config)),
+            acceptor: tokio_rustls::TlsAcceptor::from(Arc::clone(&self.config)),
         }
     }
 

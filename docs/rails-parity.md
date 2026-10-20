@@ -20,14 +20,14 @@ the work is finished and waiting for its review; **Planned** means not started.
 | Persistent jobs, cron, outbox | Solid Queue | Done | Done (framework crates; `forge new` wiring planned) |
 | Mailer with previews | Action Mailer | Done | Done (`forge::mail`, password-reset emails, `/_mail` previews, [ADR 0035](adr/0035-mail.md); `forge generate mailer`, [ADR 0038](adr/0038-generators-and-destroy.md)) |
 | Rate limiting | `rate_limit` | Done | Done |
-| Client address behind trusted proxies | `request.remote_ip`, `trusted_proxies` | Done (`FORGE_HTTP_TRUSTED_PROXIES`, ADR 0037) | Done (`FORGE_HTTP_TRUSTED_PROXIES`, ADR 0032; `forge deploy` sets it once ported) |
+| Client address behind trusted proxies | `request.remote_ip`, `trusted_proxies` | Done (`FORGE_HTTP_TRUSTED_PROXIES`, ADR 0037) | Done (`FORGE_HTTP_TRUSTED_PROXIES`, ADR 0032; `forge deploy` sets it for the proxied role, [ADR 0042](adr/0042-forge-deploy.md)) |
 | Cache | Solid Cache | Done | Done |
 | File storage with signed URLs | Active Storage | Done (disk) | Done (disk) |
 | Import maps, Turbo, Stimulus | Hotwire | In review | Done |
 | Turbo Streams over SSE | Action Cable | In review | Done (`scaffold --broadcast`, ADR 0031) |
 | Traces, metrics, log correlation | (gems) | Done (OpenTelemetry, Prometheus) | Done (OpenTelemetry, Prometheus; ADR 0033) |
 | Preconfigured Prometheus, Grafana, Tempo, Loki | — | Done (`compose.observability.yaml`, Forge-Go ADR 0038) | Done (`compose.observability.yaml`, [ADR 0034](adr/0034-local-observability-stack.md)) |
-| Zero-downtime deploys, rollback, remote logs | Kamal | Done (`forge deploy`, `forge logs`, `forge-proxy`) | Planned |
+| Zero-downtime deploys, rollback, remote logs | Kamal | Done (`forge deploy`, `forge logs`, `forge-proxy`) | In review (`forge deploy`, `forge logs`, `forge app`, `forge-proxy` with ACME TLS, same `config/deploy.yml`, [ADR 0042](adr/0042-forge-deploy.md), [deployment](deployment.md#forge-deploy)) |
 | Live reload and database lifecycle | `bin/dev`, `db:*` | In review (`forge dev`, `forge db`) | In review (`forge dev`, `forge db create\|drop\|reset\|setup\|prepare\|migrate\|rollback\|status\|seed`, `forge migrate\|rollback\|setup\|seed`, `forge doctor`, `forge version`, [ADR 0036](adr/0036-application-lifecycle-commands.md)) |
 | Encrypted credentials, attribute encryption | `credentials:edit`, AR Encryption | Done (`forge credentials`, `encryption`) | Done (`forge credentials init\|edit\|show\|rotate-key`, `forge::credentials`, `forge::encryption`, [ADR 0041](adr/0041-encrypted-credentials-and-attribute-encryption.md), [credentials](credentials.md), [encryption](encryption.md)) |
 | i18n | I18n | Done (`config/locales/*.json`, `t`, CLDR plurals, `forge new --locale`, `forge i18n check`, Forge-Go ADR 0042) | Done (`config/locales/*.json`, `layout.i18n.t`, CLDR plurals, `forge new --locale`, `forge i18n check`, [ADR 0037](adr/0037-internationalization.md), [i18n](i18n.md)) |
@@ -87,8 +87,7 @@ the work is finished and waiting for its review; **Planned** means not started.
   `.env.development`/`.env.local` files in `forge dev` and the lifecycle
   commands together with generating them. Planned right after the generators
   ([forge-rust#15](https://github.com/rocketinsidecorp/forge-rust/issues/15)).
-  `forge inspect`, `deploy`, `logs` and `app`
-  stay "Planned" in the table above. Forge-Go reads the target
+  `forge inspect` stays "Planned" in the table above. Forge-Go reads the target
   database of `db create|drop` from `FORGE_DATABASE_URL` and the credentials
   from `FORGE_MIGRATION_DATABASE_URL`; Forge-Rust uses
   `FORGE_MIGRATION_DATABASE_URL` for both (see
@@ -114,6 +113,26 @@ the work is finished and waiting for its review; **Planned** means not started.
   frameworks in one change, Forge-Go first since its live updates are still in
   review; until then the rotation procedure is in
   [deployment](deployment.md#rotating-the-stream-signing-key).
+
+- Deployment ([ADR 0042](adr/0042-forge-deploy.md)): commands, flags,
+  `config/deploy.yml`, `.forge/secrets`, hooks, remote layout, lock and
+  deploy-log records, exit codes and the forge-proxy command line, control
+  protocol and state file match Forge-Go, and the dry-run plans equal
+  Forge-Go's golden files. Differences, each a follow-up: (1) both frameworks
+  run `migrate` with the migrate role's env file, so Forge-Rust's separate
+  `FORGE_MIGRATION_DATABASE_URL` reaches that role's long-running containers;
+  a per-command environment (for example `migrate.env`) needs the same schema
+  change in both, Forge-Go first since its schema is the reference. (2)
+  Forge-Rust's forge-proxy obtains certificates ahead of time over HTTP-01
+  instead of autocert's on-demand TLS-ALPN-01/HTTP-01 at the first handshake;
+  the cache layout is shared. It speaks HTTP/1.1 only (no `h2` crate) and
+  opens one application connection per request. (3) The YAML reader refuses
+  anchors, aliases, tags, block scalars and multi-line scalars, which
+  yaml.v3 accepts. (4) clap reports usage errors with exit code 2 where
+  Forge-Go's `flag` uses 1, and single-dash long flags (`-dry-run`) are not
+  accepted by `forge` (forge-proxy accepts both, like Go). (5) As in
+  Forge-Go, `forge new` does not write `config/deploy.yml`; `forge deploy
+  init` does.
 
 ## Review gate
 

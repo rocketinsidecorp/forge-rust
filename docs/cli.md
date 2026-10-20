@@ -43,6 +43,15 @@ forge db rollback [--steps N]
 forge openapi [--output FILE | --check FILE]
 forge i18n check [--json]
 forge credentials init|edit|show|rotate-key [-e|--environment ENV] [show: --reveal] [rotate-key: --keep-old --print-key --write-key-file]
+forge deploy [--version TAG] [--skip-build] [--dry-run] [--json] [-c PATH] [--secrets PATH]
+forge deploy init [--service NAME]
+forge deploy setup | prune | details [--dry-run] [--json]
+forge deploy rollback VERSION [--dry-run] [--json]
+forge deploy lock status | acquire | release [--message TEXT] [--force]
+forge deploy maintenance on | off [--dry-run]
+forge logs [-f] [--role ROLE] [--host HOST] [--since 1h] [--grep REGEX] [--lines N]
+forge app exec [--role ROLE] [--host HOST] [-i] [--reuse] CMD...
+forge app shell [--role ROLE] [--host HOST] [--image IMAGE]
 ```
 
 The quality and build commands run `cargo` directly (no shell) in the current
@@ -872,6 +881,54 @@ Same command names, flags, messages and exit codes, except:
   tracked in [Rails parity](rails-parity.md).
 - `forge doctor` also checks the toolchain and that the database server answers.
 - Progress lines of `forge dev` carry no time stamp.
+
+## `forge deploy`, `forge logs`, `forge app`
+
+Kamal-style deploys to your own servers over SSH, with forge-proxy switching
+traffic without downtime ([ADR 0042](adr/0042-forge-deploy.md), the port of
+Forge-Go ADR 0030). The full guide, the `config/deploy.yml` reference and the
+proxy are in [deployment](deployment.md#forge-deploy).
+
+```sh
+forge deploy init                      # config/deploy.yml, .forge/secrets (0600), ignore entries
+forge deploy setup --dry-run           # every remote command, secrets redacted
+forge deploy setup                     # docker check, network, forge-proxy, accessories
+forge deploy                           # build, push, migrate, health-gated switch
+forge deploy rollback 3f2a9c1d07be     # back to a retained version
+forge deploy details --json
+forge logs -f --grep ERROR
+forge app exec migrate status
+```
+
+Every command reads `config/deploy.yml` (`--config`/`-c`) and
+`.forge/secrets` (`--secrets`; mode `0600`, `NAME=value` or
+`NAME=$VARIABLE`, no command substitution) and accepts `--dry-run`. The
+`forge deploy` flags may come before or after the subcommand. `ssh` runs from
+an argument vector with host keys always verified and `BatchMode=yes`; one
+multiplexed connection per host; secrets reach hosts on stdin only.
+
+| Exit code | Meaning |
+| --- | --- |
+| 0 | Success |
+| 1 | Invalid configuration, SSH or remote command failure |
+| 2 | Invalid arguments |
+| 3 | Another operation holds the deploy lock; nothing was changed |
+| 4 | A new container failed its health check; every host serves its previous version |
+| 5 | The migration failed before any container was switched |
+| 6 | A `.forge/hooks` executable exited non-zero; the following step did not run |
+| 7 | A failure could not be fully reverted; hosts may run different versions (see `forge deploy details`) |
+
+With `--json`, `setup`, `deploy`, `rollback` and `prune` print one report line
+(`schema_version`, `action`, `service`, `version`, `dry_run`, `steps`,
+`pruned`, `warnings`, `duration_ms`, `ok`, `error`, `exit_code`) on stdout,
+also on failure; progress goes to stderr. Without `--json`, a dry-run plan is
+printed on stdout.
+
+Differences from Forge-Go: usage errors exit 2 (clap) instead of 1; long
+flags take two dashes (`--dry-run`); `forge deploy init` names the service
+after the Cargo package and writes `app_port: 3000` and
+`FORGE_MIGRATION_DATABASE_URL`; the YAML reader refuses anchors, tags and
+block scalars ([parity follow-ups](rails-parity.md#parity-follow-ups)).
 
 ## Generated application binary
 

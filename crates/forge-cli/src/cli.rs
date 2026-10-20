@@ -205,6 +205,221 @@ pub(crate) enum Command {
         #[command(subcommand)]
         command: DbCommand,
     },
+    /// Build, push and deploy the application image to hosts over SSH
+    /// (like Kamal): health-gated zero-downtime switch through forge-proxy,
+    /// migrations before the switch, all-or-nothing revert, deploy lock and
+    /// retained versions for rollback (ADR 0042).
+    Deploy(DeployArgs),
+    /// Stream docker logs of the current role container from every matching
+    /// host, each line prefixed with host|; Ctrl-C stops the remote streams.
+    Logs(LogsArgs),
+    /// Run a command next to the deployed application, or open a shell.
+    App {
+        #[command(subcommand)]
+        command: AppCommand,
+    },
+}
+
+/// The flags every `forge deploy` command accepts, before or after the
+/// subcommand.
+#[derive(Clone, Debug, Args)]
+pub(crate) struct DeployCommon {
+    /// Deploy configuration.
+    #[arg(
+        short = 'c',
+        long,
+        value_name = "PATH",
+        default_value = "config/deploy.yml",
+        global = true
+    )]
+    pub(crate) config: std::path::PathBuf,
+    /// Secrets file; must be mode 0600.
+    #[arg(
+        long,
+        value_name = "PATH",
+        default_value = ".forge/secrets",
+        global = true
+    )]
+    pub(crate) secrets: std::path::PathBuf,
+    /// Print the remote and local commands with secrets redacted; read-only
+    /// queries (docker ps, lock status) still run.
+    #[arg(long, global = true)]
+    pub(crate) dry_run: bool,
+    /// Print a schema-versioned report on stdout (also on failure); progress
+    /// goes to stderr.
+    #[arg(long, global = true)]
+    pub(crate) json: bool,
+}
+
+/// `forge deploy`.
+#[derive(Debug, Args)]
+pub(crate) struct DeployArgs {
+    #[command(subcommand)]
+    pub(crate) command: Option<DeployCommand>,
+    #[command(flatten)]
+    pub(crate) common: DeployCommon,
+    /// Image tag to deploy; default is the abbreviated git commit of a clean
+    /// tree.
+    #[arg(long = "version", value_name = "TAG")]
+    pub(crate) tag: Option<String>,
+    /// Deploy a tag already in the registry instead of building and pushing.
+    #[arg(long)]
+    pub(crate) skip_build: bool,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum DeployCommand {
+    /// Write a commented config/deploy.yml and .forge/secrets (0600); add
+    /// .forge/secrets to .gitignore and .forge to .dockerignore. Never
+    /// overwrites.
+    Init {
+        /// Service name (default: from Cargo.toml).
+        #[arg(long, value_name = "NAME")]
+        service: Option<String>,
+    },
+    /// Check Docker, create ~/.forge/SERVICE (0700) and the forge network,
+    /// log in to the registry, start forge-proxy and accessories.
+    /// Idempotent.
+    Setup,
+    /// Restart the retained containers of VERSION on every host through the
+    /// same health-gated switch. Migrations are not reverted.
+    Rollback {
+        /// A version still retained on every host.
+        version: String,
+    },
+    /// Remove stopped containers beyond retain per role, and images no
+    /// remaining container uses. Never touches running containers.
+    Prune,
+    /// Containers and versions per host and role, proxy routing and
+    /// maintenance, lock holder, last deploys.
+    Details,
+    /// Inspect or hold the deploy lock (for maintenance windows).
+    Lock {
+        #[arg(value_enum)]
+        action: LockActionArg,
+        /// acquire: reason recorded with the lock.
+        #[arg(long, value_name = "TEXT", default_value = "manual lock")]
+        message: String,
+        /// release: release a lock held by someone else.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Serve forge-proxy's static 503 page (with Retry-After) instead of the
+    /// application.
+    Maintenance {
+        #[arg(value_enum)]
+        state: Toggle,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub(crate) enum LockActionArg {
+    Status,
+    Acquire,
+    Release,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub(crate) enum Toggle {
+    On,
+    Off,
+}
+
+/// The flags of `forge logs` and `forge app`.
+#[derive(Clone, Debug, Args)]
+pub(crate) struct RemoteCommon {
+    /// Deploy configuration.
+    #[arg(
+        short = 'c',
+        long,
+        value_name = "PATH",
+        default_value = "config/deploy.yml"
+    )]
+    pub(crate) config: std::path::PathBuf,
+    /// Secrets file; must be mode 0600.
+    #[arg(long, value_name = "PATH", default_value = ".forge/secrets")]
+    pub(crate) secrets: std::path::PathBuf,
+    /// Print the remote command with secrets redacted instead of running it.
+    #[arg(long)]
+    pub(crate) dry_run: bool,
+}
+
+/// `forge logs`.
+#[derive(Debug, Args)]
+pub(crate) struct LogsArgs {
+    #[command(flatten)]
+    pub(crate) common: RemoteCommon,
+    /// Keep streaming new lines.
+    #[arg(short = 'f', long)]
+    pub(crate) follow: bool,
+    /// Role (default: the proxied role, else web).
+    #[arg(long, value_name = "ROLE")]
+    pub(crate) role: Option<String>,
+    /// Only this host.
+    #[arg(long, value_name = "HOST")]
+    pub(crate) host: Option<String>,
+    /// Only lines since 1h, 30m or a timestamp.
+    #[arg(long, value_name = "DURATION")]
+    pub(crate) since: Option<String>,
+    /// Only lines matching this RE2 expression (filtered locally).
+    #[arg(long, value_name = "REGEX")]
+    pub(crate) grep: Option<String>,
+    /// Lines per host to start with (default 100, 10 with --follow).
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = 0,
+        allow_negative_numbers = true
+    )]
+    pub(crate) lines: i64,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum AppCommand {
+    /// Run CMD on one host (the first of the role unless --host): in a
+    /// one-off container of the image the role runs, with its env file, so
+    /// CMD goes to the image entrypoint (`forge app exec migrate status`);
+    /// --reuse runs inside the running container.
+    Exec {
+        #[command(flatten)]
+        common: RemoteCommon,
+        /// Role (default: the proxied role, else web).
+        #[arg(long, value_name = "ROLE")]
+        role: Option<String>,
+        /// Host (default: the first host of the role).
+        #[arg(long, value_name = "HOST")]
+        host: Option<String>,
+        /// Allocate a terminal (ssh -t, docker -it).
+        #[arg(short = 'i', long)]
+        interactive: bool,
+        /// Run inside the running container instead of a one-off container.
+        #[arg(long)]
+        reuse: bool,
+        /// The command and its arguments (flags must precede it).
+        #[arg(
+            required = true,
+            trailing_var_arg = true,
+            allow_hyphen_values = true,
+            value_name = "CMD"
+        )]
+        command: Vec<String>,
+    },
+    /// Interactive shell over ssh -t. Distroless images have no shell:
+    /// --image busybox:1.37 starts a sidecar sharing the container's network
+    /// and process namespaces, without the application's environment.
+    Shell {
+        #[command(flatten)]
+        common: RemoteCommon,
+        /// Role (default: the proxied role, else web).
+        #[arg(long, value_name = "ROLE")]
+        role: Option<String>,
+        /// Host (default: the first host of the role).
+        #[arg(long, value_name = "HOST")]
+        host: Option<String>,
+        /// Debug image with a shell, run as a sidecar.
+        #[arg(long, value_name = "IMAGE")]
+        image: Option<String>,
+    },
 }
 
 const DEFAULT_POLL_INTERVAL_TEXT: &str = "500ms";

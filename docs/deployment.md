@@ -2,10 +2,11 @@
 
 Status: Phase 3 in progress. This guide covers the generated container image,
 standalone binary, PostgreSQL development profile, least-privilege database roles, environment configuration,
-health endpoints and graceful shutdown. The examples use an application named `shop`.
-Kubernetes and systemd snippets are starting points to review, not certified
-configurations. Forge does not generate a deployment tool yet
-([ADR 0009](adr/0009-rails-style-generated-delivery-assets.md)).
+health endpoints and graceful shutdown, and [`forge deploy`](#forge-deploy):
+Kamal-style deploys to your own servers over SSH with zero-downtime switches
+through forge-proxy ([ADR 0042](adr/0042-forge-deploy.md)). The examples use
+an application named `shop`. Kubernetes and systemd snippets are starting
+points to review, not certified configurations.
 
 ## Container image
 
@@ -538,3 +539,316 @@ token lifetime (24 hours), then remove it. A `FORGE_STREAMS_PREVIOUS_KEYS`
 setting will come to Forge-Rust and Forge-Go together
 ([parity follow-ups](rails-parity.md#parity-follow-ups)).
 
+## forge deploy
+
+`forge deploy` puts the image on your own servers over SSH, Kamal-style, with
+zero-downtime switches through **forge-proxy**
+([ADR 0042](adr/0042-forge-deploy.md), the port of Forge-Go's ADR 0030).
+Hosts need only an SSH server and Docker; your machine needs `ssh` and, to
+build, the `docker` CLI. Commands, flags, `config/deploy.yml`, `.forge/secrets`,
+the remote layout (`~/.forge/SERVICE`), the forge-proxy control protocol and
+state file, and the exit codes are Forge-Go's: a project can move between the
+frameworks without rewriting its configuration, and either framework's
+`forge deploy` drives either forge-proxy image.
+
+### From a fresh VPS
+
+1. **Prepare each host** (Debian/Ubuntu shown) as root. Install Docker Engine
+   from Docker's signed apt repository, following Docker's guide for
+   [Ubuntu](https://docs.docker.com/engine/install/ubuntu/) or
+   [Debian](https://docs.docker.com/engine/install/debian/), rather than
+   piping a script into a shell:
+
+   ```sh
+   apt-get update && apt-get install -y ca-certificates curl
+   install -m 0755 -d /etc/apt/keyrings
+   . /etc/os-release   # ID is ubuntu or debian
+   curl -fsSL "https://download.docker.com/linux/$ID/gpg" -o /etc/apt/keyrings/docker.asc
+   chmod a+r /etc/apt/keyrings/docker.asc
+   echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/$ID ${UBUNTU_CODENAME:-$VERSION_CODENAME} stable" \
+     > /etc/apt/sources.list.d/docker.list
+   apt-get update && apt-get install -y docker-ce docker-ce-cli containerd.io
+   ```
+
+   Then create the deploy user and open the firewall:
+
+   ```sh
+   adduser --disabled-password --gecos '' deploy
+   usermod -aG docker deploy          # docker access is root-equivalent
+   install -d -m 700 -o deploy -g deploy /home/deploy/.ssh
+   cp ~/.ssh/authorized_keys /home/deploy/.ssh/ && chown deploy: /home/deploy/.ssh/authorized_keys
+   ufw allow 22,80,443/tcp && ufw enable
+   ```
+
+   Ports Docker publishes bypass `ufw`. Forge publishes only the proxy's 80
+   and 443; application containers publish nothing and accessories bind
+   `127.0.0.1` unless you give another address.
+
+   Connect once with `ssh deploy@HOST` so its host key is in your
+   `known_hosts`: Forge never disables host key checking. Use an SSH agent for
+   passphrase-protected keys (commands run with `BatchMode=yes`).
+
+2. **Build forge-proxy** once from a Forge checkout, push it and note the
+   digest:
+
+   ```sh
+   docker build -f crates/forge-proxy/Dockerfile -t registry.example.com/acme/forge-proxy:0.1.0 .
+   docker push registry.example.com/acme/forge-proxy:0.1.0
+   docker buildx imagetools inspect registry.example.com/acme/forge-proxy:0.1.0   # Digest: sha256:...
+   ```
+
+   Forge-Go's signed forge-proxy image works too: the command line, control
+   protocol and state volume are the same.
+
+3. **Configure** the application:
+
+   ```sh
+   forge deploy init        # config/deploy.yml, .forge/secrets (0600), ignore entries
+   $EDITOR config/deploy.yml .forge/secrets
+   ```
+
+4. **Point DNS** for `proxy.hosts` at the web hosts (needed for `ssl: true`).
+
+5. **Deploy:**
+
+   ```sh
+   export REGISTRY_PASSWORD=... FORGE_DATABASE_URL=... FORGE_MIGRATION_DATABASE_URL=...   # referenced as $VAR in .forge/secrets
+   forge deploy setup --dry-run   # review every remote command
+   forge deploy setup             # docker check, network, proxy, accessories
+   forge deploy                   # build, push, migrate, switch
+   forge deploy details
+   forge logs -f
+   ```
+
+### config/deploy.yml
+
+```yaml
+service: shop                                # container names, ~/.forge/shop
+image: registry.example.com/acme/shop        # no tag: the version is the tag
+registry:
+  server: registry.example.com
+  username: acme
+  password: REGISTRY_PASSWORD                # a secret NAME, not the password
+servers:
+  web:                                       # routed through forge-proxy
+    hosts: [192.0.2.10, 192.0.2.11]
+  jobs:
+    hosts: [192.0.2.11]
+    cmd: ["jobs"]                            # arguments to the image entrypoint
+    env: {clear: {JOBS_CONCURRENCY: "8"}}
+env:
+  clear: {FORGE_ENV: production}
+  secret: [FORGE_DATABASE_URL, FORGE_MIGRATION_DATABASE_URL, FORGE_AUTH_MFA_KEY]
+volumes: []                                  # e.g. shop-data:/data (SQLite)
+proxy:
+  image: registry.example.com/acme/forge-proxy@sha256:...
+  hosts: [shop.example.com]
+  ssl: true                                  # Let's Encrypt (accepts its terms)
+  acme_email: ops@example.com
+  app_port: 3000                             # FORGE_BIND of Forge-Rust applications
+  healthcheck: {path: /health/ready, interval: 1s, timeout: 2s, healthy_count: 3, deploy_timeout: 60s}
+  drain_timeout: 30s
+  response_timeout: 30s
+  max_body_bytes: 67108864
+migrate: {enabled: true, cmd: ["migrate"], role: web}
+accessories:
+  db:
+    image: postgres:18-alpine
+    host: 192.0.2.20
+    port: 5432                               # published on 127.0.0.1 only
+    volumes: ["shop-postgres:/var/lib/postgresql"]
+    env: {secret: [POSTGRES_PASSWORD]}
+builder: {context: ., dockerfile: Dockerfile, platform: linux/amd64, args: {RUST_VERSION: "1.98.1"}}
+retain: 5                                    # stopped versions kept for rollback
+stop_timeout: 35s                            # > FORGE_SHUTDOWN_GRACE_SECS
+boot_timeout: 60s                            # readiness wait for non-proxied roles
+hooks: .forge/hooks
+parallelism: 4                               # hosts handled at once
+ssh: {user: deploy, port: 22, proxy_jump: bastion.example.com}
+```
+
+Decoding is strict: unknown or duplicate keys, a second YAML document,
+durations that are not strings (`30s`), a tag in `image`, a password in
+`registry.password`, host names starting with `-` or containing shell
+characters, and more than one proxied role are errors. `servers.web` is
+proxied by default; set `proxy: true` or `false` on a role to change that. An
+accessory `port` of `5432` or `6543:5432` binds `127.0.0.1`; write
+`IP:HOST_PORT:CONTAINER_PORT` to choose another address deliberately.
+Defaults are Forge-Go's, including `app_port: 8080`; `forge deploy init`
+writes `app_port: 3000` because Forge-Rust applications listen there.
+
+The file is YAML, read by Forge's own strict reader (no YAML library is in the
+dependency graph): block and flow mappings and sequences, plain and quoted
+scalars and comments, the forms `forge deploy init` and Forge-Go's examples
+use. Anchors, aliases, tags, block scalars (`|`, `>`), complex keys and
+multi-line scalars are refused with the line number rather than guessed.
+
+### Secrets
+
+`.forge/secrets` contains `NAME=value` or `NAME=$VARIABLE` (`${VARIABLE}`)
+lines. Passthrough copies a variable from your environment, so values can come
+from a password manager or the CI secret store; an unset variable is an error.
+Quotes are removed and nothing inside them is expanded. There is no command
+substitution. The file must be mode `0600`. Values are sent to each host on
+stdin and written to `~/.forge/SERVICE/env/ROLE.env` (mode `0600`, `umask
+077`, atomic rename), which containers read with `--env-file`. They never
+appear in command lines, dry runs or progress output.
+
+`migrate` runs with the env file of `migrate.role`, so the role's
+long-running containers receive `FORGE_MIGRATION_DATABASE_URL` too when it is
+listed there. To keep the schema-owner credential out of them, leave it out of
+`env.secret`, set `migrate.enabled: false` and run `migrate` as a separate
+job with only that credential (see [Configuration](#configuration) and
+[ADR 0011](adr/0011-postgresql-runtime-migration-roles-and-rls-context.md)).
+
+Redaction of streamed output is best effort. `forge logs` and
+non-interactive `forge app exec` replace the exact values from
+`.forge/secrets` (4 characters or longer) line by line, but **output is
+otherwise not redacted**: an encoded, partial or derived value passes through,
+and interactive sessions (`forge app exec --interactive`, `forge app shell`)
+and `docker logs` on the host are not filtered at all. Applications must not
+print secrets; treat streamed output as sensitive.
+
+### Commands
+
+Every command reads `config/deploy.yml` (`--config`/`-c`) and `.forge/secrets`
+(`--secrets`), and accepts `--dry-run`: mutating remote and local commands are
+printed (`$`), stdin is described (`<`) but not shown, and read-only queries
+(`?`, such as `docker ps`) still run, so the plan names the exact containers
+that would be stopped or pruned.
+
+```sh
+forge deploy init --service shop                      # never overwrites
+forge deploy setup --json                             # idempotent; warns when proxy.image is not pinned by digest
+forge deploy                                          # version: abbreviated commit of a clean tree
+forge deploy --version 3f2a9c1d07be --skip-build      # a tag already in the registry
+forge deploy --dry-run                                # the plan, secrets redacted
+forge deploy rollback 3f2a9c1d07be                    # retained containers, same health-gated switch
+forge deploy prune                                    # stopped containers beyond retain, unused images
+forge deploy details --json                           # containers, routing, lock, last deploys
+forge deploy lock status
+forge deploy lock acquire --message "maintenance window"
+forge deploy lock release                             # --force for someone else's lock
+forge deploy maintenance on                           # forge-proxy's 503 page with Retry-After
+forge logs -f --role jobs
+forge logs --since 1h --grep ERROR --host 192.0.2.10 --lines 50
+forge app exec migrate status                         # one-off container of the running image
+forge app exec --reuse /usr/local/bin/shop healthcheck   # inside the running container
+forge app exec --interactive --host 192.0.2.10 migrate
+forge app shell --image busybox:1.37                  # distroless images have no shell: a sidecar
+```
+
+| Command | Effect |
+| ------- | ------ |
+| `forge deploy init [--service NAME]` | Write a commented `config/deploy.yml` and `.forge/secrets`; add `.forge/secrets` to `.gitignore` and `.forge` to `.dockerignore`. The service defaults to the Cargo package name. Never overwrites. |
+| `forge deploy setup [--json]` | Check Docker, create `~/.forge/SERVICE` (0700) and the `forge` network, log in to the registry, start forge-proxy (ports 80 and 443) and accessories. Idempotent. |
+| `forge deploy [--version V] [--skip-build] [--json]` | Deploy; the version defaults to the abbreviated commit of a clean working tree. |
+| `forge deploy rollback VERSION [--json]` | Restart the retained containers of VERSION on every host through the same health-gated switch. Migrations are not reverted. |
+| `forge deploy prune [--json]` | Remove stopped containers beyond `retain` per role, and images no remaining container uses. Never touches running containers. |
+| `forge deploy details [--json]` | Containers and versions per host and role, proxy routing and maintenance, lock holder, last deploys. |
+| `forge deploy lock status\|acquire\|release [--message M] [--force]` | Inspect or hold the lock. `release` refuses a lock held by someone else without `--force`. |
+| `forge deploy maintenance on\|off` | Serve forge-proxy's static 503 page instead of the application. |
+| `forge logs [-f] [--role R] [--host H] [--since 1h] [--grep REGEX] [--lines N]` | Stream `docker logs` of the current role container from every matching host, each line prefixed `host\|`. `--grep` (RE2 syntax) filters locally. Ctrl-C stops the remote `docker logs` processes too. |
+| `forge app exec [--role R] [--host H] [--interactive] [--reuse] CMD...` | Run CMD on one host: by default in a one-off container of the image the role runs, with its env file (CMD goes to the image entrypoint); `--reuse` runs inside the running container. |
+| `forge app shell [--image IMAGE]` | Interactive shell over `ssh -t`; `--image busybox:1.37` starts a sidecar sharing the container's network and process namespaces, without the application's environment. |
+
+Exit codes: `0` success, `1` failure (invalid configuration, SSH or remote
+command failure), `2` invalid arguments (clap), `3` the lock is held (nothing
+changed), `4` a new container failed its health check and every host serves
+its previous version, `5` the migration failed before any switch, `6` a hook
+failed, `7` a failure could not be fully reverted (run `forge deploy
+details`). With `--json`, the report is printed on stdout also on failure,
+with `ok`, `error` and `exit_code`.
+
+### How a deploy switches without downtime
+
+1. Take the lock on every host (`mkdir ~/.forge/SERVICE/lock`, atomic; the
+   holder, time and message are recorded). It is released at the end, also on
+   failure.
+2. Run `pre-build`, build and push the image (unless `--skip-build`), run
+   `pre-deploy`.
+3. On all hosts in parallel (at most `parallelism`): registry login, `docker
+   pull`, write the env files.
+4. Run `migrate` once, in a one-off container on the first host of the
+   migrate role. A failure stops here: nothing was started or switched.
+5. On every host, for each role (the proxied one first), start the new
+   container on the `forge` network with no published ports. For the proxied
+   role, `forge-proxy deploy` probes `healthcheck.path` until it passes
+   `healthy_count` times in a row, then switches traffic atomically and waits
+   up to `drain_timeout` for requests still running on the old container.
+   Other roles wait until Docker reports the container healthy (or running for
+   three checks) within `boot_timeout`.
+6. If any host fails, every switched host is routed back to its previous
+   container, which is still running, and the new containers are stopped and
+   removed. A role deployed for the first time keeps its healthy new
+   container, since there is nothing to go back to.
+7. When all hosts succeeded: stop the previous containers with `docker stop -t
+   stop_timeout` (SIGTERM, then the application's graceful shutdown), prune
+   beyond `retain`, append a JSON line (time, performer, version, containers)
+   to `~/.forge/SERVICE/deploys.log`, run `post-deploy`.
+
+Interrupting a deploy (Ctrl-C) during step 5 does not revert: forge-proxy
+finishes a switch it has started, so hosts may run different versions. The
+command exits `7`; check `forge deploy details` and deploy or roll back again.
+Keep migrations compatible with the version still serving until the switch
+(expand, then contract).
+
+### Hooks
+
+Executables in `.forge/hooks` (`hooks:` in the config) run locally from the
+project directory: `pre-build` (before the build), `pre-deploy` (before any
+host is touched; also on rollback) and `post-deploy` (after success). They
+receive `FORGE_COMMAND` (`deploy` or `rollback`), `FORGE_SERVICE`,
+`FORGE_VERSION`, `FORGE_IMAGE`, `FORGE_HOSTS` and `FORGE_ROLES` (comma
+separated), `FORGE_PERFORMER` and, in `post-deploy`, `FORGE_RUNTIME` (seconds),
+plus your environment. A non-zero exit aborts with exit code `6`; a hook file
+that is not executable is an error, not skipped.
+
+### forge-proxy
+
+The proxy container (`forge-proxy`, built from `crates/forge-proxy`) listens
+on 8080 and 8443 inside, published as 80 and 443, runs as uid 65532 and keeps
+its routing state and ACME account and certificates in the `forge-proxy-data`
+volume, so it resumes routing after a restart. It:
+
+- routes by `Host` (one service per host name; a service without hosts gets
+  unmatched requests) and answers unknown hosts with `404`;
+- with `ssl: true`, obtains certificates from Let's Encrypt (ACME HTTP-01,
+  answered on port 80) for exactly the configured hosts, ahead of time when
+  the service is deployed and again 30 days before expiry, serves them with
+  rustls (TLS 1.2 and 1.3) and redirects plain HTTP with `308`. A handshake
+  for any other host, or before the certificate exists, fails rather than
+  presenting a wrong certificate. The cache uses autocert's file layout, so
+  Forge-Go's proxy image reuses it and vice versa;
+- is the internet edge: it drops any `Forwarded`, `X-Forwarded-*` and
+  `X-Real-IP` headers the client sent, sets `X-Forwarded-For` to the
+  connecting address only (replacing, never appending), `X-Forwarded-Proto`
+  and `X-Forwarded-Host`, and keeps the original `Host`. The proxied role
+  trusts that `X-Forwarded-For` because `forge deploy` sets
+  `FORGE_HTTP_TRUSTED_PROXIES` to the `forge` network (see [Client addresses
+  behind a proxy](#client-addresses-behind-a-proxy)). Running forge-proxy
+  behind another load balancer is not supported;
+- rejects bodies over `max_body_bytes` with `413`; reads bodies up to 1 MiB
+  completely, with or without `Content-Length`, before contacting the
+  application, and answers `408` if one does not arrive within 30 s; streams
+  larger bodies, answering `408` when no data arrives for 30 s; gives the
+  application `response_timeout` to send response headers;
+- tunnels protocol upgrades (WebSocket) and counts them as in flight, so a
+  switch drains them; refuses `CONNECT`;
+- writes JSON access logs (service, host, method, path without query,
+  status, bytes, duration, client IP, target) to `docker logs forge-proxy`;
+- is controlled only through a Unix socket inside the container (directory
+  0700, socket 0600): `docker exec forge-proxy /usr/local/bin/forge-proxy
+  status`. A routing state file it cannot read stops it from starting.
+
+```sh
+docker exec forge-proxy /usr/local/bin/forge-proxy status
+docker exec forge-proxy /usr/local/bin/forge-proxy maintenance -service shop on
+docker logs forge-proxy --since 10m
+```
+
+forge-proxy speaks HTTP/1.1 to clients and applications (no HTTP/2) and opens
+one connection to the application per request. To upgrade it, change
+`proxy.image`, then on each host run `docker rm -f forge-proxy` and `forge
+deploy setup`: requests fail for the few seconds the proxy restarts.
+Certificates from static files are not supported.

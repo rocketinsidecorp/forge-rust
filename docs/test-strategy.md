@@ -382,3 +382,34 @@ The trusted-proxy resolver (ADR 0032) mirrors the Forge-Go ADR 0037 tests:
   `docker compose config` on the overlay and smoke-tests the running stack
   (Grafana login and data sources, dashboard, metrics in Prometheus, traces
   in Tempo, logs in Loki).
+
+## Deployment tests
+
+`forge deploy` ([ADR 0042](adr/0042-forge-deploy.md)) is tested at three
+levels, without a Docker daemon:
+
+- **Unit and golden** (`crates/forge-cli/src/deploy/tests.rs`): configuration
+  validation including option, `;`, `$(...)` and newline injections; the
+  exact ssh argv and remote command text; quoting round-tripped through a real
+  `sh`; and the dry-run plans of deploy, rollback, prune and setup compared
+  byte for byte with Forge-Go's golden files
+  (`crates/forge-cli/tests/fixtures/deploy/*.golden`, copied from Forge-Go;
+  `FORGE_BLESS=1` rewrites them only after review). Failure paths (unhealthy
+  host, failed revert, interruption, failed migration, failing hook, held
+  lock) assert their exit codes against a recording runner.
+- **Real SSH** (`crates/forge-cli/src/deploy/ssh_tests.rs`): two private
+  `sshd` instances and the system `ssh` client, with a docker stand-in
+  (`crates/forge-cli/tests/support/fake_docker.rs`, built by `cargo test`)
+  first on each session's PATH: setup, two deploys, a failed migration, a
+  health failure on one host reverting both, lock contention, rollback,
+  pruning, logs with redaction and with `--follow` cancellation (the remote
+  `docker logs` processes must exit), `app exec`, details, a dry run that
+  changes nothing, and no secret in any docker argv. It is skipped with a
+  notice without `sshd`, `ssh`, `ssh-keygen` or the stand-in;
+  `FORGE_TEST_REQUIRE_SSHD=true` makes that a failure.
+- **forge-proxy over sockets** (`crates/forge-proxy/tests`): switches under
+  concurrent load with zero failed requests, health gating, draining and
+  drain timeouts, routing, forwarding headers, body limits and slow bodies,
+  upgrades, the control socket and state persistence, the command line, and
+  HTTPS with an `openssl`-made CA plus a full ACME HTTP-01 issuance against an
+  in-test RFC 8555 server (skipped with a notice without `openssl`).

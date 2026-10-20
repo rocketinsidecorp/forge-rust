@@ -1,0 +1,35 @@
+192.0.2.10      $ mkdir -p .forge/shop && if mkdir .forge/shop/lock 2>/dev/null; then cat > .forge/shop/lock/info; else cat .forge/shop/lock/info 2>/dev/null; exit 75; fi
+192.0.2.10      < stdin: lock record (holder, time, message)
+192.0.2.11      $ mkdir -p .forge/shop && if mkdir .forge/shop/lock 2>/dev/null; then cat > .forge/shop/lock/info; else cat .forge/shop/lock/info 2>/dev/null; exit 75; fi
+192.0.2.11      < stdin: lock record (holder, time, message)
+192.0.2.20      $ mkdir -p .forge/shop && if mkdir .forge/shop/lock 2>/dev/null; then cat > .forge/shop/lock/info; else cat .forge/shop/lock/info 2>/dev/null; exit 75; fi
+192.0.2.20      < stdin: lock record (holder, time, message)
+192.0.2.10      # lock acquired (setup)
+192.0.2.11      # lock acquired (setup)
+192.0.2.20      # lock acquired (setup)
+192.0.2.10      ? docker version --format '{{.Server.Version}}'
+192.0.2.10      $ mkdir -p .forge/shop/env && chmod 700 .forge .forge/shop .forge/shop/env
+192.0.2.10      $ docker network inspect forge >/dev/null 2>&1 || docker network create forge
+192.0.2.10      $ docker login registry.example.com --username acme --password-stdin
+192.0.2.10      < stdin: registry password (REGISTRY_PASSWORD)
+192.0.2.10      $ docker container inspect forge-proxy >/dev/null 2>&1 && docker start forge-proxy >/dev/null || docker run --detach --name forge-proxy --network forge --restart unless-stopped --publish 80:8080 --publish 443:8443 --volume forge-proxy-data:/var/lib/forge-proxy --label forge.proxy=true registry.example.com/forge-proxy@sha256:1111111111111111111111111111111111111111111111111111111111111111 run
+192.0.2.10      # forge-proxy running
+192.0.2.11      ? docker version --format '{{.Server.Version}}'
+192.0.2.11      $ mkdir -p .forge/shop/env && chmod 700 .forge .forge/shop .forge/shop/env
+192.0.2.11      $ docker network inspect forge >/dev/null 2>&1 || docker network create forge
+192.0.2.11      $ docker login registry.example.com --username acme --password-stdin
+192.0.2.11      < stdin: registry password (REGISTRY_PASSWORD)
+192.0.2.11      $ docker container inspect forge-proxy >/dev/null 2>&1 && docker start forge-proxy >/dev/null || docker run --detach --name forge-proxy --network forge --restart unless-stopped --publish 80:8080 --publish 443:8443 --volume forge-proxy-data:/var/lib/forge-proxy --label forge.proxy=true registry.example.com/forge-proxy@sha256:1111111111111111111111111111111111111111111111111111111111111111 run
+192.0.2.11      # forge-proxy running
+192.0.2.20      ? docker version --format '{{.Server.Version}}'
+192.0.2.20      $ mkdir -p .forge/shop/env && chmod 700 .forge .forge/shop .forge/shop/env
+192.0.2.20      $ docker network inspect forge >/dev/null 2>&1 || docker network create forge
+192.0.2.20      $ docker login registry.example.com --username acme --password-stdin
+192.0.2.20      < stdin: registry password (REGISTRY_PASSWORD)
+192.0.2.20      $ umask 077 && mkdir -p .forge/shop/env && cat > .forge/shop/env/accessory-db.env.tmp && mv .forge/shop/env/accessory-db.env.tmp .forge/shop/env/accessory-db.env
+192.0.2.20      < stdin: env file: 0 clear, 1 secret (POSTGRES_PASSWORD), values not shown
+192.0.2.20      $ docker container inspect shop-db >/dev/null 2>&1 && docker start shop-db >/dev/null || docker run --detach --name shop-db --network forge --restart unless-stopped --env-file .forge/shop/env/accessory-db.env --label forge.accessory=shop/db --publish 127.0.0.1:5432:5432 --volume shop-pg:/var/lib/postgresql postgres:18-alpine
+192.0.2.20      # accessory db running
+192.0.2.10      $ rm -rf .forge/shop/lock
+192.0.2.11      $ rm -rf .forge/shop/lock
+192.0.2.20      $ rm -rf .forge/shop/lock
