@@ -1,0 +1,41 @@
+[package]
+name = "forge-cache"
+publish = false
+description = "Application cache for Forge: bounded in-memory cache, shared PostgreSQL/MySQL/SQLite stores and per-process stampede protection"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+forge-config = { path = "../forge-config" }
+forge-db = { path = "../forge-db", optional = true }
+forge-tenancy = { path = "../forge-tenancy" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+sqlx = { workspace = true, features = ["macros"], optional = true }
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[features]
+# Shared stores, one per backend (ADR 0028). None is on by default.
+postgres = ["dep:forge-db", "dep:sqlx", "forge-db/postgres"]
+mysql = ["dep:forge-db", "dep:sqlx", "forge-db/mysql"]
+sqlite = ["dep:forge-db", "dep:sqlx", "forge-db/sqlite"]
+# The conformance suite every `Cache` must pass (`forge_cache::testing`).
+testing = []
+
+[dev-dependencies]
+forge-auth = { path = "../forge-auth" }
+forge-cache = { path = ".", features = ["postgres", "mysql", "sqlite", "testing"] }
+forge-db = { path = "../forge-db", features = ["postgres", "mysql", "sqlite", "testing"] }
+forge-security = { path = "../forge-security" }
+sqlx = { workspace = true, features = ["macros"] }
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true
