@@ -1,0 +1,60 @@
+{
+  "en": {
+    "events": {
+      "back": "Back to events",
+      "edit": {
+        "conflict": "This event was changed by someone else after you opened the form. Review your changes and save again to overwrite.",
+        "title": "Editing event"
+      },
+      "fields": {
+        "attendees": "Attendees",
+        "capacity": "Capacity",
+        "ends_at": "Ends at",
+        "featured": "Featured",
+        "name": "Name",
+        "notes": "Notes",
+        "organizer": "Organizer",
+        "public": "Public",
+        "starts_at": "Starts at",
+        "venue": "Venue"
+      },
+      "flash": {
+        "created": "Event was successfully created.",
+        "deleted": "Event was successfully deleted.",
+        "no_version": "The delete form has no valid version; reload the page.",
+        "stale": "This event was changed by someone else. Review it and delete it again.",
+        "updated": "Event was successfully updated."
+      },
+      "form": {
+        "create": "Create event",
+        "no": "No",
+        "no_version": "The form has no valid version; reload the page.",
+        "not_set": "Not set",
+        "update": "Update event",
+        "utc": "(UTC)",
+        "yes": "Yes"
+      },
+      "index": {
+        "actions": "Actions",
+        "edit": "Edit",
+        "empty": "No events yet.",
+        "new": "New event",
+        "next_page": "Next page",
+        "show": "Show",
+        "title": "Events"
+      },
+      "new": {
+        "title": "New event"
+      },
+      "not_found": {
+        "message": "The event does not exist or was deleted.",
+        "title": "Event not found"
+      },
+      "show": {
+        "confirm_delete": "Delete this event?",
+        "delete": "Delete event",
+        "title": "Event"
+      }
+    }
+  }
+}

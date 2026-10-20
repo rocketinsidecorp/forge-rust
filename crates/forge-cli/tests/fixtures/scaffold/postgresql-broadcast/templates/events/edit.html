@@ -1,10 +1,12 @@
 {% extends "layouts/application.html" %}
 
+{% block title %}{{ layout.i18n.t("events.edit.title") }}{% endblock %}
+
 {% block content %}
-<h1>Editing event</h1>
+<h1>{{ layout.i18n.t("events.edit.title") }}</h1>
 {% include "events/_form.html" %}
 <p>
-  <a href="{{ show_path }}">Show</a>
-  <a href="{{ back_path }}">Back to events</a>
+  <a href="{{ show_path }}">{{ layout.i18n.t("events.index.show") }}</a>
+  <a href="{{ back_path }}">{{ layout.i18n.t("events.back") }}</a>
 </p>
 {% endblock %}

@@ -3,7 +3,7 @@ use std::time::Duration;
 use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 
 use crate::dev::{parse_debounce, parse_poll_interval};
-use crate::generate::Database;
+use crate::generate::{Database, Locale};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -60,6 +60,17 @@ pub(crate) enum Command {
         /// paths are resolved by Cargo from the new application's directory.
         #[arg(long, value_name = "PATH")]
         forge_path: Option<String>,
+        /// Default locale of the pages: en, es or pt-BR. Writes
+        /// config/locales/en.json and the locale's file (plus the sign-in
+        /// pages' authentication.LOCALE.json).
+        #[arg(
+            long,
+            value_enum,
+            value_name = "LOCALE",
+            default_value_t = Locale::En,
+            conflicts_with = "api"
+        )]
+        locale: Locale,
     },
     /// Generate application artifacts.
     Generate {

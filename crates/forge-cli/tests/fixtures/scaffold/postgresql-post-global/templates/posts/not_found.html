@@ -1,7 +1,9 @@
 {% extends "layouts/application.html" %}
 
+{% block title %}{{ layout.i18n.t("posts.not_found.title") }}{% endblock %}
+
 {% block content %}
-<h1>Post not found</h1>
-<p>The post does not exist or was deleted.</p>
-<p><a href="{{ back_path }}">Back to posts</a></p>
+<h1>{{ layout.i18n.t("posts.not_found.title") }}</h1>
+<p>{{ layout.i18n.t("posts.not_found.message") }}</p>
+<p><a href="{{ back_path }}">{{ layout.i18n.t("posts.back") }}</a></p>
 {% endblock %}

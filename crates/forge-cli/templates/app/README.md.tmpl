@@ -43,6 +43,27 @@ tunnel `PATCH`, `PUT` or `DELETE` in a `_method` field. Decode form bodies with
 `forge::views::Flash`. The CSRF and flash cookies use the `__Host-` prefix
 and are `Secure`: browsers accept them on `https://` and on
 `http://localhost`/`127.0.0.1`.
+
+### Translations
+
+The pages' text is in `config/locales/*.json`, Rails I18n's layout in JSON
+([guide](https://github.com/rocketinsidecorp/forge-rust/blob/main/docs/i18n.md)).
+Templates use `{{ layout.i18n.t("welcome.title").with("app", application) }}`,
+handlers `site.i18n(&request).t("sessions.signed_in").text()`. Each request
+gets the locale of its `locale` cookie, else `Accept-Language`, else the
+default (`DEFAULT_LOCALE` in `src/adapters/http/views/locales.rs`, overridden
+by `FORGE_I18N_DEFAULT_LOCALE`):
+
+```sh
+curl -s -H 'Accept-Language: es' http://127.0.0.1:3000/ | grep '<h1>'
+FORGE_I18N_DEFAULT_LOCALE=en cargo run
+cp config/locales/en.json config/locales/fr.json   # then rename the "en" key to "fr" and translate
+forge i18n check                                   # what each locale lacks; exit 1 when incomplete
+```
+
+Development and test show a missing key as `translation missing: LOCALE.KEY`
+(the generated tests reject it); production falls back to the default
+locale.
 %%end%%
 
 ## Development

@@ -45,9 +45,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use forge::audit::{AuditAction, AuditActor, AuditEvent, AuditOutcome, AuditSink};
 use forge::auth::{
-    CanonicalLogin, LoginThrottle, NewPassword, PASSWORD_RESET_LIFETIME_SECS,
-    PasswordCredentialStore, PasswordHasher, PasswordResetDelivery, PasswordResetNotifier,
-    PasswordResetToken, SessionStore, ThrottleDecision, ThrottleKey, UnixTimestamp,
+    CanonicalLogin, LoginThrottle, MIN_PASSWORD_CHARS, NewPassword, PASSWORD_RESET_LIFETIME_SECS,
+    PasswordCredentialStore, PasswordHasher, PasswordPolicyError, PasswordResetDelivery,
+    PasswordResetNotifier, PasswordResetToken, SessionStore, ThrottleDecision, ThrottleKey,
+    UnixTimestamp,
 };
 use forge::core::{ErrorCategory, ForgeError};
 use forge::http::{HeaderValue, Method, Request, Response, StatusCode, header};
@@ -57,8 +58,8 @@ use forge::tenancy::{
     TenantId, TenantSlug,
 };
 use forge::views::{
-    FieldErrors, Flash, SignInRedirect, csrf_cookie, csrf_field, csrf_token, csrf_verified,
-    return_path, see_other,
+    FieldErrors, Flash, SignInRedirect, Translation, csrf_cookie, csrf_field, csrf_token,
+    csrf_verified, return_path, see_other,
 };
 use forge::{ComposeError, Composition, WorkQueue};
 
@@ -85,13 +86,11 @@ pub const RESET_QUEUE_CAPACITY: usize = 256;
 /// happened, so its timing does not tell whether an account exists.
 pub const RESET_RESPONSE_TIME: Duration = Duration::from_millis(100);
 
-/// The only message a failed sign-in shows: it must not say whether the
-/// organization, the email or the password was wrong.
-const INVALID_CREDENTIALS: &str = "That organization, email and password do not match an account.";
-/// The only answer to a reset request, whether or not the account exists.
-const RESET_REQUESTED: &str =
-    "If that account exists, password reset instructions are on their way to its email address.";
-const RESET_INVALID: &str = "That reset link is invalid or has expired. Request a new one.";
+// Messages are the `sessions.*`, `passwords.*` and `throttled.*` keys of
+// config/locales/authentication.LOCALE.json. A failed sign-in shows one
+// message (`sessions.invalid_credentials`) whatever was wrong, and a reset
+// request one answer (`passwords.reset_requested`) whether or not the
+// account exists, in every locale.
 
 /// What the pages need: the identity stores, the password hasher, the
 /// reset-link notifier, the audit sink and the attempt throttles.
@@ -289,7 +288,10 @@ async fn create_session(pages: Arc<Pages>, request: Request) -> Response {
     match ports.sign_in_throttle.attempt(&key).await {
         Ok(ThrottleDecision::Allowed) => {}
         Ok(ThrottleDecision::Throttled { retry_after }) => {
-            let message = too_many_attempts("sign-in", retry_after);
+            let message = too_many_attempts(
+                pages.site.i18n(&request).t("throttled.sign_in"),
+                retry_after,
+            );
             let mut response = render_sign_in(
                 &pages,
                 &request,
@@ -338,7 +340,13 @@ async fn create_session(pages: Arc<Pages>, request: Request) -> Response {
             &pages,
             &request,
             values,
-            Some(INVALID_CREDENTIALS.to_owned()),
+            Some(
+                pages
+                    .site
+                    .i18n(&request)
+                    .t("sessions.invalid_credentials")
+                    .text(),
+            ),
             false,
             StatusCode::UNPROCESSABLE_ENTITY,
         );
@@ -393,7 +401,8 @@ async fn create_session(pages: Arc<Pages>, request: Request) -> Response {
     } else {
         values.return_to.as_str()
     };
-    let mut response = redirect(target, Flash::new().with_notice("Signed in."));
+    let notice = pages.site.i18n(&request).t("sessions.signed_in").text();
+    let mut response = redirect(target, Flash::new().with_notice(notice));
     set_cookie(&mut response, &session_set_cookie(&issued.secrets.bearer));
     // The form CSRF cookie now holds the new session's CSRF token, so pages
     // render it and the session-bound check (ADR 0014) agrees.
@@ -444,7 +453,8 @@ async fn destroy_session(pages: Arc<Pages>, request: Request) -> Response {
         }
         Err(_) => {}
     }
-    signed_out(SIGN_IN_PATH, Flash::new().with_notice("Signed out."))
+    let notice = pages.site.i18n(&request).t("sessions.signed_out").text();
+    signed_out(SIGN_IN_PATH, Flash::new().with_notice(notice))
 }
 
 async fn new_password(pages: Arc<Pages>, request: Request) -> Response {
@@ -491,7 +501,8 @@ async fn request_password_reset(pages: Arc<Pages>, request: Request) -> Response
     match pages.ports.reset_throttle.attempt(&key).await {
         Ok(ThrottleDecision::Allowed) => {}
         Ok(ThrottleDecision::Throttled { retry_after }) => {
-            let message = too_many_attempts("reset", retry_after);
+            let message =
+                too_many_attempts(pages.site.i18n(&request).t("throttled.reset"), retry_after);
             let mut response = render_password_new(
                 &pages,
                 &request,
@@ -524,7 +535,12 @@ async fn request_password_reset(pages: Arc<Pages>, request: Request) -> Response
             );
         }
     }
-    redirect(SIGN_IN_PATH, Flash::new().with_notice(RESET_REQUESTED))
+    let notice = pages
+        .site
+        .i18n(&request)
+        .t("passwords.reset_requested")
+        .text();
+    redirect(SIGN_IN_PATH, Flash::new().with_notice(notice))
 }
 
 /// The background worker's step: issues and delivers a reset link when the
@@ -611,7 +627,7 @@ async fn edit_password(pages: Arc<Pages>, request: Request) -> Response {
     else {
         return reset_page(redirect(
             NEW_PASSWORD_PATH,
-            Flash::new().with_alert(RESET_INVALID),
+            Flash::new().with_alert(invalid_link(&pages, &request)),
         ));
     };
     render_password_edit(
@@ -637,7 +653,7 @@ async fn update_password(pages: Arc<Pages>, request: Request) -> Response {
     let Ok(token) = PasswordResetToken::new(form.token) else {
         return reset_page(redirect(
             NEW_PASSWORD_PATH,
-            Flash::new().with_alert(RESET_INVALID),
+            Flash::new().with_alert(invalid_link(&pages, &request)),
         ));
     };
     let ports = &pages.ports;
@@ -645,7 +661,8 @@ async fn update_password(pages: Arc<Pages>, request: Request) -> Response {
     match ports.reset_throttle.attempt(&key).await {
         Ok(ThrottleDecision::Allowed) => {}
         Ok(ThrottleDecision::Throttled { retry_after }) => {
-            let message = too_many_attempts("reset", retry_after);
+            let message =
+                too_many_attempts(pages.site.i18n(&request).t("throttled.reset"), retry_after);
             let mut response = render_password_edit(
                 &pages,
                 &request,
@@ -666,7 +683,7 @@ async fn update_password(pages: Arc<Pages>, request: Request) -> Response {
         Ok(false) => {
             return reset_page(redirect(
                 NEW_PASSWORD_PATH,
-                Flash::new().with_alert(RESET_INVALID),
+                Flash::new().with_alert(invalid_link(&pages, &request)),
             ));
         }
         Err(error) => {
@@ -681,12 +698,25 @@ async fn update_password(pages: Arc<Pages>, request: Request) -> Response {
     let password = match NewPassword::new(form.password.as_str()) {
         Ok(password) => Some(password),
         Err(violation) => {
-            errors.add("password", violation.to_string());
+            let i18n = pages.site.i18n(&request);
+            let message = match violation {
+                PasswordPolicyError::TooShort => i18n
+                    .t("passwords.errors.too_short")
+                    .count(MIN_PASSWORD_CHARS)
+                    .text(),
+                _ => i18n.t("passwords.errors.invalid").text(),
+            };
+            errors.add("password", message);
             None
         }
     };
     if form.password_confirmation != form.password {
-        errors.add("password_confirmation", "does not match the password");
+        let message = pages
+            .site
+            .i18n(&request)
+            .t("passwords.errors.mismatch")
+            .text();
+        errors.add("password_confirmation", message);
     }
     let Some(password) = password.filter(|_| errors.is_empty()) else {
         return render_password_edit(
@@ -716,13 +746,12 @@ async fn update_password(pages: Arc<Pages>, request: Request) -> Response {
             .await;
             reset_page(signed_out(
                 SIGN_IN_PATH,
-                Flash::new()
-                    .with_notice("Your password was changed. Sign in with the new password."),
+                Flash::new().with_notice(pages.site.i18n(&request).t("passwords.changed").text()),
             ))
         }
         Ok(None) => reset_page(redirect(
             NEW_PASSWORD_PATH,
-            Flash::new().with_alert(RESET_INVALID),
+            Flash::new().with_alert(invalid_link(&pages, &request)),
         )),
         Err(error) => reset_page(unavailable_because(
             "password_reset_store_unavailable",
@@ -817,7 +846,7 @@ fn render_sign_in(
     let mut response = forge::web::html_with_status(
         status,
         &SessionNew {
-            layout: pages.site.layout(request, "Sign in"),
+            layout: pages.site.layout(request),
             csrf_field: csrf_field_for(request),
             tenant: values.tenant,
             email: values.email,
@@ -841,7 +870,7 @@ fn render_password_new(
     forge::web::html_with_status(
         status,
         &PasswordNew {
-            layout: pages.site.layout(request, "Forgot your password?"),
+            layout: pages.site.layout(request),
             csrf_field: csrf_field_for(request),
             tenant,
             email,
@@ -861,7 +890,7 @@ fn render_password_edit(
     reset_page(forge::web::html_with_status(
         status,
         &PasswordEdit {
-            layout: pages.site.layout(request, "Choose a new password"),
+            layout: pages.site.layout(request),
             csrf_field: csrf_field_for(request),
             token: token.expose().to_owned(),
             error,
@@ -898,13 +927,16 @@ fn now() -> Option<UnixTimestamp> {
         .map(|elapsed| UnixTimestamp::from_secs(elapsed.as_secs()))
 }
 
-fn too_many_attempts(what: &str, retry_after: Duration) -> String {
-    let minutes = retry_after.as_secs().div_ceil(60);
-    if minutes <= 1 {
-        format!("Too many {what} attempts. Try again in a minute.")
-    } else {
-        format!("Too many {what} attempts. Try again in {minutes} minutes.")
-    }
+/// The throttling message `message` (a `throttled.*` key, plural by
+/// minutes) for a wait of `retry_after`.
+fn too_many_attempts(message: Translation<'_>, retry_after: Duration) -> String {
+    let minutes = retry_after.as_secs().div_ceil(60).max(1);
+    message.count(minutes).text()
+}
+
+/// The answer to a reset link that is unknown, used or expired.
+fn invalid_link(pages: &Pages, request: &Request) -> String {
+    pages.site.i18n(request).t("passwords.invalid_link").text()
 }
 
 fn set_retry_after(response: &mut Response, retry_after: Duration) {

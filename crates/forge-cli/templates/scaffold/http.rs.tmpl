@@ -61,10 +61,8 @@ use crate::domain::entities::%%RESOURCE%%::{
     %%TYPE%%, %%TYPE%%Attributes, %%TYPE%%Id, %%TYPE%%ValidationErrors,
 };
 
-const STALE_UPDATE: &str = "This %%NOUN%% was changed by someone else after you opened the form. \
-     Review your changes and save again to overwrite.";
-const STALE_DELETE: &str =
-    "This %%NOUN%% was changed by someone else. Review it and delete it again.";
+// Page text and messages are the `%%RESOURCES%%.*` keys of
+// config/locales/%%RESOURCES%%.LOCALE.json.
 
 /// What every %%NOUN%% handler shares.
 struct %%TYPE%%Routes {
@@ -180,7 +178,7 @@ async fn index(state: Arc<%%TYPE%%Routes>, request: Request) -> Response {
     };
     match state.service.list(%%CONTEXT_ARG_REF%%query.after).await {
         Ok(page) => forge::web::html(&%%TYPE%%Index {
-            layout: state.site.layout(&request, "%%LABELS%%"),
+            layout: state.site.layout(&request),
             new_path: format!("{collection}/new"),
             rows: page
                 .%%RESOURCES%%
@@ -204,7 +202,7 @@ async fn show(state: Arc<%%TYPE%%Routes>, request: Request) -> Response {
     };
     match state.service.find(%%CONTEXT_ARG_REF%%id).await {
         Ok(%%RESOURCE%%) => forge::web::html(&%%TYPE%%Show {
-            layout: state.site.layout(&request, "%%LABEL%%"),
+            layout: state.site.layout(&request),
             csrf_field: csrf_field_for(&request),
             back_path: collection.clone(),
             version: %%RESOURCE%%.version().get(),
@@ -263,14 +261,26 @@ async fn create(state: Arc<%%TYPE%%Routes>, request: Request) -> Response {
             publish_created(&state, %%CONTEXT_ARG_REF%%&collection, &%%RESOURCE%%).await;
             redirect(
                 &format!("{collection}/{}", %%RESOURCE%%.id()),
-                Flash::new().with_notice("%%LABEL%% was successfully created."),
+                Flash::new().with_notice(
+                    state
+                        .site
+                        .i18n(&request)
+                        .t("%%RESOURCES%%.flash.created")
+                        .text(),
+                ),
             )
         }
 %%end%%
 %%if !broadcast%%
         Ok(%%RESOURCE%%) => redirect(
             &format!("{collection}/{}", %%RESOURCE%%.id()),
-            Flash::new().with_notice("%%LABEL%% was successfully created."),
+            Flash::new().with_notice(
+                    state
+                        .site
+                        .i18n(&request)
+                        .t("%%RESOURCES%%.flash.created")
+                        .text(),
+                ),
         ),
 %%end%%
         Err(%%TYPE%%Error::Invalid(violations)) => render_new(
@@ -318,7 +328,8 @@ async fn update(state: Arc<%%TYPE%%Routes>, request: Request) -> Response {
             Some(Ok(expected)) => (form, expected),
             _ => {
                 let mut errors = FieldErrors::new();
-                errors.add(BASE_FIELD, "The form has no valid version; reload the page.");
+                let message = state.site.i18n(&request).t("%%RESOURCES%%.form.no_version").text();
+                errors.add(BASE_FIELD, message);
                 return reload_edit(&state, &request, &collection, %%CONTEXT_ARG_REF%%id, errors).await;
             }
         },
@@ -352,14 +363,26 @@ async fn update(state: Arc<%%TYPE%%Routes>, request: Request) -> Response {
             publish_updated(&state, %%CONTEXT_ARG_REF%%&collection, &%%RESOURCE%%).await;
             redirect(
                 &format!("{collection}/{}", %%RESOURCE%%.id()),
-                Flash::new().with_notice("%%LABEL%% was successfully updated."),
+                Flash::new().with_notice(
+                    state
+                        .site
+                        .i18n(&request)
+                        .t("%%RESOURCES%%.flash.updated")
+                        .text(),
+                ),
             )
         }
 %%end%%
 %%if !broadcast%%
         Ok(%%RESOURCE%%) => redirect(
             &format!("{collection}/{}", %%RESOURCE%%.id()),
-            Flash::new().with_notice("%%LABEL%% was successfully updated."),
+            Flash::new().with_notice(
+                    state
+                        .site
+                        .i18n(&request)
+                        .t("%%RESOURCES%%.flash.updated")
+                        .text(),
+                ),
         ),
 %%end%%
         Err(%%TYPE%%Error::Invalid(violations)) => render_form_page(
@@ -377,7 +400,8 @@ async fn update(state: Arc<%%TYPE%%Routes>, request: Request) -> Response {
             match state.service.find(%%CONTEXT_ARG_REF%%id).await {
                 Ok(current) => {
                     let mut errors = FieldErrors::new();
-                    errors.add(BASE_FIELD, STALE_UPDATE);
+                    let message = state.site.i18n(&request).t("%%RESOURCES%%.edit.conflict").text();
+                    errors.add(BASE_FIELD, message);
                     let target = EditTarget {
                         id,
                         expected: current.version(),
@@ -411,7 +435,7 @@ async fn destroy(state: Arc<%%TYPE%%Routes>, request: Request) -> Response {
         .ok()
         .and_then(|form| Version::new(form.version).ok());
     let Some(expected) = expected else {
-        let alert = "The delete form has no valid version; reload the page.";
+        let alert = state.site.i18n(&request).t("%%RESOURCES%%.flash.no_version").text();
         return redirect(&member, Flash::new().with_alert(alert));
     };
     match state.service.delete(%%CONTEXT_ARG_REF%%id, expected).await {
@@ -420,17 +444,32 @@ async fn destroy(state: Arc<%%TYPE%%Routes>, request: Request) -> Response {
             publish_deleted(&state, %%CONTEXT_ARG_REF%%id).await;
             redirect(
                 &collection,
-                Flash::new().with_notice("%%LABEL%% was successfully deleted."),
+                Flash::new().with_notice(
+                    state
+                        .site
+                        .i18n(&request)
+                        .t("%%RESOURCES%%.flash.deleted")
+                        .text(),
+                ),
             )
         }
 %%end%%
 %%if !broadcast%%
         Ok(()) => redirect(
             &collection,
-            Flash::new().with_notice("%%LABEL%% was successfully deleted."),
+            Flash::new().with_notice(
+                    state
+                        .site
+                        .i18n(&request)
+                        .t("%%RESOURCES%%.flash.deleted")
+                        .text(),
+                ),
         ),
 %%end%%
-        Err(%%TYPE%%Error::Conflict) => redirect(&member, Flash::new().with_alert(STALE_DELETE)),
+        Err(%%TYPE%%Error::Conflict) => {
+            let alert = state.site.i18n(&request).t("%%RESOURCES%%.flash.stale").text();
+            redirect(&member, Flash::new().with_alert(alert))
+        }
         Err(error) => failure(&state, &request, &collection, error),
     }
 }
@@ -494,12 +533,12 @@ fn render_new(
     forge::web::html_with_status(
         status,
         &%%TYPE%%New {
-            layout: state.site.layout(request, "New %%NOUN%%"),
+            layout: state.site.layout(request),
             csrf_field: csrf_field_for(request),
             action: collection.to_owned(),
             method: None,
             version: None,
-            submit: "Create %%NOUN%%",
+            submit: state.site.i18n(request).t("%%RESOURCES%%.form.create").text(),
             back_path: collection.to_owned(),
             form,
             errors,
@@ -536,12 +575,12 @@ fn render_form_page(
     forge::web::html_with_status(
         status,
         &%%TYPE%%Edit {
-            layout: state.site.layout(request, "Editing %%NOUN%%"),
+            layout: state.site.layout(request),
             csrf_field: csrf_field_for(request),
             action: show_path.clone(),
             method: Some("patch"),
             version: Some(target.expected.get()),
-            submit: "Update %%NOUN%%",
+            submit: state.site.i18n(request).t("%%RESOURCES%%.form.update").text(),
             back_path: collection.to_owned(),
             show_path,
             form,
@@ -579,7 +618,7 @@ fn not_found(state: &%%TYPE%%Routes, request: &Request, collection: &str) -> Res
     forge::web::html_with_status(
         StatusCode::NOT_FOUND,
         &%%TYPE%%NotFound {
-            layout: state.site.layout(request, "%%LABEL%% not found"),
+            layout: state.site.layout(request),
             back_path: collection.to_owned(),
         },
     )
@@ -672,6 +711,7 @@ fn channel() -> Option<Channel> {
 /// first) and removes the "no %%NOUNS%% yet" row.
 async fn publish_created(state: &%%TYPE%%Routes, %%CONTEXT_PARAM%%collection: &str, %%RESOURCE%%: &%%TYPE%%) {
     let item = row(collection, %%RESOURCE%%);
+    let i18n = state.site.default_i18n();
     state
         .streams
         .publish(channel(%%CONTEXT_NAME%%), || {
@@ -680,7 +720,7 @@ async fn publish_created(state: &%%TYPE%%Routes, %%CONTEXT_PARAM%%collection: &s
                 TurboStreamAction::from_view(
                     StreamAction::Append,
                     forge::views::DomId::new("%%RESOURCES%%")?,
-                    &%%TYPE%%RowFragment { row: item },
+                    &%%TYPE%%RowFragment { row: item, i18n },
                 )?,
             ])
         })
@@ -691,13 +731,14 @@ async fn publish_created(state: &%%TYPE%%Routes, %%CONTEXT_PARAM%%collection: &s
 async fn publish_updated(state: &%%TYPE%%Routes, %%CONTEXT_PARAM%%collection: &str, %%RESOURCE%%: &%%TYPE%%) {
     let item = row(collection, %%RESOURCE%%);
     let id = %%RESOURCE%%.id();
+    let i18n = state.site.default_i18n();
     state
         .streams
         .publish(channel(%%CONTEXT_NAME%%), || {
             Ok(vec![TurboStreamAction::from_view(
                 StreamAction::Replace,
                 dom_id(id, "%%RESOURCE%%")?,
-                &%%TYPE%%RowFragment { row: item },
+                &%%TYPE%%RowFragment { row: item, i18n },
             )?])
         })
         .await;

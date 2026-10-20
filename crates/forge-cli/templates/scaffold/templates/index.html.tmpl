@@ -1,43 +1,46 @@
 {% extends "layouts/application.html" %}
 
+{% block title %}{{ layout.i18n.t("%%RESOURCES%%.index.title") }}{% endblock %}
+
 {% block content %}
-<h1>%%LABELS%%</h1>
+<h1>{{ layout.i18n.t("%%RESOURCES%%.index.title") }}</h1>
 %%if broadcast%%
 {% if let Some(stream_source) = stream_source %}{{ stream_source|safe }}{% endif %}
-<p><a href="{{ new_path }}">New %%NOUN%%</a></p>
+<p><a href="{{ new_path }}">{{ layout.i18n.t("%%RESOURCES%%.index.new") }}</a></p>
 <table>
   <thead>
     <tr>
 %%INDEX_HEADERS%%
-      <th scope="col">Actions</th>
+      <th scope="col">{{ layout.i18n.t("%%RESOURCES%%.index.actions") }}</th>
     </tr>
   </thead>
   <tbody id="%%RESOURCES%%">
+    {% let i18n = layout.i18n.clone() %}
     {% for row in rows %}
     {% include "%%RESOURCES%%/_row.html" %}
     {% else %}
-    <tr id="%%RESOURCES%%_empty"><td>No %%NOUNS%% yet.</td></tr>
+    <tr id="%%RESOURCES%%_empty"><td>{{ layout.i18n.t("%%RESOURCES%%.index.empty") }}</td></tr>
     {% endfor %}
   </tbody>
 </table>
 %%end%%
 %%if !broadcast%%
-<p><a href="{{ new_path }}">New %%NOUN%%</a></p>
+<p><a href="{{ new_path }}">{{ layout.i18n.t("%%RESOURCES%%.index.new") }}</a></p>
 {% if rows.is_empty() %}
-<p>No %%NOUNS%% yet.</p>
+<p>{{ layout.i18n.t("%%RESOURCES%%.index.empty") }}</p>
 {% else %}
 <table>
   <thead>
     <tr>
 %%INDEX_HEADERS%%
-      <th scope="col">Actions</th>
+      <th scope="col">{{ layout.i18n.t("%%RESOURCES%%.index.actions") }}</th>
     </tr>
   </thead>
   <tbody>
     {% for row in rows %}
     <tr>
 %%INDEX_CELLS%%
-      <td><a href="{{ row.show_path }}">Show</a> <a href="{{ row.edit_path }}">Edit</a></td>
+      <td><a href="{{ row.show_path }}">{{ layout.i18n.t("%%RESOURCES%%.index.show") }}</a> <a href="{{ row.edit_path }}">{{ layout.i18n.t("%%RESOURCES%%.index.edit") }}</a></td>
     </tr>
     {% endfor %}
   </tbody>
@@ -45,6 +48,6 @@
 {% endif %}
 %%end%%
 {% if let Some(next_path) = next_path %}
-<p><a href="{{ next_path }}">Next page</a></p>
+<p><a href="{{ next_path }}">{{ layout.i18n.t("%%RESOURCES%%.index.next_page") }}</a></p>
 {% endif %}
 {% endblock %}

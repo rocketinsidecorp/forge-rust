@@ -1,18 +1,20 @@
 {% extends "layouts/application.html" %}
 
+{% block title %}{{ layout.i18n.t("posts.index.title") }}{% endblock %}
+
 {% block content %}
-<h1>Posts</h1>
-<p><a href="{{ new_path }}">New post</a></p>
+<h1>{{ layout.i18n.t("posts.index.title") }}</h1>
+<p><a href="{{ new_path }}">{{ layout.i18n.t("posts.index.new") }}</a></p>
 {% if rows.is_empty() %}
-<p>No posts yet.</p>
+<p>{{ layout.i18n.t("posts.index.empty") }}</p>
 {% else %}
 <table>
   <thead>
     <tr>
-      <th scope="col">Title</th>
-      <th scope="col">Body</th>
-      <th scope="col">Published</th>
-      <th scope="col">Actions</th>
+      <th scope="col">{{ layout.i18n.t("posts.fields.title") }}</th>
+      <th scope="col">{{ layout.i18n.t("posts.fields.body") }}</th>
+      <th scope="col">{{ layout.i18n.t("posts.fields.published") }}</th>
+      <th scope="col">{{ layout.i18n.t("posts.index.actions") }}</th>
     </tr>
   </thead>
   <tbody>
@@ -21,13 +23,13 @@
       <td>{{ row.title }}</td>
       <td>{{ row.body }}</td>
       <td>{{ row.published }}</td>
-      <td><a href="{{ row.show_path }}">Show</a> <a href="{{ row.edit_path }}">Edit</a></td>
+      <td><a href="{{ row.show_path }}">{{ layout.i18n.t("posts.index.show") }}</a> <a href="{{ row.edit_path }}">{{ layout.i18n.t("posts.index.edit") }}</a></td>
     </tr>
     {% endfor %}
   </tbody>
 </table>
 {% endif %}
 {% if let Some(next_path) = next_path %}
-<p><a href="{{ next_path }}">Next page</a></p>
+<p><a href="{{ next_path }}">{{ layout.i18n.t("posts.index.next_page") }}</a></p>
 {% endif %}
 {% endblock %}

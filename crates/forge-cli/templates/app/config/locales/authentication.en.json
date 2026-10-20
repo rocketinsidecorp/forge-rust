@@ -1,0 +1,54 @@
+{
+  "en": {
+    "sessions": {
+      "new": {
+        "title": "Sign in",
+        "organization": "Organization",
+        "organization_hint_html": "The short name of your organization, such as <code>acme</code>.",
+        "email": "Email",
+        "password": "Password",
+        "submit": "Sign in",
+        "forgot_password": "Forgot your password?",
+        "already_signed_in": "You are signed in. Sign in again to switch accounts, or sign out."
+      },
+      "sign_out": "Sign out",
+      "signed_in": "Signed in.",
+      "signed_out": "Signed out.",
+      "invalid_credentials": "That organization, email and password do not match an account."
+    },
+    "passwords": {
+      "new": {
+        "title": "Forgot your password?",
+        "instructions": "Enter your organization and email. If they match an account, we send a link to choose a new password.",
+        "organization": "Organization",
+        "email": "Email",
+        "submit": "Email me a reset link",
+        "back": "Back to sign in"
+      },
+      "edit": {
+        "title": "Choose a new password",
+        "password": "New password",
+        "password_confirmation": "Confirm the new password",
+        "submit": "Change password"
+      },
+      "reset_requested": "If that account exists, we sent password reset instructions to its email address.",
+      "invalid_link": "That reset link is invalid or has expired. Request a new one.",
+      "changed": "Your password was changed. Sign in with the new password.",
+      "errors": {
+        "too_short": "New password must be at least %{count} characters",
+        "mismatch": "Confirmation does not match the password",
+        "invalid": "New password is not a valid password"
+      }
+    },
+    "throttled": {
+      "sign_in": {
+        "one": "Too many sign-in attempts. Try again in a minute.",
+        "other": "Too many sign-in attempts. Try again in %{count} minutes."
+      },
+      "reset": {
+        "one": "Too many reset attempts. Try again in a minute.",
+        "other": "Too many reset attempts. Try again in %{count} minutes."
+      }
+    }
+  }
+}

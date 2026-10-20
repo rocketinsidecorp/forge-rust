@@ -45,9 +45,8 @@ use crate::application::use_cases::posts::{
 };
 use crate::domain::entities::post::{Post, PostAttributes, PostId, PostValidationErrors};
 
-const STALE_UPDATE: &str = "This post was changed by someone else after you opened the form. \
-     Review your changes and save again to overwrite.";
-const STALE_DELETE: &str = "This post was changed by someone else. Review it and delete it again.";
+// Page text and messages are the `posts.*` keys of
+// config/locales/posts.LOCALE.json.
 
 /// What every post handler shares.
 struct PostRoutes {
@@ -163,7 +162,7 @@ async fn index(state: Arc<PostRoutes>, request: Request) -> Response {
     };
     match state.service.list(query.after).await {
         Ok(page) => forge::web::html(&PostIndex {
-            layout: state.site.layout(&request, "Posts"),
+            layout: state.site.layout(&request),
             new_path: format!("{collection}/new"),
             rows: page
                 .posts
@@ -187,7 +186,7 @@ async fn show(state: Arc<PostRoutes>, request: Request) -> Response {
     };
     match state.service.find(id).await {
         Ok(post) => forge::web::html(&PostShow {
-            layout: state.site.layout(&request, "Post"),
+            layout: state.site.layout(&request),
             csrf_field: csrf_field_for(&request),
             back_path: collection.clone(),
             version: post.version().get(),
@@ -249,7 +248,7 @@ async fn create(state: Arc<PostRoutes>, request: Request) -> Response {
             publish_created(&state, &collection, &post).await;
             redirect(
                 &format!("{collection}/{}", post.id()),
-                Flash::new().with_notice("Post was successfully created."),
+                Flash::new().with_notice(state.site.i18n(&request).t("posts.flash.created").text()),
             )
         }
         Err(PostError::Invalid(violations)) => render_new(
@@ -301,10 +300,8 @@ async fn update(state: Arc<PostRoutes>, request: Request) -> Response {
             Some(Ok(expected)) => (form, expected),
             _ => {
                 let mut errors = FieldErrors::new();
-                errors.add(
-                    BASE_FIELD,
-                    "The form has no valid version; reload the page.",
-                );
+                let message = state.site.i18n(&request).t("posts.form.no_version").text();
+                errors.add(BASE_FIELD, message);
                 return reload_edit(&state, &request, &collection, id, errors).await;
             }
         },
@@ -333,7 +330,7 @@ async fn update(state: Arc<PostRoutes>, request: Request) -> Response {
             publish_updated(&state, &collection, &post).await;
             redirect(
                 &format!("{collection}/{}", post.id()),
-                Flash::new().with_notice("Post was successfully updated."),
+                Flash::new().with_notice(state.site.i18n(&request).t("posts.flash.updated").text()),
             )
         }
         Err(PostError::Invalid(violations)) => render_form_page(
@@ -351,7 +348,8 @@ async fn update(state: Arc<PostRoutes>, request: Request) -> Response {
             match state.service.find(id).await {
                 Ok(current) => {
                     let mut errors = FieldErrors::new();
-                    errors.add(BASE_FIELD, STALE_UPDATE);
+                    let message = state.site.i18n(&request).t("posts.edit.conflict").text();
+                    errors.add(BASE_FIELD, message);
                     let target = EditTarget {
                         id,
                         expected: current.version(),
@@ -387,7 +385,7 @@ async fn destroy(state: Arc<PostRoutes>, request: Request) -> Response {
         .ok()
         .and_then(|form| Version::new(form.version).ok());
     let Some(expected) = expected else {
-        let alert = "The delete form has no valid version; reload the page.";
+        let alert = state.site.i18n(&request).t("posts.flash.no_version").text();
         return redirect(&member, Flash::new().with_alert(alert));
     };
     match state.service.delete(id, expected).await {
@@ -395,10 +393,13 @@ async fn destroy(state: Arc<PostRoutes>, request: Request) -> Response {
             publish_deleted(&state, id).await;
             redirect(
                 &collection,
-                Flash::new().with_notice("Post was successfully deleted."),
+                Flash::new().with_notice(state.site.i18n(&request).t("posts.flash.deleted").text()),
             )
         }
-        Err(PostError::Conflict) => redirect(&member, Flash::new().with_alert(STALE_DELETE)),
+        Err(PostError::Conflict) => {
+            let alert = state.site.i18n(&request).t("posts.flash.stale").text();
+            redirect(&member, Flash::new().with_alert(alert))
+        }
         Err(error) => failure(&state, &request, &collection, error),
     }
 }
@@ -468,12 +469,12 @@ fn render_new(
     forge::web::html_with_status(
         status,
         &PostNew {
-            layout: state.site.layout(request, "New post"),
+            layout: state.site.layout(request),
             csrf_field: csrf_field_for(request),
             action: collection.to_owned(),
             method: None,
             version: None,
-            submit: "Create post",
+            submit: state.site.i18n(request).t("posts.form.create").text(),
             back_path: collection.to_owned(),
             form,
             errors,
@@ -510,12 +511,12 @@ fn render_form_page(
     forge::web::html_with_status(
         status,
         &PostEdit {
-            layout: state.site.layout(request, "Editing post"),
+            layout: state.site.layout(request),
             csrf_field: csrf_field_for(request),
             action: show_path.clone(),
             method: Some("patch"),
             version: Some(target.expected.get()),
-            submit: "Update post",
+            submit: state.site.i18n(request).t("posts.form.update").text(),
             back_path: collection.to_owned(),
             show_path,
             form,
@@ -550,7 +551,7 @@ fn not_found(state: &PostRoutes, request: &Request, collection: &str) -> Respons
     forge::web::html_with_status(
         StatusCode::NOT_FOUND,
         &PostNotFound {
-            layout: state.site.layout(request, "Post not found"),
+            layout: state.site.layout(request),
             back_path: collection.to_owned(),
         },
     )
@@ -624,6 +625,7 @@ fn channel() -> Option<Channel> {
 /// first) and removes the "no posts yet" row.
 async fn publish_created(state: &PostRoutes, collection: &str, post: &Post) {
     let item = row(collection, post);
+    let i18n = state.site.default_i18n();
     state
         .streams
         .publish(channel(), || {
@@ -632,7 +634,7 @@ async fn publish_created(state: &PostRoutes, collection: &str, post: &Post) {
                 TurboStreamAction::from_view(
                     StreamAction::Append,
                     forge::views::DomId::new("posts")?,
-                    &PostRowFragment { row: item },
+                    &PostRowFragment { row: item, i18n },
                 )?,
             ])
         })
@@ -643,13 +645,14 @@ async fn publish_created(state: &PostRoutes, collection: &str, post: &Post) {
 async fn publish_updated(state: &PostRoutes, collection: &str, post: &Post) {
     let item = row(collection, post);
     let id = post.id();
+    let i18n = state.site.default_i18n();
     state
         .streams
         .publish(channel(), || {
             Ok(vec![TurboStreamAction::from_view(
                 StreamAction::Replace,
                 dom_id(id, "post")?,
-                &PostRowFragment { row: item },
+                &PostRowFragment { row: item, i18n },
             )?])
         })
         .await;

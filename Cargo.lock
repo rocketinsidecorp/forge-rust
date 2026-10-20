@@ -624,6 +624,7 @@ dependencies = [
  "clap",
  "forge-config",
  "forge-db",
+ "forge-i18n",
  "rustix",
  "serde_json",
  "tempfile",

@@ -127,6 +127,89 @@ impl Database {
     }
 }
 
+/// The default locale of a full-stack application, `forge new --locale`
+/// (ADR 0037): Forge ships the text of the generated pages in these.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum Locale {
+    /// English (default).
+    #[default]
+    #[value(name = "en")]
+    En,
+    /// Spanish.
+    #[value(name = "es")]
+    Es,
+    /// Brazilian Portuguese.
+    #[value(name = "pt-BR")]
+    PtBr,
+}
+
+impl Locale {
+    /// The canonical locale name, as in `config/locales/LOCALE.json`.
+    pub(crate) fn tag(self) -> &'static str {
+        match self {
+            Self::En => "en",
+            Self::Es => "es",
+            Self::PtBr => "pt-BR",
+        }
+    }
+}
+
+/// A translation file `forge new` writes byte for byte into
+/// `config/locales` (not rendered: `%{name}` placeholders are runtime
+/// interpolation).
+struct LocaleFile {
+    /// `None` for `LOCALE.json`, `Some(scope)` for `SCOPE.LOCALE.json`.
+    scope: Option<&'static str>,
+    locale: Locale,
+    content: &'static str,
+}
+
+macro_rules! locale_file {
+    ($scope:expr, $locale:expr, $file:literal) => {
+        LocaleFile {
+            scope: $scope,
+            locale: $locale,
+            content: include_str!(concat!("../templates/app/config/locales/", $file)),
+        }
+    };
+}
+
+/// The layout and welcome page (`LOCALE.json`, with the number and date
+/// formats) and the sign-in pages (`authentication.LOCALE.json`), in every
+/// locale `--locale` accepts.
+const LOCALE_FILES: &[LocaleFile] = &[
+    locale_file!(None, Locale::En, "en.json"),
+    locale_file!(None, Locale::Es, "es.json"),
+    locale_file!(None, Locale::PtBr, "pt-BR.json"),
+    locale_file!(Some("authentication"), Locale::En, "authentication.en.json"),
+    locale_file!(Some("authentication"), Locale::Es, "authentication.es.json"),
+    locale_file!(
+        Some("authentication"),
+        Locale::PtBr,
+        "authentication.pt-BR.json"
+    ),
+];
+
+/// The directory of an application's translation files.
+pub(crate) const LOCALES_DIRECTORY: &str = "config/locales";
+
+/// The path and content of the `scope` translations (`None` for the layout
+/// and welcome page) in `locale`.
+pub(crate) fn locale_file(scope: Option<&str>, locale: Locale) -> (String, &'static str) {
+    let content = LOCALE_FILES
+        .iter()
+        .find(|file| file.scope == scope && file.locale == locale)
+        .map_or("", |file| file.content);
+    let name = match scope {
+        Some(scope) => format!("{scope}.{}.json", locale.tag()),
+        None => format!("{}.json", locale.tag()),
+    };
+    (format!("{LOCALES_DIRECTORY}/{name}"), content)
+}
+
+/// The locales `--locale` accepts.
+pub(crate) const LOCALES: [Locale; 3] = [Locale::En, Locale::Es, Locale::PtBr];
+
 /// Options accepted by `forge new`.
 #[derive(Debug, Clone)]
 pub(crate) struct NewApplication {
@@ -137,6 +220,8 @@ pub(crate) struct NewApplication {
     /// Full-stack (server-rendered views, ADR 0022); `false` with `--api`.
     pub(crate) views: bool,
     pub(crate) forge: ForgeSource,
+    /// The default locale of a full-stack application.
+    pub(crate) locale: Locale,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -208,6 +293,10 @@ const TEMPLATES: &[Template] = &[
     template!(
         Group::Views,
         "src/adapters/http/views/welcome.rs" => "src/adapters/http/views/welcome.rs.tmpl"
+    ),
+    template!(
+        Group::Views,
+        "src/adapters/http/views/locales.rs" => "src/adapters/http/views/locales.rs.tmpl"
     ),
     template!(
         Group::Views,
@@ -765,6 +854,7 @@ fn write_application(
             forge_views_dependency.as_str(),
         ),
         ("%%DATABASE_NAME%%", database_name.as_str()),
+        ("%%DEFAULT_LOCALE%%", options.locale.tag()),
         ("%%DATABASE_DRIVER%%", options.database.driver()),
         ("%%DATABASE_LABEL%%", options.database.label()),
         (
@@ -818,6 +908,23 @@ fn write_application(
     for file in BINARY_FILES {
         if enabled(file.group) {
             write_file(&root.join(file.path), file.content)?;
+        }
+    }
+    // English, which every scaffold writes, and the default locale.
+    if options.views {
+        let mut locales = vec![Locale::En];
+        if options.locale != Locale::En {
+            locales.push(options.locale);
+        }
+        let mut scopes = vec![None];
+        if enabled(Group::Authentication) {
+            scopes.push(Some("authentication"));
+        }
+        for scope in scopes {
+            for locale in &locales {
+                let (path, content) = locale_file(scope, *locale);
+                write_file(&root.join(path), content)?;
+            }
         }
     }
 
@@ -1070,6 +1177,7 @@ mod tests {
             database: Database::Postgresql,
             views: true,
             forge: ForgeSource::GitTag,
+            locale: Locale::En,
         }
     }
 
@@ -1798,6 +1906,12 @@ mod tests {
 
             let build = read(&root, "build.rs");
             assert!(build.contains("embed_assets_with_crate_path(\"assets\", \"forge::views\")"));
+            assert!(build.contains("embed_locales(\"config/locales\")"));
+            assert!(root.join("config/locales/en.json").is_file());
+            assert!(
+                read(&root, "src/adapters/http/views/locales.rs")
+                    .contains("pub const DEFAULT_LOCALE: &str = \"en\";")
+            );
             assert_eq!(
                 build.contains("rerun-if-changed=migrations"),
                 database.is_enabled()
@@ -1806,7 +1920,7 @@ mod tests {
             let bootstrap = read(&root, "src/bootstrap/mod.rs");
             assert!(bootstrap.contains(".compose(compose)"));
             assert!(bootstrap.contains(
-                "let site = crate::adapters::http::site(composition.router())?;\n    \
+                "let site = crate::adapters::http::site(composition.router(), translator)?;\n    \
                  crate::adapters::http::routes(composition.router(), &site)?;"
             ));
             assert!(!bootstrap.contains(".routes("));
@@ -1919,6 +2033,82 @@ mod tests {
 
             assert!(matches!(error, CliError::InvalidForgePath { .. }));
             assert!(!parent.path().join("sample-app").exists());
+        }
+    }
+
+    #[test]
+    fn locale_selects_the_default_locale_and_its_translation_files() {
+        for (locale, extra) in [
+            (Locale::En, None),
+            (Locale::Es, Some("es")),
+            (Locale::PtBr, Some("pt-BR")),
+        ] {
+            let parent = tempfile::tempdir().expect("temporary directory should be available");
+            let options = NewApplication {
+                docker: false,
+                ci: false,
+                locale,
+                ..options("shop")
+            };
+            let root = create_application(parent.path(), &options).expect("generation");
+            let module = read(&root, "src/adapters/http/views/locales.rs");
+            assert!(
+                module.contains(&format!(
+                    "pub const DEFAULT_LOCALE: &str = \"{}\";",
+                    locale.tag()
+                )),
+                "{module}"
+            );
+            let mut files: Vec<String> = fs::read_dir(root.join(LOCALES_DIRECTORY))
+                .expect("config/locales")
+                .filter_map(Result::ok)
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .collect();
+            files.sort();
+            let mut expected = vec!["authentication.en.json".to_owned(), "en.json".to_owned()];
+            if let Some(tag) = extra {
+                expected.push(format!("authentication.{tag}.json"));
+                expected.push(format!("{tag}.json"));
+            }
+            expected.sort();
+            assert_eq!(files, expected, "{locale:?}");
+            // The files load, with the same keys in every locale.
+            let translator = forge_i18n::Translator::load_dir(
+                root.join(LOCALES_DIRECTORY),
+                forge_i18n::Options::new().default_locale(locale.tag()),
+            )
+            .expect("valid translations");
+            assert_eq!(translator.keys("en"), translator.keys(locale.tag()));
+        }
+    }
+
+    #[test]
+    fn shipped_translations_have_the_same_keys_and_plural_forms_in_every_locale() {
+        for scope in [None, Some("authentication")] {
+            let files: Vec<(String, &str)> = LOCALES
+                .into_iter()
+                .map(|locale| {
+                    let (path, content) = locale_file(scope, locale);
+                    let name = path.rsplit('/').next().unwrap_or_default().to_owned();
+                    (name, content)
+                })
+                .collect();
+            let translator = forge_i18n::Translator::from_files(&files, forge_i18n::Options::new())
+                .expect("valid translations");
+            for locale in LOCALES {
+                assert_eq!(
+                    translator.keys("en"),
+                    translator.keys(locale.tag()),
+                    "{scope:?} {locale:?}"
+                );
+                for key in translator.keys(locale.tag()) {
+                    if let Some(forms) = translator.plural_forms(locale.tag(), &key) {
+                        for needed in translator.plural_categories(locale.tag()) {
+                            assert!(forms.contains(&needed), "{locale:?} {key} {needed}");
+                        }
+                    }
+                }
+            }
         }
     }
 

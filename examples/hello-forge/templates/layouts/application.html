@@ -1,17 +1,19 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="{{ layout.i18n.locale() }}">
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>{{ layout.title }}</title>
+    <title>{% block title %}{% endblock %}</title>
+    {% block head %}{% endblock %}
     {% if let Some(csrf_meta) = layout.csrf_meta %}{{ csrf_meta|safe }}{% endif %}
     <link rel="stylesheet" href="{{ layout.stylesheet }}">
     {{ layout.import_map|safe }}
     <script type="module" src="{{ layout.javascript }}"></script>
   </head>
   <body>
+    <a class="skip-link" href="#main">{{ layout.i18n.t("layout.skip_to_content") }}</a>
     {% include "layouts/_flash.html" %}
-    <main>
+    <main id="main">
       {% block content %}{% endblock %}
     </main>
   </body>

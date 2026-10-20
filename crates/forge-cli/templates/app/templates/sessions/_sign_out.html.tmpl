@@ -1,5 +1,5 @@
 <form action="/session" method="post">
   {{ csrf_field|safe }}
   <input type="hidden" name="_method" value="delete">
-  <button type="submit">Sign out</button>
+  <button type="submit">{{ layout.i18n.t("sessions.sign_out") }}</button>
 </form>

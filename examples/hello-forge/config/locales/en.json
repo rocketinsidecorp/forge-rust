@@ -1,0 +1,93 @@
+{
+  "en": {
+    "layout": {
+      "skip_to_content": "Skip to content"
+    },
+    "welcome": {
+      "page_title": "Welcome to %{app} · Forge Rust",
+      "description": "A Rust service built with Forge Rust.",
+      "eyebrow": "Your service is running",
+      "title": "Welcome to %{app}",
+      "lede": "Your Rust service is ready. Replace this welcome page as you add the routes and capabilities your application needs.",
+      "sign_in": "Sign in",
+      "status": "View service status",
+      "documentation": "Forge documentation",
+      "health_endpoints": "Service health endpoints",
+      "logo_alt": "Forge Rust — Rust Framework",
+      "masthead": "Rust Framework",
+      "footer": "Forge Rust · Rust Framework",
+      "tagline": "Built to get you moving"
+    },
+    "number": {
+      "format": {
+        "separator": ".",
+        "delimiter": ",",
+        "precision": 2
+      }
+    },
+    "date": {
+      "formats": {
+        "default": "%Y-%m-%d",
+        "short": "%b %d",
+        "long": "%B %d, %Y"
+      },
+      "day_names": [
+        "Sunday",
+        "Monday",
+        "Tuesday",
+        "Wednesday",
+        "Thursday",
+        "Friday",
+        "Saturday"
+      ],
+      "abbr_day_names": [
+        "Sun",
+        "Mon",
+        "Tue",
+        "Wed",
+        "Thu",
+        "Fri",
+        "Sat"
+      ],
+      "month_names": [
+        null,
+        "January",
+        "February",
+        "March",
+        "April",
+        "May",
+        "June",
+        "July",
+        "August",
+        "September",
+        "October",
+        "November",
+        "December"
+      ],
+      "abbr_month_names": [
+        null,
+        "Jan",
+        "Feb",
+        "Mar",
+        "Apr",
+        "May",
+        "Jun",
+        "Jul",
+        "Aug",
+        "Sep",
+        "Oct",
+        "Nov",
+        "Dec"
+      ]
+    },
+    "time": {
+      "formats": {
+        "default": "%a, %d %b %Y %H:%M:%S %z",
+        "short": "%d %b %H:%M",
+        "long": "%B %d, %Y %H:%M"
+      },
+      "am": "am",
+      "pm": "pm"
+    }
+  }
+}

@@ -1,7 +1,9 @@
 {% extends "layouts/application.html" %}
 
+{% block title %}{{ layout.i18n.t("%%RESOURCES%%.not_found.title") }}{% endblock %}
+
 {% block content %}
-<h1>%%LABEL%% not found</h1>
-<p>The %%NOUN%% does not exist or was deleted.</p>
-<p><a href="{{ back_path }}">Back to %%NOUNS%%</a></p>
+<h1>{{ layout.i18n.t("%%RESOURCES%%.not_found.title") }}</h1>
+<p>{{ layout.i18n.t("%%RESOURCES%%.not_found.message") }}</p>
+<p><a href="{{ back_path }}">{{ layout.i18n.t("%%RESOURCES%%.back") }}</a></p>
 {% endblock %}

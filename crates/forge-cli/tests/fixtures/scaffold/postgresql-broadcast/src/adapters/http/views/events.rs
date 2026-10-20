@@ -1,9 +1,11 @@
 //! View models of the event pages in `templates/events/`. Values
 //! are prepared as text by `crate::adapters::http::events`; the
-//! templates only lay them out (escaped).
+//! templates only lay them out (escaped), with the text of
+//! `config/locales/events.LOCALE.json`.
 
 use askama::Template;
 use forge::views::FieldErrors;
+use forge::views::I18n;
 
 use super::Layout;
 
@@ -61,6 +63,8 @@ pub struct EventIndex<'a> {
 #[template(path = "events/_row.html")]
 pub struct EventRowFragment {
     pub row: EventRow,
+    /// The default locale: a live update reaches every subscriber.
+    pub i18n: I18n,
 }
 
 /// `templates/events/show.html`, with the delete form.
@@ -85,7 +89,8 @@ pub struct EventNew<'a> {
     pub method: Option<&'static str>,
     /// The optimistic-locking version the form was rendered with.
     pub version: Option<i64>,
-    pub submit: &'static str,
+    /// The submit button, translated.
+    pub submit: String,
     pub back_path: String,
     pub form: EventFormValues,
     pub errors: FieldErrors,
@@ -102,7 +107,8 @@ pub struct EventEdit<'a> {
     pub method: Option<&'static str>,
     /// The optimistic-locking version the form was rendered with.
     pub version: Option<i64>,
-    pub submit: &'static str,
+    /// The submit button, translated.
+    pub submit: String,
     pub back_path: String,
     pub show_path: String,
     pub form: EventFormValues,

@@ -3,26 +3,31 @@
 //! `{{ value }}` is HTML-escaped unless the template opts out with `|safe`.
 //!
 //! [`Site`] configures the asset pipeline (the counterpart of Rails'
-//! `config/importmap.rb` and stylesheet tags) and [`Layout`] is what every
-//! page hands to `templates/layouts/application.html`.
+//! `config/importmap.rb` and stylesheet tags) and the request's locale, and
+//! [`Layout`] is what every page hands to `templates/layouts/application.html`.
+//! Templates translate with `layout.i18n.t(KEY)` (see `locales`).
 
+pub mod locales;
 pub mod welcome;
 
 use std::error::Error;
+use std::sync::Arc;
 
 use forge::http::{Request, Router};
+use forge::i18n::Translator;
 use forge::views::{
-    AssetError, AssetSet, ContentSecurityPolicy, CsrfProtection, Flash, FlashLayer, ImportMap,
-    csrf_meta, csrf_token, flash, vendor,
+    AssetError, AssetSet, ContentSecurityPolicy, CsrfProtection, Flash, FlashLayer, I18n,
+    ImportMap, LocaleNegotiation, csrf_meta, csrf_token, flash, vendor,
 };
 
 // `FORGE_ASSETS`: every file under assets/, digested and embedded by build.rs.
 include!(concat!(env!("OUT_DIR"), "/forge_assets.rs"));
 
-/// Digested assets, the import map and the Content-Security-Policy shared by
-/// every page, built once at startup.
+/// Digested assets, the import map, the Content-Security-Policy and the
+/// translations shared by every page, built once at startup.
 #[derive(Debug)]
 pub struct Site {
+    translator: Arc<Translator>,
     assets: AssetSet,
     import_map: ImportMap,
     policy: ContentSecurityPolicy,
@@ -33,8 +38,9 @@ pub struct Site {
 
 impl Site {
     /// Validates the embedded assets (the application's and the vendored
-    /// Turbo and Stimulus modules) and pins the JavaScript modules.
-    pub fn load() -> Result<Self, Box<dyn Error + Send + Sync>> {
+    /// Turbo and Stimulus modules) and pins the JavaScript modules; pages
+    /// are translated with `translator` (`locales::translator`).
+    pub fn load(translator: Translator) -> Result<Self, Box<dyn Error + Send + Sync>> {
         let assets = AssetSet::from_tables(&[FORGE_ASSETS, vendor::HOTWIRE_ASSETS])?;
         // Bare specifiers that `import` statements in assets/*.js may use.
         let import_map = ImportMap::builder()
@@ -48,6 +54,7 @@ impl Site {
         let javascript = asset_path(&assets, "application.js")?;
         let logo = asset_path(&assets, "forge-rust-logo.png")?;
         Ok(Self {
+            translator: Arc::new(translator),
             assets,
             import_map,
             policy,
@@ -63,23 +70,41 @@ impl Site {
     }
 
     /// Registers one route per digested asset and the request layers, from
-    /// the outermost: the Content-Security-Policy on every response, CSRF
-    /// protection for every unsafe request (it also applies the `_method`
-    /// override of HTML forms before routing) and flash messages.
+    /// the outermost: the request's locale (the `locale` cookie, then
+    /// `Accept-Language`, then the default; translated responses get
+    /// `Content-Language`), the Content-Security-Policy on every response,
+    /// CSRF protection for every unsafe request (it also applies the
+    /// `_method` override of HTML forms before routing) and flash messages.
     pub fn register(&self, router: &mut Router) -> Result<(), AssetError> {
         self.assets.register(router)?;
         router
+            .layer(LocaleNegotiation::new(Arc::clone(&self.translator)))
             .layer(self.policy.clone())
             .layer(CsrfProtection::new())
             .layer(FlashLayer::new());
         Ok(())
     }
 
+    /// The request's locale and the translator (`i18n.t(KEY).text()` in
+    /// handlers). Without the locale layer, the default locale.
+    pub fn i18n(&self, request: &Request) -> I18n {
+        I18n::from_request(request).unwrap_or_else(|| self.default_i18n())
+    }
+
+    /// The default locale, for what is rendered without a request: live
+    /// updates reach every subscriber in it (as Rails' broadcasts do).
+    pub fn default_i18n(&self) -> I18n {
+        I18n::new(
+            Arc::clone(&self.translator),
+            self.translator.default_locale(),
+        )
+    }
+
     /// The layout data of a page rendered for `request`. Reading it consumes
     /// the flash and issues the CSRF token the page's forms carry.
-    pub fn layout<'a>(&'a self, request: &Request, title: &'a str) -> Layout<'a> {
+    pub fn layout(&self, request: &Request) -> Layout<'_> {
         Layout {
-            title,
+            i18n: self.i18n(request),
             csrf_meta: csrf_token(request).map(|token| csrf_meta(&token)),
             flash: flash(request),
             import_map: self.import_map.script_tag(),
@@ -96,10 +121,11 @@ fn asset_path(assets: &AssetSet, logical: &str) -> Result<String, Box<dyn Error 
     }
 }
 
-/// What `templates/layouts/application.html` renders around every page.
+/// What `templates/layouts/application.html` renders around every page;
+/// each page sets the document title in its `title` block.
 pub struct Layout<'a> {
-    /// The document title.
-    pub title: &'a str,
+    /// The request's locale: `t`, `l`, `number` and `locale` in templates.
+    pub i18n: I18n,
     /// `<meta name="csrf-token">` for Turbo and `fetch`. `None` only when
     /// CSRF protection is not installed, and then every form is refused.
     pub csrf_meta: Option<String>,

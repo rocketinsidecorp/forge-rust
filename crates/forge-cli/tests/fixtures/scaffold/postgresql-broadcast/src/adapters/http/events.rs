@@ -46,9 +46,8 @@ use crate::application::use_cases::events::{
 };
 use crate::domain::entities::event::{Event, EventAttributes, EventId, EventValidationErrors};
 
-const STALE_UPDATE: &str = "This event was changed by someone else after you opened the form. \
-     Review your changes and save again to overwrite.";
-const STALE_DELETE: &str = "This event was changed by someone else. Review it and delete it again.";
+// Page text and messages are the `events.*` keys of
+// config/locales/events.LOCALE.json.
 
 /// What every event handler shares.
 struct EventRoutes {
@@ -179,7 +178,7 @@ async fn index(state: Arc<EventRoutes>, request: Request) -> Response {
     };
     match state.service.list(&context, query.after).await {
         Ok(page) => forge::web::html(&EventIndex {
-            layout: state.site.layout(&request, "Events"),
+            layout: state.site.layout(&request),
             new_path: format!("{collection}/new"),
             rows: page
                 .events
@@ -204,7 +203,7 @@ async fn show(state: Arc<EventRoutes>, request: Request) -> Response {
     };
     match state.service.find(&context, id).await {
         Ok(event) => forge::web::html(&EventShow {
-            layout: state.site.layout(&request, "Event"),
+            layout: state.site.layout(&request),
             csrf_field: csrf_field_for(&request),
             back_path: collection.clone(),
             version: event.version().get(),
@@ -268,7 +267,8 @@ async fn create(state: Arc<EventRoutes>, request: Request) -> Response {
             publish_created(&state, &context, &collection, &event).await;
             redirect(
                 &format!("{collection}/{}", event.id()),
-                Flash::new().with_notice("Event was successfully created."),
+                Flash::new()
+                    .with_notice(state.site.i18n(&request).t("events.flash.created").text()),
             )
         }
         Err(EventError::Invalid(violations)) => render_new(
@@ -322,10 +322,8 @@ async fn update(state: Arc<EventRoutes>, request: Request) -> Response {
             Some(Ok(expected)) => (form, expected),
             _ => {
                 let mut errors = FieldErrors::new();
-                errors.add(
-                    BASE_FIELD,
-                    "The form has no valid version; reload the page.",
-                );
+                let message = state.site.i18n(&request).t("events.form.no_version").text();
+                errors.add(BASE_FIELD, message);
                 return reload_edit(&state, &request, &collection, &context, id, errors).await;
             }
         },
@@ -358,7 +356,8 @@ async fn update(state: Arc<EventRoutes>, request: Request) -> Response {
             publish_updated(&state, &context, &collection, &event).await;
             redirect(
                 &format!("{collection}/{}", event.id()),
-                Flash::new().with_notice("Event was successfully updated."),
+                Flash::new()
+                    .with_notice(state.site.i18n(&request).t("events.flash.updated").text()),
             )
         }
         Err(EventError::Invalid(violations)) => render_form_page(
@@ -376,7 +375,8 @@ async fn update(state: Arc<EventRoutes>, request: Request) -> Response {
             match state.service.find(&context, id).await {
                 Ok(current) => {
                     let mut errors = FieldErrors::new();
-                    errors.add(BASE_FIELD, STALE_UPDATE);
+                    let message = state.site.i18n(&request).t("events.edit.conflict").text();
+                    errors.add(BASE_FIELD, message);
                     let target = EditTarget {
                         id,
                         expected: current.version(),
@@ -413,7 +413,11 @@ async fn destroy(state: Arc<EventRoutes>, request: Request) -> Response {
         .ok()
         .and_then(|form| Version::new(form.version).ok());
     let Some(expected) = expected else {
-        let alert = "The delete form has no valid version; reload the page.";
+        let alert = state
+            .site
+            .i18n(&request)
+            .t("events.flash.no_version")
+            .text();
         return redirect(&member, Flash::new().with_alert(alert));
     };
     match state.service.delete(&context, id, expected).await {
@@ -421,10 +425,14 @@ async fn destroy(state: Arc<EventRoutes>, request: Request) -> Response {
             publish_deleted(&state, &context, id).await;
             redirect(
                 &collection,
-                Flash::new().with_notice("Event was successfully deleted."),
+                Flash::new()
+                    .with_notice(state.site.i18n(&request).t("events.flash.deleted").text()),
             )
         }
-        Err(EventError::Conflict) => redirect(&member, Flash::new().with_alert(STALE_DELETE)),
+        Err(EventError::Conflict) => {
+            let alert = state.site.i18n(&request).t("events.flash.stale").text();
+            redirect(&member, Flash::new().with_alert(alert))
+        }
         Err(error) => failure(&state, &request, &collection, error),
     }
 }
@@ -544,12 +552,12 @@ fn render_new(
     forge::web::html_with_status(
         status,
         &EventNew {
-            layout: state.site.layout(request, "New event"),
+            layout: state.site.layout(request),
             csrf_field: csrf_field_for(request),
             action: collection.to_owned(),
             method: None,
             version: None,
-            submit: "Create event",
+            submit: state.site.i18n(request).t("events.form.create").text(),
             back_path: collection.to_owned(),
             form,
             errors,
@@ -586,12 +594,12 @@ fn render_form_page(
     forge::web::html_with_status(
         status,
         &EventEdit {
-            layout: state.site.layout(request, "Editing event"),
+            layout: state.site.layout(request),
             csrf_field: csrf_field_for(request),
             action: show_path.clone(),
             method: Some("patch"),
             version: Some(target.expected.get()),
-            submit: "Update event",
+            submit: state.site.i18n(request).t("events.form.update").text(),
             back_path: collection.to_owned(),
             show_path,
             form,
@@ -627,7 +635,7 @@ fn not_found(state: &EventRoutes, request: &Request, collection: &str) -> Respon
     forge::web::html_with_status(
         StatusCode::NOT_FOUND,
         &EventNotFound {
-            layout: state.site.layout(request, "Event not found"),
+            layout: state.site.layout(request),
             back_path: collection.to_owned(),
         },
     )
@@ -713,6 +721,7 @@ async fn publish_created(
     event: &Event,
 ) {
     let item = row(collection, event);
+    let i18n = state.site.default_i18n();
     state
         .streams
         .publish(channel(context), || {
@@ -721,7 +730,7 @@ async fn publish_created(
                 TurboStreamAction::from_view(
                     StreamAction::Append,
                     forge::views::DomId::new("events")?,
-                    &EventRowFragment { row: item },
+                    &EventRowFragment { row: item, i18n },
                 )?,
             ])
         })
@@ -737,13 +746,14 @@ async fn publish_updated(
 ) {
     let item = row(collection, event);
     let id = event.id();
+    let i18n = state.site.default_i18n();
     state
         .streams
         .publish(channel(context), || {
             Ok(vec![TurboStreamAction::from_view(
                 StreamAction::Replace,
                 dom_id(id, "event")?,
-                &EventRowFragment { row: item },
+                &EventRowFragment { row: item, i18n },
             )?])
         })
         .await;

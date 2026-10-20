@@ -1,27 +1,30 @@
 {% extends "layouts/application.html" %}
 
+{% block title %}{{ layout.i18n.t("posts.index.title") }}{% endblock %}
+
 {% block content %}
-<h1>Posts</h1>
+<h1>{{ layout.i18n.t("posts.index.title") }}</h1>
 {% if let Some(stream_source) = stream_source %}{{ stream_source|safe }}{% endif %}
-<p><a href="{{ new_path }}">New post</a></p>
+<p><a href="{{ new_path }}">{{ layout.i18n.t("posts.index.new") }}</a></p>
 <table>
   <thead>
     <tr>
-      <th scope="col">Title</th>
-      <th scope="col">Body</th>
-      <th scope="col">Published</th>
-      <th scope="col">Actions</th>
+      <th scope="col">{{ layout.i18n.t("posts.fields.title") }}</th>
+      <th scope="col">{{ layout.i18n.t("posts.fields.body") }}</th>
+      <th scope="col">{{ layout.i18n.t("posts.fields.published") }}</th>
+      <th scope="col">{{ layout.i18n.t("posts.index.actions") }}</th>
     </tr>
   </thead>
   <tbody id="posts">
+    {% let i18n = layout.i18n.clone() %}
     {% for row in rows %}
     {% include "posts/_row.html" %}
     {% else %}
-    <tr id="posts_empty"><td>No posts yet.</td></tr>
+    <tr id="posts_empty"><td>{{ layout.i18n.t("posts.index.empty") }}</td></tr>
     {% endfor %}
   </tbody>
 </table>
 {% if let Some(next_path) = next_path %}
-<p><a href="{{ next_path }}">Next page</a></p>
+<p><a href="{{ next_path }}">{{ layout.i18n.t("posts.index.next_page") }}</a></p>
 {% endif %}
 {% endblock %}

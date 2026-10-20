@@ -12,11 +12,14 @@ pub fn run() -> ExitCode {
         .run()
 }
 
-/// Wires the HTTP adapter: the site (digested assets and the HTML request
-/// layers) and the routes. `forge generate scaffold` prints the lines that
-/// wire each generated resource at the end of this function.
+/// Wires the HTTP adapter: the translations of `config/locales`, the site
+/// (digested assets and the HTML request layers) and the routes. `forge
+/// generate scaffold` prints the lines that wire each generated resource at
+/// the end of this function.
 fn compose(composition: &mut forge::Composition<'_>) -> Result<(), forge::ComposeError> {
-    let site = crate::adapters::http::site(composition.router())?;
+    let translator = crate::adapters::http::views::locales::translator(composition.config())
+        .map_err(forge::ComposeError::other)?;
+    let site = crate::adapters::http::site(composition.router(), translator)?;
     crate::adapters::http::routes(composition.router(), &site)?;
     Ok(())
 }

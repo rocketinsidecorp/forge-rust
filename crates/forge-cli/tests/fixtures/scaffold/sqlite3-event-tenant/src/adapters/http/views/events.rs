@@ -1,6 +1,7 @@
 //! View models of the event pages in `templates/events/`. Values
 //! are prepared as text by `crate::adapters::http::events`; the
-//! templates only lay them out (escaped).
+//! templates only lay them out (escaped), with the text of
+//! `config/locales/events.LOCALE.json`.
 
 use askama::Template;
 use forge::views::FieldErrors;
@@ -71,7 +72,8 @@ pub struct EventNew<'a> {
     pub method: Option<&'static str>,
     /// The optimistic-locking version the form was rendered with.
     pub version: Option<i64>,
-    pub submit: &'static str,
+    /// The submit button, translated.
+    pub submit: String,
     pub back_path: String,
     pub form: EventFormValues,
     pub errors: FieldErrors,
@@ -88,7 +90,8 @@ pub struct EventEdit<'a> {
     pub method: Option<&'static str>,
     /// The optimistic-locking version the form was rendered with.
     pub version: Option<i64>,
-    pub submit: &'static str,
+    /// The submit button, translated.
+    pub submit: String,
     pub back_path: String,
     pub show_path: String,
     pub form: EventFormValues,

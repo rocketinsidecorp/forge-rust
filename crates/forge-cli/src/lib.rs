@@ -51,6 +51,7 @@ fn execute(
             api,
             skip_lockfile,
             forge_path,
+            locale,
         } => {
             let options = NewApplication {
                 name,
@@ -59,6 +60,7 @@ fn execute(
                 database,
                 views: !api,
                 forge: forge_path.map_or(ForgeSource::GitTag, ForgeSource::Path),
+                locale,
             };
             let destination = generate::create_application(current_dir, &options)?;
             writeln!(

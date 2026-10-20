@@ -4,58 +4,58 @@
   {% if let Some(version) = version %}<input type="hidden" name="version" value="{{ version }}">{% endif %}
   {% if let Some(message) = errors.get("base") %}<p class="flash flash-alert" role="alert">{{ message }}</p>{% endif %}
   <div>
-    <label for="event_name">Name</label>
+    <label for="event_name">{{ layout.i18n.t("events.fields.name") }}</label>
     <input type="text" id="event_name" name="name" value="{{ form.name }}" maxlength="255">
-    {% if let Some(message) = errors.get("name") %}<p class="flash flash-alert" role="alert">Name {{ message }}</p>{% endif %}
+    {% if let Some(message) = errors.get("name") %}<p class="flash flash-alert" role="alert">{{ layout.i18n.t("events.fields.name") }} {{ message }}</p>{% endif %}
   </div>
   <div>
-    <label for="event_notes">Notes</label>
+    <label for="event_notes">{{ layout.i18n.t("events.fields.notes") }}</label>
     <textarea id="event_notes" name="notes" rows="6">{{ form.notes }}</textarea>
-    {% if let Some(message) = errors.get("notes") %}<p class="flash flash-alert" role="alert">Notes {{ message }}</p>{% endif %}
+    {% if let Some(message) = errors.get("notes") %}<p class="flash flash-alert" role="alert">{{ layout.i18n.t("events.fields.notes") }} {{ message }}</p>{% endif %}
   </div>
   <div>
-    <label for="event_starts_at">Starts at (UTC)</label>
+    <label for="event_starts_at">{{ layout.i18n.t("events.fields.starts_at") }} {{ layout.i18n.t("events.form.utc") }}</label>
     <input type="datetime-local" id="event_starts_at" name="starts_at" value="{{ form.starts_at }}" step="1">
-    {% if let Some(message) = errors.get("starts_at") %}<p class="flash flash-alert" role="alert">Starts at {{ message }}</p>{% endif %}
+    {% if let Some(message) = errors.get("starts_at") %}<p class="flash flash-alert" role="alert">{{ layout.i18n.t("events.fields.starts_at") }} {{ message }}</p>{% endif %}
   </div>
   <div>
-    <label for="event_ends_at">Ends at (UTC)</label>
+    <label for="event_ends_at">{{ layout.i18n.t("events.fields.ends_at") }} {{ layout.i18n.t("events.form.utc") }}</label>
     <input type="datetime-local" id="event_ends_at" name="ends_at" value="{{ form.ends_at }}" step="1">
-    {% if let Some(message) = errors.get("ends_at") %}<p class="flash flash-alert" role="alert">Ends at {{ message }}</p>{% endif %}
+    {% if let Some(message) = errors.get("ends_at") %}<p class="flash flash-alert" role="alert">{{ layout.i18n.t("events.fields.ends_at") }} {{ message }}</p>{% endif %}
   </div>
   <div>
-    <label for="event_capacity">Capacity</label>
+    <label for="event_capacity">{{ layout.i18n.t("events.fields.capacity") }}</label>
     <input type="number" id="event_capacity" name="capacity" value="{{ form.capacity }}" step="1">
-    {% if let Some(message) = errors.get("capacity") %}<p class="flash flash-alert" role="alert">Capacity {{ message }}</p>{% endif %}
+    {% if let Some(message) = errors.get("capacity") %}<p class="flash flash-alert" role="alert">{{ layout.i18n.t("events.fields.capacity") }} {{ message }}</p>{% endif %}
   </div>
   <div>
-    <label for="event_attendees">Attendees</label>
+    <label for="event_attendees">{{ layout.i18n.t("events.fields.attendees") }}</label>
     <input type="number" id="event_attendees" name="attendees" value="{{ form.attendees }}" step="1">
-    {% if let Some(message) = errors.get("attendees") %}<p class="flash flash-alert" role="alert">Attendees {{ message }}</p>{% endif %}
+    {% if let Some(message) = errors.get("attendees") %}<p class="flash flash-alert" role="alert">{{ layout.i18n.t("events.fields.attendees") }} {{ message }}</p>{% endif %}
   </div>
   <div>
-    <label for="event_public">Public</label>
+    <label for="event_public">{{ layout.i18n.t("events.fields.public") }}</label>
     <input type="checkbox" id="event_public" name="public" value="true"{% if form.public %} checked{% endif %}>
-    {% if let Some(message) = errors.get("public") %}<p class="flash flash-alert" role="alert">Public {{ message }}</p>{% endif %}
+    {% if let Some(message) = errors.get("public") %}<p class="flash flash-alert" role="alert">{{ layout.i18n.t("events.fields.public") }} {{ message }}</p>{% endif %}
   </div>
   <div>
-    <label for="event_featured">Featured</label>
+    <label for="event_featured">{{ layout.i18n.t("events.fields.featured") }}</label>
     <select id="event_featured" name="featured">
-      <option value="">Not set</option>
-      <option value="true"{% if form.featured == "true" %} selected{% endif %}>Yes</option>
-      <option value="false"{% if form.featured == "false" %} selected{% endif %}>No</option>
+      <option value="">{{ layout.i18n.t("events.form.not_set") }}</option>
+      <option value="true"{% if form.featured == "true" %} selected{% endif %}>{{ layout.i18n.t("events.form.yes") }}</option>
+      <option value="false"{% if form.featured == "false" %} selected{% endif %}>{{ layout.i18n.t("events.form.no") }}</option>
     </select>
-    {% if let Some(message) = errors.get("featured") %}<p class="flash flash-alert" role="alert">Featured {{ message }}</p>{% endif %}
+    {% if let Some(message) = errors.get("featured") %}<p class="flash flash-alert" role="alert">{{ layout.i18n.t("events.fields.featured") }} {{ message }}</p>{% endif %}
   </div>
   <div>
-    <label for="event_venue">Venue</label>
+    <label for="event_venue">{{ layout.i18n.t("events.fields.venue") }}</label>
     <input type="text" id="event_venue" name="venue" value="{{ form.venue }}" spellcheck="false" autocomplete="off">
-    {% if let Some(message) = errors.get("venue") %}<p class="flash flash-alert" role="alert">Venue {{ message }}</p>{% endif %}
+    {% if let Some(message) = errors.get("venue") %}<p class="flash flash-alert" role="alert">{{ layout.i18n.t("events.fields.venue") }} {{ message }}</p>{% endif %}
   </div>
   <div>
-    <label for="event_organizer">Organizer</label>
+    <label for="event_organizer">{{ layout.i18n.t("events.fields.organizer") }}</label>
     <input type="text" id="event_organizer" name="organizer" value="{{ form.organizer }}" spellcheck="false" autocomplete="off">
-    {% if let Some(message) = errors.get("organizer") %}<p class="flash flash-alert" role="alert">Organizer {{ message }}</p>{% endif %}
+    {% if let Some(message) = errors.get("organizer") %}<p class="flash flash-alert" role="alert">{{ layout.i18n.t("events.fields.organizer") }} {{ message }}</p>{% endif %}
   </div>
   <button type="submit">{{ submit }}</button>
 </form>

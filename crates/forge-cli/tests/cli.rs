@@ -340,3 +340,22 @@ fn generate_scaffold_refuses_api_and_database_free_applications() {
         assert!(stderr.contains("cannot generate the scaffold"), "{stderr}");
     }
 }
+
+#[test]
+fn new_refuses_unknown_locales_and_api_applications_with_a_locale() {
+    let directory = tempfile::tempdir().expect("temporary directory should be available");
+
+    let unknown = forge(
+        directory.path(),
+        &["new", "shop", "--locale", "fr", "--skip-lockfile"],
+    );
+    let api = forge(
+        directory.path(),
+        &["new", "shop", "--api", "--locale", "es", "--skip-lockfile"],
+    );
+
+    assert!(!unknown.status.success());
+    assert!(String::from_utf8_lossy(&unknown.stderr).contains("pt-BR"));
+    assert!(!api.status.success());
+    assert!(!directory.path().join("shop").exists());
+}
