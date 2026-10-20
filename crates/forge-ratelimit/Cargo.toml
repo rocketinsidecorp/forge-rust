@@ -1,0 +1,40 @@
+[package]
+name = "forge-ratelimit"
+publish = false
+description = "Fixed-window rate limiting for Forge: bounded in-memory limiter, shared PostgreSQL/MySQL/SQLite stores and fail-closed HTTP middleware"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+forge-config = { path = "../forge-config" }
+forge-db = { path = "../forge-db", optional = true }
+forge-http = { path = "../forge-http" }
+serde_json.workspace = true
+sha2.workspace = true
+sqlx = { workspace = true, features = ["macros"], optional = true }
+thiserror.workspace = true
+tokio = { workspace = true, optional = true }
+tracing.workspace = true
+
+[features]
+# Shared stores, one per backend (ADR 0027). None is on by default.
+postgres = ["dep:forge-db", "dep:sqlx", "forge-db/postgres"]
+mysql = ["dep:forge-db", "dep:sqlx", "forge-db/mysql"]
+sqlite = ["dep:forge-db", "dep:sqlx", "forge-db/sqlite"]
+# The conformance suite every `Limiter` must pass (`forge_ratelimit::testing`).
+testing = ["dep:tokio"]
+
+[dev-dependencies]
+forge-db = { path = "../forge-db", features = ["postgres", "mysql", "sqlite", "testing"] }
+forge-ratelimit = { path = ".", features = ["postgres", "mysql", "sqlite", "testing"] }
+sqlx = { workspace = true, features = ["macros"] }
+tokio.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

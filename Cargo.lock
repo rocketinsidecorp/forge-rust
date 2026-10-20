@@ -648,6 +648,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "forge-ratelimit"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "forge-config",
+ "forge-db",
+ "forge-http",
+ "forge-ratelimit",
+ "serde_json",
+ "sha2 0.11.1",
+ "sqlx",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "forge-security"
 version = "0.1.0"
 dependencies = [
