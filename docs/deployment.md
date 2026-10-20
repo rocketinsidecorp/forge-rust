@@ -403,3 +403,31 @@ every replica:
 export FORGE_STREAMS_KEY=$(openssl rand -base64 32)
 ```
 
+Terminate HTTP/2 at the proxy: over HTTP/1.1 a browser opens at most 6
+connections per origin and every open page holds one for its stream. Stream
+limits (16 per signed-in person, 1 000 per tenant, 10 000 in all) are counted
+per process, and a client that vanishes without closing its connection keeps
+its slot until a write fails, at most until the 30 minute maximum age
+([ADR 0031](adr/0031-live-updates-over-server-sent-events.md#accepted-residuals-and-capacity-edges)).
+
+### Rotating the stream signing key
+
+Generated applications sign stream names with `FORGE_STREAMS_KEY` only.
+Rotating it invalidates the stream URL of every page already open: on its
+next reconnect (at the latest after 30 minutes) such a page gets `403` and
+stops updating live until it is reloaded. Nothing else breaks, and pages
+loaded afterwards work. Rotate during a quiet period:
+
+```sh
+export FORGE_STREAMS_KEY=$(openssl rand -base64 32)   # the new key, on every replica
+# redeploy every replica with it; replicas with different keys refuse each other's pages
+```
+
+To keep open pages working across a rotation, build the signer yourself in
+`src/adapters/http/streams.rs` with
+`forge::broadcast::Signer::new(&new_key, &[&old_key])`, which signs with the
+new key and still verifies the old one, keep the old key for at least the
+token lifetime (24 hours), then remove it. A `FORGE_STREAMS_PREVIOUS_KEYS`
+setting will come to Forge-Rust and Forge-Go together
+([parity follow-ups](rails-parity.md#parity-follow-ups)).
+

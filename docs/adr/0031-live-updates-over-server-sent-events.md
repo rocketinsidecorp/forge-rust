@@ -181,6 +181,60 @@ elsewhere. `forge new` enables the `broadcast` feature for database HTML
 applications; older applications are refused with instructions. The plural
 `streams` is reserved.
 
+### Accepted residuals and capacity edges
+
+Recorded after the independent review of the pull request:
+
+- **`sqlx::PgListener` internals.** The listener buffers notifications in an
+  unbounded `futures` mpsc channel, and its `Drop` spawns a detached task
+  that runs `UNLISTEN *` and returns the connection to the pool. Both are
+  third-party code that Forge's own rule against unbounded queues and
+  detached tasks cannot reach without replacing the driver; they are
+  accepted. The buffer only takes notifications that arrive while the
+  listener's connection executes a statement, and `PgBroker` issues none
+  after `LISTEN` (it only awaits `try_recv`, which reads the socket
+  directly), so it holds at most what arrives during one `LISTEN` round
+  trip. The detached task runs one statement on a connection the pool
+  already counts, and ends with it or with the runtime. The listener's
+  whole lifetime (connect, reconnect with backoff, drop) belongs to the
+  `PgBroker::listen` lifecycle worker that `Composition::broadcast`
+  registers, which returns when shutdown begins. Revisit if sqlx offers a
+  bounded listener.
+- **Detecting vanished clients.** A browser that disappears without closing
+  its connection (network loss, a suspended laptop) is noticed only when a
+  write fails. The 20 second heartbeat guarantees a write at least that
+  often, but the kernel accepts writes until its buffer is full, so the
+  stream ends when TCP gives up retransmitting (minutes, operating-system
+  dependent), when the stalled-write guard trips (at least 30 seconds
+  without progress once the buffer is full), or at the 30 minute maximum
+  age, whichever comes first. Until then it holds a connection slot and one
+  of its principal's 16 streams; if the same person opens pages meanwhile
+  and reaches 16, the new page gets `429 stream_limit`, on which
+  `EventSource` gives up, and updates live again once reloaded.
+- **Per-process limits.** Every limit (10 000 subscribers, 1 000 per channel,
+  1 000 per tenant, 16 per principal) is counted per process: with N
+  replicas a tenant may hold up to N x 1 000 streams, and ten tenants at
+  their limit fill one process. Open streams also hold connection slots
+  shared with ordinary requests, so size `FORGE_MAX_CONNECTIONS` for both.
+  A shared, cross-replica counter is not provided.
+- **Browser connection limit.** Over HTTP/1.1 browsers open at most 6
+  connections per origin, and each open page holds one for its stream:
+  with five or more tabs of the application open, further page loads in that
+  browser wait. Forge-Rust serves HTTP/1.1, so terminate HTTP/2 (or HTTP/3)
+  at the reverse proxy in front of it, which multiplexes every stream of a
+  browser over one connection; the stream response sets no hop-by-hop
+  header and passes through unchanged.
+- **Key rotation.** `Signer::new(key, previous)` verifies tokens signed with
+  previous keys, but generated applications build the signer from
+  `FORGE_STREAMS_KEY` alone, like Forge-Go's generated `htmlstreams.NewSigner`
+  (whose library also has `SignerOptions.PreviousKeys`). Changing the key
+  makes every open page's token invalid: its next reconnect gets `403` and
+  `EventSource` stops, so the page updates live again once reloaded. The
+  procedure is in [deployment](../deployment.md#rotating-the-stream-signing-key).
+  A `FORGE_STREAMS_PREVIOUS_KEYS` setting is a parity follow-up for both
+  frameworks ([parity](../rails-parity.md#parity-follow-ups)), not added
+  here alone.
+
 ## Consequences
 
 - Open pages show other people's changes without polling, across replicas on

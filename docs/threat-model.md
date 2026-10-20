@@ -336,7 +336,13 @@ difference is stated.
 
 Residual risks beyond the rows above: delivery is at most once without
 replay; the in-process broker reaches one process only; each open stream
-holds a connection slot.
+holds a connection slot; stream limits are per process; a vanished client
+keeps its slot until a write fails (at most 30 minutes); rotating
+`FORGE_STREAMS_KEY` stops live updates on open pages until reloaded (no
+previous-key setting yet, a parity follow-up); `sqlx::PgListener` buffers
+notifications in an unbounded channel and drops with a detached `UNLISTEN`
+task, accepted as bounded in practice (ADR 0031, "Accepted residuals and
+capacity edges").
 
 ## Review cadence
 

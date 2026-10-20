@@ -47,6 +47,16 @@ the work is finished and waiting for its review; **Planned** means not started.
   contain; it adopts the same rule in rocketinsidecorp/forge-go#13 (in
   progress, next Forge-Go pull request after the observability stack).
 
+- Stream signing key rotation (ADR 0031, rocketinsidecorp/forge-rust#14):
+  both libraries verify previous keys (`Signer::new(key, previous)`,
+  `SignerOptions.PreviousKeys`), but generated applications of both read only
+  `FORGE_STREAMS_KEY`, so rotating it stops live updates on open pages until
+  they are reloaded. Add `FORGE_STREAMS_PREVIOUS_KEYS` (comma-separated,
+  validated and redacted like `FORGE_STREAMS_KEY`, at most 3) to both
+  frameworks in one change, Forge-Go first since its live updates are still in
+  review; until then the rotation procedure is in
+  [deployment](deployment.md#rotating-the-stream-signing-key).
+
 ## Review gate
 
 Every pull request passes the Claude Code Review before it merges to `main`,

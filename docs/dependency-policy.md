@@ -220,6 +220,13 @@ stable channel, signer or access contracts; `PgBroker::publish_in` takes a
 transactional adapters. `forge-http` streams response bodies with its own
 unfold body over the existing `hyper` `Body` trait, without `futures`.
 
+Accepted exception: `sqlx::PgListener` keeps notifications in an unbounded
+internal channel and its `Drop` spawns a detached `UNLISTEN *` task. Both are
+inside the driver, bounded in practice (the listener runs no statement after
+`LISTEN`, so the channel only buffers what arrives during that round trip),
+and the listener's lifetime is owned by the `PgBroker::listen` lifecycle
+worker ([ADR 0031](adr/0031-live-updates-over-server-sent-events.md#accepted-residuals-and-capacity-edges)).
+
 ## Rate limiting, cache and storage dependency decision
 
 [ADR 0027](adr/0027-rate-limiting.md), [0028](adr/0028-cache.md) and
