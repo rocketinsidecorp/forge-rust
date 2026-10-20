@@ -13,6 +13,7 @@
 //! bits from the OS CSPRNG through `getrandom`, persisted only as SHA-256
 //! digests through `sha2`) delivered by a [`PasswordResetNotifier`].
 
+mod login;
 mod password_policy;
 mod password_reset;
 mod throttle;
@@ -24,6 +25,7 @@ use forge_core::Id;
 use forge_security::PrincipalId;
 use thiserror::Error;
 
+pub use login::{CanonicalLogin, LoginFormatError, MAX_LOGIN_BYTES};
 pub use password_policy::{
     MAX_PASSWORD_BYTES, MIN_PASSWORD_CHARS, NewPassword, PasswordPolicyError,
 };
@@ -453,6 +455,7 @@ pub struct PasswordCredential {
     password_hash: PasswordHash,
     disabled: bool,
     version: PasswordCredentialVersion,
+    login: Option<String>,
 }
 
 impl PasswordCredential {
@@ -469,7 +472,22 @@ impl PasswordCredential {
             password_hash,
             disabled,
             version,
+            login: None,
         }
+    }
+
+    /// Adds the login exactly as stored, the only address reset links may
+    /// be delivered to (never the address a visitor typed).
+    #[must_use]
+    pub fn with_login(mut self, login: impl Into<String>) -> Self {
+        self.login = Some(login.into());
+        self
+    }
+
+    /// The stored login, when the store provided it.
+    #[must_use]
+    pub fn login(&self) -> Option<&str> {
+        self.login.as_deref()
     }
 
     /// Principal owning the credential.
@@ -500,7 +518,8 @@ impl PasswordCredential {
 /// Persistence boundary used by password authentication.
 #[async_trait]
 pub trait PasswordCredentialStore: Send + Sync {
-    /// Resolves one case-insensitive login identifier.
+    /// Resolves one login. Callers pass a [`CanonicalLogin`]; stores should
+    /// return the stored login with [`PasswordCredential::with_login`].
     async fn find_by_login(
         &self,
         login: &str,
