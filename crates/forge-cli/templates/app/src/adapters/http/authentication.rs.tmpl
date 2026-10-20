@@ -16,9 +16,9 @@
 //! | `POST` | `/session/mfa` | checks the code: `303` signed in, `422` wrong code, `429` throttled |
 //! | `GET` | `/mfa` | two-factor settings of the signed-in account |
 //! | `POST` | `/mfa` | turns it on after the password (step-up): shows the key to scan |
-//! | `POST` | `/mfa/confirm` | confirms the key with a code; shows the backup codes once |
+//! | `POST` | `/mfa/confirm` | confirms the key with the password and a code; shows the backup codes once |
 //! | `POST` | `/mfa/rotation` | replaces the authenticator (password and current code) |
-//! | `POST` | `/mfa/rotation/confirm` | confirms the new key; shows new backup codes once |
+//! | `POST` | `/mfa/rotation/confirm` | confirms the new key (password, current code and a new code); shows new backup codes once |
 //! | `POST` | `/mfa/backup_codes` | new backup codes (password and current code) |
 //! | `DELETE` | `/mfa` | turns it off (password and current code) |
 //!
@@ -57,9 +57,10 @@
 //!   the code in one transaction: a code, or a backup code, works once.
 //!   Without `FORGE_AUTH_MFA_KEY` such an account cannot sign in (an
 //!   error page; the cause is logged).
-//! - Turning two-factor on needs the password again; replacing the
-//!   authenticator, new backup codes and turning it off need the password
-//!   and a current code (step-up, throttled). Turning it on, replacing it
+//! - Turning two-factor on, and confirming its key, needs the password
+//!   again; replacing the authenticator (and confirming the new key), new
+//!   backup codes and turning it off need the password and a current code
+//!   (step-up, throttled). The pending key is shown only after step-up. Turning it on, replacing it
 //!   and turning it off sign the account out everywhere. Keys and backup
 //!   codes are shown once, on `no-store` pages, and never logged.
 
@@ -1390,7 +1391,9 @@ enum StepUpFailure {
 
 /// Step-up authentication of the signed-in `principal`: the password, and
 /// `code` (an authenticator or backup code, used up) when given. Counted on
-/// the second-factor throttle before anything is checked. Returns the
+/// the second-factor throttle before anything is checked; a success clears
+/// the counters only when it checked a code or the account has no factor.
+/// Returns the
 /// stored login, the account label of the authenticator entry.
 async fn step_up(
     pages: &Pages,
@@ -1436,7 +1439,18 @@ async fn step_up(
             Err(_) => return Err(StepUpFailure::Unavailable("mfa_unavailable")),
         }
     }
-    if ports.mfa.throttle().success(&key).await.is_err() {
+    // The password alone clears the counters only while the account has no
+    // factor: with one, they guard its codes, and clearing them after a
+    // password-only step-up would let a session holding the password mix
+    // unlimited code guesses with password-only step-ups.
+    let clears = match code {
+        Some(_) => true,
+        None => match ports.mfa.status(principal).await {
+            Ok(status) => status.is_none(),
+            Err(_) => return Err(StepUpFailure::Unavailable("mfa_unavailable")),
+        },
+    };
+    if clears && ports.mfa.throttle().success(&key).await.is_err() {
         return Err(StepUpFailure::Unavailable("mfa_throttle_unavailable"));
     }
     Ok(login)

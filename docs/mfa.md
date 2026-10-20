@@ -41,6 +41,11 @@ The pages are in `src/adapters/http/authentication.rs`, `templates/mfa/` and
 keys) and `mfa.*` in `config/locales/authentication.LOCALE.json` (`en`, `es`,
 `pt-BR`). Change them freely; keep the security steps each handler documents.
 
+Confirming a new key asks for the password again (and, for a rotation, a
+current code), so a stolen session can neither read the pending key nor
+confirm it. A TOTP code works once: for the current code of a rotation, wait
+for the next code of the old authenticator or use a backup code.
+
 ## How sign-in works
 
 1. The password form (`POST /session`) verifies the password. An account with

@@ -60,9 +60,13 @@ secrets redacted everywhere, and sign-in pages generated into the application
    the challenge (cookie `__Host-forge_mfa`, Forge-Go's name) to its digest;
    the code step accepts the challenge only from the browser session holding
    that token.
-6. **Step-up.** Turning MFA on needs the password again; replacing the
-   authenticator, new backup codes and turning it off need the password and a
-   current code (a used-up TOTP period or backup code). Forge-Go leaves this
+6. **Step-up.** Turning MFA on, and confirming its key, needs the password
+   again; replacing the authenticator and confirming the new key, new backup
+   codes and turning it off need the password and a current code (a used-up
+   TOTP period or backup code). The pending key is shown only after step-up,
+   so a session alone can neither read it nor confirm it. A password-only
+   step-up clears the step-up counters only while the account has no factor,
+   so it cannot reset the throttle that guards the codes. Forge-Go leaves this
    policy to an application `MFAChangeAuthorizer`; Forge-Rust generates the
    policy into the pages, where the application can change it.
 7. **Audit.** Forge-Go's event names: `auth.mfa.enrollment_started`,

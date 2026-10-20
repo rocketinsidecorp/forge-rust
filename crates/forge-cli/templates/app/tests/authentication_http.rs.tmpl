@@ -1980,7 +1980,10 @@ async fn confirming_a_new_authenticator_needs_the_password_and_a_current_code() 
             StatusCode::UNPROCESSABLE_ENTITY,
             "{current}"
         );
-        assert!(!text(&refused).contains(&new_key));
+        let body = text(&refused);
+        assert!(!body.contains("mfa_key"), "{body}");
+        assert!(!body.contains("otpauth://"), "{body}");
+        assert!(!body.contains(&new_key), "{body}");
     }
     // After step-up, a wrong new code shows the pending key again.
     let retry = browser
@@ -2015,6 +2018,35 @@ async fn confirming_a_new_authenticator_needs_the_password_and_a_current_code() 
         AuditOutcome::Succeeded
     ));
     assert_eq!(live_sessions(&fixture.world, fixture.ada), 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn password_only_step_ups_do_not_reset_the_code_throttle() -> TestResult {
+    let fixture = fixture()?;
+    let (key, codes) = enroll_ada(&fixture).await?;
+    let mut browser = Browser::default();
+    password_step(&fixture, &mut browser).await?;
+    browser
+        .post(&fixture.router, "/session/mfa", &[("code", &codes[0])])
+        .await?;
+    let wrong = wrong_totp(&key)?;
+    let disable = [
+        ("_method", "delete"),
+        ("password", PASSWORD),
+        ("code", wrong.as_str()),
+    ];
+    for _ in 0..4 {
+        let refused = browser.post(&fixture.router, "/mfa", &disable).await?;
+        assert_eq!(refused.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+    // A password-only step-up (confirming an enrollment the account cannot
+    // start) does not clear the counters of the codes.
+    browser
+        .post(&fixture.router, "/mfa/confirm", &[("password", PASSWORD)])
+        .await?;
+    let throttled = browser.post(&fixture.router, "/mfa", &disable).await?;
+    assert_eq!(throttled.status(), StatusCode::TOO_MANY_REQUESTS);
     Ok(())
 }
 
