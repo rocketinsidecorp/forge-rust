@@ -8,7 +8,7 @@ fn main() -> ExitCode {
             if !matches!(error, forge_cli::CliError::Reported) {
                 eprintln!("error: {error}");
             }
-            ExitCode::FAILURE
+            ExitCode::from(error.exit_code())
         }
     }
 }

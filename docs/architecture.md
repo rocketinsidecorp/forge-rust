@@ -130,7 +130,8 @@ forge/
 │   ├── forge-telemetry     # traces, metrics, log export over OTLP/Prometheus (ADR 0033)
 │   ├── forge-openapi       # OpenAPI 3.1 documents from typed routes (ADR 0039)
 │   ├── forge-ai            # provider and controlled execution ports
-│   ├── forge-cli           # `forge` executable
+│   ├── forge-cli           # `forge` executable, including `forge deploy` (ADR 0042)
+│   ├── forge-proxy         # zero-downtime reverse proxy of `forge deploy`, ACME TLS (ADR 0042)
 │   ├── forge-testing       # fixtures and contract test suites
 │   └── forge-macros        # narrowly scoped derives: OpenApiSchema (ADR 0039)
 ├── examples/               # executable applications added with features

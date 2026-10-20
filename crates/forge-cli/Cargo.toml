@@ -15,6 +15,13 @@ workspace = true
 name = "forge"
 path = "src/main.rs"
 
+# Test support: the docker CLI stand-in of the real-sshd `forge deploy`
+# tests (src/deploy/ssh_tests.rs). Built by `cargo test`, never installed.
+[[example]]
+name = "fake_docker"
+path = "tests/support/fake_docker.rs"
+test = false
+
 [dependencies]
 clap.workspace = true
 # `forge doctor` validates the same FORGE_* settings the application loads and
@@ -24,6 +31,14 @@ forge-config = { path = "../forge-config" }
 # (ADR 0041): the same file format and key handling the application reads.
 forge-credentials = { path = "../forge-credentials" }
 forge-encryption = { path = "../forge-encryption" }
+# `forge deploy` shares forge-proxy's Go-compatible durations and
+# timestamps, so its flags, lock records and logs read the same as the
+# proxy's (no new package in Cargo.lock).
+forge-proxy = { path = "../forge-proxy" }
+# Random container-name suffixes and ssh control directory names.
+getrandom.workspace = true
+# Validation patterns and `forge logs --grep`, with Forge-Go's RE2 syntax.
+regex-automata.workspace = true
 # `forge i18n check` loads config/locales with the translator's own parser
 # and rules (no new package in Cargo.lock).
 forge-i18n = { path = "../forge-i18n" }

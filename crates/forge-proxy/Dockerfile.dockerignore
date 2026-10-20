@@ -1,0 +1,11 @@
+# Build context of crates/forge-proxy/Dockerfile (the repository root).
+/.git
+/.github
+**/target
+/docs
+/examples
+/scripts
+**/.env
+**/.env.*
+**/*.pem
+**/*.key

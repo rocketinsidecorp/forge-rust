@@ -443,6 +443,45 @@ Admission review:
   errors are Forge-owned types; the SQLx adapters take `forge_db::Database`.
 - `forge-cli` gains `forge-credentials`, `forge-encryption` and `zeroize` as
   normal dependencies (path crates and an already-locked crate).
+
+## Deployment dependency decision
+
+[ADR 0042](adr/0042-forge-deploy.md) adds `forge deploy`, `forge logs`,
+`forge app` and the `forge-proxy` crate with **no new package in
+`Cargo.lock`** (the lock gains only the `forge-proxy` workspace entry and the
+new edges below). Newly declared, all already in the graph:
+
+| Crate | Version | Used by | Purpose | Feature policy |
+| --- | --- | --- | --- | --- |
+| `regex-automata` | `0.4.18` | `forge-cli` | Forge-Go's validation patterns (RE2 syntax) and `forge logs --grep` | default features; already locked through `tracing-subscriber` with its `aho-corasick`, `memchr` and `regex-syntax` |
+| `getrandom` | as admitted | `forge-cli`, `forge-proxy` | container-name suffixes, ssh control directory and state file names | unchanged workspace entry |
+| `hyper` `client` | as admitted | `forge-proxy` | health probes, forwarding and the ACME client | the feature `forge-telemetry` already enables |
+| `rustls`, `tokio-rustls`, `ring`, `webpki-roots` | as admitted | `forge-proxy` | HTTPS serving (TLS 1.2/1.3), the ACME client's verified HTTPS, ES256 JWS and P-256 keys | `ring` provider only, as for SQLx and telemetry |
+| `url`, `base64`, `tokio-util` | as admitted | `forge-proxy` | ACME URLs, JWS and PEM encodings, task ownership | unchanged workspace entries |
+
+Admission review:
+
+- No YAML crate was admitted. `serde_yaml` is deprecated, `serde_yml` carries
+  an unsoundness advisory, `yaml-rust` is unmaintained and the maintained
+  forks (`serde_norway`, `saphyr`, `yaml-rust2`) are new packages with large
+  parsers for a file whose subset is small. `forge-cli` reads that subset
+  with a strict reader and refuses the rest with a line number.
+- No ACME crate was admitted. `instant-acme` and `rustls-acme` would add new
+  packages (certificate-request generation such as `rcgen` and its encoders,
+  and their own HTTP client integration) to the lock; the RFC 8555 flow over
+  the existing hyper, rustls and ring is a few hundred lines. The PKCS#10 request is DER encoding
+  only; every key, signature and digest comes from `ring`. The client is
+  integration-tested against an in-test ACME server that verifies the JWS
+  signatures and nonces and has `openssl` verify and sign the requests.
+- No HTTP/2 (`h2`) and no `hyper-util` client-legacy (`tower-service`):
+  forge-proxy speaks HTTP/1.1 and opens one connection per forwarded
+  request.
+- The `ssh` and `docker` binaries are driven as subprocesses from argument
+  vectors, as in Forge-Go; no SSH or Docker library is linked.
+- `forge-cli` gains a test-support example (`tests/support/fake_docker.rs`),
+  built by `cargo test` and never installed. Neither crate has a build
+  script, procedural macro or `unsafe` code; forge-proxy's network calls are
+  the configured targets, the ACME directory and nothing else.
 - `cargo deny check` was run with these declarations.
 
 ## CLI lifecycle dependencies

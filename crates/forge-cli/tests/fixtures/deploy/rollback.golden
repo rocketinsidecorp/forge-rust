@@ -1,0 +1,41 @@
+192.0.2.10      $ mkdir -p .forge/shop && if mkdir .forge/shop/lock 2>/dev/null; then cat > .forge/shop/lock/info; else cat .forge/shop/lock/info 2>/dev/null; exit 75; fi
+192.0.2.10      < stdin: lock record (holder, time, message)
+192.0.2.11      $ mkdir -p .forge/shop && if mkdir .forge/shop/lock 2>/dev/null; then cat > .forge/shop/lock/info; else cat .forge/shop/lock/info 2>/dev/null; exit 75; fi
+192.0.2.11      < stdin: lock record (holder, time, message)
+192.0.2.10      # lock acquired (rollback to v1)
+192.0.2.11      # lock acquired (rollback to v1)
+192.0.2.10      ? docker ps --all --no-trunc --filter label=forge.service=shop --format '{{json .}}'
+192.0.2.11      ? docker ps --all --no-trunc --filter label=forge.service=shop --format '{{json .}}'
+192.0.2.10      $ docker start shop-web-v1-aaaaaa
+192.0.2.10      # restarted shop-web-v1-aaaaaa
+192.0.2.10      $ docker exec forge-proxy /usr/local/bin/forge-proxy deploy -service shop -target shop-web-v1-aaaaaa:8080 -hosts shop.example.com -tls -health-path /health/ready -health-interval 500ms -health-timeout 2s -healthy-count 3 -deploy-timeout 1m0s -drain-timeout 30s -response-timeout 30s -max-body-bytes 67108864
+192.0.2.10      # traffic switched to shop-web-v1-aaaaaa
+192.0.2.11      $ docker start shop-web-v1-aaaaaa
+192.0.2.11      # restarted shop-web-v1-aaaaaa
+192.0.2.11      $ docker exec forge-proxy /usr/local/bin/forge-proxy deploy -service shop -target shop-web-v1-aaaaaa:8080 -hosts shop.example.com -tls -health-path /health/ready -health-interval 500ms -health-timeout 2s -healthy-count 3 -deploy-timeout 1m0s -drain-timeout 30s -response-timeout 30s -max-body-bytes 67108864
+192.0.2.11      # traffic switched to shop-web-v1-aaaaaa
+192.0.2.11      $ docker start shop-jobs-v1-aaaaaa
+192.0.2.11      # restarted shop-jobs-v1-aaaaaa
+192.0.2.11      $ end=$(($(date +%s)+60)); ok=0; while :; do s=$(docker inspect --format '{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' shop-jobs-v1-aaaaaa) || exit 1; case "$s" in "running healthy") exit 0;; "running none") ok=$((ok+1)); [ "$ok" -ge 3 ] && exit 0;; "running starting") ;; *) echo "container shop-jobs-v1-aaaaaa is $s" >&2; exit 1;; esac; [ "$(date +%s)" -ge "$end" ] && { echo "container shop-jobs-v1-aaaaaa not ready after 60s" >&2; exit 1; }; sleep 1; done
+192.0.2.11      # shop-jobs-v1-aaaaaa ready
+192.0.2.10      $ docker stop -t 35 shop-web-v2-bbbbbb
+192.0.2.10      # stopped shop-web-v2-bbbbbb
+192.0.2.10      $ docker rm shop-web-v0-999999
+192.0.2.10      # pruned shop-web-v0-999999
+192.0.2.10      ? docker image ls --format '{{json .}}' registry.example.com/acme/shop
+192.0.2.10      $ docker image rm registry.example.com/acme/shop:v3
+192.0.2.10      $ docker image rm registry.example.com/acme/shop:v0
+192.0.2.10      $ umask 077 && mkdir -p .forge/shop && cat >> .forge/shop/deploys.log
+192.0.2.10      < stdin: deploy log entry
+192.0.2.11      $ docker stop -t 35 shop-web-v2-bbbbbb
+192.0.2.11      # stopped shop-web-v2-bbbbbb
+192.0.2.11      $ docker stop -t 35 shop-jobs-v2-bbbbbb
+192.0.2.11      # stopped shop-jobs-v2-bbbbbb
+192.0.2.11      $ docker rm shop-jobs-v0-999999 shop-web-v0-999999
+192.0.2.11      # pruned shop-jobs-v0-999999, shop-web-v0-999999
+192.0.2.11      ? docker image ls --format '{{json .}}' registry.example.com/acme/shop
+192.0.2.11      $ docker image rm registry.example.com/acme/shop:v0
+192.0.2.11      $ umask 077 && mkdir -p .forge/shop && cat >> .forge/shop/deploys.log
+192.0.2.11      < stdin: deploy log entry
+192.0.2.10      $ rm -rf .forge/shop/lock
+192.0.2.11      $ rm -rf .forge/shop/lock

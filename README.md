@@ -25,7 +25,7 @@ results.
 | Phase | Scope | State |
 | --- | --- | --- |
 | 0 | Architecture, ADRs, threat model, dependency and test policy | Done |
-| 1 | Runtime, CLI, configuration, HTTP, graceful shutdown, health, Docker | Implemented, unreleased |
+| 1 | Runtime, CLI, configuration, HTTP, graceful shutdown, health, Docker | Implemented, unreleased; `forge deploy` with forge-proxy ([ADR 0042](docs/adr/0042-forge-deploy.md)) in review |
 | 2 | PostgreSQL, migrations, transaction contracts, repositories | Behavior implemented; CI runner gate still blocked |
 | 3 | Authentication, authorization, tenancy, RLS, audit | Implemented for PostgreSQL (sign-in pages, setup, RBAC, RLS, audit, reset emails through the mailer of [ADR 0035](docs/adr/0035-mail.md), TOTP two-factor authentication of [ADR 0040](docs/adr/0040-totp-multi-factor-authentication.md)); other backends pending |
 | 4 | PostgreSQL jobs, cron scheduler, outbox, idempotent consumers | Library implemented and tested (`forge` features `jobs`, `events`); `forge new` wiring pending |
@@ -220,14 +220,28 @@ forge db drop                                  # refused when FORGE_ENV=producti
 FORGE_ALLOW_DESTRUCTIVE=true forge db drop --force-production --yes   # the only way in production
 forge openapi                                  # the OpenAPI 3.1 document of the JSON routes
 forge openapi --output openapi.json            # write it; --check openapi.json exits 1 when stale (CI)
+forge deploy init                              # config/deploy.yml + .forge/secrets (0600) for Kamal-style deploys
+forge deploy setup --dry-run                   # every remote command, secrets redacted
+forge deploy setup                             # once per host: docker check, network, forge-proxy, accessories
+forge deploy                                   # build, push, migrate, health-gated zero-downtime switch
+forge deploy --version 3f2a9c1d07be --skip-build   # a tag already in the registry
+forge deploy rollback 3f2a9c1d07be             # back to a retained version, same health gate
+forge deploy details --json                    # containers, routing, lock, last deploys
+forge deploy lock status                       # or acquire --message "...", release [--force]
+forge deploy maintenance on                    # forge-proxy's 503 page; off to resume
+forge deploy prune                             # stopped containers beyond retain, unused images
+forge logs -f --role web --grep ERROR          # every host, lines prefixed host|
+forge app exec migrate status                  # one-off container of the deployed image
+forge app shell --image busybox:1.37           # debug sidecar (distroless has no shell)
 cargo run -- healthcheck                       # application binary: serve, healthcheck, version, help,
 cargo run -- migrate                           #   migrate [status], rollback [--steps N], db create|exists|drop,
 cargo run -- seed                              #   setup, seed, openapi: what the forge commands above run
 ```
 
 The commands above that are not `new`, `generate`, `id`, `version`, `doctor`,
-`i18n`, `credentials`, `check`, `lint`, `test`, `format` or `build` run the generated application's own
-subcommands: the CLI builds it with `cargo build --locked`, runs the binary it
+`i18n`, `credentials`, `check`, `lint`, `test`, `format`, `build`, `deploy`, `logs` or
+`app` run the generated application's own subcommands (`deploy`, `logs` and `app`
+drive `ssh` and Docker on your hosts; see below): the CLI builds it with `cargo build --locked`, runs the binary it
 produced with your terminal and environment, and reads no database URL itself
 (`forge doctor` only describes it, redacted, and opens a TCP connection to its
 host). `drop`, `reset` and `db rollback` refuse `FORGE_ENV=production`; with
@@ -259,6 +273,28 @@ on `127.0.0.1:3000` only:
 
 ```sh
 docker compose up --build
+```
+
+Deploy it to your own servers, Kamal-style: SSH and Docker on the hosts,
+forge-proxy switching traffic only after the new container passed its health
+check, migrations before the switch, and an all-or-nothing revert
+([deployment guide](docs/deployment.md#forge-deploy),
+[ADR 0042](docs/adr/0042-forge-deploy.md)). `config/deploy.yml` is Forge-Go's
+format, so a project can switch frameworks without rewriting it.
+
+```sh
+# once, from a Forge checkout: build and push the proxy image, then pin its digest in config/deploy.yml
+docker build -f crates/forge-proxy/Dockerfile -t registry.example.com/acme/forge-proxy:0.1.0 .
+docker push registry.example.com/acme/forge-proxy:0.1.0
+
+cd shop
+forge deploy init                    # writes config/deploy.yml and .forge/secrets (0600)
+$EDITOR config/deploy.yml            # hosts, registry, proxy.hosts, proxy.image@sha256:...
+export REGISTRY_PASSWORD=... FORGE_DATABASE_URL=... FORGE_MIGRATION_DATABASE_URL=...
+forge deploy setup                   # docker check, network, forge-proxy (80/443, Let's Encrypt)
+forge deploy                         # build, push, migrate, switch; exit 4 = reverted everywhere
+forge logs -f
+forge deploy rollback <previous version>
 ```
 
 ### Client addresses behind a proxy
@@ -892,7 +928,8 @@ crates/
 ├── forge-telemetry # traces, metrics, log export: W3C context, OTLP/HTTP JSON, Prometheus text
 ├── forge-tenancy  # membership and explicit authorized TenantContext
 ├── forge-views    # server-rendered views: HTML, CSRF, flash, assets, import map, CSP
-└── forge-cli      # the `forge` executable and application generator
+├── forge-proxy    # zero-downtime reverse proxy of `forge deploy`: health-gated switches, draining, ACME TLS
+└── forge-cli      # the `forge` executable, application generator and `forge deploy`
 examples/
 └── hello-forge    # committed `forge new` output; standalone package (not a
                    # workspace member) with its own Cargo.lock; golden-tested

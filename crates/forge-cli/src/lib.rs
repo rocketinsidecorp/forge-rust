@@ -9,6 +9,7 @@ mod credentials;
 mod credentials_edit;
 #[cfg(test)]
 mod credentials_tests;
+mod deploy;
 mod destroy;
 mod dev;
 mod doctor;
@@ -35,8 +36,9 @@ pub use error::CliError;
 use crate::application::{Application as _, CargoApplication};
 use crate::cargo::CargoCommand;
 use crate::cli::{
-    Cli, Command, ControllerArgs, CredentialsCommand, DbCommand, DestroyArgs, DestroyCommand,
-    DestructiveArgs, GenerateCommand, I18nCommand, JobArgs, MailerArgs, MigrateView, ResourceArgs,
+    AppCommand, Cli, Command, ControllerArgs, CredentialsCommand, DbCommand, DeployArgs,
+    DeployCommand, DestroyArgs, DestroyCommand, DestructiveArgs, GenerateCommand, I18nCommand,
+    JobArgs, LockActionArg, LogsArgs, MailerArgs, MigrateView, RemoteCommon, ResourceArgs, Toggle,
 };
 use crate::controller::ControllerOptions;
 use crate::destroy::{DestroyFlags, DestroyPlan};
@@ -258,6 +260,9 @@ fn execute(
             }
             lifecycle(current_dir, |app| app.openapi(&arguments))
         }
+        Command::Deploy(args) => run_deploy(current_dir, args),
+        Command::Logs(args) => run_logs(current_dir, args),
+        Command::App { command } => run_app(current_dir, command),
         Command::Db { command } => {
             let command = match command {
                 DbCommand::Create => Db::Create,
@@ -328,6 +333,146 @@ fn run_credentials(
         after_read: None,
     };
     context.run(&action, environment)
+}
+
+/// Installs the signal handlers deploy commands stop on.
+fn deploy_signals() -> Result<(Signals, deploy::runner::Cancel), CliError> {
+    let signals = Signals::install()?;
+    let cancel = deploy::runner::Cancel::signal(signals.shutdown());
+    Ok((signals, cancel))
+}
+
+/// `forge deploy [SUBCOMMAND]`.
+fn run_deploy(current_dir: &std::path::Path, args: DeployArgs) -> Result<(), CliError> {
+    use deploy::cli::{DeployAction, LockAction};
+
+    let common = deploy::cli::Common {
+        config: args.common.config,
+        secrets: args.common.secrets,
+        dry_run: args.common.dry_run,
+        json: args.common.json,
+    };
+    if args.command.is_some() && (args.tag.is_some() || args.skip_build) {
+        return Err(CliError::Usage(
+            "--version and --skip-build apply to `forge deploy` without a subcommand".to_owned(),
+        ));
+    }
+    let action = match args.command {
+        None => DeployAction::Deploy {
+            version: args.tag,
+            skip_build: args.skip_build,
+        },
+        Some(DeployCommand::Init { service }) => DeployAction::Init { service },
+        Some(DeployCommand::Setup) => DeployAction::Setup,
+        Some(DeployCommand::Rollback { version }) => DeployAction::Rollback { version },
+        Some(DeployCommand::Prune) => DeployAction::Prune,
+        Some(DeployCommand::Details) => DeployAction::Details,
+        Some(DeployCommand::Lock {
+            action,
+            message,
+            force,
+        }) => DeployAction::Lock {
+            action: match action {
+                LockActionArg::Status => LockAction::Status,
+                LockActionArg::Acquire => LockAction::Acquire,
+                LockActionArg::Release => LockAction::Release,
+            },
+            message,
+            force,
+        },
+        Some(DeployCommand::Maintenance { state }) => DeployAction::Maintenance {
+            on: state == Toggle::On,
+        },
+    };
+    let (_signals, cancel) = deploy_signals()?;
+    deploy::cli::run_deploy(
+        action,
+        &common,
+        current_dir,
+        &deploy::cli::Io::process(),
+        &deploy::cli::Factory::system(),
+        &cancel,
+    )
+    .map_err(CliError::from)
+}
+
+fn remote_common(common: RemoteCommon) -> deploy::cli::Common {
+    deploy::cli::Common {
+        config: common.config,
+        secrets: common.secrets,
+        dry_run: common.dry_run,
+        json: false,
+    }
+}
+
+/// `forge logs`.
+fn run_logs(current_dir: &std::path::Path, args: LogsArgs) -> Result<(), CliError> {
+    let options = deploy::remote::LogsOptions {
+        role: args.role.unwrap_or_default(),
+        host: args.host.unwrap_or_default(),
+        follow: args.follow,
+        since: args.since.unwrap_or_default(),
+        lines: args.lines,
+        grep: args.grep.unwrap_or_default(),
+    };
+    let (_signals, cancel) = deploy_signals()?;
+    deploy::cli::run_logs(
+        options,
+        &remote_common(args.common),
+        current_dir,
+        &deploy::cli::Io::process(),
+        &deploy::cli::Factory::system(),
+        &cancel,
+    )
+    .map_err(CliError::from)
+}
+
+/// `forge app exec|shell`.
+fn run_app(current_dir: &std::path::Path, command: AppCommand) -> Result<(), CliError> {
+    use deploy::cli::AppAction;
+
+    let (common, action) = match command {
+        AppCommand::Exec {
+            common,
+            role,
+            host,
+            interactive,
+            reuse,
+            command,
+        } => (
+            common,
+            AppAction::Exec(deploy::remote::ExecOptions {
+                role: role.unwrap_or_default(),
+                host: host.unwrap_or_default(),
+                interactive,
+                reuse,
+                argv: command,
+            }),
+        ),
+        AppCommand::Shell {
+            common,
+            role,
+            host,
+            image,
+        } => (
+            common,
+            AppAction::Shell {
+                role: role.unwrap_or_default(),
+                host: host.unwrap_or_default(),
+                image: image.unwrap_or_default(),
+            },
+        ),
+    };
+    let (_signals, cancel) = deploy_signals()?;
+    deploy::cli::run_app(
+        action,
+        &remote_common(common),
+        current_dir,
+        &deploy::cli::Io::process(),
+        &deploy::cli::Factory::system(),
+        &cancel,
+    )
+    .map_err(CliError::from)
 }
 
 fn resource_options(resource: ResourceArgs, layers: Layers, broadcast: bool) -> ScaffoldOptions {

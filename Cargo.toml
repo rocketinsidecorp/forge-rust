@@ -18,6 +18,7 @@ members = [
     "crates/forge-macros",
     "crates/forge-mail",
     "crates/forge-openapi",
+    "crates/forge-proxy",
     "crates/forge-ratelimit",
     "crates/forge-security",
     "crates/forge-storage",
@@ -52,6 +53,10 @@ http = "1.5.0"
 http-body-util = "0.1.5"
 hyper = { version = "1.11.1", features = ["http1", "server"] }
 hyper-util = { version = "0.1.21", features = ["tokio"] }
+# `forge deploy` validation patterns and `forge logs --grep` (RE2 syntax, as
+# in Forge-Go): the regex engine already in the graph through
+# tracing-subscriber; its default features add no package.
+regex-automata = "0.4.18"
 # AES-256-GCM for TOTP seeds at rest (forge-auth): the ring already in the
 # graph through rustls; no default features.
 ring = { version = "0.17.14", default-features = false }

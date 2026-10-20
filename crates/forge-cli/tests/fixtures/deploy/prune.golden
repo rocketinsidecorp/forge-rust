@@ -1,0 +1,19 @@
+192.0.2.10      $ mkdir -p .forge/shop && if mkdir .forge/shop/lock 2>/dev/null; then cat > .forge/shop/lock/info; else cat .forge/shop/lock/info 2>/dev/null; exit 75; fi
+192.0.2.10      < stdin: lock record (holder, time, message)
+192.0.2.11      $ mkdir -p .forge/shop && if mkdir .forge/shop/lock 2>/dev/null; then cat > .forge/shop/lock/info; else cat .forge/shop/lock/info 2>/dev/null; exit 75; fi
+192.0.2.11      < stdin: lock record (holder, time, message)
+192.0.2.10      # lock acquired (prune)
+192.0.2.11      # lock acquired (prune)
+192.0.2.10      ? docker ps --all --no-trunc --filter label=forge.service=shop --format '{{json .}}'
+192.0.2.10      $ docker rm shop-web-v0-999999
+192.0.2.10      # pruned shop-web-v0-999999
+192.0.2.10      ? docker image ls --format '{{json .}}' registry.example.com/acme/shop
+192.0.2.10      $ docker image rm registry.example.com/acme/shop:v3
+192.0.2.10      $ docker image rm registry.example.com/acme/shop:v0
+192.0.2.11      ? docker ps --all --no-trunc --filter label=forge.service=shop --format '{{json .}}'
+192.0.2.11      $ docker rm shop-jobs-v0-999999 shop-web-v0-999999
+192.0.2.11      # pruned shop-jobs-v0-999999, shop-web-v0-999999
+192.0.2.11      ? docker image ls --format '{{json .}}' registry.example.com/acme/shop
+192.0.2.11      $ docker image rm registry.example.com/acme/shop:v0
+192.0.2.10      $ rm -rf .forge/shop/lock
+192.0.2.11      $ rm -rf .forge/shop/lock
