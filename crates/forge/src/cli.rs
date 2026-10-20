@@ -422,6 +422,7 @@ Environment:
   FORGE_MAIL_PREVIEW          true serves mail previews (development and test only; default: false)
   FORGE_MAIL_TLS_CA_FILE      PEM roots trusted in addition to the Mozilla roots (private relays)
   FORGE_AUTH_PASSWORD_RESET_URL public URL of /passwords/edit for reset emails (https; http only on localhost)
+  FORGE_AUTH_MFA_KEY          TOTP seed key: unpadded base64url of 32 random bytes (unset: no two-factor)
   FORGE_TELEMETRY_ENABLED     false installs no tracing, metrics or log export (default: true)
   FORGE_TELEMETRY_SERVICE_NAME    service.name (default: the application name)
   FORGE_TELEMETRY_SERVICE_VERSION service.version (default: the application version)

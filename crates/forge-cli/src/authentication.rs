@@ -33,6 +33,8 @@ const REQUIRED: &[(&str, &[&str])] = &[
         "src/infrastructure/security/mod.rs",
         &[
             "pub async fn authenticate_password",
+            "pub async fn verify_password",
+            "pub async fn verify_principal_password",
             "pub async fn issue_persisted_session",
             "pub fn issue_session_secrets",
             "pub fn session_set_cookie",
@@ -46,6 +48,7 @@ const REQUIRED: &[(&str, &[&str])] = &[
         "src/infrastructure/auth/mod.rs",
         &[
             "pub struct PostgresPasswordCredentialStore",
+            "async fn find_by_principal",
             "pub struct PostgresSessionStore",
         ],
     ),
@@ -197,7 +200,10 @@ fn refuse_collisions(root: &Path, files: &[File]) -> Result<(), CliError> {
         let mut migrations: Vec<String> = entries
             .filter_map(Result::ok)
             .map(|entry| entry.file_name().to_string_lossy().into_owned())
-            .filter(|name| name.ends_with("_forge_authentication.up.sql"))
+            .filter(|name| {
+                name.ends_with("_forge_authentication.up.sql")
+                    || name.ends_with("_forge_mfa.up.sql")
+            })
             .map(|name| format!("migrations/{name}"))
             .filter(|path| !existing.contains(path))
             .collect();
@@ -250,7 +256,10 @@ fn wiring() -> Result<String, CliError> {
          They go only to the login the credential store returns: if\n  \
          src/infrastructure/auth/mod.rs predates this generator, select `login` in\n  \
          `find_by_login` and add `.with_login(login)` to the credential, as `forge new`\n  \
-         does; without it no link is delivered.\n",
+         does; without it no link is delivered.\n\n  \
+         Two-factor authentication (/mfa, /session/mfa) needs FORGE_AUTH_MFA_KEY,\n  \
+         canonical unpadded base64url of 32 random bytes:\n\n    \
+         export FORGE_AUTH_MFA_KEY=$(openssl rand -base64 32 | tr '+/' '-_' | tr -d '=')\n",
     );
     Ok(out)
 }

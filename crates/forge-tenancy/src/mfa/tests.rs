@@ -1,0 +1,744 @@
+use std::net::{IpAddr, Ipv4Addr};
+use std::sync::Mutex;
+
+use forge_auth::{Aes256GcmSecretCipher, MemoryLoginThrottle};
+
+use super::testing::MemoryMfaStore;
+use super::*;
+
+const ISSUER: &str = "Acme";
+const ACCOUNT: &str = "ada@example.com";
+const START: u64 = 1_800_000_000;
+
+fn at(seconds: u64) -> UnixTimestamp {
+    UnixTimestamp::from_secs(seconds)
+}
+
+fn source(last: u8) -> Option<IpAddr> {
+    Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, last)))
+}
+
+fn binding(byte: u8) -> MfaChallengeBinding {
+    MfaChallengeBinding::from_bytes([byte; 32])
+}
+
+fn version(value: u64) -> PasswordCredentialVersion {
+    PasswordCredentialVersion::new(value).expect("positive")
+}
+
+struct Harness {
+    store: Arc<MemoryMfaStore>,
+    service: MfaService,
+    revoked: Arc<Mutex<Vec<PrincipalId>>>,
+}
+
+fn harness_with(key: [u8; 32]) -> Harness {
+    let revoked = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&revoked);
+    let store = Arc::new(MemoryMfaStore::new().with_session_revoker(Arc::new(
+        move |principal, _| sink.lock().expect("lock").push(principal),
+    )));
+    let cipher: Arc<dyn SecretCipher> = Arc::new(Aes256GcmSecretCipher::new(&key).expect("key"));
+    let throttle = Arc::new(MemoryLoginThrottle::new(mfa_throttle_config()).expect("config"));
+    let service = MfaService::new(store.clone(), Some(cipher), throttle);
+    Harness {
+        store,
+        service,
+        revoked,
+    }
+}
+
+fn harness() -> Harness {
+    harness_with([7; 32])
+}
+
+/// Enrolls `principal` at `START` and returns its seed and backup codes.
+async fn enrolled(harness: &Harness, principal: PrincipalId) -> (TotpSecret, Vec<MfaBackupCode>) {
+    let enrollment = harness
+        .service
+        .begin(principal, MfaChange::Enrollment, ISSUER, ACCOUNT, at(START))
+        .await
+        .expect("begin");
+    let code = enrollment.secret.code_at(at(START));
+    let codes = harness
+        .service
+        .confirm(principal, MfaChange::Enrollment, &code, at(START))
+        .await
+        .expect("confirm");
+    (enrollment.secret, codes)
+}
+
+async fn challenge(
+    harness: &Harness,
+    principal: PrincipalId,
+    tenant: TenantId,
+    now: u64,
+) -> MfaChallengeToken {
+    harness
+        .service
+        .issue_challenge(
+            principal,
+            tenant,
+            version(1),
+            binding(1),
+            at(now + 3600),
+            at(now),
+        )
+        .await
+        .expect("challenge")
+        .token
+}
+
+#[tokio::test]
+async fn enrollment_installs_the_factor_with_backup_codes_and_revokes_sessions() {
+    let harness = harness();
+    let ada = PrincipalId::new();
+    assert_eq!(harness.service.status(ada).await, Ok(None));
+    let enrollment = harness
+        .service
+        .begin(ada, MfaChange::Enrollment, ISSUER, ACCOUNT, at(START))
+        .await
+        .expect("begin");
+    assert_eq!(
+        enrollment.expires_at,
+        at(START + MFA_ENROLLMENT_LIFETIME_SECS)
+    );
+    assert!(
+        enrollment
+            .provisioning_uri
+            .expose()
+            .contains(&enrollment.secret.base32())
+    );
+    // Not active until confirmed; a wrong code changes nothing.
+    assert_eq!(harness.service.status(ada).await, Ok(None));
+    assert_eq!(
+        harness
+            .service
+            .confirm(ada, MfaChange::Enrollment, "000000", at(START))
+            .await
+            .err()
+            .filter(|_| enrollment.secret.code_at(at(START)) != "000000"),
+        Some(MfaError::InvalidCode)
+    );
+    // The pending seed can be shown again after a wrong code.
+    let again = harness
+        .service
+        .pending(ada, ISSUER, ACCOUNT, at(START))
+        .await
+        .expect("pending")
+        .expect("still pending");
+    assert_eq!(again.secret.digest(), enrollment.secret.digest());
+
+    let code = enrollment.secret.code_at(at(START));
+    let codes = harness
+        .service
+        .confirm(ada, MfaChange::Enrollment, &code, at(START))
+        .await
+        .expect("confirm");
+    assert_eq!(codes.len(), MFA_BACKUP_CODE_COUNT);
+    assert_eq!(
+        harness.service.status(ada).await,
+        Ok(Some(MfaStatus {
+            remaining_backup_codes: 10
+        }))
+    );
+    assert_eq!(*harness.revoked.lock().expect("lock"), vec![ada]);
+    // A second enrollment is refused; the confirmation used up the pending seed.
+    assert_eq!(
+        harness
+            .service
+            .begin(ada, MfaChange::Enrollment, ISSUER, ACCOUNT, at(START))
+            .await
+            .err(),
+        Some(MfaError::AlreadyEnabled)
+    );
+    assert_eq!(
+        harness
+            .service
+            .confirm(ada, MfaChange::Enrollment, &code, at(START))
+            .await
+            .err(),
+        Some(MfaError::EnrollmentInvalid)
+    );
+}
+
+#[tokio::test]
+async fn an_expired_enrollment_cannot_be_confirmed() {
+    let harness = harness();
+    let ada = PrincipalId::new();
+    let enrollment = harness
+        .service
+        .begin(ada, MfaChange::Enrollment, ISSUER, ACCOUNT, at(START))
+        .await
+        .expect("begin");
+    let late = START + MFA_ENROLLMENT_LIFETIME_SECS;
+    assert_eq!(
+        harness
+            .service
+            .confirm(
+                ada,
+                MfaChange::Enrollment,
+                &enrollment.secret.code_at(at(late)),
+                at(late)
+            )
+            .await
+            .err(),
+        Some(MfaError::EnrollmentInvalid)
+    );
+    assert_eq!(harness.service.status(ada).await, Ok(None));
+}
+
+#[tokio::test]
+async fn a_challenge_completes_once_and_its_code_is_never_replayed() {
+    let harness = harness();
+    let (ada, tenant) = (PrincipalId::new(), TenantId::new());
+    let (secret, _) = enrolled(&harness, ada).await;
+    let now = START + 60;
+
+    // The confirmation's period is recorded: its code cannot sign in.
+    let token = challenge(&harness, ada, tenant, now).await;
+    let confirmation_code = secret.code_at(at(START));
+    let replay = harness
+        .service
+        .complete(
+            token.expose(),
+            &binding(1),
+            &confirmation_code,
+            source(1),
+            at(START + 29),
+        )
+        .await
+        .err()
+        .map(|rejection| rejection.error);
+    assert_eq!(replay, Some(MfaError::InvalidCode));
+
+    let code = secret.code_at(at(now));
+    let signed_in = harness
+        .service
+        .complete(token.expose(), &binding(1), &code, source(1), at(now))
+        .await
+        .expect("completes");
+    assert_eq!(signed_in.principal_id, ada);
+    assert_eq!(signed_in.tenant_id, tenant);
+    assert_eq!(signed_in.factor, SecondFactor::Totp);
+    assert_eq!(signed_in.session_expires_at, at(now + 3600));
+
+    // The challenge is used up.
+    let used = harness
+        .service
+        .complete(token.expose(), &binding(1), &code, source(1), at(now))
+        .await
+        .err();
+    assert_eq!(used.map(|r| r.error), Some(MfaError::ChallengeExpired));
+    // The same code on a fresh challenge is a replay.
+    let fresh = challenge(&harness, ada, tenant, now).await;
+    let replayed = harness
+        .service
+        .complete(fresh.expose(), &binding(1), &code, source(1), at(now))
+        .await
+        .err();
+    assert_eq!(
+        replayed,
+        Some(MfaRejection {
+            error: MfaError::InvalidCode,
+            principal_id: Some(ada),
+            tenant_id: Some(tenant),
+        })
+    );
+    // The next period's code works.
+    harness
+        .service
+        .complete(
+            fresh.expose(),
+            &binding(1),
+            &secret.code_at(at(now + 30)),
+            source(1),
+            at(now + 30),
+        )
+        .await
+        .expect("next period");
+}
+
+#[tokio::test]
+async fn wrong_codes_expired_challenges_and_foreign_browsers_are_refused() {
+    let harness = harness();
+    let (ada, tenant) = (PrincipalId::new(), TenantId::new());
+    let (secret, _) = enrolled(&harness, ada).await;
+    let now = START + 120;
+    let token = challenge(&harness, ada, tenant, now).await;
+    let code = secret.code_at(at(now));
+    let wrong = if code == "123456" { "654321" } else { "123456" };
+    let complete = |token: &str, binding: MfaChallengeBinding, code: &str, when: u64| {
+        let service = harness.service.clone();
+        let (token, code) = (token.to_owned(), code.to_owned());
+        async move {
+            service
+                .complete(&token, &binding, &code, source(1), at(when))
+                .await
+                .err()
+                .map(|rejection| rejection.error)
+        }
+    };
+
+    assert_eq!(
+        complete(token.expose(), binding(1), wrong, now).await,
+        Some(MfaError::InvalidCode)
+    );
+    assert_eq!(
+        complete(token.expose(), binding(1), "12345", now).await,
+        Some(MfaError::InvalidCode)
+    );
+    // Another browser session holding the challenge cookie.
+    assert_eq!(
+        complete(token.expose(), binding(2), &code, now).await,
+        Some(MfaError::InvalidCode)
+    );
+    // A code two periods away.
+    assert_eq!(
+        complete(
+            token.expose(),
+            binding(1),
+            &secret.code_at(at(now + 60)),
+            now
+        )
+        .await,
+        Some(MfaError::InvalidCode)
+    );
+    // Malformed and unknown tokens.
+    assert_eq!(
+        complete("not-a-token", binding(1), &code, now).await,
+        Some(MfaError::ChallengeExpired)
+    );
+    let unknown = MfaChallengeToken::generate().expect("random");
+    assert_eq!(
+        complete(unknown.expose(), binding(1), &code, now).await,
+        Some(MfaError::ChallengeExpired)
+    );
+    // Expired: at and after its expiry.
+    let expiry = now + MFA_CHALLENGE_LIFETIME_SECS;
+    assert_eq!(
+        complete(
+            token.expose(),
+            binding(1),
+            &secret.code_at(at(expiry)),
+            expiry
+        )
+        .await,
+        Some(MfaError::ChallengeExpired)
+    );
+    // Still valid before it.
+    assert_eq!(complete(token.expose(), binding(1), &code, now).await, None);
+}
+
+#[tokio::test]
+async fn a_new_challenge_voids_the_old_one_and_password_changes_void_both() {
+    let harness = harness();
+    let (ada, tenant) = (PrincipalId::new(), TenantId::new());
+    let (secret, _) = enrolled(&harness, ada).await;
+    let now = START + 300;
+    let first = challenge(&harness, ada, tenant, now).await;
+    let second = challenge(&harness, ada, tenant, now).await;
+    let code = secret.code_at(at(now));
+    let first_result = harness
+        .service
+        .complete(first.expose(), &binding(1), &code, source(1), at(now))
+        .await
+        .err()
+        .map(|rejection| rejection.error);
+    assert_eq!(first_result, Some(MfaError::ChallengeExpired));
+
+    harness.store.set_credential_version(ada, version(2));
+    let stale = harness
+        .service
+        .complete(second.expose(), &binding(1), &code, source(1), at(now))
+        .await
+        .err()
+        .map(|rejection| rejection.error);
+    assert_eq!(stale, Some(MfaError::ChallengeExpired));
+    assert_eq!(
+        harness
+            .service
+            .issue_challenge(ada, tenant, version(1), binding(1), at(now + 60), at(now))
+            .await
+            .err(),
+        Some(MfaError::NotEnabled)
+    );
+}
+
+#[tokio::test]
+async fn attempts_are_throttled_per_account_and_per_source_before_the_code_is_checked() {
+    let harness = harness();
+    let (ada, tenant) = (PrincipalId::new(), TenantId::new());
+    let (secret, _) = enrolled(&harness, ada).await;
+    let now = START + 600;
+    let token = challenge(&harness, ada, tenant, now).await;
+    let code = secret.code_at(at(now));
+    let wrong = if code == "000001" { "000002" } else { "000001" };
+    for _ in 0..5 {
+        let error = harness
+            .service
+            .complete(token.expose(), &binding(1), wrong, source(1), at(now))
+            .await
+            .err()
+            .map(|rejection| rejection.error);
+        assert_eq!(error, Some(MfaError::InvalidCode));
+    }
+    // The right code is refused now, from any source: the account's budget is spent.
+    for last in [1, 2] {
+        let throttled = harness
+            .service
+            .complete(token.expose(), &binding(1), &code, source(last), at(now))
+            .await
+            .err()
+            .map(|rejection| rejection.error);
+        assert!(
+            matches!(throttled, Some(MfaError::Throttled { retry_after }) if retry_after > Duration::ZERO),
+            "{throttled:?}"
+        );
+    }
+
+    // One source guessing at many accounts stops at 60.
+    let harness = harness_with([9; 32]);
+    let mut throttled = 0;
+    for _ in 0..13 {
+        let (principal, tenant) = (PrincipalId::new(), TenantId::new());
+        enrolled(&harness, principal).await;
+        let token = challenge(&harness, principal, tenant, now).await;
+        for _ in 0..5 {
+            let error = harness
+                .service
+                .complete(token.expose(), &binding(1), "999999x", source(9), at(now))
+                .await
+                .err()
+                .map(|rejection| rejection.error);
+            if matches!(error, Some(MfaError::Throttled { .. })) {
+                throttled += 1;
+            }
+        }
+    }
+    assert_eq!(throttled, 13 * 5 - 60);
+}
+
+#[tokio::test]
+async fn backup_codes_complete_a_challenge_once() {
+    let harness = harness();
+    let (ada, tenant) = (PrincipalId::new(), TenantId::new());
+    let (_, codes) = enrolled(&harness, ada).await;
+    let now = START + 900;
+    let token = challenge(&harness, ada, tenant, now).await;
+    let typed = codes[0].expose().to_lowercase();
+    let signed_in = harness
+        .service
+        .complete(token.expose(), &binding(1), &typed, source(1), at(now))
+        .await
+        .expect("backup code");
+    assert_eq!(signed_in.factor, SecondFactor::BackupCode);
+    assert_eq!(
+        harness.service.status(ada).await,
+        Ok(Some(MfaStatus {
+            remaining_backup_codes: 9
+        }))
+    );
+    let again = challenge(&harness, ada, tenant, now).await;
+    let reused = harness
+        .service
+        .complete(
+            again.expose(),
+            &binding(1),
+            codes[0].expose(),
+            source(1),
+            at(now),
+        )
+        .await
+        .err()
+        .map(|rejection| rejection.error);
+    assert_eq!(reused, Some(MfaError::InvalidCode));
+    // An unknown well-formed code too.
+    let (unknown, _) = MfaBackupCode::generate_set(1).expect("codes");
+    let unknown_result = harness
+        .service
+        .complete(
+            again.expose(),
+            &binding(1),
+            unknown[0].expose(),
+            source(1),
+            at(now),
+        )
+        .await
+        .err()
+        .map(|rejection| rejection.error);
+    assert_eq!(unknown_result, Some(MfaError::InvalidCode));
+    harness
+        .service
+        .complete(
+            again.expose(),
+            &binding(1),
+            codes[1].expose(),
+            source(1),
+            at(now),
+        )
+        .await
+        .expect("another code");
+}
+
+#[tokio::test]
+async fn step_up_codes_are_single_use_and_regeneration_replaces_every_backup_code() {
+    let harness = harness();
+    let ada = PrincipalId::new();
+    let (secret, codes) = enrolled(&harness, ada).await;
+    let now = START + 1200;
+    let code = secret.code_at(at(now));
+    assert_eq!(
+        harness
+            .service
+            .verify_second_factor(ada, &code, at(now))
+            .await,
+        Ok(SecondFactor::Totp)
+    );
+    assert_eq!(
+        harness
+            .service
+            .verify_second_factor(ada, &code, at(now))
+            .await,
+        Err(MfaError::InvalidCode)
+    );
+    assert_eq!(
+        harness
+            .service
+            .verify_second_factor(ada, codes[0].expose(), at(now))
+            .await,
+        Ok(SecondFactor::BackupCode)
+    );
+    assert_eq!(
+        harness
+            .service
+            .verify_second_factor(ada, codes[0].expose(), at(now))
+            .await,
+        Err(MfaError::InvalidCode)
+    );
+    let fresh = harness
+        .service
+        .regenerate_backup_codes(ada, at(now))
+        .await
+        .expect("regenerated");
+    assert_eq!(fresh.len(), MFA_BACKUP_CODE_COUNT);
+    assert_eq!(
+        harness
+            .service
+            .verify_second_factor(ada, codes[1].expose(), at(now))
+            .await,
+        Err(MfaError::InvalidCode)
+    );
+    assert_eq!(
+        harness
+            .service
+            .verify_second_factor(ada, fresh[0].expose(), at(now))
+            .await,
+        Ok(SecondFactor::BackupCode)
+    );
+    let bob = PrincipalId::new();
+    assert_eq!(
+        harness
+            .service
+            .verify_second_factor(bob, &code, at(now))
+            .await,
+        Err(MfaError::NotEnabled)
+    );
+}
+
+#[tokio::test]
+async fn rotation_keeps_the_old_factor_until_confirmed_and_disable_removes_it() {
+    let harness = harness();
+    let (ada, tenant) = (PrincipalId::new(), TenantId::new());
+    let (old, _) = enrolled(&harness, ada).await;
+    let now = START + 1500;
+    assert_eq!(
+        harness
+            .service
+            .begin(
+                PrincipalId::new(),
+                MfaChange::Rotation,
+                ISSUER,
+                ACCOUNT,
+                at(now)
+            )
+            .await
+            .err(),
+        Some(MfaError::NotEnabled)
+    );
+    let rotation = harness
+        .service
+        .begin(ada, MfaChange::Rotation, ISSUER, ACCOUNT, at(now))
+        .await
+        .expect("rotation");
+    let pending_challenge = challenge(&harness, ada, tenant, now).await;
+    // The old factor still works until the new one is confirmed.
+    assert_eq!(
+        harness
+            .service
+            .verify_second_factor(ada, &old.code_at(at(now)), at(now))
+            .await,
+        Ok(SecondFactor::Totp)
+    );
+    harness
+        .service
+        .confirm(
+            ada,
+            MfaChange::Rotation,
+            &rotation.secret.code_at(at(now + 30)),
+            at(now + 30),
+        )
+        .await
+        .expect("rotated");
+    assert_eq!(harness.revoked.lock().expect("lock").len(), 2);
+    // Outstanding challenges died with the old factor.
+    let stale = harness
+        .service
+        .complete(
+            pending_challenge.expose(),
+            &binding(1),
+            &rotation.secret.code_at(at(now + 60)),
+            source(1),
+            at(now + 60),
+        )
+        .await
+        .err()
+        .map(|rejection| rejection.error);
+    assert_eq!(stale, Some(MfaError::ChallengeExpired));
+    assert_eq!(
+        harness
+            .service
+            .verify_second_factor(ada, &old.code_at(at(now + 60)), at(now + 60))
+            .await,
+        Err(MfaError::InvalidCode)
+    );
+
+    harness
+        .service
+        .disable(ada, at(now + 90))
+        .await
+        .expect("disabled");
+    assert_eq!(harness.service.status(ada).await, Ok(None));
+    assert_eq!(harness.revoked.lock().expect("lock").len(), 3);
+    assert_eq!(
+        harness.service.disable(ada, at(now + 90)).await,
+        Err(MfaError::NotEnabled)
+    );
+}
+
+#[tokio::test]
+async fn a_wrong_key_or_tampered_seed_fails_closed() {
+    let harness = harness();
+    let (ada, tenant) = (PrincipalId::new(), TenantId::new());
+    let (secret, _) = enrolled(&harness, ada).await;
+    let now = START + 1800;
+    let token = challenge(&harness, ada, tenant, now).await;
+
+    // The same store read with another key: the seed does not open.
+    let other: Arc<dyn SecretCipher> = Arc::new(Aes256GcmSecretCipher::new(&[8; 32]).expect("key"));
+    let throttle = Arc::new(MemoryLoginThrottle::new(mfa_throttle_config()).expect("config"));
+    let wrong_key = MfaService::new(harness.store.clone(), Some(other), throttle);
+    let error = wrong_key
+        .complete(
+            token.expose(),
+            &binding(1),
+            &secret.code_at(at(now)),
+            source(1),
+            at(now),
+        )
+        .await
+        .err()
+        .map(|rejection| rejection.error);
+    assert_eq!(error, Some(MfaError::Mechanism));
+    assert_eq!(
+        wrong_key
+            .verify_second_factor(ada, &secret.code_at(at(now)), at(now))
+            .await,
+        Err(MfaError::Mechanism)
+    );
+
+    // A tampered ciphertext under the right key.
+    let active = harness
+        .store
+        .active(ada)
+        .await
+        .expect("store")
+        .expect("factor");
+    let mut ciphertext = active.sealed.ciphertext().to_vec();
+    let last = ciphertext.len() - 1;
+    ciphertext[last] ^= 0x80;
+    let tampered = SealedTotpSecret::new(ciphertext, *active.sealed.digest());
+    let cipher = Aes256GcmSecretCipher::new(&[7; 32]).expect("key");
+    assert!(TotpSecret::open(&cipher, &tampered).is_err());
+}
+
+#[tokio::test]
+async fn without_a_key_every_operation_but_status_fails_closed() {
+    let harness = harness();
+    let ada = PrincipalId::new();
+    enrolled(&harness, ada).await;
+    let throttle = Arc::new(MemoryLoginThrottle::new(mfa_throttle_config()).expect("config"));
+    let unconfigured = MfaService::new(harness.store.clone(), None, throttle);
+    assert!(!unconfigured.is_configured());
+    assert!(matches!(unconfigured.status(ada).await, Ok(Some(_))));
+    let now = at(START + 2000);
+    assert_eq!(
+        unconfigured
+            .issue_challenge(
+                ada,
+                TenantId::new(),
+                version(1),
+                binding(1),
+                at(START + 9000),
+                now
+            )
+            .await
+            .err(),
+        Some(MfaError::NotConfigured)
+    );
+    assert_eq!(
+        unconfigured
+            .complete("x", &binding(1), "123456", source(1), now)
+            .await
+            .err()
+            .map(|rejection| rejection.error),
+        Some(MfaError::NotConfigured)
+    );
+    assert_eq!(
+        unconfigured.disable(ada, now).await,
+        Err(MfaError::NotConfigured)
+    );
+    assert_eq!(
+        unconfigured
+            .begin(
+                PrincipalId::new(),
+                MfaChange::Enrollment,
+                ISSUER,
+                ACCOUNT,
+                now
+            )
+            .await
+            .err(),
+        Some(MfaError::NotConfigured)
+    );
+    assert_eq!(
+        unconfigured.verify_second_factor(ada, "123456", now).await,
+        Err(MfaError::NotConfigured)
+    );
+    assert!(format!("{unconfigured:?}").contains("configured: false"));
+}
+
+#[tokio::test]
+async fn labels_are_validated_before_anything_is_stored() {
+    let harness = harness();
+    let ada = PrincipalId::new();
+    assert_eq!(
+        harness
+            .service
+            .begin(ada, MfaChange::Enrollment, "", ACCOUNT, at(START))
+            .await
+            .err(),
+        Some(MfaError::InvalidLabel)
+    );
+    assert_eq!(harness.store.pending(ada, at(START)).await, Ok(None));
+}

@@ -561,10 +561,15 @@ name = "forge-auth"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64",
  "forge-core",
  "forge-security",
  "getrandom 0.4.3",
+ "hmac",
+ "ring",
+ "sha1",
  "sha2 0.11.1",
+ "subtle",
  "thiserror",
  "tokio",
 ]
@@ -623,6 +628,7 @@ name = "forge-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "forge-auth",
  "forge-config",
  "forge-db",
  "forge-i18n",
@@ -885,6 +891,7 @@ dependencies = [
  "forge-core",
  "forge-security",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]

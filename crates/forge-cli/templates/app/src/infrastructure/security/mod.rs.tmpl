@@ -12,9 +12,9 @@ use async_trait::async_trait;
 use cookie::{Cookie, SameSite};
 use forge::auth::{
     AuthenticatedPrincipal, CsrfToken, CsrfTokenDigest, PasswordCredentialStore,
-    PasswordCredentialStoreError, PasswordHash, PasswordHashError, PasswordHasher, Session,
-    SessionBearerToken, SessionCredentialDigest, SessionError, SessionStore, SessionStoreError,
-    UnixTimestamp,
+    PasswordCredentialStoreError, PasswordCredentialVersion, PasswordHash, PasswordHashError,
+    PasswordHasher, Session, SessionBearerToken, SessionCredentialDigest, SessionError,
+    SessionStore, SessionStoreError, UnixTimestamp,
 };
 use forge::http::{Method, Request, header};
 use forge::security::PrincipalId;
@@ -154,6 +154,30 @@ pub async fn authenticate_password(
     login: &str,
     password: &[u8],
 ) -> Result<PrincipalId, LoginError> {
+    verify_password(store, hasher, login, password)
+        .await
+        .map(|verified| verified.principal_id)
+}
+
+/// A password [`verify_password`] accepted: the principal and the credential
+/// version it was verified at (after any rehash). A sign-in that still needs
+/// a second factor binds its challenge to this version, so a password change
+/// in between voids it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VerifiedPassword {
+    /// The authenticated principal.
+    pub principal_id: PrincipalId,
+    /// The credential version the password was verified at.
+    pub version: PasswordCredentialVersion,
+}
+
+/// [`authenticate_password`], also returning the verified credential version.
+pub async fn verify_password(
+    store: &dyn PasswordCredentialStore,
+    hasher: &dyn PasswordHasher,
+    login: &str,
+    password: &[u8],
+) -> Result<VerifiedPassword, LoginError> {
     let login_valid = !login.trim().is_empty()
         && login.len() <= 320
         && !login.bytes().any(|byte| byte.is_ascii_control());
@@ -183,6 +207,7 @@ pub async fn authenticate_password(
         return Err(LoginError::InvalidCredentials);
     }
 
+    let mut version = credential.version();
     if hasher
         .needs_rehash(credential.password_hash())
         .map_err(map_password_hash_error)?
@@ -192,16 +217,56 @@ pub async fn authenticate_password(
             .await
             .map_err(map_password_hash_error)?;
         store
-            .replace_password_hash(
-                credential.principal_id(),
-                credential.version(),
-                &replacement,
-            )
+            .replace_password_hash(credential.principal_id(), version, &replacement)
             .await
             .map_err(map_credential_store_error)?;
+        // The store advanced the version by one.
+        version = version
+            .get()
+            .checked_add(1)
+            .and_then(PasswordCredentialVersion::new)
+            .ok_or(LoginError::AuthenticationUnavailable)?;
     }
 
-    Ok(credential.principal_id())
+    Ok(VerifiedPassword {
+        principal_id: credential.principal_id(),
+        version,
+    })
+}
+
+/// Re-verifies the password of a signed-in principal (step-up
+/// authentication before changing a second factor). A missing, disabled or
+/// password-less account is a wrong password; the stored login is returned
+/// on success.
+pub async fn verify_principal_password(
+    store: &dyn PasswordCredentialStore,
+    hasher: &dyn PasswordHasher,
+    principal_id: PrincipalId,
+    password: &[u8],
+) -> Result<String, LoginError> {
+    if password.is_empty() || password.len() > MAX_PASSWORD_BYTES {
+        perform_dummy_password_work(hasher).await?;
+        return Err(LoginError::InvalidCredentials);
+    }
+    let Some(credential) = store
+        .find_by_principal(principal_id)
+        .await
+        .map_err(map_credential_store_error)?
+    else {
+        perform_dummy_password_work(hasher).await?;
+        return Err(LoginError::InvalidCredentials);
+    };
+    let verified = hasher
+        .verify(password, credential.password_hash())
+        .await
+        .map_err(map_password_hash_error)?;
+    if !verified || credential.disabled() {
+        return Err(LoginError::InvalidCredentials);
+    }
+    credential
+        .login()
+        .map(str::to_owned)
+        .ok_or(LoginError::AuthenticationUnavailable)
 }
 
 async fn perform_dummy_password_work(hasher: &dyn PasswordHasher) -> Result<(), LoginError> {

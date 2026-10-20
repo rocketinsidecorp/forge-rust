@@ -1,0 +1,18 @@
+{% extends "layouts/application.html" %}
+
+{% block title %}{{ layout.i18n.t("mfa.backup_codes.title") }}{% endblock %}
+
+{% block content %}
+<h1>{{ layout.i18n.t("mfa.backup_codes.title") }}</h1>
+<p>{{ layout.i18n.t("mfa.backup_codes.instructions") }}</p>
+<ol class="backup-codes">
+  {% for code in codes %}<li><code>{{ code }}</code></li>
+  {% endfor %}
+</ol>
+{% if signed_out %}
+<p>{{ layout.i18n.t("mfa.backup_codes.signed_out") }}</p>
+<p><a href="/session/new?return_to=%2Fmfa">{{ layout.i18n.t("mfa.backup_codes.sign_in") }}</a></p>
+{% else %}
+<p><a href="/mfa">{{ layout.i18n.t("mfa.show.back") }}</a></p>
+{% endif %}
+{% endblock %}

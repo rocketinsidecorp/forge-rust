@@ -50,11 +50,17 @@ http = "1.5.0"
 http-body-util = "0.1.5"
 hyper = { version = "1.11.1", features = ["http1", "server"] }
 hyper-util = { version = "0.1.21", features = ["tokio"] }
+# AES-256-GCM for TOTP seeds at rest (forge-auth): the ring already in the
+# graph through rustls; no default features.
+ring = { version = "0.17.14", default-features = false }
 # TLS for the OTLP exporter: the rustls/ring/webpki-roots stack SQLx already uses.
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
 rustix = { version = "1.1.5", default-features = false, features = ["fs", "std"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+# HMAC-SHA-1 of RFC 6238 TOTP codes (forge-auth), the RustCrypto release
+# already locked through sqlx-mysql.
+sha1 = { version = "0.11.0", default-features = false }
 sha2 = { version = "0.11.0", default-features = false }
 sqlx = { version = "0.9", default-features = false, features = ["migrate", "runtime-tokio", "tls-rustls-ring-webpki", "uuid"] }
 subtle = { version = "2.6.1", default-features = false }

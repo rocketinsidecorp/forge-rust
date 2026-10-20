@@ -27,7 +27,7 @@ results.
 | 0 | Architecture, ADRs, threat model, dependency and test policy | Done |
 | 1 | Runtime, CLI, configuration, HTTP, graceful shutdown, health, Docker | Implemented, unreleased |
 | 2 | PostgreSQL, migrations, transaction contracts, repositories | Behavior implemented; CI runner gate still blocked |
-| 3 | Authentication, authorization, tenancy, RLS, audit | Implemented for PostgreSQL (sign-in pages, setup, RBAC, RLS, audit, reset emails through the mailer of [ADR 0035](docs/adr/0035-mail.md)); MFA and other backends pending |
+| 3 | Authentication, authorization, tenancy, RLS, audit | Implemented for PostgreSQL (sign-in pages, setup, RBAC, RLS, audit, reset emails through the mailer of [ADR 0035](docs/adr/0035-mail.md), TOTP two-factor authentication of [ADR 0040](docs/adr/0040-totp-multi-factor-authentication.md)); other backends pending |
 | 4 | PostgreSQL jobs, cron scheduler, outbox, idempotent consumers | Library implemented and tested (`forge` features `jobs`, `events`); `forge new` wiring pending |
 | 5 | Traces, metrics, correlated logs (OTLP, Prometheus) | Implemented ([ADR 0033](docs/adr/0033-telemetry.md)); generated local Grafana, Prometheus, Tempo and Loki stack ([ADR 0034](docs/adr/0034-local-observability-stack.md)) |
 | 6 | OpenAPI from typed routes | Implemented ([ADR 0039](docs/adr/0039-openapi-from-typed-routes.md)); code generation and AI pending |
@@ -578,6 +578,27 @@ Credentials go only over verified TLS (or to a loopback relay with
 `FORGE_MAIL_ALLOW_PLAINTEXT=true`); production refuses the file sender and
 previews.
 
+## Two-factor authentication
+
+Generated PostgreSQL applications support TOTP authenticator apps (RFC 6238)
+with one-time backup codes ([ADR 0040](docs/adr/0040-totp-multi-factor-authentication.md),
+[docs/mfa.md](docs/mfa.md)). Seeds are encrypted with `FORGE_AUTH_MFA_KEY`;
+without it the feature is off and an enrolled account cannot sign in:
+
+```sh
+export FORGE_AUTH_MFA_KEY=$(openssl rand -base64 32 | tr '+/' '-_' | tr -d '=')
+forge dev
+# sign in, open http://127.0.0.1:3000/mfa, enter your password, add the key to
+# your authenticator app (the link opens it on a phone) and confirm with a code;
+# keep the 10 backup codes. The next sign-in asks for a code at /session/mfa.
+# Replace the authenticator, create new backup codes or turn it off at /mfa
+# (password and a current code each time).
+```
+
+A code and a backup code work once, the code step allows five attempts per
+account and 60 per address in five minutes, and a challenge only works in the
+browser that entered the password.
+
 ## Translations
 
 Full-stack applications are translated like Rails I18n: JSON files in
@@ -881,6 +902,7 @@ Contribution rules:
 - [Jobs, schedules, outbox and consumers](docs/jobs.md)
 - [Mail: SMTP, templates, previews and reset emails](docs/mail.md)
 - [Internationalization: translations, plurals, locales](docs/i18n.md)
+- [Two-factor authentication (TOTP)](docs/mfa.md)
 - [OpenAPI from typed routes](docs/openapi.md)
 - [Deployment](docs/deployment.md)
 - [Observability: traces, metrics and logs](docs/observability.md)

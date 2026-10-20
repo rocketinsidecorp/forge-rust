@@ -1,0 +1,85 @@
+-- Forge TOTP multi-factor authentication (ADR 0040): Forge-Go's pending
+-- enrollments, active factors, one-time backup codes and sign-in
+-- challenges. A seed is stored only as AES-256-GCM ciphertext under
+-- FORGE_AUTH_MFA_KEY (never stored in the database) beside its SHA-256
+-- digest; backup codes and challenge tokens only as SHA-256 digests.
+-- Identifiers are UUIDv7 values generated in Rust.
+
+CREATE TABLE forge_totp_enrollments (
+    principal_id uuid PRIMARY KEY REFERENCES forge_principals(id) ON DELETE CASCADE,
+    secret_digest bytea NOT NULL CHECK (octet_length(secret_digest) = 32),
+    secret_ciphertext bytea NOT NULL CHECK (octet_length(secret_ciphertext) > 0),
+    expires_at timestamptz NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp()
+);
+
+CREATE TABLE forge_totp_factors (
+    principal_id uuid PRIMARY KEY REFERENCES forge_principals(id) ON DELETE CASCADE,
+    secret_digest bytea NOT NULL CHECK (octet_length(secret_digest) = 32),
+    secret_ciphertext bytea NOT NULL CHECK (octet_length(secret_ciphertext) > 0),
+    -- The last accepted TOTP period; -1 before the first. A code is
+    -- accepted only for a later period, so it is never accepted twice.
+    last_counter bigint NOT NULL DEFAULT -1 CHECK (last_counter >= -1),
+    enabled_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    updated_at timestamptz NOT NULL DEFAULT clock_timestamp()
+);
+
+CREATE TABLE forge_mfa_backup_codes (
+    id uuid PRIMARY KEY,
+    principal_id uuid NOT NULL REFERENCES forge_principals(id) ON DELETE CASCADE,
+    code_digest bytea NOT NULL CHECK (octet_length(code_digest) = 32),
+    consumed_at timestamptz,
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    UNIQUE (principal_id, code_digest)
+);
+
+CREATE INDEX forge_mfa_backup_codes_unused
+ON forge_mfa_backup_codes (principal_id)
+WHERE consumed_at IS NULL;
+
+CREATE TABLE forge_mfa_challenges (
+    id uuid PRIMARY KEY,
+    token_digest bytea NOT NULL UNIQUE CHECK (octet_length(token_digest) = 32),
+    principal_id uuid NOT NULL REFERENCES forge_principals(id) ON DELETE CASCADE,
+    tenant_id uuid NOT NULL REFERENCES forge_tenants(id) ON DELETE CASCADE,
+    -- The password credential version the password step verified.
+    credential_version bigint NOT NULL CHECK (credential_version > 0),
+    -- The factor the challenge was issued for.
+    factor_secret_digest bytea NOT NULL CHECK (octet_length(factor_secret_digest) = 32),
+    -- SHA-256 of the CSRF token of the browser session it was issued to.
+    binding_digest bytea NOT NULL CHECK (octet_length(binding_digest) = 32),
+    expires_at timestamptz NOT NULL,
+    session_expires_at timestamptz NOT NULL,
+    consumed_at timestamptz,
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp()
+);
+
+CREATE INDEX forge_mfa_challenges_pending
+ON forge_mfa_challenges (principal_id)
+WHERE consumed_at IS NULL;
+
+REVOKE ALL ON TABLE forge_totp_enrollments FROM PUBLIC;
+REVOKE ALL ON TABLE forge_totp_factors FROM PUBLIC;
+REVOKE ALL ON TABLE forge_mfa_backup_codes FROM PUBLIC;
+REVOKE ALL ON TABLE forge_mfa_challenges FROM PUBLIC;
+
+-- The runtime role enrolls, rotates and disables factors, uses backup
+-- codes and issues and consumes challenges. It cannot rewrite a
+-- challenge's binding or a backup code's digest.
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'app_runtime') THEN
+        REVOKE ALL ON TABLE forge_totp_enrollments FROM app_runtime;
+        REVOKE ALL ON TABLE forge_totp_factors FROM app_runtime;
+        REVOKE ALL ON TABLE forge_mfa_backup_codes FROM app_runtime;
+        REVOKE ALL ON TABLE forge_mfa_challenges FROM app_runtime;
+
+        GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE forge_totp_enrollments TO app_runtime;
+        GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE forge_totp_factors TO app_runtime;
+        GRANT SELECT, INSERT, DELETE ON TABLE forge_mfa_backup_codes TO app_runtime;
+        GRANT UPDATE (consumed_at) ON TABLE forge_mfa_backup_codes TO app_runtime;
+        GRANT SELECT, INSERT ON TABLE forge_mfa_challenges TO app_runtime;
+        GRANT UPDATE (consumed_at) ON TABLE forge_mfa_challenges TO app_runtime;
+    END IF;
+END
+$$;

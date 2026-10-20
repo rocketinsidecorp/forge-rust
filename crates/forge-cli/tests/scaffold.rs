@@ -399,6 +399,11 @@ fn postgresql_application_with_scaffolds_passes_its_gates_and_migrations_revert(
         "postgres_round_trip_locking_and_pages ... ok",
         "postgres_row_level_security_isolates_tenants ... ok",
         "every_wrong_field_gets_the_same_answer ... ok",
+        "two_factor_sign_in_takes_a_code_once_and_a_backup_code_once ... ok",
+        "a_challenge_cookie_carried_to_another_browser_is_refused ... ok",
+        "changing_the_factor_needs_the_password_and_a_current_code ... ok",
+        "without_the_key_an_enrolled_account_cannot_sign_in ... ok",
+        "two_factor_codes_and_challenges_work_once_and_fail_closed ... ok",
         "a_reset_link_works_once_changes_the_password_and_revokes_sessions ... ok",
         "setup_creates_one_owner_who_can_sign_in_and_refuses_afterwards ... ok",
         "concurrent_setups_create_exactly_one_tenant ... ok",
@@ -694,7 +699,11 @@ fn sign_in_use_a_tenant_scaffold_and_sign_out(root: &Path, binary: &str, url: &s
         root,
         binary,
         &["serve"],
-        &[("FORGE_DATABASE_URL", url), ("FORGE_BIND", &bind)],
+        &[
+            ("FORGE_DATABASE_URL", url),
+            ("FORGE_BIND", &bind),
+            ("FORGE_AUTH_MFA_KEY", MFA_KEY),
+        ],
     );
     let _server = Server(
         serve
@@ -801,6 +810,136 @@ fn sign_in_use_a_tenant_scaffold_and_sign_out(root: &Path, binary: &str, url: &s
         .push(("__Host-forge_session".to_owned(), session));
     let refused = stale.request(port, "GET", &events, None);
     assert_eq!(refused.status, 303);
+
+    two_factor_enrol_sign_in_and_recover(port);
+}
+
+/// `FORGE_AUTH_MFA_KEY` of the served application: 32 bytes of 0x07.
+const MFA_KEY: &str = "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc";
+
+/// The current TOTP period.
+fn totp_period() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_else(|error| panic!("{error}"))
+        .as_secs()
+        / forge_auth::TOTP_PERIOD_SECS
+}
+
+fn totp(key: &str, offset: u64) -> String {
+    forge_auth::TotpSecret::from_base32(key)
+        .unwrap_or_else(|error| panic!("key: {error}"))
+        .code(totp_period() + offset)
+}
+
+/// Signs the owner in with the password; returns the answer.
+fn password_sign_in(browser: &mut Browser, port: u16) -> Reply {
+    browser.request(port, "GET", "/session/new", None);
+    let form = format!(
+        "csrf_token={}&tenant=acme&email=owner%40example.com&password={}",
+        browser.csrf(),
+        form_encode(OWNER_PASSWORD)
+    );
+    browser.request(port, "POST", "/session", Some(&form))
+}
+
+/// The owner turns two-factor on (password, then a code of the new key),
+/// signs in with a TOTP code, is refused the same code again, signs in with
+/// a backup code once and is refused it the second time.
+fn two_factor_enrol_sign_in_and_recover(port: u16) {
+    let mut browser = Browser::default();
+    let signed_in = password_sign_in(&mut browser, port);
+    assert_eq!(signed_in.status, 303, "{}", signed_in.body);
+    let settings = browser.request(port, "GET", "/mfa", None);
+    assert_eq!(settings.status, 200, "{}", settings.body);
+    assert!(settings.body.contains("Two-factor authentication is off."));
+
+    let form = format!(
+        "csrf_token={}&password={}",
+        browser.csrf(),
+        form_encode(OWNER_PASSWORD)
+    );
+    let setup = browser.request(port, "POST", "/mfa", Some(&form));
+    assert_eq!(setup.status, 200, "{}", setup.body);
+    assert_eq!(setup.header("cache-control"), Some("no-store"));
+    let key = setup
+        .body
+        .split("<code id=\"mfa_key\">")
+        .nth(1)
+        .and_then(|rest| rest.split("</code>").next())
+        .unwrap_or_else(|| panic!("the key in {}", setup.body))
+        .replace(' ', "");
+    assert!(setup.body.contains("otpauth://totp/"));
+    let confirm = format!(
+        "csrf_token={}&password={}&code={}",
+        browser.csrf(),
+        form_encode(OWNER_PASSWORD),
+        totp(&key, 0)
+    );
+    let confirmed = browser.request(port, "POST", "/mfa/confirm", Some(&confirm));
+    assert_eq!(confirmed.status, 200, "{}", confirmed.body);
+    let backup_codes: Vec<String> = confirmed
+        .body
+        .split("<li><code>")
+        .skip(1)
+        .filter_map(|rest| rest.split("</code>").next())
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(backup_codes.len(), 10, "{}", confirmed.body);
+    assert!(
+        browser.cookie("__Host-forge_session").is_none(),
+        "enrolling signs out everywhere"
+    );
+
+    let code_step = |browser: &mut Browser, code: &str| {
+        let challenged = password_sign_in(browser, port);
+        assert_eq!(challenged.status, 303, "{}", challenged.body);
+        assert_eq!(challenged.header("location"), Some("/session/mfa"));
+        assert!(browser.cookie("__Host-forge_session").is_none());
+        let page = browser.request(port, "GET", "/session/mfa", None);
+        assert_eq!(page.status, 200, "{}", page.body);
+        let form = format!("csrf_token={}&code={}", browser.csrf(), form_encode(code));
+        browser.request(port, "POST", "/session/mfa", Some(&form))
+    };
+    let sign_out = |browser: &mut Browser| {
+        let form = format!("csrf_token={}&_method=delete", browser.csrf());
+        let out = browser.request(port, "POST", "/session", Some(&form));
+        assert_eq!(out.status, 303, "{}", out.body);
+    };
+
+    let code = totp(&key, 1);
+    let mut first = Browser::default();
+    let done = code_step(&mut first, &code);
+    assert_eq!(done.status, 303, "{}", done.body);
+    assert_eq!(done.header("location"), Some("/"));
+    assert_eq!(
+        first
+            .cookie("__Host-forge_session")
+            .map(|session| session.len()),
+        Some(64)
+    );
+    sign_out(&mut first);
+
+    let mut replay = Browser::default();
+    let refused = code_step(&mut replay, &code);
+    assert_eq!(
+        refused.status, 422,
+        "a used code is refused: {}",
+        refused.body
+    );
+    assert!(replay.cookie("__Host-forge_session").is_none());
+
+    let mut recovery = Browser::default();
+    let recovered = code_step(&mut recovery, &backup_codes[0]);
+    assert_eq!(recovered.status, 303, "{}", recovered.body);
+    assert!(recovery.cookie("__Host-forge_session").is_some());
+    let left = recovery.request(port, "GET", "/mfa", None);
+    assert!(left.body.contains("9 backup codes left."), "{}", left.body);
+    sign_out(&mut recovery);
+
+    let mut reuse = Browser::default();
+    let reused = code_step(&mut reuse, &backup_codes[0]);
+    assert_eq!(reused.status, 422, "a used backup code is refused");
 }
 
 #[test]

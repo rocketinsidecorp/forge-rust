@@ -1,5 +1,6 @@
 //! Outgoing mail settings: the `FORGE_MAIL_*` variables and
-//! `FORGE_AUTH_PASSWORD_RESET_URL` (ADR 0035).
+//! `FORGE_AUTH_PASSWORD_RESET_URL` (ADR 0035), and the TOTP seed key
+//! `FORGE_AUTH_MFA_KEY` (ADR 0040).
 //!
 //! The keys, defaults and rules are Forge-Go's (`config/mail.go`,
 //! `config/mailbox.go`, ADR 0024 there), so one set of variables configures
@@ -13,6 +14,7 @@ use std::{
     time::Duration,
 };
 
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -31,6 +33,14 @@ pub const MAIL_KEYS: &[&str] = &[
 /// `FORGE_AUTH_PASSWORD_RESET_URL`: the absolute URL of the page password
 /// reset emails link to.
 pub const PASSWORD_RESET_URL_KEY: &str = "FORGE_AUTH_PASSWORD_RESET_URL";
+
+/// `FORGE_AUTH_MFA_KEY`: the AES-256-GCM key that encrypts TOTP seeds at
+/// rest, as canonical unpadded base64url of 32 random bytes (Forge-Go's
+/// format). Unset or empty, multi-factor authentication is not configured.
+pub const MFA_KEY_KEY: &str = "FORGE_AUTH_MFA_KEY";
+
+/// Bytes of the `FORGE_AUTH_MFA_KEY` key.
+pub const MFA_KEY_BYTES: usize = 32;
 
 const DEFAULT_MAIL_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_MAIL_TIMEOUT: Duration = Duration::from_secs(600);
@@ -159,6 +169,38 @@ pub struct AuthConfig {
     /// (`FORGE_AUTH_PASSWORD_RESET_URL`): https, or http on a loopback host,
     /// without credentials, query or fragment. `None` disables reset emails.
     pub password_reset_url: Option<String>,
+    /// The TOTP seed key (`FORGE_AUTH_MFA_KEY`), validated when loaded and
+    /// redacted in diagnostics. `None` leaves MFA unconfigured: enrolling is
+    /// refused and an account with a factor cannot sign in.
+    pub mfa_key: Option<SecretString>,
+}
+
+impl AuthConfig {
+    /// Decodes the configured MFA key, or `None` when none is set. The
+    /// error never contains the key.
+    pub fn mfa_key_bytes(&self) -> Result<Option<[u8; MFA_KEY_BYTES]>, ConfigError> {
+        self.mfa_key
+            .as_ref()
+            .map(|key| decode_mfa_key(key.expose()))
+            .transpose()
+    }
+}
+
+/// Canonical unpadded base64url of exactly 32 bytes: no padding, the
+/// URL-safe alphabet, no trailing bits, nothing around it.
+fn decode_mfa_key(value: &str) -> Result<[u8; MFA_KEY_BYTES], ConfigError> {
+    let refused = || {
+        invalid(
+            MFA_KEY_KEY,
+            REDACTED,
+            "canonical unpadded base64url of exactly 32 random bytes",
+        )
+    };
+    let bytes = URL_SAFE_NO_PAD.decode(value).map_err(|_| refused())?;
+    if URL_SAFE_NO_PAD.encode(&bytes) != value {
+        return Err(refused());
+    }
+    <[u8; MFA_KEY_BYTES]>::try_from(bytes.as_slice()).map_err(|_| refused())
 }
 
 /// Reads the `FORGE_MAIL_*` keys and `FORGE_AUTH_PASSWORD_RESET_URL`.
@@ -214,6 +256,14 @@ pub(crate) fn apply(
         && !value.is_empty()
     {
         auth.password_reset_url = Some(value);
+    }
+    if let Some(value) = lookup(MFA_KEY_KEY)
+        && !value.is_empty()
+    {
+        // A key that is set but invalid stops start-up in every
+        // environment; the rejected value is a secret and never echoed.
+        decode_mfa_key(&value)?;
+        auth.mfa_key = Some(SecretString::new(value));
     }
     Ok(())
 }
@@ -837,6 +887,54 @@ mod tests {
     fn rejected(pairs: &[(&str, &str)]) -> ConfigError {
         load(pairs).expect_err("must be rejected")
     }
+
+    #[test]
+    fn the_mfa_key_is_optional_canonical_and_never_echoed() {
+        let key = URL_SAFE_NO_PAD.encode([7_u8; 32]);
+        for environment in ["development", "test", "production"] {
+            let unset = load(&[("FORGE_ENV", environment)]).expect("optional");
+            assert_eq!(unset.auth.mfa_key, None);
+            assert_eq!(unset.auth.mfa_key_bytes(), Ok(None));
+            let empty = load(&[("FORGE_ENV", environment), (MFA_KEY_KEY, "")]).expect("empty");
+            assert_eq!(empty.auth.mfa_key, None);
+            let set = load(&[("FORGE_ENV", environment), (MFA_KEY_KEY, &key)]).expect("valid");
+            assert_eq!(set.auth.mfa_key_bytes(), Ok(Some([7_u8; 32])));
+            assert!(!format!("{set:?}").contains(&key));
+            assert!(
+                !serde_json::to_string(&set)
+                    .expect("serializes")
+                    .contains(&key)
+            );
+        }
+        let padded = format!("{key}=");
+        let standard = STANDARD_KEY;
+        let short = URL_SAFE_NO_PAD.encode([1_u8; 31]);
+        let long = URL_SAFE_NO_PAD.encode([1_u8; 33]);
+        let spaced = format!(" {key}");
+        let mut trailing_bits = key.clone();
+        trailing_bits.pop();
+        trailing_bits.push('B');
+        for bad in [
+            padded.as_str(),
+            standard,
+            short.as_str(),
+            long.as_str(),
+            spaced.as_str(),
+            trailing_bits.as_str(),
+            "not a key",
+        ] {
+            for environment in ["development", "production"] {
+                let error = rejected(&[("FORGE_ENV", environment), (MFA_KEY_KEY, bad)]);
+                let text = error.to_string();
+                assert!(text.contains(MFA_KEY_KEY), "{text}");
+                assert!(text.contains("[REDACTED]"), "{text}");
+                assert!(!text.contains(bad.trim()), "{text}");
+            }
+        }
+    }
+
+    /// 32 bytes in the standard (not URL-safe) alphabet.
+    const STANDARD_KEY: &str = "+/+/+/+/+/+/+/+/+/+/+/+/+/+/+/+/+/+/+/+/+/8";
 
     #[test]
     fn mail_is_disabled_by_default() {

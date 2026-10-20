@@ -11,10 +11,19 @@
         "forgot_password": "¿Olvidaste tu contraseña?",
         "already_signed_in": "Ya iniciaste sesión. Inicia sesión de nuevo para cambiar de cuenta, o cierra la sesión."
       },
+      "mfa": {
+        "title": "Autenticación en dos pasos",
+        "code": "Código",
+        "code_hint": "El código de 6 dígitos de tu aplicación de autenticación, o uno de tus códigos de respaldo.",
+        "submit": "Verificar",
+        "start_over": "Empezar de nuevo"
+      },
       "sign_out": "Cerrar sesión",
       "signed_in": "Sesión iniciada.",
       "signed_out": "Sesión cerrada.",
-      "invalid_credentials": "Esa organización, correo electrónico y contraseña no coinciden con ninguna cuenta."
+      "invalid_credentials": "Esa organización, correo electrónico y contraseña no coinciden con ninguna cuenta.",
+      "expired": "Tu inicio de sesión expiró. Inicia sesión de nuevo.",
+      "invalid_code": "Ese código no funcionó. Introduce el código actual de tu aplicación de autenticación, o un código de respaldo."
     },
     "passwords": {
       "new": {
@@ -40,6 +49,54 @@
         "invalid": "La nueva contraseña no es válida"
       }
     },
+    "mfa": {
+      "show": {
+        "title": "Autenticación en dos pasos",
+        "enabled": "La autenticación en dos pasos está activada.",
+        "disabled": "La autenticación en dos pasos está desactivada. Actívala para pedir un código de una aplicación de autenticación en cada inicio de sesión.",
+        "unavailable": "La autenticación en dos pasos no está disponible: FORGE_AUTH_MFA_KEY no está configurada.",
+        "remaining": {
+          "one": "Te queda %{count} código de respaldo.",
+          "other": "Te quedan %{count} códigos de respaldo."
+        },
+        "password": "Contraseña actual",
+        "code": "Código actual",
+        "code_hint": "De tu aplicación de autenticación, o uno de tus códigos de respaldo.",
+        "enable": "Activar la autenticación en dos pasos",
+        "rotate_title": "Reemplazar tu autenticador",
+        "rotate": "Reemplazar el autenticador",
+        "backup_codes_title": "Códigos de respaldo",
+        "regenerate": "Crear nuevos códigos de respaldo",
+        "disable_title": "Desactivar",
+        "disable": "Desactivar la autenticación en dos pasos",
+        "back": "Volver a la autenticación en dos pasos"
+      },
+      "new": {
+        "title": "Configura tu aplicación de autenticación",
+        "rotate_title": "Configura tu nuevo autenticador",
+        "instructions": "Agrega esta cuenta a tu aplicación de autenticación con el enlace, o escribe la clave en ella. Luego introduce el código de 6 dígitos que muestra.",
+        "link": "Abrir en tu aplicación de autenticación",
+        "key": "Clave",
+        "expires": "Esta configuración expira en 10 minutos.",
+        "code": "Código",
+        "current_code": "Código de tu autenticador actual",
+        "submit": "Activar",
+        "rotate_submit": "Reemplazar"
+      },
+      "backup_codes": {
+        "title": "Tus códigos de respaldo",
+        "instructions": "Cada código inicia tu sesión una vez cuando no puedes usar tu aplicación de autenticación. Guárdalos en un lugar seguro: solo se muestran ahora.",
+        "signed_out": "Se cerraron todas tus sesiones. Inicia sesión con tu contraseña y un código.",
+        "sign_in": "Iniciar sesión de nuevo"
+      },
+      "disabled": "La autenticación en dos pasos está desactivada. Inicia sesión de nuevo.",
+      "errors": {
+        "step_up": "Esa contraseña o ese código no funcionó.",
+        "invalid_code": "Ese código no funcionó. Introduce el código actual de tu aplicación de autenticación.",
+        "expired": "Esa configuración expiró. Empieza de nuevo.",
+        "changed": "La autenticación en dos pasos cambió mientras tanto. Revisa la configuración e inténtalo de nuevo."
+      }
+    },
     "throttled": {
       "sign_in": {
         "one": "Demasiados intentos de inicio de sesión. Inténtalo de nuevo en un minuto.",
@@ -48,6 +105,10 @@
       "reset": {
         "one": "Demasiados intentos de restablecimiento. Inténtalo de nuevo en un minuto.",
         "other": "Demasiados intentos de restablecimiento. Inténtalo de nuevo en %{count} minutos."
+      },
+      "code": {
+        "one": "Demasiados intentos de código. Inténtalo de nuevo en un minuto.",
+        "other": "Demasiados intentos de código. Inténtalo de nuevo en %{count} minutos."
       }
     }
   }

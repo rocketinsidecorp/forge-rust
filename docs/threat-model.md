@@ -176,7 +176,7 @@ Per-account and per-source credential throttling and the HTTP
 sign-in/sign-out/password-reset composition are now generated
 ([browser authentication review](#browser-authentication-review)). Remaining
 Phase 3 threat-model controls are not claimed complete: a shared (multi-process)
-throttle, password-reset delivery, MFA, audit integrity chaining/retention and
+throttle, password-reset delivery, audit integrity chaining/retention and
 privileged reader workflows, and administrative cross-tenant role separation
 still require implementation and abuse tests.
 
@@ -266,8 +266,8 @@ worker's database load still depends on whether accounts exist, observable
 only through server load; sign-in still does slightly more work (session
 issuance) when it succeeds; without `FORGE_MAIL_URL` the notifier is
 `UndeliverablePasswordResets`, reset links are not delivered and the failure
-is only logged (see the mail review below); MFA is not implemented; a session
-lasts 24 hours without idle expiry.
+is only logged (see the mail review below); a session lasts 24 hours without
+idle expiry. Two-factor authentication has its own review below.
 
 ## Phase 4 review: jobs, schedules and the outbox
 
@@ -515,6 +515,36 @@ Residual risks: `describe` descriptions are claims about a handler and can
 still be wrong where tests do not exercise a response; enabling the
 document in production publishes the API surface, which is a deliberate
 operator decision.
+
+## Two-factor authentication review
+
+Review date: 2026-10-20 ([ADR 0040](adr/0040-totp-multi-factor-authentication.md),
+port of Forge-Go ADR 0014 and 0015). Scope: `forge_auth::mfa`,
+`forge_tenancy::MfaService`, `FORGE_AUTH_MFA_KEY`, the generated `PgMfaStore`,
+migration `00000000000000000004_forge_mfa` and the `/session/mfa` and `/mfa`
+pages. Guide: [two-factor authentication](mfa.md).
+
+| Threat | STRIDE | Control | Verification |
+| --- | --- | --- | --- |
+| A stolen password signs in | S | An account with a factor gets only a five-minute challenge, never a session, from the password; without `FORGE_AUTH_MFA_KEY` it cannot sign in at all | `two_factor_sign_in_takes_a_code_once_and_a_backup_code_once`, `without_the_key_an_enrolled_account_cannot_sign_in`, `without_a_key_every_operation_but_status_fails_closed` |
+| Code guessing | S | Five attempts per account and per account and source, 60 per source, in five minutes, counted before any code is checked; `429` with `Retry-After`; one message for every wrong code | `attempts_are_throttled_per_account_and_per_source_before_the_code_is_checked`, `second_factor_attempts_are_throttled` |
+| Replay of an observed code or backup code, also concurrently | S | The accepted period is recorded and only a later one is accepted; the challenge and the period (or the backup code) are consumed in one locking transaction | `a_challenge_completes_once_and_its_code_is_never_replayed`, `backup_codes_complete_a_challenge_once`, `two_factor_codes_and_challenges_work_once_and_fail_closed` (two racing requests, one succeeds), generated end to end in `scaffold.rs` |
+| A challenge cookie stolen or planted into another browser | S, E | The challenge is bound to the digest of a fresh CSRF token issued with it; the code step compares it in constant time; the cookie is `__Host-`, `HttpOnly`, `Secure`, `SameSite=Lax` | `wrong_codes_expired_challenges_and_foreign_browsers_are_refused`, `a_challenge_cookie_carried_to_another_browser_is_refused` |
+| A challenge outliving a password reset, a disabled account, a suspended membership or a factor change | E | Every challenge query requires the credential version the password step verified, an enabled account, an active membership and the same factor; a new sign-in and every factor change void pending challenges | `a_new_challenge_voids_the_old_one_and_password_changes_void_both`, `rotation_keeps_the_old_factor_until_confirmed_and_disable_removes_it`, `two_factor_codes_and_challenges_work_once_and_fail_closed` |
+| A hijacked session turns MFA off or swaps the authenticator | E | Turning on and confirming the key need the password; rotation and its confirmation, new backup codes and turning off need the password and a current code (used up), throttled, and a password-only step-up never clears the counters of an account with a factor; the pending key is shown only after step-up; CSRF is checked by the layer and bound to the session; changes sign out everywhere | `changing_the_factor_needs_the_password_and_a_current_code`, `step_up_codes_are_single_use_and_regeneration_replaces_every_backup_code`, `a_session_alone_can_neither_see_nor_confirm_a_pending_key`, `confirming_a_new_authenticator_needs_the_password_and_a_current_code`, `password_only_step_ups_do_not_reset_the_code_throttle` |
+| Database disclosure reveals seeds, codes or challenges | I | Seeds are AES-256-GCM ciphertext under a key that is never in the database; backup codes and challenge tokens are SHA-256 digests; the runtime role can only mark codes and challenges used | `sealed_seeds_round_trip_and_fail_closed_on_tamper_or_wrong_key`, migration grants |
+| Tampered ciphertext, a swapped seed or a wrong key accepted | T | AEAD authentication plus the seed digest compared after decryption; every failure is the same opaque error and refuses the code | `sealed_seeds_round_trip_and_fail_closed_on_tamper_or_wrong_key`, `a_wrong_key_or_tampered_seed_fails_closed`, the PostgreSQL test that flips a stored byte |
+| A weak or malformed key | T, I | `FORGE_AUTH_MFA_KEY` must be canonical unpadded base64url of 32 bytes; otherwise startup stops in every environment; the value is redacted in errors, `Debug` and serialized configuration | `the_mfa_key_is_optional_canonical_and_never_echoed`, `keys_must_be_canonical_unpadded_base64url_of_32_bytes` |
+| Seeds, codes or tokens in logs, errors or caches | I | Every secret type redacts `Debug`; errors carry no secret; key and backup-code pages are `no-store` with `Referrer-Policy: no-referrer`; audit events hold no codes | unit tests on `Debug` output, `enroll_ada` (`no-store`) |
+| Repudiation of factor changes and second-factor use | R | Forge-Go's audit events (`auth.mfa.enrollment_started`, `enabled`, `rotation_started`, `rotated`, `disabled`, `challenge_succeeded`, `challenge_failed`, `backup_code_used`) plus `backup_codes_regenerated`; refused step-ups record the action as `denied` | `audited(...)` assertions in the generated HTTP tests |
+
+Residual risks: counters are per process, so a scaled deployment needs a
+shared `LoginThrottle`; an attacker who knows the password can spend the
+account's five attempts and delay the owner's code step for five minutes;
+TOTP codes can be phished in real time (no origin binding, unlike WebAuthn);
+expired enrollments and consumed challenges are not pruned yet; rotating
+`FORGE_AUTH_MFA_KEY` needs a custom `SecretCipher`; losing the key locks every
+enrolled account out (fail closed by design).
 
 ## Review cadence
 

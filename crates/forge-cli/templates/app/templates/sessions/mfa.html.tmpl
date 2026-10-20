@@ -1,0 +1,19 @@
+{% extends "layouts/application.html" %}
+
+{% block title %}{{ layout.i18n.t("sessions.mfa.title") }}{% endblock %}
+
+{% block content %}
+<h1>{{ layout.i18n.t("sessions.mfa.title") }}</h1>
+{% if let Some(error) = error %}<p class="flash flash-alert" role="alert">{{ error }}</p>{% endif %}
+<form action="/session/mfa" method="post">
+  {{ csrf_field|safe }}
+  {% if !return_to.is_empty() %}<input type="hidden" name="return_to" value="{{ return_to }}">{% endif %}
+  <div>
+    <label for="session_mfa_code">{{ layout.i18n.t("sessions.mfa.code") }}</label>
+    <input type="text" id="session_mfa_code" name="code" required maxlength="32" inputmode="numeric" autocomplete="one-time-code" autocapitalize="none" spellcheck="false" aria-describedby="session_mfa_code_hint">
+    <p class="muted" id="session_mfa_code_hint">{{ layout.i18n.t("sessions.mfa.code_hint") }}</p>
+  </div>
+  <button type="submit">{{ layout.i18n.t("sessions.mfa.submit") }}</button>
+</form>
+<p><a href="/session/new">{{ layout.i18n.t("sessions.mfa.start_over") }}</a></p>
+{% endblock %}

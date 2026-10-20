@@ -194,9 +194,9 @@ will never broadcast, you may remove `"broadcast"` from the features.
 
 ### Sign in
 
-The application has sign-in, sign-out and password-reset pages
+The application has sign-in, sign-out, password-reset and two-factor pages
 (`src/adapters/http/authentication.rs`, `templates/sessions/`,
-`templates/passwords/`), like `rails generate authentication`. Create the
+`templates/passwords/`, `templates/mfa/`), like `rails generate authentication`. Create the
 first tenant and its owner with the migration role, then sign in:
 
 ```bash
@@ -255,6 +255,36 @@ stops the application at startup. Send your own email through the
 `forge::mail::Sender` port that `forge::mail::from_config` builds, and test
 it with `forge::mail::testing::Recorder` (see the Forge mail guide,
 `docs/mail.md`).
+
+### Two-factor authentication
+
+Accounts can require a code from an authenticator app (TOTP, RFC 6238) at
+every sign-in. Seeds are encrypted with `FORGE_AUTH_MFA_KEY`, canonical
+unpadded base64url of 32 random bytes; keep it in your secret manager, never
+in the database or the repository:
+
+```bash
+export FORGE_AUTH_MFA_KEY=$(openssl rand -base64 32 | tr '+/' '-_' | tr -d '=')
+forge dev                     # or: cargo run
+# sign in, open http://127.0.0.1:3000/mfa, enter your password,
+# add the key to your authenticator app and confirm with its code
+```
+
+| Method | Path | Page |
+| --- | --- | --- |
+| `GET`, `POST` | `/session/mfa` | The code step of a sign-in (authenticator or backup code) |
+| `GET` | `/mfa` | Two-factor settings of the signed-in account |
+| `POST` | `/mfa`, `/mfa/confirm` | Turn on (password), then confirm with the password and a code; shows 10 backup codes once |
+| `POST` | `/mfa/rotation`, `/mfa/rotation/confirm` | Replace the authenticator (password and current code, again when confirming) |
+| `POST` | `/mfa/backup_codes` | New backup codes (password and current code) |
+| `DELETE` | `/mfa` | Turn off (password and current code) |
+
+A code, or a backup code, works once; the code step is limited to five
+attempts per account and 60 per network address in five minutes. Turning
+two-factor on, replacing the authenticator and turning it off sign the
+account out everywhere. An invalid key stops startup; without a key the
+settings page says two-factor is unavailable and an account that has it
+cannot sign in. With Docker, export the key before `docker compose up`.
 %%end%%
 
 %%end%%

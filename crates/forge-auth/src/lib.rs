@@ -12,8 +12,13 @@
 //! the [`NewPassword`] policy, and one-time [`PasswordResetToken`]s (256
 //! bits from the OS CSPRNG through `getrandom`, persisted only as SHA-256
 //! digests through `sha2`) delivered by a [`PasswordResetNotifier`].
+//!
+//! The TOTP multi-factor primitives are in [`mfa`]: RFC 6238 codes over
+//! HMAC-SHA-1 (`hmac`, `sha1`), AES-256-GCM seed encryption (`ring`),
+//! one-time backup codes and the sign-in challenge token.
 
 mod login;
+pub mod mfa;
 mod password_policy;
 mod password_reset;
 mod throttle;
@@ -26,6 +31,13 @@ use forge_security::PrincipalId;
 use thiserror::Error;
 
 pub use login::{CanonicalLogin, LoginFormatError, MAX_LOGIN_BYTES};
+pub use mfa::{
+    Aes256GcmSecretCipher, MFA_BACKUP_CODE_COUNT, MFA_KEY_BYTES, MfaBackupCode,
+    MfaBackupCodeDigest, MfaChallengeBinding, MfaChallengeDigest, MfaChallengeToken,
+    MfaPrimitiveError, SealedTotpSecret, SecretCipher, SecretCipherError, TOTP_DIGITS,
+    TOTP_PERIOD_SECS, TOTP_SECRET_BYTES, TotpProvisioningUri, TotpSecret, TotpSecretDigest,
+    parse_mfa_key,
+};
 pub use password_policy::{
     MAX_PASSWORD_BYTES, MIN_PASSWORD_CHARS, NewPassword, PasswordPolicyError,
 };
@@ -524,6 +536,17 @@ pub trait PasswordCredentialStore: Send + Sync {
         &self,
         login: &str,
     ) -> Result<Option<PasswordCredential>, PasswordCredentialStoreError>;
+
+    /// Resolves the credential of a signed-in principal, for step-up
+    /// authentication (re-entering the password before changing a second
+    /// factor). The default fails closed: a store that does not implement
+    /// it makes every step-up unavailable.
+    async fn find_by_principal(
+        &self,
+        _principal_id: PrincipalId,
+    ) -> Result<Option<PasswordCredential>, PasswordCredentialStoreError> {
+        Err(PasswordCredentialStoreError::Unavailable)
+    }
 
     /// Replaces the password hash only when the observed credential version is
     /// still current. Implementations increment the persisted version on

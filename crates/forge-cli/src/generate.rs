@@ -347,6 +347,14 @@ const TEMPLATES: &[Template] = &[
     ),
     template!(
         Group::Authentication,
+        "migrations/00000000000000000004_forge_mfa.up.sql" => "migrations/00000000000000000004_forge_mfa.up.sql.tmpl"
+    ),
+    template!(
+        Group::Authentication,
+        "migrations/00000000000000000004_forge_mfa.down.sql" => "migrations/00000000000000000004_forge_mfa.down.sql.tmpl"
+    ),
+    template!(
+        Group::Authentication,
         "src/infrastructure/accounts/mod.rs" => "src/infrastructure/accounts/mod.rs.tmpl"
     ),
     template!(
@@ -364,6 +372,26 @@ const TEMPLATES: &[Template] = &[
     template!(
         Group::Authentication,
         "templates/sessions/_sign_out.html" => "templates/sessions/_sign_out.html.tmpl"
+    ),
+    template!(
+        Group::Authentication,
+        "templates/sessions/mfa.html" => "templates/sessions/mfa.html.tmpl"
+    ),
+    template!(
+        Group::Authentication,
+        "templates/mfa/show.html" => "templates/mfa/show.html.tmpl"
+    ),
+    template!(
+        Group::Authentication,
+        "templates/mfa/_step_up.html" => "templates/mfa/_step_up.html.tmpl"
+    ),
+    template!(
+        Group::Authentication,
+        "templates/mfa/new.html" => "templates/mfa/new.html.tmpl"
+    ),
+    template!(
+        Group::Authentication,
+        "templates/mfa/backup_codes.html" => "templates/mfa/backup_codes.html.tmpl"
     ),
     template!(
         Group::Authentication,

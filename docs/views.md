@@ -682,7 +682,7 @@ those rules.
 
 ## Not in this slice
 
-MFA and user management pages, JSON scaffolds and `forge generate controller`, development-mode
+User management pages, JSON scaffolds and `forge generate controller`, development-mode
 asset serving from disk, `forge assets precompile`, `forge dev`, multipart
 forms and file uploads, per-response CSRF token masking, WebSocket transport,
 replay of missed live updates and presence.

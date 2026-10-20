@@ -12,8 +12,9 @@ are implemented, including optimistic Argon2id rehash-on-policy-upgrade after a
 successful login. Full-stack PostgreSQL applications are generated with
 sign-in, sign-out and password-reset pages, bounded in-process sign-in
 throttling, a `setup` command for the first tenant and owner, and seeds ([ADR
-0026](adr/0026-authentication-pages-and-setup.md)). Still open in Phase 3:
-MFA, a shared persistent throttle for horizontally scaled deployments, user
+0026](adr/0026-authentication-pages-and-setup.md)), and TOTP two-factor
+authentication ([ADR 0040](adr/0040-totp-multi-factor-authentication.md)).
+Still open in Phase 3: a shared persistent throttle for horizontally scaled deployments, user
 invitation and management, identity persistence on MySQL, MariaDB and SQLite,
 and stronger audit integrity/retention controls. Phase 4 is implemented as a
 library: `forge-jobs` (durable PostgreSQL jobs, fenced leases, workers, cron

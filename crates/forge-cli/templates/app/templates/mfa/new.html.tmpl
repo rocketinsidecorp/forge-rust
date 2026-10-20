@@ -1,0 +1,30 @@
+{% extends "layouts/application.html" %}
+
+{% block title %}{% if rotation %}{{ layout.i18n.t("mfa.new.rotate_title") }}{% else %}{{ layout.i18n.t("mfa.new.title") }}{% endif %}{% endblock %}
+
+{% block content %}
+<h1>{% if rotation %}{{ layout.i18n.t("mfa.new.rotate_title") }}{% else %}{{ layout.i18n.t("mfa.new.title") }}{% endif %}</h1>
+{% if let Some(error) = error %}<p class="flash flash-alert" role="alert">{{ error }}</p>{% endif %}
+<p>{{ layout.i18n.t("mfa.new.instructions") }}</p>
+<p><a href="{{ provisioning_uri }}">{{ layout.i18n.t("mfa.new.link") }}</a></p>
+<p>{{ layout.i18n.t("mfa.new.key") }}: <code id="mfa_key">{{ key }}</code></p>
+<p class="muted">{{ layout.i18n.t("mfa.new.expires") }}</p>
+<form action="{% if rotation %}/mfa/rotation/confirm{% else %}/mfa/confirm{% endif %}" method="post">
+  {{ csrf_field|safe }}
+  <div>
+    <label for="mfa_password">{{ layout.i18n.t("mfa.show.password") }}</label>
+    <input type="password" id="mfa_password" name="password" required autocomplete="current-password" maxlength="1024">
+  </div>
+  {% if rotation %}<div>
+    <label for="mfa_current_code">{{ layout.i18n.t("mfa.new.current_code") }}</label>
+    <input type="text" id="mfa_current_code" name="current_code" required maxlength="32" inputmode="numeric" autocomplete="off" autocapitalize="none" spellcheck="false">
+    <p class="muted">{{ layout.i18n.t("mfa.show.code_hint") }}</p>
+  </div>{% endif %}
+  <div>
+    <label for="mfa_code">{{ layout.i18n.t("mfa.new.code") }}</label>
+    <input type="text" id="mfa_code" name="code" required maxlength="32" inputmode="numeric" autocomplete="one-time-code" autocapitalize="none" spellcheck="false">
+  </div>
+  <button type="submit">{% if rotation %}{{ layout.i18n.t("mfa.new.rotate_submit") }}{% else %}{{ layout.i18n.t("mfa.new.submit") }}{% endif %}</button>
+</form>
+<p><a href="/mfa">{{ layout.i18n.t("mfa.show.back") }}</a></p>
+{% endblock %}

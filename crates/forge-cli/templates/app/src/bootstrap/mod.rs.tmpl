@@ -60,8 +60,9 @@ fn compose(composition: &mut forge::Composition<'_>) -> Result<(), forge::Compos
     let site = crate::adapters::http::site(composition.router(), translator)?;
     crate::adapters::http::routes(composition.router(), &site)?;
 %%if authentication%%
-    // Sign-in, sign-out and password-reset pages (ADR 0026), with the
-    // PostgreSQL identity stores, Argon2id and per-process attempt throttles.
+    // Sign-in, sign-out, password-reset and two-factor pages (ADR 0026,
+    // ADR 0040), with the PostgreSQL identity stores, Argon2id and
+    // per-process attempt throttles.
     // Reset links are emailed (ADR 0035) once FORGE_MAIL_URL, FORGE_MAIL_FROM
     // and FORGE_AUTH_PASSWORD_RESET_URL are set; without FORGE_MAIL_URL the
     // notifier fails closed and delivers nothing, and FORGE_MAIL_URL without
@@ -93,6 +94,29 @@ fn compose(composition: &mut forge::Composition<'_>) -> Result<(), forge::Compos
             .map(std::sync::Arc::new)
             .map_err(forge::ComposeError::other)
     };
+    // TOTP two-factor authentication (ADR 0040): seeds are encrypted with
+    // FORGE_AUTH_MFA_KEY (canonical unpadded base64url of 32 bytes; an
+    // invalid key stops start-up). Without it, enrolling is refused and an
+    // account with a factor cannot sign in.
+    let mfa_cipher = composition
+        .config()
+        .auth
+        .mfa_key_bytes()
+        .map_err(forge::ComposeError::other)?
+        .map(|key| forge::auth::Aes256GcmSecretCipher::new(&key))
+        .transpose()
+        .map_err(forge::ComposeError::other)?
+        .map(|cipher| std::sync::Arc::new(cipher) as std::sync::Arc<dyn forge::auth::SecretCipher>);
+    let mfa = forge::tenancy::MfaService::new(
+        std::sync::Arc::new(crate::infrastructure::accounts::PgMfaStore::new(
+            pool.clone(),
+        )),
+        mfa_cipher,
+        std::sync::Arc::new(
+            forge::auth::MemoryLoginThrottle::new(forge::tenancy::mfa_throttle_config())
+                .map_err(forge::ComposeError::other)?,
+        ),
+    );
     let ports = crate::adapters::http::authentication::AuthenticationPorts {
         credentials: std::sync::Arc::new(
             crate::infrastructure::auth::PostgresPasswordCredentialStore::new(pool.clone()),
@@ -114,6 +138,7 @@ fn compose(composition: &mut forge::Composition<'_>) -> Result<(), forge::Compos
         audit: std::sync::Arc::new(crate::infrastructure::audit::PgAuditSink::new(pool)),
         sign_in_throttle: throttle()?,
         reset_throttle: throttle()?,
+        mfa,
     };
     crate::adapters::http::authentication::routes(composition, &site, ports)?;
 %%end%%

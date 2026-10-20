@@ -68,6 +68,36 @@ impl PasswordCredentialStore for PostgresPasswordCredentialStore {
         .transpose()
     }
 
+    async fn find_by_principal(
+        &self,
+        principal_id: PrincipalId,
+    ) -> Result<Option<PasswordCredential>, PasswordCredentialStoreError> {
+        let row = sqlx::query_as::<_, (String, bool, i64, String)>(
+            "SELECT password_hash, disabled_at IS NOT NULL, version, login
+             FROM forge_principals
+             WHERE id = $1
+               AND password_hash IS NOT NULL",
+        )
+        .bind(principal_id.into_uuid())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|_| PasswordCredentialStoreError::Unavailable)?;
+
+        row.map(|(password_hash, disabled, version, stored_login)| {
+            let password_hash = PasswordHash::new(password_hash)
+                .map_err(|_| PasswordCredentialStoreError::CorruptRecord)?;
+            let version = u64::try_from(version)
+                .ok()
+                .and_then(PasswordCredentialVersion::new)
+                .ok_or(PasswordCredentialStoreError::CorruptRecord)?;
+            Ok(
+                PasswordCredential::new(principal_id, password_hash, disabled, version)
+                    .with_login(stored_login),
+            )
+        })
+        .transpose()
+    }
+
     async fn replace_password_hash(
         &self,
         principal_id: PrincipalId,

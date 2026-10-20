@@ -16,7 +16,7 @@ the work is finished and waiting for its review; **Planned** means not started.
 | Authentication pages, password reset | `rails g authentication` | Done | Done |
 | First tenant and owner, seeds | `db:seed` | Done (`forge setup`, `forge seed`) | In review (`forge setup`, `forge seed`; the application commands `setup` and `seed` are Done) |
 | Multi-tenancy with database enforcement | (gems) | Done (PostgreSQL RLS) | Done (PostgreSQL RLS) |
-| TOTP MFA | (gems) | Done | Planned |
+| TOTP MFA | (gems) | Done | Done (`FORGE_AUTH_MFA_KEY`, `/session/mfa`, `/mfa`, [ADR 0040](adr/0040-totp-multi-factor-authentication.md), [MFA](mfa.md)) |
 | Persistent jobs, cron, outbox | Solid Queue | Done | Done (framework crates; `forge new` wiring planned) |
 | Mailer with previews | Action Mailer | Done | Done (`forge::mail`, password-reset emails, `/_mail` previews, [ADR 0035](adr/0035-mail.md); `forge generate mailer`, [ADR 0038](adr/0038-generators-and-destroy.md)) |
 | Rate limiting | `rate_limit` | Done | Done |
@@ -39,6 +39,16 @@ the work is finished and waiting for its review; **Planned** means not started.
 | Getting Started guide | Rails Guides | Done (Forge-Go docs/GETTING_STARTED.md) | Planned |
 
 ## Parity follow-ups
+
+- TOTP MFA ([ADR 0040](adr/0040-totp-multi-factor-authentication.md)): the
+  primitives, storage format, key, throttle limits and audit names match
+  Forge-Go. Forge-Rust's generated application also has the enrollment,
+  rotation, backup-code regeneration and disable pages behind password and
+  code step-up, which Forge-Go's scaffold leaves to the application (its
+  bootstrap comment "MFA enrollment/management routes"); Forge-Go adopts the
+  same pages and `auth.mfa.backup_codes_regenerated` in a follow-up pull
+  request. Forge-Rust has no JSON login API, so it has no
+  `/auth/mfa/complete` bearer route, and does not port `PruneMFA` yet.
 
 - Framework migration ownership ([ADR 0030](adr/0030-framework-migration-ownership.md),
   rocketinsidecorp/forge-rust#10): Forge-Rust's `rollback` never reverts the

@@ -1,6 +1,8 @@
-//! View models of the sign-in and password-reset pages in
-//! `templates/sessions/` and `templates/passwords/`. They never carry a
-//! password; the reset page carries the reset token in a hidden field only.
+//! View models of the sign-in, password-reset and two-factor pages in
+//! `templates/sessions/`, `templates/passwords/` and `templates/mfa/`. They
+//! never carry a password; the reset page carries the reset token in a
+//! hidden field only, and a two-factor key or backup codes are rendered
+//! once on a `no-store` page.
 
 use askama::Template;
 use forge::views::FieldErrors;
@@ -45,4 +47,57 @@ pub struct PasswordEdit<'a> {
     pub token: String,
     pub error: Option<String>,
     pub errors: FieldErrors,
+}
+
+/// `templates/sessions/mfa.html`: the second step of a sign-in.
+#[derive(Template)]
+#[template(path = "sessions/mfa.html")]
+pub struct SessionMfa<'a> {
+    pub layout: Layout<'a>,
+    pub csrf_field: String,
+    /// A validated local path to return to after signing in, or empty.
+    pub return_to: String,
+    /// The one message a wrong or throttled code shows.
+    pub error: Option<String>,
+}
+
+/// `templates/mfa/show.html`: the two-factor settings of the account.
+#[derive(Template)]
+#[template(path = "mfa/show.html")]
+pub struct MfaShow<'a> {
+    pub layout: Layout<'a>,
+    pub csrf_field: String,
+    /// Whether `FORGE_AUTH_MFA_KEY` is set.
+    pub configured: bool,
+    /// Whether the account has a factor.
+    pub enabled: bool,
+    /// How many backup codes are left, as a sentence.
+    pub remaining: String,
+    pub error: Option<String>,
+}
+
+/// `templates/mfa/new.html`: the key to add to an authenticator app and
+/// the confirming code.
+#[derive(Template)]
+#[template(path = "mfa/new.html")]
+pub struct MfaNew<'a> {
+    pub layout: Layout<'a>,
+    pub csrf_field: String,
+    /// Replacing the authenticator rather than turning two-factor on.
+    pub rotation: bool,
+    /// The Base32 key in groups of four.
+    pub key: String,
+    /// The `otpauth://` URI authenticator apps open.
+    pub provisioning_uri: String,
+    pub error: Option<String>,
+}
+
+/// `templates/mfa/backup_codes.html`: the backup codes, shown once.
+#[derive(Template)]
+#[template(path = "mfa/backup_codes.html")]
+pub struct MfaBackupCodes<'a> {
+    pub layout: Layout<'a>,
+    pub codes: Vec<String>,
+    /// Whether every session ended (after turning on or replacing).
+    pub signed_out: bool,
 }
