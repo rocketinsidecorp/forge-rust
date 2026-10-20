@@ -75,6 +75,29 @@ fn parse(options: &MailerOptions) -> Result<Vec<Method>, CliError> {
     // Every generated Rust name, with the email that generates it.
     let mut functions: Vec<(String, String)> = Vec::new();
     let mut types: Vec<(String, String)> = vec![(format!("{type_name}Mailer"), String::new())];
+    // Types the generated mailer and its tests import.
+    for imported in [
+        "Address",
+        "AppConfig",
+        "Arc",
+        "Environment",
+        "Error",
+        "HeaderMap",
+        "MailConfig",
+        "MailError",
+        "Message",
+        "Method",
+        "Preview",
+        "PreviewHandler",
+        "Recorder",
+        "Request",
+        "Sender",
+        "StatusCode",
+        "Template",
+        "Templates",
+    ] {
+        types.push((imported.to_owned(), "imports".to_owned()));
+    }
     let mut methods = Vec::new();
     for declaration in &options.methods {
         let (method, list) = match declaration.split_once(':') {
@@ -137,6 +160,8 @@ fn parse(options: &MailerOptions) -> Result<Vec<Method>, CliError> {
             if let Some((_, other)) = types.iter().find(|(name, _)| *name == generated) {
                 let owner = if other.is_empty() {
                     "the mailer".to_owned()
+                } else if other == "imports" {
+                    "the generated code".to_owned()
                 } else {
                     format!("email `{other}`")
                 };
@@ -505,6 +530,8 @@ mod tests {
             ("user", &["x", "build_x"][..]),
             ("user", &["mailer"][..]),
             ("user", &["welcome:na-me"][..]),
+            ("mail", &["error"][..]),
+            ("app", &["config"][..]),
         ] {
             assert!(
                 parse(&options(name, declarations)).is_err(),

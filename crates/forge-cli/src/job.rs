@@ -22,6 +22,23 @@ const JOBS_MODULE_CONTENT: &str = "//! Job handlers of the persistent queue (`fo
 //! a job into use-case calls, like HTTP handlers do for requests. `forge\n\
 //! generate job --queue` adds one module per job.\n";
 
+/// Types the generated job module and its tests import.
+const RESERVED_TYPES: &[&str] = &[
+    "DbTransaction",
+    "Deserialize",
+    "Duration",
+    "EnqueueOptions",
+    "Enqueued",
+    "Error",
+    "Job",
+    "JobContext",
+    "JobError",
+    "JobHandler",
+    "Jobs",
+    "JobsError",
+    "Serialize",
+];
+
 const JOB: &str = include_str!("../templates/job/job.rs.tmpl");
 const TESTS: &str = include_str!("../templates/job/tests.rs.tmpl");
 
@@ -113,6 +130,15 @@ fn validate(options: &JobOptions) -> Result<Vec<Field>, CliError> {
     generators::snake_case("job name", name, MAX_NAME_LENGTH).map_err(fail)?;
     if name == "mod" {
         return Err(fail("job name `mod` would replace the jobs module"));
+    }
+    let type_name = pascal_case(name);
+    for generated in [type_name.clone(), format!("{type_name}Handler")] {
+        if RESERVED_TYPES.contains(&generated.as_str()) {
+            return Err(fail(format!(
+                "job name `{name}` would define the type `{generated}`, which the generated \
+                 code already imports; choose another name"
+            )));
+        }
     }
     if options.fields.len() > MAX_FIELDS {
         return Err(fail(format!(
@@ -294,9 +320,11 @@ mod tests {
         ] {
             assert!(validate(&options(fields)).is_err(), "{fields:?}");
         }
-        let mut bad_name = options(&[]);
-        bad_name.name = "SendWelcome".to_owned();
-        assert!(validate(&bad_name).is_err());
+        for name in ["SendWelcome", "job", "jobs_error", "duration", "mod"] {
+            let mut bad_name = options(&[]);
+            bad_name.name = name.to_owned();
+            assert!(validate(&bad_name).is_err(), "{name}");
+        }
         let fields = validate(&options(&["id:uuid", "version:integer", "note:text?"]))
             .unwrap_or_else(|error| panic!("{error}"));
         assert_eq!(fields[0].rust, "forge::core::Uuid");

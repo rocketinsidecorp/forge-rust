@@ -449,6 +449,8 @@ fn controllers_are_validated_and_need_a_full_stack_application() {
         ("pages", &["fn"][..]),
         ("pages", &["about-us"][..]),
         ("pages", &["home", "home"][..]),
+        ("compose", &["error"][..]),
+        ("pages", &["controller"][..]),
     ] {
         let refusal = controller::generate(&root, &controller(name, actions))
             .err()

@@ -28,6 +28,23 @@ const WRITE_ACTIONS: &[&str] = &["create", "update", "destroy"];
 /// Functions of the generated module an action may not shadow.
 const RESERVED_ACTIONS: &[&str] = &["authorize", "respond", "route", "routes"];
 
+/// Types the generated controller module imports or declares besides its
+/// view types; a view type (`NAME` + `ACTION` in PascalCase) must differ.
+const RESERVED_TYPES: &[&str] = &[
+    "Arc",
+    "ComposeError",
+    "Future",
+    "GlobalAccess",
+    "Layout",
+    "Method",
+    "Permission",
+    "Request",
+    "Response",
+    "Router",
+    "Site",
+    "Template",
+];
+
 /// Names whose routes, modules or templates the application already uses.
 const RESERVED_NAMES: &[&str] = &[
     "access",
@@ -171,6 +188,13 @@ fn validate(options: &ControllerOptions) -> Result<(), CliError> {
         }
         // `a_b` and `ab` differ, but two actions must not share a view type.
         let type_name = pascal_case(action);
+        let view = format!("{}{type_name}", pascal_case(name));
+        if RESERVED_TYPES.contains(&view.as_str()) || type_name == "Controller" {
+            return Err(fail(format!(
+                "action `{action}` would name the type `{view}`, which the generated module \
+                 already uses; choose another action name"
+            )));
+        }
         if seen.contains(&type_name) {
             return Err(fail(format!(
                 "action `{action}` is declared twice (or names the same view type as another \
