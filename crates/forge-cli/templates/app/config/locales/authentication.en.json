@@ -79,6 +79,7 @@
         "key": "Key",
         "expires": "This setup expires in 10 minutes.",
         "code": "Code",
+        "current_code": "Code from your current authenticator",
         "submit": "Turn on",
         "rotate_submit": "Replace"
       },

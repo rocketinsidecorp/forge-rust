@@ -870,7 +870,12 @@ fn two_factor_enrol_sign_in_and_recover(port: u16) {
         .unwrap_or_else(|| panic!("the key in {}", setup.body))
         .replace(' ', "");
     assert!(setup.body.contains("otpauth://totp/"));
-    let confirm = format!("csrf_token={}&code={}", browser.csrf(), totp(&key, 0));
+    let confirm = format!(
+        "csrf_token={}&password={}&code={}",
+        browser.csrf(),
+        form_encode(OWNER_PASSWORD),
+        totp(&key, 0)
+    );
     let confirmed = browser.request(port, "POST", "/mfa/confirm", Some(&confirm));
     assert_eq!(confirmed.status, 200, "{}", confirmed.body);
     let backup_codes: Vec<String> = confirmed

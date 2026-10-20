@@ -301,6 +301,19 @@ struct MfaCodeForm {
     return_to: String,
 }
 
+/// Confirms a pending key: a code of the new key, after step-up
+/// authentication (the password, and for a rotation a current code), so a
+/// session alone can neither confirm the key nor see it again.
+#[derive(Default, serde::Deserialize)]
+struct MfaConfirmForm {
+    #[serde(default)]
+    password: String,
+    #[serde(default)]
+    current_code: String,
+    #[serde(default)]
+    code: String,
+}
+
 /// Step-up authentication: the password, and a current code once two-factor
 /// authentication is on.
 #[derive(Default, serde::Deserialize)]
@@ -1200,7 +1213,26 @@ async fn confirm_mfa_change(pages: Arc<Pages>, request: Request, change: MfaChan
         MfaChange::Enrollment => "auth.mfa.enabled",
         MfaChange::Rotation => "auth.mfa.rotated",
     };
-    let form = request.form::<MfaCodeForm>().unwrap_or_default();
+    let form = request.form::<MfaConfirmForm>().unwrap_or_default();
+    // The pending key was shown only after step-up; confirming it, or seeing
+    // it again after a wrong code, takes the same step-up, so a stolen
+    // session can neither read the key nor guess its codes.
+    let current_code = (change == MfaChange::Rotation).then_some(form.current_code.as_str());
+    let login = match step_up(
+        &pages,
+        &request,
+        principal,
+        &form.password,
+        current_code,
+        now,
+    )
+    .await
+    {
+        Ok(login) => login,
+        Err(failure) => {
+            return step_up_failed(&pages, &request, principal, action, failure, now).await;
+        }
+    };
     let ports = &pages.ports;
     let result = ports.mfa.confirm(principal, change, &form.code, now).await;
     let outcome = if result.is_ok() {
@@ -1231,10 +1263,6 @@ async fn confirm_mfa_change(pages: Arc<Pages>, request: Request, change: MfaChan
             response
         }
         Err(MfaError::InvalidCode) => {
-            let login = match pages.ports.credentials.find_by_principal(principal).await {
-                Ok(Some(credential)) => credential.login().unwrap_or_default().to_owned(),
-                _ => return unavailable("credential_store_unavailable"),
-            };
             match ports.mfa.pending(principal, MFA_ISSUER, &login, now).await {
                 Ok(Some(enrollment)) => {
                     let message = pages

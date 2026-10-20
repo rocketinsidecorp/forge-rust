@@ -79,6 +79,7 @@
         "key": "Chave",
         "expires": "Esta configuração expira em 10 minutos.",
         "code": "Código",
+        "current_code": "Código do seu autenticador atual",
         "submit": "Ativar",
         "rotate_submit": "Substituir"
       },

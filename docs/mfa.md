@@ -30,8 +30,8 @@ With Docker Compose, export the key before `docker compose up`; the generated
 | `GET`, `POST` | `/session/mfa` | The code step of a sign-in: `303` signed in, `422` wrong code, `429` throttled (`Retry-After`) |
 | `GET` | `/mfa` | Settings of the signed-in account: on or off, backup codes left |
 | `POST` | `/mfa` | Turn on: the password again, then the key (`otpauth://` link and Base32 text) |
-| `POST` | `/mfa/confirm` | Confirm with a code of the new key: shows 10 backup codes once and signs out everywhere |
-| `POST` | `/mfa/rotation`, `/mfa/rotation/confirm` | Replace the authenticator: password and a current code, then a code of the new key |
+| `POST` | `/mfa/confirm` | Confirm with the password and a code of the new key: shows 10 backup codes once and signs out everywhere |
+| `POST` | `/mfa/rotation`, `/mfa/rotation/confirm` | Replace the authenticator: password and a current code, then the password, a current code and a code of the new key |
 | `POST` | `/mfa/backup_codes` | New backup codes (password and a current code); the old ones stop working |
 | `DELETE` | `/mfa` | Turn off (password and a current code); signs out everywhere |
 

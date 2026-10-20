@@ -274,8 +274,8 @@ forge dev                     # or: cargo run
 | --- | --- | --- |
 | `GET`, `POST` | `/session/mfa` | The code step of a sign-in (authenticator or backup code) |
 | `GET` | `/mfa` | Two-factor settings of the signed-in account |
-| `POST` | `/mfa`, `/mfa/confirm` | Turn on (password), then confirm with a code; shows 10 backup codes once |
-| `POST` | `/mfa/rotation`, `/mfa/rotation/confirm` | Replace the authenticator (password and current code) |
+| `POST` | `/mfa`, `/mfa/confirm` | Turn on (password), then confirm with the password and a code; shows 10 backup codes once |
+| `POST` | `/mfa/rotation`, `/mfa/rotation/confirm` | Replace the authenticator (password and current code, again when confirming) |
 | `POST` | `/mfa/backup_codes` | New backup codes (password and current code) |
 | `DELETE` | `/mfa` | Turn off (password and current code) |
 

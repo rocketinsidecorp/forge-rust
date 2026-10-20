@@ -1590,7 +1590,7 @@ async fn enroll_ada(fixture: &Fixture) -> Result<(String, Vec<String>), Box<dyn 
         .post(
             &fixture.router,
             "/mfa/confirm",
-            &[("code", &totp(&key, 0)?)],
+            &[("password", PASSWORD), ("code", &totp(&key, 0)?)],
         )
         .await?;
     assert_eq!(confirmed.status(), StatusCode::OK, "{}", text(&confirmed));
@@ -1881,6 +1881,140 @@ async fn changing_the_factor_needs_the_password_and_a_current_code() -> TestResu
         .sign_in(&fixture.router, "acme", "ada@example.com", PASSWORD)
         .await?;
     assert_eq!(header_of(&response, header::LOCATION).as_deref(), Some("/"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_session_alone_can_neither_see_nor_confirm_a_pending_key() -> TestResult {
+    let fixture = fixture()?;
+    let mut owner = Browser::default();
+    owner
+        .sign_in(&fixture.router, "acme", "ada@example.com", PASSWORD)
+        .await?;
+    // A second session of Ada, as a stolen cookie would be.
+    let mut thief = Browser::default();
+    thief
+        .sign_in(&fixture.router, "acme", "ada@example.com", PASSWORD)
+        .await?;
+    let page = owner
+        .post(&fixture.router, "/mfa", &[("password", PASSWORD)])
+        .await?;
+    assert_eq!(page.status(), StatusCode::OK, "{}", text(&page));
+    let key = mfa_key_of(&page)?;
+    // Without the password, or with a wrong one, a wrong code shows no key and
+    // a right code turns nothing on.
+    let attempts = [
+        ("", wrong_totp(&key)?),
+        ("", totp(&key, 0)?),
+        ("not the password", totp(&key, 0)?),
+    ];
+    for (password, code) in &attempts {
+        let refused = thief
+            .post(
+                &fixture.router,
+                "/mfa/confirm",
+                &[("password", *password), ("code", code.as_str())],
+            )
+            .await?;
+        assert_eq!(refused.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = text(&refused);
+        assert!(!body.contains("mfa_key"), "{body}");
+        assert!(!body.contains("otpauth://"), "{body}");
+        assert!(!body.contains(&key), "{body}");
+    }
+    assert!(audited(
+        &fixture.world,
+        "auth.mfa.enabled",
+        AuditOutcome::Denied
+    ));
+    let off = owner.get(&fixture.router, "/mfa").await?;
+    assert!(text(&off).contains("Two-factor authentication is off."));
+    // The owner, with the password, still confirms it.
+    let confirmed = owner
+        .post(
+            &fixture.router,
+            "/mfa/confirm",
+            &[("password", PASSWORD), ("code", &totp(&key, 0)?)],
+        )
+        .await?;
+    assert_eq!(confirmed.status(), StatusCode::OK, "{}", text(&confirmed));
+    assert_eq!(backup_codes_of(&confirmed).len(), 10);
+    Ok(())
+}
+
+#[tokio::test]
+async fn confirming_a_new_authenticator_needs_the_password_and_a_current_code() -> TestResult {
+    let fixture = fixture()?;
+    let (key, codes) = enroll_ada(&fixture).await?;
+    let mut browser = Browser::default();
+    password_step(&fixture, &mut browser).await?;
+    browser
+        .post(&fixture.router, "/session/mfa", &[("code", &codes[0])])
+        .await?;
+    let page = browser
+        .post(
+            &fixture.router,
+            "/mfa/rotation",
+            &[("password", PASSWORD), ("code", &codes[1])],
+        )
+        .await?;
+    assert_eq!(page.status(), StatusCode::OK, "{}", text(&page));
+    let new_key = mfa_key_of(&page)?;
+    assert_ne!(new_key, key);
+    // The password alone, or with a used or wrong current code, is refused and
+    // shows no key.
+    for current in ["", codes[1].as_str(), wrong_totp(&key)?.as_str()] {
+        let refused = browser
+            .post(
+                &fixture.router,
+                "/mfa/rotation/confirm",
+                &[
+                    ("password", PASSWORD),
+                    ("current_code", current),
+                    ("code", &wrong_totp(&new_key)?),
+                ],
+            )
+            .await?;
+        assert_eq!(
+            refused.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{current}"
+        );
+        assert!(!text(&refused).contains(&new_key));
+    }
+    // After step-up, a wrong new code shows the pending key again.
+    let retry = browser
+        .post(
+            &fixture.router,
+            "/mfa/rotation/confirm",
+            &[
+                ("password", PASSWORD),
+                ("current_code", &codes[2]),
+                ("code", &wrong_totp(&new_key)?),
+            ],
+        )
+        .await?;
+    assert_eq!(retry.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(mfa_key_of(&retry)?, new_key);
+    let rotated = browser
+        .post(
+            &fixture.router,
+            "/mfa/rotation/confirm",
+            &[
+                ("password", PASSWORD),
+                ("current_code", &codes[3]),
+                ("code", &totp(&new_key, 0)?),
+            ],
+        )
+        .await?;
+    assert_eq!(rotated.status(), StatusCode::OK, "{}", text(&rotated));
+    assert_eq!(backup_codes_of(&rotated).len(), 10);
+    assert!(audited(
+        &fixture.world,
+        "auth.mfa.rotated",
+        AuditOutcome::Succeeded
+    ));
+    assert_eq!(live_sessions(&fixture.world, fixture.ada), 0);
     Ok(())
 }
 
