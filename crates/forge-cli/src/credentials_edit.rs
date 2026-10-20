@@ -373,7 +373,10 @@ impl Context<'_> {
             return writeln!(self.stdout, "no changes").map_err(CliError::Output);
         }
         interrupts.check(false)?;
-        let sealed = seal(environment, &edited, &keys[0]).map_err(fail)?;
+        let Some(active) = keys.first() else {
+            return Err(fail(forge_credentials::CredentialsError::KeyMissing));
+        };
+        let sealed = seal(environment, &edited, active).map_err(fail)?;
         // Refuse to overwrite a file somebody else changed while the editor
         // was open (a merge, a concurrent edit): their update would be lost.
         let dir = self.dir();
@@ -388,7 +391,7 @@ impl Context<'_> {
             self.stdout,
             "saved {} (key {})",
             Context::shown(&file_name(environment)),
-            keys[0].id()
+            active.id()
         )
         .map_err(CliError::Output)
     }

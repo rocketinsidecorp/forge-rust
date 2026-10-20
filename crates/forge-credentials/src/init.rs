@@ -54,7 +54,11 @@ pub fn init(dir: &Path, environment: &str) -> Result<Vec<PathBuf>, InitError> {
         }
         Err(source) => return Err(fail(created, source)),
     };
-    let sealed = match skeleton().and_then(|document| seal(environment, &document, &keys[0])) {
+    let sealed = keys
+        .first()
+        .ok_or(CredentialsError::KeyMissing)
+        .and_then(|active| skeleton().and_then(|document| seal(environment, &document, active)));
+    let sealed = match sealed {
         Ok(sealed) => sealed,
         Err(source) => return Err(fail(created, source)),
     };
