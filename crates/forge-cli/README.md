@@ -17,6 +17,8 @@ forge migrate [status] | rollback [--steps N] | seed
 forge setup --tenant SLUG --email EMAIL [--organization NAME] [--password-stdin]
 forge db create | drop | reset | setup | prepare | migrate | rollback | status | seed
                                  database lifecycle, like Rails' db:* tasks
+forge openapi [--output FILE | --check FILE]
+                                 the application's OpenAPI 3.1 document (ADR 0039)
 ```
 
 `forge new` creates a standalone Cargo package with Forge's hexagonal module
