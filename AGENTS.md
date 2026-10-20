@@ -164,6 +164,8 @@ A change is done only when:
 - targeted and required broader checks pass, or execution limitations are explicitly reported;
 - documentation and generated examples match the implementation;
 - README.md carries copyable commands to create, run and use every user-facing feature (owner decision, 2026-10-19);
+- every user-facing capability exists in both Forge frameworks with the same commands, names and style, or a tracked follow-up records when (owner decision, 2026-10-20);
+- nothing merges to main without a passing Claude Code Review (`@claude review`) that also screens for malicious or exfiltrating code (owner decision, 2026-10-20);
 - no critical TODO, fake provider, duplicate implementation, or knowingly broken quality gate remains.
 
 ## Final report
