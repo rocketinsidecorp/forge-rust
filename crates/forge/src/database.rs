@@ -537,7 +537,9 @@ mod commands {
     fn protection(environment: Environment, url: &SecretString) -> Option<String> {
         match environment {
             Environment::Production => Some("FORGE_ENV is production".to_owned()),
-            Environment::Development | Environment::Test if !forge_db::is_local(url) => {
+            Environment::Development | Environment::Test
+                if !forge_config::database_url::is_local(url) =>
+            {
                 Some("the database server is not on this machine".to_owned())
             }
             Environment::Development | Environment::Test => None,
@@ -549,7 +551,7 @@ mod commands {
         command: DbCommand,
         environment: Environment,
     ) -> ExitCode {
-        let described = forge_db::describe(url);
+        let described = forge_config::database_url::describe(url);
         let failed = |action: &str, error: &(dyn std::error::Error + 'static)| {
             write_stderr(&format!(
                 "error: could not {action} {described}: {}\n",
