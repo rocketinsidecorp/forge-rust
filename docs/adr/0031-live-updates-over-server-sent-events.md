@@ -34,9 +34,12 @@ the `turbo_stream_from` case is server to client only.
 whose chunks are written with chunked transfer encoding by the connection's
 own task (no spawned task), and `Response::next_chunk` for in-process
 readers. Every connection's socket is wrapped in a stalled-write guard: a
-write that makes **no progress** for a whole request timeout fails and ends
+write that makes **no progress** for the request timeout
+(`FORGE_REQUEST_TIMEOUT_SECS`), but never less than 30 seconds, fails and ends
 the connection. Progress resets the clock, so slow but live clients are
-unaffected; this replaces Forge-Go's per-write deadline. Forge-Rust serves
+unaffected, and the 30 second floor keeps an application that lowers its
+request timeout (a fast JSON API, say) from cutting off downloads and streams
+to clients on slow links; this replaces Forge-Go's per-write deadline. Forge-Rust serves
 HTTP/1.1; the event stream sets no hop-by-hop header, so an HTTP/2 proxy in
 front passes it unchanged.
 

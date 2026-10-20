@@ -47,6 +47,12 @@ pub use query::{QueryError, QueryErrorKind};
 /// Pause after a failed `accept` so transient errors such as `EMFILE` do not
 /// turn the accept loop into a busy loop.
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(50);
+/// The shortest time a response write may make no progress before the
+/// connection is ended (the stalled-write guard). The guard is the request
+/// timeout, but never less than this, so lowering `FORGE_REQUEST_TIMEOUT_SECS`
+/// for a fast API does not cut off clients that read a large download or an
+/// event stream slowly; those are only disconnected when they stop reading.
+const MIN_WRITE_STALL_TIMEOUT: Duration = Duration::from_secs(30);
 const JSON_CONTENT_TYPE: &str = "application/json";
 
 type BoxHandlerFuture = Pin<Box<dyn Future<Output = Response> + Send + 'static>>;
@@ -267,8 +273,9 @@ impl Response {
     /// Chunks are written (with chunked transfer encoding) as soon as they
     /// are produced; empty chunks are skipped. `step` runs on the
     /// connection's task, so the body is owned by the connection: it stops
-    /// when the client disconnects, when a write stalls for longer than the
-    /// request timeout (the peer stopped reading), or when shutdown aborts
+    /// when the client disconnects, when a write makes no progress for the
+    /// request timeout or 30 seconds, whichever is longer
+    /// (the peer stopped reading), or when shutdown aborts
     /// connections after the grace period. A body that should end on
     /// graceful shutdown must watch a cancellation signal of its own.
     ///
@@ -637,6 +644,8 @@ pub enum RouteError {
 pub struct Server {
     config: ServerConfig,
     router: Arc<Router>,
+    /// [`MIN_WRITE_STALL_TIMEOUT`]; lowered only by tests.
+    min_write_stall: Duration,
 }
 
 impl Server {
@@ -646,6 +655,7 @@ impl Server {
         Self {
             config,
             router: Arc::new(router),
+            min_write_stall: MIN_WRITE_STALL_TIMEOUT,
         }
     }
 
@@ -763,6 +773,7 @@ impl Server {
         let router = Arc::clone(&self.router);
         let max_body_bytes = self.config.max_body_bytes;
         let request_timeout = self.config.request_timeout;
+        let write_stall = write_stall_timeout(request_timeout, self.min_write_stall);
         connections.spawn(async move {
             serve_connection(
                 stream,
@@ -770,6 +781,7 @@ impl Server {
                 router,
                 max_body_bytes,
                 request_timeout,
+                write_stall,
                 cancellation,
             )
             .await;
@@ -777,6 +789,12 @@ impl Server {
             drop(permit);
         });
     }
+}
+
+/// How long a response write may make no progress: the request timeout, but
+/// at least `floor` ([`MIN_WRITE_STALL_TIMEOUT`]).
+fn write_stall_timeout(request_timeout: Duration, floor: Duration) -> Duration {
+    request_timeout.max(floor)
 }
 
 fn log_connection_result(completed: Result<(), JoinError>) {
@@ -791,6 +809,7 @@ async fn serve_connection(
     router: Arc<Router>,
     max_body_bytes: usize,
     request_timeout: Duration,
+    write_stall: Duration,
     cancellation: CancellationToken,
 ) {
     let service = service_fn(move |request| {
@@ -802,9 +821,10 @@ async fn serve_connection(
             request_timeout,
         )
     });
-    // A write that makes no progress for a whole request timeout means the
-    // peer stopped reading; end the connection rather than hold its slot.
-    let stream = io::StallTimeout::new(stream, request_timeout);
+    // A write that makes no progress for `write_stall` (the request timeout,
+    // at least 30 seconds) means the peer stopped reading; end the connection
+    // rather than hold its slot. Slow writes that progress never trip it.
+    let stream = io::StallTimeout::new(stream, write_stall);
     let connection = hyper::server::conn::http1::Builder::new()
         .timer(TokioTimer::new())
         .header_read_timeout(request_timeout)
@@ -1379,12 +1399,15 @@ mod tests {
 
     impl TestServer {
         async fn start(config: ServerConfig, router: Router) -> Self {
+            Self::start_server(Server::new(config, router)).await
+        }
+
+        async fn start_server(server: Server) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0")
                 .await
                 .expect("test listener must bind");
             let addr = listener.local_addr().expect("listener has an address");
             let (shutdown, signal) = oneshot::channel::<()>();
-            let server = Server::new(config, router);
             let handle = tokio::spawn(server.serve(listener, async {
                 // A dropped sender also means shutdown.
                 let _ = signal.await;
@@ -1740,23 +1763,84 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn a_client_that_stops_reading_a_stream_is_disconnected() {
-        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    /// A router whose `GET /flood` streams an endless body far larger than
+    /// the socket buffers; `dropped` turns true when the body is dropped.
+    fn flood(dropped: &Arc<std::sync::atomic::AtomicBool>) -> Router {
         let mut router = Router::new();
-        let flag = Arc::clone(&dropped);
+        let flag = Arc::clone(dropped);
         router
             .route(Method::GET, "/flood", move |_| {
                 let guard = DropFlag(Arc::clone(&flag));
                 async move {
-                    // An endless body far larger than the socket buffers.
                     Response::stream(StatusCode::OK, guard, |guard| async move {
                         Some((Bytes::from(vec![b'x'; 64 * 1024]), guard))
                     })
                 }
             })
             .expect("route must register");
-        let server = TestServer::start(test_config(Duration::from_millis(300)), router).await;
+        router
+    }
+
+    #[test]
+    fn the_write_stall_guard_is_the_request_timeout_but_at_least_30_seconds() {
+        assert_eq!(MIN_WRITE_STALL_TIMEOUT, Duration::from_secs(30));
+        for (request_timeout, guard) in [(1, 30), (29, 30), (30, 30), (31, 31), (120, 120)] {
+            assert_eq!(
+                write_stall_timeout(
+                    Duration::from_secs(request_timeout),
+                    MIN_WRITE_STALL_TIMEOUT
+                ),
+                Duration::from_secs(guard),
+                "{request_timeout}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_short_request_timeout_does_not_disconnect_a_slow_reader() {
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // The request timeout is far shorter than the pause below, but the
+        // stalled-write guard keeps its 30 second floor.
+        let server =
+            TestServer::start(test_config(Duration::from_millis(100)), flood(&dropped)).await;
+        let addr = server.addr;
+
+        let (paused, received) = tokio::task::spawn_blocking(move || {
+            let mut stream = connect(addr);
+            stream
+                .write_all(b"GET /flood HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                .expect("request must be written");
+            // Not reading: the socket buffers fill and the server's writes
+            // stall for ten request timeouts.
+            std::thread::sleep(Duration::from_secs(1));
+            let mut buffer = vec![0_u8; 64 * 1024];
+            let mut received = 0;
+            while received < 4 << 20 {
+                let read = stream.read(&mut buffer).expect("the stream must stay open");
+                assert_ne!(read, 0, "the server must not end the stream");
+                received += read;
+            }
+            (stream, received)
+        })
+        .await
+        .expect("client task must not panic");
+
+        assert!(received >= 4 << 20);
+        assert!(
+            !dropped.load(std::sync::atomic::Ordering::SeqCst),
+            "a slow but live reader must keep its stream"
+        );
+        drop(paused);
+        server.stop().await;
+    }
+
+    #[tokio::test]
+    async fn a_client_that_stops_reading_a_stream_is_disconnected() {
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut server = Server::new(test_config(Duration::from_millis(300)), flood(&dropped));
+        // Without the 30 second floor, so the test does not wait for it.
+        server.min_write_stall = Duration::ZERO;
+        let server = TestServer::start_server(server).await;
         let addr = server.addr;
 
         // The client sends its request and never reads the response.

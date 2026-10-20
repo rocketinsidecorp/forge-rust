@@ -120,7 +120,7 @@ from env files, Kubernetes manifests and unit files.
 | --- | --- | --- |
 | `FORGE_ENV` | `development` | `development`, `test` or `production`. Selects safety-sensitive defaults such as the log format. |
 | `FORGE_BIND` | `127.0.0.1:3000` | Listen socket address. The container image sets `0.0.0.0:3000`. |
-| `FORGE_REQUEST_TIMEOUT_SECS` | `30` | Maximum time for one request, including reading the request body. |
+| `FORGE_REQUEST_TIMEOUT_SECS` | `30` | Maximum time for one request, including reading the request body. A response write that makes no progress for this long (at least 30 seconds) ends the connection. |
 | `FORGE_SHUTDOWN_GRACE_SECS` | `15` | Drain deadline for in-flight requests after SIGTERM/SIGINT. |
 | `FORGE_MAX_BODY_BYTES` | `1048576` | Maximum request body size in bytes. |
 | `FORGE_MAX_CONNECTIONS` | `10000` | Maximum concurrent connections. Extra connections wait for a slot (backpressure) instead of being served without bound. |
@@ -391,7 +391,9 @@ sends `X-Accel-Buffering: no` for nginx) and its idle timeout must exceed the
 20 second heartbeat. Each open stream holds one connection slot
 (`FORGE_MAX_CONNECTIONS`); streams end after 30 minutes and when shutdown
 begins, and a client that stops reading is disconnected once a write makes no
-progress for `FORGE_REQUEST_TIMEOUT_SECS`. With several replicas on
+progress for `FORGE_REQUEST_TIMEOUT_SECS` or 30 seconds, whichever is longer
+(the floor keeps a short API request timeout from cutting off slow but live
+downloads and streams). With several replicas on
 PostgreSQL, the generated wiring fans updates out with `LISTEN/NOTIFY`, which
 holds one database connection per replica and does not work through
 PgBouncer in transaction pooling mode. Set the same `FORGE_STREAMS_KEY` on

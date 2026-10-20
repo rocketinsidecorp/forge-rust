@@ -265,8 +265,9 @@ and [dependency policy](dependency-policy.md).
   viewers per address with IPv6 `/64` and IPv4-mapped IPv6, a full broker,
   shutdown ending open streams, heartbeats and the maximum age, a slow
   subscriber dropped, SSE framing that cannot be broken out of.
-- **Transport:** `forge-http` sends streamed bodies chunked, and disconnects a
-  real client that stops reading; a real server drains at once when shutdown
+- **Transport:** `forge-http` sends streamed bodies chunked, disconnects a
+  real client that stops reading, keeps a slow reader that pauses for ten
+  request timeouts (the 30 second stalled-write floor); a real server drains at once when shutdown
   begins although a stream is open (`crates/forge/tests/broadcast.rs`).
 - **PostgreSQL fanout** (`--include-ignored` with `FORGE_TEST_DATABASE_URL`):
   two brokers on one database deliver once to each replica (multi-chunk
