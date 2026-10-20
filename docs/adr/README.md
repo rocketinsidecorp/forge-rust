@@ -42,6 +42,7 @@ does not mean implementation exists.
 | [0040](0040-totp-multi-factor-authentication.md) | TOTP multi-factor authentication: RFC 6238 over `hmac`/`sha1`, AES-256-GCM seeds (`ring`) under `FORGE_AUTH_MFA_KEY`, backup codes, browser-bound throttled challenges, step-up enrollment, rotation and disable pages (port of Forge-Go ADR 0014 and 0015) | Accepted |
 | [0041](0041-encrypted-credentials-and-attribute-encryption.md) | Encrypted credentials and attribute encryption: `config/credentials/<env>.json.enc` under `FORGE_MASTER_KEY` or a 0600 key file, `forge credentials init\|edit\|show\|rotate-key`, AES-256-GCM/HKDF/HMAC from `ring`, row-bound `fg1.` values, blind indexes and resumable rotation (port of Forge-Go ADR 0036) | Accepted |
 | [0042](0042-forge-deploy.md) | `forge deploy`, `forge logs`, `forge app` and forge-proxy: Kamal-style SSH deploys with Forge-Go's `config/deploy.yml`, health-gated zero-downtime switches, all-or-nothing revert, deploy lock, ACME TLS on rustls (port of Forge-Go ADR 0030) | Accepted |
+| [0043](0043-continuous-fuzzing-sbom-signed-images.md) | Continuous fuzzing (cargo-fuzz targets for every hostile-input parser, per pull request and nightly), CycloneDX and SPDX SBOMs, a keyless cosign-signed forge-proxy image from `v*` tags, OpenSSF Scorecard and SHA/digest pins enforced by a test (port of Forge-Go ADR 0043) | Accepted |
 
 New ADRs use the next four-digit number. A changed decision receives a new ADR
 that marks the prior record `Superseded`; accepted records are not rewritten to

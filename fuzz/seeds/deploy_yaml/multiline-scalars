@@ -1,0 +1,8 @@
+a: |
+  line one
+  line two
+b: >
+  folded
+  text
+c: "quoted \n escape"
+d: 'single ''quote'

@@ -1,7 +1,8 @@
 name: Supply chain
 
 # Enforces docs/dependency-policy.md: locked graph, RustSec advisories,
-# licenses, bans and sources. Advisories are published independently of code
+# licenses, bans and sources, for the framework workspace and for the fuzz/
+# package (the one place libfuzzer-sys is admitted). Advisories are published independently of code
 # changes, so the gate also runs daily against the committed lockfile.
 on:
   push:
@@ -17,24 +18,26 @@ concurrency:
   group: supply-chain-${{ github.ref }}
   cancel-in-progress: true
 
-# Actions are referenced by major-version tag during early development; pin them
-# to full commit SHAs before the first release (docs/dependency-policy.md).
+# Actions are pinned by commit SHA (docs/supply-chain.md); the gate in
+# crates/forge/tests/supply_chain.rs enforces it.
 jobs:
   locked-graph:
     name: locked dependency graph
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Install toolchain from rust-toolchain.toml
         run: cargo --version
       - name: Cargo.lock matches every manifest
         run: cargo metadata --locked --all-features --format-version 1 > /dev/null
+      - name: fuzz/Cargo.lock matches fuzz/Cargo.toml
+        run: cargo metadata --locked --all-features --format-version 1 --manifest-path fuzz/Cargo.toml > /dev/null
 
   cargo-deny:
-    name: cargo deny (${{ matrix.check }})
+    name: cargo deny (${{ matrix.manifest }}, ${{ matrix.check }})
     runs-on: ubuntu-latest
     timeout-minutes: 15
     strategy:
@@ -43,10 +46,13 @@ jobs:
         # Advisories are separate so a new RustSec entry never hides a license
         # or source violation in the same run.
         check: [advisories, "bans licenses sources"]
+        # The framework workspace, and the fuzz package with its own lockfile.
+        manifest: [Cargo.toml, fuzz/Cargo.toml]
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
+          manifest-path: ${{ matrix.manifest }}
           command: check ${{ matrix.check }}

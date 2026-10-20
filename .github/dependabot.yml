@@ -4,7 +4,7 @@
 #
 # The Docker base images used by generated applications are defined in the
 # forge-cli generator source, not in a Dockerfile at this repository's root,
-# so Dependabot cannot update them here.
+# so Dependabot cannot update them here; forge-proxy's own Dockerfile is below.
 version: 2
 updates:
   - package-ecosystem: cargo
@@ -32,3 +32,23 @@ updates:
       interval: weekly
     commit-message:
       prefix: "ci"
+
+  # forge-proxy's image (crates/forge-proxy/Dockerfile): base images are pinned
+  # by digest, which Dependabot refreshes. The digests inside workflow `run:`
+  # steps and `sbom: generator=` it does not see; docs/supply-chain.md lists
+  # them.
+  - package-ecosystem: docker
+    directory: /crates/forge-proxy
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "ci"
+
+  # The fuzz package is a standalone workspace with its own lockfile and is
+  # never part of a release; see docs/dependency-policy.md, "Fuzzing".
+  - package-ecosystem: cargo
+    directory: /fuzz
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "deps(fuzz)"

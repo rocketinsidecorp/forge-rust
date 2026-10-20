@@ -1,0 +1,1 @@
+postgres://app:pw@localhost:5432/app?sslmode=require

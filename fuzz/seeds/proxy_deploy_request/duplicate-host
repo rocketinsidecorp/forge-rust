@@ -1,0 +1,1 @@
+{"service": "app", "hosts": ["a.example.com", "A.example.com"], "target": "h:1"}

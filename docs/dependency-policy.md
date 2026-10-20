@@ -606,6 +606,42 @@ Native dependencies are avoided unless they provide a material security or
 platform benefit. They require supported-platform, cross-compilation, patching,
 and minimal-container analysis.
 
+## Fuzzing and supply-chain tooling (ADR 0043)
+
+[ADR 0043](adr/0043-continuous-fuzzing-sbom-signed-images.md) adds coverage-guided
+fuzzing, SBOMs and signed images. It adds **no package to the framework
+workspace or its `Cargo.lock`**; everything below is test or release tooling that
+is never linked into a released artifact.
+
+The fuzz targets live in `fuzz/`, a standalone package with its own `[workspace]`
+and committed `Cargo.lock` (excluded from the framework workspace like
+`examples/`), so the framework's dependency graph, features and lockfile are
+unchanged. The package depends on the framework crates by path and on one
+third-party crate:
+
+| Crate | Version | Role | Notes |
+| --- | --- | --- | --- |
+| `libfuzzer-sys` | `0.4.13` | the libFuzzer entry point of every `fuzz_target!` | Maintained by the Rust Fuzz project (rust-fuzz); 0.4.13 is 4 months old at admission. Build script compiling LLVM's libFuzzer C++ sources through `cc` (a C++ compiler is needed to fuzz); `unsafe` FFI glue by design; no network access at build time. License `(MIT OR Apache-2.0) AND NCSA`: the NCSA part (the University of Illinois/NCSA license, permissive and BSD-style) is allowed for this crate only by a scoped, expiring exception in `deny.toml`. Exit: the targets are plain `&[u8]` functions, so any other harness (`bolero`, AFL) replaces it by changing the macro. |
+| `arbitrary` | `1.5.0` | transitive of `libfuzzer-sys` (not used directly: targets split `&[u8]` themselves) | rust-fuzz; no build script, no proc macro (the `derive` feature is off). |
+| `jobserver` | `0.1.35` | transitive of `cc` (already in the framework lockfile) for parallel C++ builds | Cargo's own crate. |
+
+The rest of `fuzz/Cargo.lock` is the framework's `Cargo.lock` pruned to the crates
+the targets use, at the same versions. `cargo deny check` runs on
+`fuzz/Cargo.toml` with the same `deny.toml` in CI (job `cargo deny` of
+`supply-chain.yml`), and Dependabot proposes updates for `fuzz/` separately.
+
+Fuzzing needs a nightly toolchain (`-Zsanitizer` for AddressSanitizer and
+coverage instrumentation). It is pinned by date in `scripts/fuzz.sh`, installed
+only by the fuzz jobs, and the framework itself builds on the stable toolchain of
+`rust-toolchain.toml`. `cargo-fuzz` (`0.13.2`) and `cargo-auditable` (`0.7.7`) are
+developer and CI tools installed with `cargo install --locked` at exact versions
+that are at least a week old; they are not dependencies of any crate. Syft
+(SBOMs) and cosign (signing) are not Rust dependencies either: Syft runs from an
+image pinned by digest, cosign comes from a SHA-pinned action. Release tooling
+needs security-owner review (see Admission review): the pins, the permission
+rules and the tag-only trigger are checked by `crates/forge/tests/supply_chain.rs`,
+and [supply chain](supply-chain.md) lists every pin and how it was verified.
+
 ## Exceptions and removal
 
 Exceptions are checked-in records containing scope, reason, risk, compensating

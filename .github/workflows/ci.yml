@@ -17,9 +17,12 @@ env:
   CARGO_INCREMENTAL: "0"
   RUST_BACKTRACE: "1"
 
-# Third-party actions are referenced by major-version tag during early
-# development. Per docs/dependency-policy.md, pin every action to a full commit
-# SHA (keeping the version as a trailing comment) before the first release.
+# Every action is pinned to a full commit SHA with its version in a comment, and
+# every container a workflow runs (the database service below, Syft in
+# scripts/sbom.sh) to the digest of its multi-architecture index; the
+# crates/forge/tests/supply_chain.rs gate fails `cargo test` when one is not.
+# New pins use releases at least a week old. docs/supply-chain.md says how to
+# update them.
 #
 # No toolchain action is used: rustup is preinstalled on GitHub-hosted runners,
 # and the first `cargo` invocation installs the channel and components pinned in
@@ -31,25 +34,27 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Install toolchain from rust-toolchain.toml
         run: cargo --version
       - name: Check formatting
         run: cargo fmt --all -- --check
+      - name: fuzz format check
+        run: cargo fmt --manifest-path fuzz/Cargo.toml --all -- --check
 
   clippy:
     name: clippy
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Install toolchain from rust-toolchain.toml
         run: cargo --version
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Clippy (warnings denied)
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
@@ -58,12 +63,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Install toolchain from rust-toolchain.toml
         run: cargo --version
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: |
             .
@@ -87,12 +92,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Install toolchain from rust-toolchain.toml
         run: cargo --version
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Show Docker version
         run: docker version
       - name: Generated application end-to-end
@@ -105,7 +110,7 @@ jobs:
     timeout-minutes: 60
     services:
       postgres:
-        image: postgres:18
+        image: postgres:18.6-trixie@sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336
         env:
           POSTGRES_PASSWORD: forge
         ports:
@@ -118,11 +123,79 @@ jobs:
     env:
       FORGE_TEST_DATABASE_URL: postgres://postgres:forge@127.0.0.1:5432/postgres
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Install toolchain from rust-toolchain.toml
         run: cargo --version
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Scaffold PostgreSQL, SQLite and MySQL applications and run their gates
         run: cargo test -p forge-cli --test scaffold --locked -- --ignored
+
+  fuzz:
+    # Every fuzz target of fuzz/, found by scripts/fuzz.sh from fuzz/Cargo.toml,
+    # for a short time each after replaying its committed seeds. The nightly
+    # Fuzz workflow (fuzz.yml) runs them longer. cargo-fuzz needs the nightly
+    # toolchain pinned in scripts/fuzz.sh; nothing else in CI does.
+    name: fuzz (every target, 10 s each)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the pinned nightly toolchain
+        run: rustup toolchain install "$(scripts/fuzz.sh -T)" --profile minimal
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: fuzz
+          shared-key: fuzz-${{ hashFiles('scripts/fuzz.sh', 'fuzz/Cargo.lock') }}
+      - name: Install cargo-fuzz
+        run: command -v cargo-fuzz >/dev/null || cargo install cargo-fuzz --version 0.13.2 --locked
+      - name: Fuzz
+        run: scripts/fuzz.sh -t 10s
+      - name: Collect failing inputs
+        if: failure()
+        run: scripts/fuzz.sh -c "$RUNNER_TEMP/fuzz-failures"
+      - name: Upload failing inputs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fuzz-failures
+          path: ${{ runner.temp }}/fuzz-failures
+          if-no-files-found: ignore
+          retention-days: 30
+
+  sbom:
+    # CycloneDX and SPDX SBOMs of the forge and forge-proxy binaries (read from
+    # the dependency list cargo-auditable embeds) and of Cargo.lock; Syft runs
+    # from its image, pinned by digest, without network access.
+    name: sbom (CycloneDX and SPDX)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install toolchain from rust-toolchain.toml
+        run: cargo --version
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Install cargo-auditable
+        run: command -v cargo-auditable >/dev/null || cargo install cargo-auditable --version 0.7.7 --locked
+      - name: Build the binaries and their SBOMs
+        run: scripts/sbom.sh "$RUNNER_TEMP/sbom"
+      - name: The SBOMs describe the binaries
+        env:
+          SBOM_DIR: ${{ runner.temp }}/sbom
+        run: |
+          for name in forge forge-proxy workspace; do
+            jq -e '.bomFormat == "CycloneDX" and (.components | length) > 50' "$SBOM_DIR/$name.cdx.json"
+            jq -e '(.spdxVersion | startswith("SPDX-")) and (.packages | length) > 50' "$SBOM_DIR/$name.spdx.json"
+          done
+          jq -e '[.components[] | select(.name == "rustls")] | length >= 1' "$SBOM_DIR/forge-proxy.cdx.json"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sbom
+          path: ${{ runner.temp }}/sbom
+          if-no-files-found: error
+          retention-days: 30

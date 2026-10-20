@@ -8,12 +8,12 @@
 # ADR 0042. Crates/forge-proxy/Dockerfile.dockerignore keeps target/, .git
 # and the docs out of the build context.
 #
-# Pin both base images by digest (image@sha256:...) for release builds.
-# RUST_VERSION matches rust-toolchain.toml.
+# Both base images are pinned by the digest of their multi-architecture index
+# (docs/supply-chain.md says how to refresh them); the release workflow signs
+# the image built from this file. The Rust tag matches rust-toolchain.toml, and
+# crates/forge/tests/supply_chain.rs fails when it or a digest is missing.
 
-ARG RUST_VERSION=1.98.1
-
-FROM rust:${RUST_VERSION}-slim-trixie AS build
+FROM rust:1.98.1-slim-trixie@sha256:4cd829461bd5c4d511c32e269da9cb8929223b666519d8004e35fc8d1d771ab7 AS build
 WORKDIR /src
 COPY . .
 # Cargo.lock is required: the image is built from the reviewed dependency graph.
@@ -27,7 +27,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
 RUN mkdir -p /out/var/lib/forge-proxy/acme /out/run/forge-proxy \
     && chmod 0700 /out/var/lib/forge-proxy /out/var/lib/forge-proxy/acme /out/run/forge-proxy
 
-FROM gcr.io/distroless/cc-debian13:nonroot AS runtime
+FROM gcr.io/distroless/cc-debian13:nonroot@sha256:b7e81cb1af38d9345680e68bcf564d388f96304e25222030fc8c051faf8565b3 AS runtime
 COPY --from=build /out/forge-proxy /usr/local/bin/forge-proxy
 COPY --from=build --chown=65532:65532 /out/var/lib/forge-proxy /var/lib/forge-proxy
 COPY --from=build --chown=65532:65532 /out/run/forge-proxy /run/forge-proxy

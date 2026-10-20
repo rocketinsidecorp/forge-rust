@@ -1,0 +1,38 @@
+service: app
+image: registry.example.com/acme/app
+servers:
+  web:
+    hosts:
+      - 192.0.2.10
+      - 192.0.2.11
+    proxy: true
+  job:
+    hosts:
+      - 192.0.2.11
+    cmd: ["jobs"]
+    proxy: false
+env:
+  clear:
+    FORGE_ENV: production
+    FORGE_HTTP_TRUSTED_PROXIES: "172.18.0.0/16"
+  secret:
+    - FORGE_DATABASE_URL
+proxy:
+  image: registry.example.com/acme/forge-proxy:0.1.0
+  hosts:
+    - app.example.com
+  ssl: true
+  app_port: 3000
+  healthcheck:
+    path: /health/ready
+    interval: 1s
+    timeout: 2s
+    healthy_count: 3
+    deploy_timeout: 60s
+  drain_timeout: 30s
+migrate:
+  enabled: true
+retain: 5
+stop_timeout: 35s
+ssh:
+  user: deploy

@@ -1,0 +1,6 @@
+# Build output, the corpus each run grows (CI caches it) and failing inputs
+# libFuzzer writes. Regression seeds live in seeds/ and are committed.
+/target
+/corpus
+/artifacts
+/coverage

@@ -206,6 +206,11 @@ fn location(raw: &str) -> Option<Location> {
             _ => {}
         }
     }
+    // Port 0 names no server (Forge-Go refuses ports outside 1-65535): a URL
+    // with it is not well formed and has no endpoint.
+    if found.port == Some(0) {
+        return None;
+    }
     Some(found)
 }
 
@@ -395,6 +400,19 @@ mod tests {
         assert!(!is_well_formed(&secret(
             "postgres://u:p@h/shop?application_name=a@b"
         )));
+    }
+
+    #[test]
+    fn port_zero_is_not_a_server() {
+        for raw in [
+            "postgres://u:p@db.internal:0/app",
+            "postgres://u:p@db.internal/app?port=0",
+            "mysql://u:p@db.internal:0/app",
+        ] {
+            let url = SecretString::new(raw);
+            assert!(!is_well_formed(&url), "{raw}");
+            assert_eq!(endpoint(&url), None, "{raw}");
+        }
     }
 
     #[test]
