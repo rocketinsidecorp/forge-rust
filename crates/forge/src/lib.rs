@@ -30,6 +30,7 @@ mod console;
 mod database;
 mod logging;
 mod observability;
+pub mod openapi;
 #[cfg(feature = "jobs")]
 mod operator;
 mod probe;

@@ -1,6 +1,7 @@
 //! Command-line parsing for generated application binaries.
 
 use std::ffi::OsString;
+use std::path::PathBuf;
 
 use thiserror::Error;
 
@@ -22,6 +23,8 @@ pub(crate) enum Command {
     },
     /// Server-level administration of the application's database.
     Db(DbCommand),
+    /// Print, write or check the OpenAPI document.
+    OpenApi(OpenApiOutput),
     /// Print name and version.
     Version,
     /// Print usage.
@@ -49,6 +52,17 @@ pub(crate) enum DbCommand {
     Exists,
 }
 
+/// Where `openapi` puts the document.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum OpenApiOutput {
+    /// Standard output.
+    Stdout,
+    /// `--output FILE`: write it.
+    Output(PathBuf),
+    /// `--check FILE`: exit 1 when FILE differs.
+    Check(PathBuf),
+}
+
 /// Names of the built-in commands, which applications cannot replace.
 pub(crate) const BUILT_IN: &[&str] = &[
     "serve",
@@ -56,6 +70,7 @@ pub(crate) const BUILT_IN: &[&str] = &[
     "migrate",
     "rollback",
     "db",
+    "openapi",
     "version",
     "help",
     "jobs",
@@ -146,6 +161,7 @@ pub(crate) fn parse(
                 steps: parse_steps(&mut args)?,
             },
             Some("db") => Command::Db(parse_db(&mut args)?),
+            Some("openapi") => Command::OpenApi(parse_openapi(&mut args)?),
             Some("version" | "--version" | "-V") => Command::Version,
             Some("help" | "--help" | "-h") => Command::Help,
             #[cfg(feature = "jobs")]
@@ -197,6 +213,35 @@ fn parse_steps(args: &mut impl Iterator<Item = OsString>) -> Result<u32, UsageEr
             value,
         }),
     }
+}
+
+/// `[--output FILE | --check FILE]` after `openapi` (also `--output=FILE`).
+fn parse_openapi(args: &mut impl Iterator<Item = OsString>) -> Result<OpenApiOutput, UsageError> {
+    let Some(flag) = args.next() else {
+        return Ok(OpenApiOutput::Stdout);
+    };
+    let text = flag.to_string_lossy().into_owned();
+    let (name, value) = match text.split_once('=') {
+        Some((name, value)) => (name.to_owned(), Some(OsString::from(value))),
+        None => (text.clone(), None),
+    };
+    let wrap: fn(PathBuf) -> OpenApiOutput = match name.as_str() {
+        "--output" => OpenApiOutput::Output,
+        "--check" => OpenApiOutput::Check,
+        _ => return Err(UsageError::UnexpectedArgument(text)),
+    };
+    let file = match value {
+        Some(value) => value,
+        None => args.next().ok_or(UsageError::MissingArgument(
+            "FILE after --output or --check",
+        ))?,
+    };
+    if file.is_empty() {
+        return Err(UsageError::MissingArgument(
+            "FILE after --output or --check",
+        ));
+    }
+    Ok(wrap(PathBuf::from(file)))
 }
 
 /// `create`, `exists` or `drop [--force-production]` after `db`.
@@ -335,6 +380,8 @@ Commands:
   db exists    Exit 0 when that database exists, 3 when it does not
   db drop      Drop that database; outside development and test, or for a server that is not
                on this machine, only with --force-production
+  openapi      Print the OpenAPI document; --output FILE writes it, --check FILE exits 1
+               when FILE is out of date (logs go to standard error)
 {commands}  version      Print the application name and version (also --version, -V)
   help         Print this help (also --help, -h)
 {jobs}
@@ -365,6 +412,8 @@ Environment:
   FORGE_STREAMS_KEY           base64 of 32+ bytes signing live-update stream names; required in production when streams are served
   FORGE_I18N_DEFAULT_LOCALE   default locale, spelled canonically (en, pt-BR); needs config/locales/LOCALE.json
                               (default: the application's, set by forge new --locale)
+  FORGE_OPENAPI_ENABLED       true serves GET /openapi.json in production too; false never
+                              (default: development and test only)
   FORGE_MAIL_URL              smtp://user:pass@host:587 (STARTTLS), smtps://user:pass@host:465 (implicit TLS)
                               or file:tmp/mail (development .eml files; refused in production) (default: mail off)
   FORGE_MAIL_FROM             default sender, App <app@example.com>; required with FORGE_MAIL_URL
@@ -405,6 +454,32 @@ mod tests {
 
     fn parse_builtin(args: Vec<OsString>) -> Result<Command, UsageError> {
         parse(args, &[])
+    }
+
+    #[test]
+    fn openapi_takes_one_output_or_check_file() {
+        assert_eq!(
+            parse_builtin(args(&["openapi"])),
+            Ok(Command::OpenApi(OpenApiOutput::Stdout))
+        );
+        assert_eq!(
+            parse_builtin(args(&["openapi", "--output", "openapi.json"])),
+            Ok(Command::OpenApi(OpenApiOutput::Output(
+                "openapi.json".into()
+            )))
+        );
+        assert_eq!(
+            parse_builtin(args(&["openapi", "--check=api.json"])),
+            Ok(Command::OpenApi(OpenApiOutput::Check("api.json".into())))
+        );
+        assert!(parse_builtin(args(&["openapi", "--output"])).is_err());
+        assert!(parse_builtin(args(&["openapi", "--output="])).is_err());
+        assert!(parse_builtin(args(&["openapi", "--yaml"])).is_err());
+        assert_eq!(
+            parse_builtin(args(&["openapi", "--output", "a", "--check", "b"])),
+            Err(UsageError::UnexpectedArgument("--check".to_owned()))
+        );
+        assert!(BUILT_IN.contains(&"openapi"));
     }
 
     #[test]

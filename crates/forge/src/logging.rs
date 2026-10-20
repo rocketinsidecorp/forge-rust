@@ -29,22 +29,46 @@ pub(crate) struct InvalidLogFilter {
 /// If a global subscriber is already installed (for example by a test
 /// harness embedding the application) it is kept and this call succeeds.
 pub(crate) fn init(config: &LogConfig, export: Option<LogLayer>) -> Result<(), InvalidLogFilter> {
+    install(config, export, false)
+}
+
+/// Like [`init`], writing to standard error: for commands whose standard
+/// output is data, such as `openapi`.
+pub(crate) fn init_stderr(config: &LogConfig) -> Result<(), InvalidLogFilter> {
+    install(config, None, true)
+}
+
+fn install(
+    config: &LogConfig,
+    export: Option<LogLayer>,
+    stderr: bool,
+) -> Result<(), InvalidLogFilter> {
     let filter = EnvFilter::try_new(&config.filter).map_err(|reason| InvalidLogFilter {
         filter: config.filter.clone(),
         reason,
     })?;
-    let stdout = match config.format {
-        LogFormat::Json => tracing_subscriber::fmt::layer()
+    let output = match (config.format, stderr) {
+        (LogFormat::Json, false) => tracing_subscriber::fmt::layer()
             .json()
             .with_ansi(false)
             .boxed(),
-        LogFormat::Text => tracing_subscriber::fmt::layer()
+        (LogFormat::Json, true) => tracing_subscriber::fmt::layer()
+            .json()
+            .with_ansi(false)
+            .with_writer(std::io::stderr)
+            .boxed(),
+        (LogFormat::Text, false) => tracing_subscriber::fmt::layer()
             .compact()
             .with_ansi(std::io::stdout().is_terminal())
             .boxed(),
+        (LogFormat::Text, true) => tracing_subscriber::fmt::layer()
+            .compact()
+            .with_ansi(std::io::stderr().is_terminal())
+            .with_writer(std::io::stderr)
+            .boxed(),
     };
     let installed = tracing_subscriber::registry()
-        .with(stdout)
+        .with(output)
         .with(export)
         .with(filter)
         .try_init();

@@ -525,6 +525,7 @@ dependencies = [
  "forge-i18n",
  "forge-jobs",
  "forge-mail",
+ "forge-openapi",
  "forge-ratelimit",
  "forge-security",
  "forge-storage",
