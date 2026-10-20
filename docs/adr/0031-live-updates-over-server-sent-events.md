@@ -163,7 +163,17 @@ broker, which reaches one process only.
 pages publish after the change is stored (create appends the row and removes
 the empty-list row, because Forge-Rust lists are oldest first; update
 replaces the row; delete removes it); a publish failure is logged and never
-fails the request. Fragments are rendered from a `_row.html` partial without
+fails the request. On PostgreSQL publishing needs a pool connection for
+`NOTIFY`, so under pool pressure it could outlast the request timeout and
+turn a stored write into a `503`: the generated `Streams::publish` therefore
+waits at most `PUBLISH_TIMEOUT` (2 seconds), then logs `live_update_failed`
+and returns (this replica's pages already received the update; other
+replicas see it on their next page load). Publishing with `publish_in` inside
+the write's own transaction would be atomic, but the generated repositories
+own their transactions behind application ports that expose no SQLx type to
+the HTTP adapter, and MySQL, MariaDB and SQLite have no `NOTIFY`;
+hand-written PostgreSQL code that holds the transaction should prefer
+`publish_in`. Fragments are rendered from a `_row.html` partial without
 a request, so no CSRF token or per-user data enters a broadcast. The first
 broadcasting scaffold writes `src/adapters/http/streams.rs`; the printed
 wiring uses `Fanout::Postgres` on PostgreSQL and `Fanout::InProcess`

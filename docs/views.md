@@ -533,7 +533,9 @@ What protects a stream:
   token or per-user content.
 
 Delivery is at most once, without replay: a browser that was offline sees the
-change on its next page load. `Fanout::Postgres` reaches every replica through
+change on its next page load. Generated pages wait at most 2 seconds for the
+broker (`PUBLISH_TIMEOUT` in `src/adapters/http/streams.rs`), then log the
+update as failed, so a busy database pool never fails the stored change. `Fanout::Postgres` reaches every replica through
 `LISTEN/NOTIFY` (256 KiB per message); MySQL, MariaDB and SQLite refuse it and
 use `Fanout::InProcess`, which reaches the browsers connected to this process
 only. Behind a proxy, see [deployment](deployment.md#live-updates-behind-a-proxy).

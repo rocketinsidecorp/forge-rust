@@ -16,7 +16,10 @@
 //!    receives it, whatever the token says.
 //!
 //! Delivery is best effort and at most once: a browser that was disconnected
-//! misses what was published meanwhile and sees it on its next page load.
+//! misses what was published meanwhile and sees it on its next page load. A
+//! publish that the broker does not accept within 2 seconds (on PostgreSQL it
+//! needs a pool connection for `NOTIFY`) is given up and logged, so a busy
+//! pool never turns a stored change into a timed-out response.
 //! Streams end when shutdown begins, after 30 minutes (the browser
 //! reconnects, which checks access again), or when a browser stops reading.
 //! `FORGE_STREAMS_KEY` (`openssl rand -base64 32`, the same on every replica)
@@ -24,6 +27,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use forge::broadcast::{
@@ -41,11 +45,19 @@ use crate::adapters::http::access::{AccessDenied, GlobalAccess, TenantAccess};
 /// Where tenant channels are served; global channels use `/streams`.
 pub const TENANT_PATH: &str = "/tenants/{tenant_id}/streams";
 
+/// How long [`Streams::publish`] waits for the broker. The change is already
+/// stored when it publishes, so the request must not wait for a database
+/// connection under pool pressure: past this the update is logged and
+/// dropped (pages served by this process already received it; other
+/// replicas see the change on their next page load).
+pub const PUBLISH_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// What the HTML adapters publish to and render subscriptions from.
 pub struct Streams {
     broker: Arc<dyn Broker>,
     signer: Arc<Signer>,
     readers: Arc<Readers>,
+    publish_timeout: Duration,
 }
 
 impl Streams {
@@ -73,6 +85,7 @@ impl Streams {
             broker,
             signer,
             readers,
+            publish_timeout: PUBLISH_TIMEOUT,
         }))
     }
 
@@ -111,9 +124,10 @@ impl Streams {
     }
 
     /// Publishes the actions `build` returns to `channel`. The change is
-    /// already stored, so a failure is logged and never fails the request.
-    /// The actions reach every subscriber: render them from views that take
-    /// no request (no CSRF token, nothing about the current user).
+    /// already stored, so a failure, or a broker that does not accept the
+    /// update within [`PUBLISH_TIMEOUT`], is logged and never fails the
+    /// request. The actions reach every subscriber: render them from views
+    /// that take no request (no CSRF token, nothing about the current user).
     pub async fn publish(
         &self,
         channel: Option<Channel>,
@@ -123,9 +137,13 @@ impl Streams {
             return;
         };
         let outcome = match build() {
-            Ok(actions) => forge::broadcast::publish(self.broker.as_ref(), &channel, &actions)
-                .await
-                .map_err(StreamFailure::Publish),
+            Ok(actions) => {
+                let published = forge::broadcast::publish(self.broker.as_ref(), &channel, &actions);
+                match tokio::time::timeout(self.publish_timeout, published).await {
+                    Ok(published) => published.map_err(StreamFailure::Publish),
+                    Err(_elapsed) => Err(StreamFailure::TimedOut),
+                }
+            }
             Err(error) => Err(error),
         };
         if let Err(error) = outcome {
@@ -146,6 +164,9 @@ pub enum StreamFailure {
     /// The broker refused the message.
     #[error("broadcast failed")]
     Publish(#[from] BroadcastError),
+    /// The broker did not accept the message within [`PUBLISH_TIMEOUT`].
+    #[error("broadcast timed out")]
+    TimedOut,
 }
 
 fn report(error: StreamFailure) {
@@ -239,10 +260,49 @@ fn denied(denied: AccessDenied) -> StreamDenied {
 mod tests {
     use std::error::Error;
 
+    use forge::broadcast::{Message, Subscription};
     use forge::config::{AppConfig, Environment};
     use forge::http::Router;
+    use forge::views::DomId;
 
     use super::*;
+
+    /// A broker that never accepts a message, like a PostgreSQL broker
+    /// waiting for a connection from an exhausted pool.
+    struct Stuck;
+
+    #[async_trait]
+    impl Broker for Stuck {
+        async fn publish(&self, _: &Channel, _: Message) -> Result<(), BroadcastError> {
+            std::future::pending().await
+        }
+
+        fn subscribe(&self, _: &Channel) -> Result<Subscription, BroadcastError> {
+            Err(BroadcastError::Closed)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_publish_the_broker_does_not_accept_is_given_up() -> Result<(), Box<dyn Error>> {
+        assert_eq!(PUBLISH_TIMEOUT, Duration::from_secs(2));
+        let streams = Streams {
+            broker: Arc::new(Stuck),
+            signer: Arc::new(Signer::random()?),
+            readers: Arc::new(Readers::default()),
+            publish_timeout: Duration::from_millis(10),
+        };
+
+        let published = tokio::time::timeout(
+            Duration::from_secs(5),
+            streams.publish(Some(Channel::global("probes")?), || {
+                Ok(vec![TurboStreamAction::remove(DomId::new("probe")?)])
+            }),
+        )
+        .await;
+
+        assert!(published.is_ok(), "the request is never held by the broker");
+        Ok(())
+    }
 
     #[tokio::test]
     async fn production_refuses_to_start_without_a_signing_key() -> Result<(), Box<dyn Error>> {
