@@ -24,7 +24,7 @@ templates/layouts/application.html  layout: CSRF meta tag, stylesheet, import ma
 templates/layouts/_flash.html       one-shot notice/alert messages
 templates/welcome/index.html        the page served at /
 src/adapters/http/views/            view models checked against the templates at compile time
-assets/                             CSS and JavaScript, digested and embedded by build.rs
+assets/                             CSS, JavaScript and the logo, digested and embedded by build.rs
 ```
 
 Templates use [Askama](https://askama.rs): `{{ value }}` is HTML-escaped and a

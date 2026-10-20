@@ -125,6 +125,42 @@ async fn turbo_and_stimulus_are_served_digested() -> TestResult {
 }
 
 #[tokio::test]
+async fn welcome_page_shows_the_digested_logo_which_is_served_as_an_image() -> TestResult {
+    let router = router()?;
+    let response = router.dispatch(request(Method::GET, "/", &[], "")?).await;
+    let policy = header_text(&response, header::CONTENT_SECURITY_POLICY).unwrap_or_default();
+    assert!(policy.contains("img-src 'self'"), "{policy}");
+    let page = body(&response)?;
+    let marker = "<img class=\"brand-logo\" src=\"";
+    let start = page.find(marker).ok_or("the welcome page shows the logo")? + marker.len();
+    let end = start + page[start..].find('"').ok_or("the logo URL ends")?;
+    let url = &page[start..end];
+    assert!(url.starts_with("/assets/forge-rust-logo-"), "{url}");
+    assert!(url.ends_with(".svg"), "{url}");
+    assert!(
+        page.contains("alt=\"Forge Rust \u{2014} Rust Framework\""),
+        "{page}"
+    );
+
+    let logo = router.dispatch(request(Method::GET, url, &[], "")?).await;
+
+    assert_eq!(logo.status(), StatusCode::OK);
+    assert_eq!(
+        header_text(&logo, header::CONTENT_TYPE),
+        Some("image/svg+xml")
+    );
+    assert_eq!(
+        header_text(&logo, header::X_CONTENT_TYPE_OPTIONS),
+        Some("nosniff")
+    );
+    // Opened directly, the SVG is sandboxed: no scripts, no outside loads.
+    let svg_policy = header_text(&logo, header::CONTENT_SECURITY_POLICY).unwrap_or_default();
+    assert!(svg_policy.contains("sandbox"), "{svg_policy}");
+    assert!(body(&logo)?.starts_with("<svg "));
+    Ok(())
+}
+
+#[tokio::test]
 async fn form_posts_need_the_csrf_token_of_the_page() -> TestResult {
     let router = router()?;
     let page = router.dispatch(request(Method::GET, "/", &[], "")?).await;

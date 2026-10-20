@@ -204,6 +204,7 @@ const TEMPLATES: &[Template] = &[
     ),
     template!(Group::Views, "assets/application.css" => "assets/application.css.tmpl"),
     template!(Group::Views, "assets/application.js" => "assets/application.js.tmpl"),
+    template!(Group::Views, "assets/forge-rust-logo.svg" => "assets/forge-rust-logo.svg"),
     template!(Group::Views, "tests/http.rs" => "tests/http.rs.tmpl"),
     template!(Group::Always, "src/infrastructure/mod.rs" => "src/infrastructure/mod.rs.tmpl"),
     template!(Group::Always, "src/bootstrap/mod.rs" => "src/bootstrap/mod.rs.tmpl"),
@@ -1541,6 +1542,7 @@ mod tests {
         "templates/welcome/index.html",
         "assets/application.css",
         "assets/application.js",
+        "assets/forge-rust-logo.svg",
         "tests/http.rs",
     ];
 

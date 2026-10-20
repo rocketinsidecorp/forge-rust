@@ -28,6 +28,7 @@ pub struct Site {
     policy: ContentSecurityPolicy,
     stylesheet: String,
     javascript: String,
+    logo: String,
 }
 
 impl Site {
@@ -45,13 +46,20 @@ impl Site {
         let policy = ContentSecurityPolicy::strict().with_import_map(&import_map);
         let stylesheet = asset_path(&assets, "application.css")?;
         let javascript = asset_path(&assets, "application.js")?;
+        let logo = asset_path(&assets, "forge-rust-logo.svg")?;
         Ok(Self {
             assets,
             import_map,
             policy,
             stylesheet,
             javascript,
+            logo,
         })
+    }
+
+    /// Digested URL of `assets/forge-rust-logo.svg`, shown by the welcome page.
+    pub fn logo(&self) -> &str {
+        &self.logo
     }
 
     /// Registers one route per digested asset and the request layers, from
