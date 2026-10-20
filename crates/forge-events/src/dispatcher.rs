@@ -150,6 +150,7 @@ impl Dispatcher {
     /// without consuming attempts.
     pub async fn run(self, shutdown: Cancellation) -> Result<(), EventsError> {
         self.settings.validate()?;
+        forge_jobs::panics::redact_attempt_panics();
         info!(batch = self.settings.batch, "outbox dispatcher started");
         while !shutdown.is_cancelled() {
             let token = Uuid::now_v7();
@@ -201,7 +202,9 @@ impl Dispatcher {
         // A task of its own so a panicking publisher fails one attempt
         // instead of the dispatcher; awaited before the next event.
         let mut task = JoinSet::new();
-        task.spawn(async move { tokio::time::timeout(timeout, publisher.publish(&copy)).await });
+        task.spawn(forge_jobs::panics::redacted(async move {
+            tokio::time::timeout(timeout, publisher.publish(&copy)).await
+        }));
         let outcome = match task.join_next().await {
             Some(Ok(Ok(Ok(())))) => Ok(()),
             Some(Ok(Ok(Err(failure)))) => Err(failure),

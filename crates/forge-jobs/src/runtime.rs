@@ -301,6 +301,7 @@ impl Jobs {
     /// [`JobsError::TaskFailed`].
     pub async fn run(self, store: PgJobStore, shutdown: Cancellation) -> Result<(), JobsError> {
         self.validate()?;
+        crate::panics::redact_attempt_panics();
         let Self {
             handlers,
             concurrency,

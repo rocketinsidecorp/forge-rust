@@ -633,6 +633,7 @@ dependencies = [
  "forge-config",
  "forge-core",
  "forge-db",
+ "forge-jobs",
  "forge-security",
  "forge-tenancy",
  "getrandom 0.4.3",

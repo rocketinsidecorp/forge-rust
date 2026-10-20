@@ -221,7 +221,7 @@ impl QueueWorker {
             scope_valid,
             interrupt: interrupt.clone(),
         };
-        let abort = tasks.spawn(execution.run());
+        let abort = tasks.spawn(crate::panics::redacted(execution.run()));
         in_flight.insert(
             abort.id(),
             InFlight {

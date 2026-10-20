@@ -39,7 +39,8 @@
 //! for in-flight attempts up to a deadline, cancels the remaining ones
 //! cooperatively, then aborts them and releases their leases. A panicking
 //! handler is recorded as a failed attempt; the worker keeps running. Logs
-//! carry job ids, names, queues and attempts, never payloads.
+//! carry job ids, names, queues and attempts, never payloads; a panic hook
+//! keeps attempt panic messages off stderr ([`panics`]).
 //!
 //! # Backends
 //!
@@ -54,6 +55,7 @@ mod cron;
 mod error;
 mod job;
 mod name;
+pub mod panics;
 #[cfg(test)]
 mod pg_tests;
 pub mod postgres;

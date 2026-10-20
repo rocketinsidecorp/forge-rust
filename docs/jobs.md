@@ -84,6 +84,10 @@ impl JobHandler for WelcomeEmailHandler {
 ```
 
 Handlers are adapters, like HTTP handlers: they call application use cases.
+A panicking handler is recorded as a failed attempt (`the job panicked`);
+its panic message is kept out of the database, the logs and stderr
+(`forge::jobs::panics`, a process-wide hook that wraps the existing one and
+only affects job attempts and outbox publications).
 Delivery is **at-least-once**, so make handlers idempotent. Long handlers
 should watch `context.cancellation()` (timeout, lost lease or shutdown).
 

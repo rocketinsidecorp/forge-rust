@@ -102,6 +102,12 @@ queue; unbounded retention; payload data leaking into logs.
    cancel the attempt and count as retryable failures. A panicking handler
    is caught at its task boundary and recorded as a failed attempt
    (`the job panicked`, without the panic message); the worker continues.
+   Because the default panic hook would print the message (which can quote
+   job data) to stderr, the runtime installs once per process a hook that
+   wraps the existing one and withholds the message of panics raised inside
+   job attempts and outbox publications (a task-local scope); it is never
+   swapped back, so hooks installed later by other components are not
+   clobbered.
    Stored error messages are truncated to 1024 bytes with control
    characters replaced.
 
