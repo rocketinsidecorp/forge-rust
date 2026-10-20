@@ -152,6 +152,10 @@ async fn welcome_page_shows_the_digested_logo_which_is_served_as_an_image() -> T
         page.contains("alt=\"Forge Rust \u{2014} Rust Framework\""),
         "{page}"
     );
+    // Styled from assets/application.css, scoped to the page's body class:
+    // the strict policy allows no inline style.
+    assert!(page.contains("<body class=\"welcome-page\">"), "{page}");
+    assert!(!page.contains(" style="), "{page}");
 
     let logo = router.dispatch(request(Method::GET, url, &[], "")?).await;
 

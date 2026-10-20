@@ -402,7 +402,7 @@ index_html="$work_dir/index.html"
 index_headers="$work_dir/index.headers"
 curl --silent --fail --dump-header "$index_headers" --output "$index_html" "http://127.0.0.1:$port/" \
   || fail "index route"
-grep -q "<h1>Welcome to $app_name</h1>" "$index_html" || fail "index must render the welcome view in the layout"
+grep -q "<h1 id=\"welcome-title\">Welcome to $app_name</h1>" "$index_html" || fail "index must render the welcome view in the layout"
 grep -qi '^content-language: en' "$index_headers" || fail "translated pages must name their language"
 curl --silent --fail -H 'Accept-Language: es' "http://127.0.0.1:$port/" | grep -q "<html lang=\"es\">" \
   && fail "an application created without --locale es has no Spanish"
@@ -554,7 +554,7 @@ if docker run --rm --entrypoint /bin/sh "$image" -c true >/dev/null 2>&1; then
   fail "the runtime image must not contain a shell"
 fi
 
-curl --silent --fail "http://127.0.0.1:3000/" | grep -q "<h1>Welcome to $app_name</h1>" || fail "container index route"
+curl --silent --fail "http://127.0.0.1:3000/" | grep -q "<h1 id=\"welcome-title\">Welcome to $app_name</h1>" || fail "container index route"
 docker compose logs app 2>&1 | grep -m1 -q ' | {' || fail "production logs must be JSON"
 
 # The named volume must preserve the migrated schema across an application restart.

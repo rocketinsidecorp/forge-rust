@@ -70,10 +70,12 @@ impl Database {
 
     /// Cargo options of the `forge` dependency that select this backend and,
     /// for full-stack applications, the `views` feature (plus `testing` for
-    /// the dev-dependency that provides `TestDatabase`).
+    /// the dev-dependency that provides `TestDatabase`). PostgreSQL
+    /// applications also get `jobs`: `forge new` wires the persistent job
+    /// queue into their lifecycle (ADR 0025), which needs PostgreSQL.
     fn forge_features(self, views: bool, testing: bool) -> String {
         let (default_features, mut features) = match self {
-            Self::Postgresql => (true, Vec::new()),
+            Self::Postgresql => (true, vec!["jobs"]),
             Self::Mysql | Self::Mariadb => (false, vec!["mysql"]),
             Self::Sqlite3 => (true, vec!["sqlite"]),
             Self::Disabled => (false, Vec::new()),
@@ -1528,7 +1530,7 @@ mod tests {
             "the runtime role may not"
         );
         assert!(manifest.contains(&format!(
-            "forge = {{ git = \"https://github.com/rocketinsidecorp/forge-rust\", tag = \"v{FORGE_VERSION}\", features = [\"views\", \"broadcast\"] }}"
+            "forge = {{ git = \"https://github.com/rocketinsidecorp/forge-rust\", tag = \"v{FORGE_VERSION}\", features = [\"jobs\", \"views\", \"broadcast\"] }}"
         )));
         assert!(manifest.contains(&format!(
             "forge-views = {{ git = \"https://github.com/rocketinsidecorp/forge-rust\", tag = \"v{FORGE_VERSION}\", default-features = false, features = [\"build\"] }}"
@@ -1675,7 +1677,7 @@ mod tests {
         let (_parent, root) = generate(Database::Postgresql, true);
 
         assert!(read(&root, "Cargo.toml").contains(
-            "forge = { path = \"../forge/crates/forge\", features = [\"views\", \"broadcast\"] }"
+            "forge = { path = \"../forge/crates/forge\", features = [\"jobs\", \"views\", \"broadcast\"] }"
         ));
         assert!(read(&root, "Cargo.toml").contains("\"postgres\", \"runtime-tokio\""));
         assert!(read(&root, "src/bootstrap/mod.rs").contains(".postgres(sqlx::migrate!())"));
@@ -1932,7 +1934,7 @@ mod tests {
 
         let manifest = read(&root, "Cargo.toml");
         assert!(manifest.contains(
-            "forge = { path = \"../forge/crates/forge\", features = [\"views\", \"broadcast\"] }"
+            "forge = { path = \"../forge/crates/forge\", features = [\"jobs\", \"views\", \"broadcast\"] }"
         ));
         assert!(manifest.contains(
             "forge-views = { path = \"../forge/crates/forge-views\", default-features = false, features = [\"build\"] }"

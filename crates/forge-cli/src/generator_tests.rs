@@ -525,13 +525,16 @@ fn mailers_and_jobs_round_trip_through_destroy() {
         queue: true,
         dry_run: false,
     };
+    // `forge new` already declared the jobs and enabled the feature: the
+    // job is only registered in `jobs_configure`.
     let job = job::generate(&root, &job_options).unwrap_or_else(|error| panic!("{error}"));
     assert!(
-        job.wiring.contains(".jobs(forge::WorkerMode::InServe)"),
+        job.wiring.contains("at the end of `fn jobs_configure`"),
         "{}",
         job.wiring
     );
-    assert!(job.wiring.contains("add \"jobs\""), "{}", job.wiring);
+    assert!(!job.wiring.contains("WorkerMode"), "{}", job.wiring);
+    assert!(!job.wiring.contains("add \"jobs\""), "{}", job.wiring);
     let source =
         fs::read_to_string(root.join("src/adapters/jobs/send_welcome.rs")).unwrap_or_default();
     assert!(source.contains("pub note: Option<String>,"), "{source}");
@@ -560,6 +563,30 @@ fn mailers_and_jobs_round_trip_through_destroy() {
     );
     assert_eq!(after, before);
     assert!(!root.join("templates/mailers").exists());
+
+    // An application generated before `forge new` wired jobs: the wiring
+    // also declares them and enables the feature.
+    let (_parent, older) = application(Database::Postgresql, true, Locale::En);
+    let bootstrap = fs::read_to_string(older.join("src/bootstrap/mod.rs")).unwrap_or_default();
+    let start = bootstrap
+        .find("\n/// Configures the persistent job queue")
+        .unwrap_or_else(|| panic!("{bootstrap}"));
+    let bootstrap = bootstrap[..start]
+        .replace("        .jobs(forge::WorkerMode::InServe)\n", "")
+        .replace("        .compose(jobs_configure)\n", "");
+    fs::write(older.join("src/bootstrap/mod.rs"), bootstrap)
+        .unwrap_or_else(|error| panic!("{error}"));
+    let manifest = fs::read_to_string(older.join("Cargo.toml")).unwrap_or_default();
+    fs::write(older.join("Cargo.toml"), manifest.replace("\"jobs\", ", ""))
+        .unwrap_or_else(|error| panic!("{error}"));
+    let job = job::generate(&older, &job_options).unwrap_or_else(|error| panic!("{error}"));
+    for wiring in [
+        "at the end of `fn compose`",
+        ".jobs(forge::WorkerMode::InServe)",
+        "add \"jobs\"",
+    ] {
+        assert!(job.wiring.contains(wiring), "{wiring}: {}", job.wiring);
+    }
 
     // Jobs need PostgreSQL; mailers need the mail test support.
     let (_parent, sqlite) = application(Database::Sqlite3, true, Locale::En);

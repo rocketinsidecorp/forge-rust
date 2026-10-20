@@ -105,7 +105,15 @@ generators never edit existing files. The feature only compiles
 connection is opened and no task runs until the wiring printed by a
 `--broadcast` scaffold (`Streams::register`) is added. An application that
 will never broadcast may remove `"broadcast"` from the features; a later
-`--broadcast` scaffold then asks for it back. Until a release tag such as
+`--broadcast` scaffold then asks for it back. PostgreSQL applications (full
+stack or `--api`) also enable `jobs`: `src/bootstrap/mod.rs` declares the
+persistent job queue with `.jobs(forge::WorkerMode::InServe)` and configures
+it in `jobs_configure` (at most 4 attempts per queue, no job registered),
+like Forge-Go's `bootstrap.JobsConfigure`. `migrate` then also applies the
+framework job schema, `serve` runs the workers, cron schedules and pruning
+under its own lifecycle, and `jobs work|status|dead|retry|discard` are
+available ([jobs](jobs.md)). Other backends get no job wiring: the queue
+needs PostgreSQL. Until a release tag such as
 `v0.1.0` is pushed, that dependency cannot resolve. Use `--forge-path` with a
 local checkout in the meantime.
 
@@ -220,7 +228,7 @@ shop/
 ├── Cargo.lock               # omitted with --skip-lockfile (or if generation fails)
 ├── Cargo.toml               # package `shop`, lib `app`, deps: forge, serde, askama, SQLx + auth mechanism crates
 ├── Dockerfile               # omitted with --skip-docker
-├── README.md
+├── README.md                # starts with the Forge Rust logo
 ├── compose.yaml             # omitted with --skip-docker; 127.0.0.1:3000, stop_grace_period 20s
 ├── compose.observability.yaml  # omitted with --skip-docker; opt-in overlay: collector, Prometheus, Tempo, Loki, Grafana
 ├── docker/                   # omitted with --skip-docker
@@ -318,7 +326,9 @@ Notes on the generated package:
   `adapters`, `infrastructure`, `bootstrap`, `forge::http`, `forge::views` or
   `askama` ([ADR 0002](adr/0002-hexagonal-boundaries.md)).
 - `tests/http.rs` (full-stack only) dispatches requests through the router
-  without a network: the welcome page is HTML with the layout, the CSP and a
+  without a network: the welcome page (styled like Forge-Go's: masthead,
+  logo, call-to-action buttons, health endpoints, footer) is HTML with the
+  layout, the CSP and a
   CSRF meta tag matching the `__Host-forge_csrf` cookie; Turbo and Stimulus
   are served digested; a form `POST` without the page's token is `403` and
   with it reaches the handler.

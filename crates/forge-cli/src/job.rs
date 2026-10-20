@@ -254,15 +254,22 @@ fn wiring(root: &Path, options: &JobOptions) -> Result<String, CliError> {
         ));
     }
     out.push_str(&format!("       {JOBS_MODULE:<38} pub mod {name};\n"));
-    out.push_str(
-        "\n  2. In src/bootstrap/mod.rs, at the end of `fn compose`, before `Ok(())`:\n\n",
-    );
+    let bootstrap = fs::read_to_string(root.join("src/bootstrap/mod.rs")).unwrap_or_default();
+    // `forge new` generates `jobs_configure` for PostgreSQL applications;
+    // older ones register jobs in `compose`.
+    let function = if bootstrap.contains("fn jobs_configure(") {
+        "jobs_configure"
+    } else {
+        "compose"
+    };
+    out.push_str(&format!(
+        "\n  2. In src/bootstrap/mod.rs, at the end of `fn {function}`, before `Ok(())`:\n\n"
+    ));
     let code = format!(
         "    crate::adapters::jobs::{name}::register(composition.jobs()?)\n        \
          .map_err(forge::ComposeError::other)?;\n"
     );
     out.push_str(&scaffold::format_statements(root, &code)?);
-    let bootstrap = fs::read_to_string(root.join("src/bootstrap/mod.rs")).unwrap_or_default();
     let manifest = fs::read_to_string(root.join("Cargo.toml")).unwrap_or_default();
     let mut step = 3;
     if !bootstrap.contains(".jobs(") && !bootstrap.contains(".events()") {

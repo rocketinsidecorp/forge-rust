@@ -15,7 +15,7 @@ use forge_core::Cancellation;
 use forge_db::PgDatabase;
 use forge_jobs::{Jobs, JobsError, postgres::PgJobStore};
 use thiserror::Error;
-use tracing::warn;
+use tracing::{info, warn};
 
 /// Where the job workers (and the outbox dispatcher) run.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -194,8 +194,10 @@ impl Background {
     /// process.
     pub(crate) async fn run(self, shutdown: Cancellation) -> Result<(), BackgroundError> {
         let stop = shutdown.child();
+        // `forge new` declares jobs before the application has any, so an
+        // empty registry is the normal starting point, not a mistake.
         if self.jobs.is_empty() {
-            warn!("App::jobs is declared but no job handler is registered");
+            info!("no job handler is registered yet; only finished jobs are pruned");
         }
         let store = PgJobStore::new(self.database.clone());
         let jobs = async {

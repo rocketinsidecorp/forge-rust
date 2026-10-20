@@ -36,7 +36,8 @@ templates/welcome/index.html        {% extends "layouts/application.html" %}
 src/adapters/http/mod.rs            site(): Site::load and layers; routes(): GET /
 src/adapters/http/views/mod.rs      Site (assets, import map, CSP, layers) and Layout
 src/adapters/http/views/welcome.rs  WelcomeIndex view model
-assets/application.css              digested and embedded by build.rs
+assets/application.css              digested and embedded by build.rs; its last section
+                                    styles the welcome page (scoped to body.welcome-page)
 assets/application.js               imports Turbo and starts Stimulus
 assets/forge-rust-logo.png          the logo shown on the welcome page
 build.rs                            forge_views::build::embed_assets_with_crate_path("assets", "forge::views")

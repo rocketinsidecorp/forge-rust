@@ -13,7 +13,6 @@ pub struct WelcomeIndex<'a> {
     /// Digested URL of `assets/forge-rust-logo.png`.
     pub logo: &'a str,
     pub application: &'a str,
-    pub version: &'a str,
     /// Whether the application has the sign-in pages.
     pub sign_in: bool,
 }

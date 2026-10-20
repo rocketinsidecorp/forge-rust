@@ -140,11 +140,12 @@ fn command(
 
 /// Applies the printed wiring like a careful developer: each `pub mod`
 /// line goes into the sorted block of its file, the statements go at the
-/// end of `fn compose`.
+/// end of the function the wiring names (`fn compose` or `fn jobs_configure`).
 fn apply_wiring(root: &Path, printed: &str) {
     let mut declarations = Vec::new();
     let mut statements = Vec::new();
     let mut commands = Vec::new();
+    let mut function = String::from("compose");
     let mut section = 0;
     for line in printed.lines() {
         let trimmed = line.trim();
@@ -152,6 +153,13 @@ fn apply_wiring(root: &Path, printed: &str) {
             section = 1;
         } else if trimmed.starts_with("2. In src/bootstrap/mod.rs") {
             section = 2;
+            if let Some(name) = trimmed
+                .split("at the end of `fn ")
+                .nth(1)
+                .and_then(|rest| rest.split('`').next())
+            {
+                name.clone_into(&mut function);
+            }
         } else if trimmed.starts_with("3. In src/bootstrap/mod.rs, in `fn run`") {
             section = 4;
         } else if section == 4 {
@@ -209,9 +217,14 @@ fn apply_wiring(root: &Path, printed: &str) {
             .unwrap_or_else(|| panic!("run ends with .run():\n{source}"));
         source.insert_str(run, &format!("{}\n", commands.join("\n")));
     }
-    let end = source
-        .rfind("    Ok(())\n}\n")
-        .unwrap_or_else(|| panic!("compose ends with Ok(()):\n{source}"));
+    let start = source
+        .find(&format!("\nfn {function}("))
+        .unwrap_or_else(|| panic!("no fn {function}:\n{source}"));
+    let end = start
+        + source[start..]
+            .find("\n    Ok(())\n}\n")
+            .unwrap_or_else(|| panic!("{function} ends with Ok(()):\n{source}"))
+        + 1;
     let wired = format!("{}{statements}\n{}", &source[..end], &source[end..]);
     fs::write(&bootstrap, wired).unwrap_or_else(|error| panic!("{error}"));
 }
@@ -467,6 +480,7 @@ fn postgresql_application_with_scaffolds_passes_its_gates_and_migrations_revert(
             let seeded = migrate("seed");
             assert!(seeded.contains("Seed data loaded."), "{seeded}");
         }
+        run_the_job_workers(&root, &binary, &url);
         sign_in_use_a_tenant_scaffold_and_sign_out(&root, &binary, &url);
         database
             .cleanup()
@@ -476,6 +490,66 @@ fn postgresql_application_with_scaffolds_passes_its_gates_and_migrations_revert(
 }
 
 const OWNER_PASSWORD: &str = "correct horse battery";
+
+/// The job queue `forge new` wires: `migrate` applied its schema, `jobs
+/// status` reads it with the runtime URL, and `jobs work` runs the workers
+/// until `SIGTERM`, then drains and exits cleanly (`serve` runs them too,
+/// during the browser session that follows).
+fn run_the_job_workers(root: &Path, binary: &str, url: &str) {
+    let runtime = [("FORGE_DATABASE_URL", url)];
+    let status = String::from_utf8_lossy(&run(root, binary, &["jobs", "status"], &runtime).stdout)
+        .into_owned();
+    assert_eq!(status, "no jobs\n");
+
+    let logs = tempfile::tempdir().unwrap_or_else(|error| panic!("{error}"));
+    let log = logs.path().join("work.log");
+    let file = |path: &Path| fs::File::create(path).unwrap_or_else(|error| panic!("{error}"));
+    let mut worker = command(root, binary, &["jobs", "work"], &runtime)
+        .stdin(Stdio::null())
+        .stdout(file(&log))
+        .stderr(file(&logs.path().join("work.err")))
+        .spawn()
+        .unwrap_or_else(|error| panic!("jobs work: {error}"));
+    let read = || {
+        fs::read_to_string(&log).unwrap_or_default()
+            + &fs::read_to_string(logs.path().join("work.err")).unwrap_or_default()
+    };
+    let mut started = false;
+    for _ in 0..300 {
+        if read().contains("job workers started") {
+            started = true;
+            break;
+        }
+        if let Ok(Some(exit)) = worker.try_wait() {
+            panic!("jobs work exited with {exit}:\n{}", read());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    if !started {
+        let _ = worker.kill();
+        panic!("jobs work did not start:\n{}", read());
+    }
+    let signalled = Command::new("kill")
+        .args(["-TERM", &worker.id().to_string()])
+        .status()
+        .unwrap_or_else(|error| panic!("kill: {error}"));
+    assert!(signalled.success());
+    let mut exit = None;
+    for _ in 0..300 {
+        exit = worker.try_wait().unwrap_or_else(|error| panic!("{error}"));
+        if exit.is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let Some(exit) = exit else {
+        let _ = worker.kill();
+        panic!("jobs work did not stop on SIGTERM:\n{}", read());
+    };
+    let output = read();
+    assert!(exit.success(), "{exit}:\n{output}");
+    assert!(output.contains("job workers stopped"), "{output}");
+}
 
 /// A free loopback port.
 fn free_port() -> u16 {
@@ -1640,20 +1714,13 @@ fn postgresql_application_generates_and_destroys_every_generator() {
             assert!(printed.contains("already declares"), "{printed}");
         }
     }
-    // The job's feature, as its wiring says.
-    let manifest =
-        fs::read_to_string(root.join("Cargo.toml")).unwrap_or_else(|error| panic!("{error}"));
-    fs::write(
-        root.join("Cargo.toml"),
-        manifest.replace("features = [\"views\"", "features = [\"jobs\", \"views\""),
-    )
-    .unwrap_or_else(|error| panic!("{error}"));
-    assert!(
+    // `forge new` enabled the job feature on both `forge` dependencies.
+    assert_eq!(
         fs::read_to_string(root.join("Cargo.toml"))
             .unwrap_or_default()
             .matches("\"jobs\"")
-            .count()
-            == 2
+            .count(),
+        2
     );
 
     // A model whose permission a controller declares is refused (one owner).

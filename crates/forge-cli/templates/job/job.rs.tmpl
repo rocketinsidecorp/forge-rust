@@ -46,7 +46,7 @@ impl JobHandler for %%TYPE%%Handler {
 }
 
 /// Registers the handler with the application's jobs
-/// (`composition.jobs()?` in `fn compose`).
+/// (`composition.jobs()?` in `jobs_configure`, src/bootstrap/mod.rs).
 pub fn register(jobs: &mut Jobs) -> Result<(), JobsError> {
     jobs.register(%%TYPE%%Handler)?;
     Ok(())

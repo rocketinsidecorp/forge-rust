@@ -9,6 +9,13 @@
 //! The `seed` command (and `setup`, with the sign-in pages) runs with the
 //! migration credential, `FORGE_MIGRATION_DATABASE_URL`.
 %%end%%
+%%if postgresql%%
+//!
+//! The persistent job queue (`forge::jobs`, ADR 0025) is part of the process
+//! lifecycle: `serve` runs its workers next to the HTTP server, `jobs work`
+//! runs them alone, and both stop claiming, drain and release their jobs on
+//! shutdown. Register jobs in `jobs_configure`.
+%%end%%
 
 %%if database%%
 pub mod seeds;
@@ -27,6 +34,9 @@ pub fn run() -> ExitCode {
         .version(env!("CARGO_PKG_VERSION"))
 %%if postgresql%%
         .postgres(sqlx::migrate!())
+        // `serve` runs the job workers; `WorkerMode::Dedicated` leaves them
+        // to `jobs work` so web and worker processes scale separately.
+        .jobs(forge::WorkerMode::InServe)
 %%end%%
 %%if mysql_family%%
         .mysql(sqlx::migrate!())
@@ -39,6 +49,9 @@ pub fn run() -> ExitCode {
 %%end%%
 %%if !views%%
         .routes(crate::adapters::http::routes)
+%%end%%
+%%if postgresql%%
+        .compose(jobs_configure)
 %%end%%
 %%if authentication%%
         .command("setup", setup::SUMMARY, setup::run)
@@ -142,6 +155,35 @@ fn compose(composition: &mut forge::Composition<'_>) -> Result<(), forge::Compos
     };
     crate::adapters::http::authentication::routes(composition, &site, ports)?;
 %%end%%
+    Ok(())
+}
+%%end%%
+%%if postgresql%%
+
+/// Configures the persistent job queue (ADR 0025): the handlers, their
+/// queues' concurrency and the cron schedules. Each queue with a handler gets
+/// one bounded worker loop, owned by the process with the scheduler and the
+/// pruning of finished jobs; nothing runs detached. `forge generate job NAME
+/// --queue` writes a job and prints the line that registers it here.
+fn jobs_configure(composition: &mut forge::Composition<'_>) -> Result<(), forge::ComposeError> {
+    // At most 4 attempts of each queue run at once.
+    composition
+        .jobs()?
+        .settings(forge::jobs::WorkerSettings::default().default_concurrency(4));
+    // Register application jobs here, e.g.:
+    // crate::adapters::jobs::cleanup::register(composition.jobs()?)
+    //     .map_err(forge::ComposeError::other)?;
+    // composition
+    //     .jobs()?
+    //     .schedule(
+    //         forge::jobs::Schedule::new(
+    //             "cleanup.daily",
+    //             "0 3 * * *".parse().map_err(forge::ComposeError::other)?, // UTC
+    //             &crate::adapters::jobs::cleanup::Cleanup {},
+    //         )
+    //         .map_err(forge::ComposeError::other)?,
+    //     )
+    //     .map_err(forge::ComposeError::other)?;
     Ok(())
 }
 %%end%%

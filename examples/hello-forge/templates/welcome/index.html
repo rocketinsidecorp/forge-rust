@@ -2,28 +2,42 @@
 
 {% block title %}{{ layout.i18n.t("welcome.page_title").with("app", application) }}{% endblock %}
 
-{% block head %}<meta name="description" content="{{ layout.i18n.t("welcome.description") }}">{% endblock %}
+{% block head %}<meta name="description" content="{{ layout.i18n.t("welcome.description") }}">
+    <meta name="theme-color" content="#100d0a">{% endblock %}
+
+{% block body_class %} class="welcome-page"{% endblock %}
 
 {% block content %}
-<header class="masthead"><strong>Forge Rust</strong> <span>{{ layout.i18n.t("welcome.masthead") }}</span></header>
-<img class="brand-logo" src="{{ logo }}" alt="{{ layout.i18n.t("welcome.logo_alt") }}" width="220" height="220">
-<p class="eyebrow">{{ layout.i18n.t("welcome.eyebrow") }}</p>
-<h1>{{ layout.i18n.t("welcome.title").with("app", application) }}</h1>
-<p class="lede">{{ layout.i18n.t("welcome.lede") }}</p>
-<p class="actions">
-  {% if sign_in %}<a href="/session/new">{{ layout.i18n.t("welcome.sign_in") }}</a>{% endif %}
-  <a href="/health">{{ layout.i18n.t("welcome.status") }}</a>
-  <a href="https://github.com/rocketinsidecorp/forge-rust">{{ layout.i18n.t("welcome.documentation") }}</a>
-</p>
-<nav aria-label="{{ layout.i18n.t("welcome.health_endpoints") }}">
-  <ul class="endpoints">
-    <li><a href="/health/live">/health/live</a></li>
-    <li><a href="/health/ready">/health/ready</a></li>
-  </ul>
-</nav>
-<footer class="muted">
-  <span>{{ layout.i18n.t("welcome.footer") }}</span> · <span>{{ layout.i18n.t("welcome.tagline") }}</span> · <span>v{{ version }}</span>
-</footer>
+<div class="frame">
+  <header class="masthead"><strong>Forge Rust</strong><span>{{ layout.i18n.t("welcome.masthead") }}</span></header>
+  <div class="stage">
+    <section class="welcome" aria-labelledby="welcome-title">
+      <img class="brand-logo" src="{{ logo }}" width="512" height="512" alt="{{ layout.i18n.t("welcome.logo_alt") }}">
+      <div>
+        <p class="eyebrow">{{ layout.i18n.t("welcome.eyebrow") }}</p>
+        <h1 id="welcome-title">{{ layout.i18n.t("welcome.title").with("app", application) }}</h1>
+        <p class="lede">{{ layout.i18n.t("welcome.lede") }}</p>
+        <div class="actions">
+          {% if sign_in %}
+          <a class="button button-primary" href="/session/new">{{ layout.i18n.t("welcome.sign_in") }} <span aria-hidden="true">→</span></a>
+          <a class="button button-secondary" href="/v1/status">{{ layout.i18n.t("welcome.status") }}</a>
+          {% else %}
+          <a class="button button-primary" href="/v1/status">{{ layout.i18n.t("welcome.status") }} <span aria-hidden="true">→</span></a>
+          {% endif %}
+          <a class="button button-secondary" href="https://github.com/rocketinsidecorp/forge-rust">{{ layout.i18n.t("welcome.documentation") }}</a>
+        </div>
+        <nav aria-label="{{ layout.i18n.t("welcome.health_endpoints") }}">
+          <ul class="endpoints">
+            <li><a href="/health/live">/health/live</a></li>
+            <li><a href="/health/ready">/health/ready</a></li>
+          </ul>
+        </nav>
+      </div>
+    </section>
+  </div>
+  <footer><span>{{ layout.i18n.t("welcome.footer") }}</span><span>{{ layout.i18n.t("welcome.tagline") }}</span></footer>
+</div>
 <!-- This page is templates/welcome/index.html, rendered from the view model
-     in src/adapters/http/views/welcome.rs; its text is in config/locales. -->
+     in src/adapters/http/views/welcome.rs; its text is in config/locales and
+     its look in the "Welcome page" section of assets/application.css. -->
 {% endblock %}

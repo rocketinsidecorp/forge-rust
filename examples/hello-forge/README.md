@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/forge-rust-logo.png" alt="Forge Rust — Rust Framework" width="220">
+</p>
+
 # hello-forge
 
 A [Forge](https://github.com/rocketinsidecorp/forge-rust) application organized
