@@ -162,7 +162,7 @@ shop/
 ├── assets/                  # omitted with --api; digested and embedded in the binary
 │   ├── application.css
 │   ├── application.js       #   imports Turbo, starts Stimulus
-│   └── forge-rust-logo.svg  #   shown on the welcome page
+│   └── forge-rust-logo.png  #   shown on the welcome page
 ├── build.rs                  # embeds assets/ (omitted with --api); reruns on migration changes (omitted with -d none)
 ├── Cargo.lock               # omitted with --skip-lockfile (or if generation fails)
 ├── Cargo.toml               # package `shop`, lib `app`, deps: forge, serde, askama, SQLx + auth mechanism crates

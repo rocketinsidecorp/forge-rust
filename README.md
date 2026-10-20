@@ -1,4 +1,4 @@
-<p align="center"><img src="crates/forge-cli/templates/app/assets/forge-rust-logo.svg" alt="Forge Rust — Rust Framework" width="280"></p>
+<p align="center"><img src="crates/forge-cli/templates/app/assets/forge-rust-logo.png" alt="Forge Rust — Rust Framework" width="220" height="220"></p>
 
 # Forge
 

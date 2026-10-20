@@ -38,7 +38,7 @@ src/adapters/http/views/mod.rs      Site (assets, import map, CSP, layers) and L
 src/adapters/http/views/welcome.rs  WelcomeIndex view model
 assets/application.css              digested and embedded by build.rs
 assets/application.js               imports Turbo and starts Stimulus
-assets/forge-rust-logo.svg          the logo shown on the welcome page
+assets/forge-rust-logo.png          the logo shown on the welcome page
 build.rs                            forge_views::build::embed_assets_with_crate_path("assets", "forge::views")
 tests/http.rs                       layout, CSP, CSRF and asset tests
 ```

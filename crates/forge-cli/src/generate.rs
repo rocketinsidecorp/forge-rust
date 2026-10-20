@@ -160,6 +160,20 @@ struct Template {
     group: Group,
 }
 
+/// A binary file (an image) that `forge new` copies byte for byte: it is not
+/// rendered, so it takes no variables or conditionals.
+struct BinaryFile {
+    path: &'static str,
+    content: &'static [u8],
+    group: Group,
+}
+
+const BINARY_FILES: &[BinaryFile] = &[BinaryFile {
+    path: "assets/forge-rust-logo.png",
+    content: include_bytes!("../templates/app/assets/forge-rust-logo.png"),
+    group: Group::Views,
+}];
+
 macro_rules! template {
     ($group:expr, $path:literal => $source:literal) => {
         Template {
@@ -204,7 +218,6 @@ const TEMPLATES: &[Template] = &[
     ),
     template!(Group::Views, "assets/application.css" => "assets/application.css.tmpl"),
     template!(Group::Views, "assets/application.js" => "assets/application.js.tmpl"),
-    template!(Group::Views, "assets/forge-rust-logo.svg" => "assets/forge-rust-logo.svg"),
     template!(Group::Views, "tests/http.rs" => "tests/http.rs.tmpl"),
     template!(Group::Always, "src/infrastructure/mod.rs" => "src/infrastructure/mod.rs.tmpl"),
     template!(Group::Always, "src/bootstrap/mod.rs" => "src/bootstrap/mod.rs.tmpl"),
@@ -680,21 +693,21 @@ fn write_application(
         ),
     ];
 
+    let enabled = |group: Group| match group {
+        Group::Always => true,
+        Group::Docker => options.docker,
+        Group::Ci => options.ci,
+        Group::Database => options.database.is_enabled(),
+        Group::Postgres => options.database == Database::Postgresql,
+        Group::PostgresDocker => options.database == Database::Postgresql && options.docker,
+        Group::Sqlite => options.database == Database::Sqlite3,
+        Group::Views => options.views,
+        Group::Api => !options.views,
+        Group::BuildScript => options.views || options.database.is_enabled(),
+        Group::Authentication => options.database == Database::Postgresql && options.views,
+    };
     for template in TEMPLATES {
-        let enabled = match template.group {
-            Group::Always => true,
-            Group::Docker => options.docker,
-            Group::Ci => options.ci,
-            Group::Database => options.database.is_enabled(),
-            Group::Postgres => options.database == Database::Postgresql,
-            Group::PostgresDocker => options.database == Database::Postgresql && options.docker,
-            Group::Sqlite => options.database == Database::Sqlite3,
-            Group::Views => options.views,
-            Group::Api => !options.views,
-            Group::BuildScript => options.views || options.database.is_enabled(),
-            Group::Authentication => options.database == Database::Postgresql && options.views,
-        };
-        if enabled {
+        if enabled(template.group) {
             let content = render(
                 template.content,
                 &variables,
@@ -705,6 +718,11 @@ fn write_application(
                 },
             );
             write_file(&root.join(template.path), &content)?;
+        }
+    }
+    for file in BINARY_FILES {
+        if enabled(file.group) {
+            write_file(&root.join(file.path), file.content)?;
         }
     }
 
@@ -719,7 +737,7 @@ fn write_application(
         }
         write_file(
             &root.join(directory).join("mod.rs"),
-            &format!("//! {description}\n"),
+            format!("//! {description}\n"),
         )?;
     }
 
@@ -892,7 +910,7 @@ pub(crate) fn write_new_file(path: &Path, content: &str) -> Result<(), CliError>
         })
 }
 
-fn write_file(path: &Path, content: &str) -> Result<(), CliError> {
+fn write_file(path: &Path, content: impl AsRef<[u8]>) -> Result<(), CliError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|source| CliError::CreateDirectory {
             path: parent.to_path_buf(),
@@ -928,8 +946,8 @@ mod tests {
     }
 
     /// Reads every file below `root` except build outputs and the lockfile.
-    fn snapshot(root: &Path) -> BTreeMap<String, String> {
-        fn visit(root: &Path, directory: &Path, files: &mut BTreeMap<String, String>) {
+    fn snapshot(root: &Path) -> BTreeMap<String, Vec<u8>> {
+        fn visit(root: &Path, directory: &Path, files: &mut BTreeMap<String, Vec<u8>>) {
             let entries = fs::read_dir(directory).expect("directory should be readable");
             for entry in entries {
                 let path = entry.expect("entry should be readable").path();
@@ -944,7 +962,7 @@ mod tests {
                 if path.is_dir() {
                     visit(root, &path, files);
                 } else {
-                    let content = fs::read_to_string(&path).expect("file should be UTF-8");
+                    let content = fs::read(&path).expect("file should be readable");
                     files.insert(relative, content);
                 }
             }
@@ -952,6 +970,20 @@ mod tests {
         let mut files = BTreeMap::new();
         visit(root, root, &mut files);
         files
+    }
+
+    /// The rendered text files below `root`: the snapshot without the binary
+    /// files `forge new` copies verbatim. Every other file must be UTF-8.
+    fn text_snapshot(root: &Path) -> BTreeMap<String, String> {
+        snapshot(root)
+            .into_iter()
+            .filter(|(path, _)| !BINARY_FILES.iter().any(|file| file.path == path))
+            .map(|(path, content)| {
+                let text =
+                    String::from_utf8(content).unwrap_or_else(|_| panic!("{path} should be UTF-8"));
+                (path, text)
+            })
+            .collect()
     }
 
     #[test]
@@ -1225,7 +1257,7 @@ mod tests {
         for file in POSTGRES_ONLY_FILES {
             assert!(!root.join(file).exists(), "{file} must not be generated");
         }
-        for (path, content) in snapshot(root) {
+        for (path, content) in text_snapshot(root) {
             for needle in [
                 "gen_random_uuid",
                 "ROW LEVEL SECURITY",
@@ -1450,7 +1482,7 @@ mod tests {
                         ..options("sample-app")
                     };
                     let root = create_application(parent.path(), &options).expect("generation");
-                    for (path, content) in snapshot(&root) {
+                    for (path, content) in text_snapshot(&root) {
                         assert!(!content.contains("%%"), "{database:?} {views} {path}");
                     }
                 }
@@ -1481,7 +1513,7 @@ mod tests {
         let root = create_application(parent.path(), &options("sample-app"))
             .expect("generation should succeed");
 
-        for (path, content) in snapshot(&root) {
+        for (path, content) in text_snapshot(&root) {
             assert!(
                 !content.contains("%%"),
                 "{path} contains an unrendered placeholder"
@@ -1542,7 +1574,7 @@ mod tests {
         "templates/welcome/index.html",
         "assets/application.css",
         "assets/application.js",
-        "assets/forge-rust-logo.svg",
+        "assets/forge-rust-logo.png",
         "tests/http.rs",
     ];
 

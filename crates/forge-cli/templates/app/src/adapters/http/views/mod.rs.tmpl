@@ -49,7 +49,7 @@ impl Site {
         let policy = ContentSecurityPolicy::strict().with_import_map(&import_map);
         let stylesheet = asset_path(&assets, "application.css")?;
         let javascript = asset_path(&assets, "application.js")?;
-        let logo = asset_path(&assets, "forge-rust-logo.svg")?;
+        let logo = asset_path(&assets, "forge-rust-logo.png")?;
         Ok(Self {
             assets,
             import_map,
@@ -60,7 +60,7 @@ impl Site {
         })
     }
 
-    /// Digested URL of `assets/forge-rust-logo.svg`, shown by the welcome page.
+    /// Digested URL of `assets/forge-rust-logo.png`, shown by the welcome page.
     pub fn logo(&self) -> &str {
         &self.logo
     }
