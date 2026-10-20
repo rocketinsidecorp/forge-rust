@@ -4,9 +4,13 @@ This guide builds a small blog from `forge new` to a deployable application:
 server-rendered pages, sign-in with two-factor authentication, translations,
 email, a background job, an OpenAPI document, encrypted credentials and a
 deploy configuration. It is the Forge-Rust version of the Rails "Getting
-Started" guide and mirrors the
+Started" guide and follows the
 [Forge-Go guide](https://github.com/rocketinsidecorp/forge-go/blob/main/docs/GETTING_STARTED.md)
-section by section, with the same command names. Every command in it was run
+with the same command names. The order differs in places: this guide adds
+two-factor sign-in, `forge routes` and encrypted credentials (section 11),
+and leaves out Forge-Go's live-updates demo, its model/controller "comments"
+section and its SQLite walkthrough (`forge generate model` and `controller`,
+`--broadcast` and `-d sqlite3` exist here too; see their documentation). Every command in it was run
 against this repository on Linux with PostgreSQL 16, except the Docker
 commands (sections 4, 12 and 13): no Docker daemon was available for that run,
 and the text says so where it matters. Absolute paths in the samples are
@@ -111,9 +115,11 @@ applications depend on `forge` through the Git tag `v0.1.0`, which does not
 exist yet, so plain `forge new blog` cannot resolve its dependencies;
 `--forge-path` points the application at your checkout instead. (A path
 dependency outside the application directory is not part of a Docker build
-context, so `docker build` of this application needs the vendoring step in
-the [README](../README.md#quickstart) first; nothing in this guide builds the
-image.) Choose another database with `-d mysql`, `-d mariadb` or `-d sqlite3`,
+context, so `docker build` of this application is not supported before the
+first release tag: see the "Before the first tag" note in the
+[README](../README.md#traces-metrics-and-logs), which vendors a copy of the
+framework the way `scripts/e2e-generated-app.sh` does. Sections 12 and 13 build
+images; run them once the tag exists.) Choose another database with `-d mysql`, `-d mariadb` or `-d sqlite3`,
 a JSON-only service with `--api`, and the default language of the pages with
 `--locale en|es|pt-BR`.
 
@@ -740,7 +746,8 @@ wired the queue into `src/bootstrap/mod.rs`: `.jobs(forge::WorkerMode::InServe)`
 makes `serve` run the workers (`Dedicated` leaves them to `jobs work`), the
 framework's job schema was applied by `forge db prepare`, and `jobs_configure`
 is where you register jobs and schedules. No job exists yet, so the queue is
-empty:
+empty (while `forge dev` is rebuilding, `cargo run` may print "Blocking
+waiting for file lock" for a few seconds; it continues once the build is done):
 
 ```sh
 cargo run -q -- jobs status
@@ -1023,8 +1030,8 @@ http_server_request_duration_seconds_count{http_request_method="GET",http_route=
 Every generated application also has an opt-in stack: an OpenTelemetry
 Collector, Prometheus, Tempo (traces), Loki (logs) and Grafana with a starter
 dashboard, every port bound to `127.0.0.1`. It needs Docker and runs the
-application as a container, replacing `forge dev` while it is up (see the
-vendoring note in section 3 for building the image from a path dependency):
+application as a container, replacing `forge dev` while it is up (it builds the
+application image, so it needs the release tag; see the note in section 3):
 
 ```sh
 export GRAFANA_ADMIN_PASSWORD="$(openssl rand -base64 18)"   # required, also for `down`
@@ -1032,7 +1039,8 @@ docker compose -f compose.yaml -f compose.observability.yaml up --build
 curl http://127.0.0.1:3000/
 ```
 
-Open Grafana at <http://127.0.0.1:3001> (user `admin`, the password above;
+Open Grafana at <http://127.0.0.1:3001> (user `admin`, the password in
+`$GRAFANA_ADMIN_PASSWORD`: `echo "$GRAFANA_ADMIN_PASSWORD"` in the same shell;
 3001 because the application has 3000): the dashboard "Forge application",
 Explore > Tempo for traces and Explore > Loki for logs. Stop it with
 `docker compose -f compose.yaml -f compose.observability.yaml down` (add `-v`
@@ -1067,7 +1075,10 @@ are `192.0.2.10` and `app.example.com`; the secrets file maps names to values
 or to your local environment (`REGISTRY_PASSWORD=$REGISTRY_PASSWORD`), so
 export what it names before every command, prompting for the password so it
 never lands in your history or a command line. `forge deploy setup --dry-run`
-prints every remote command with secrets redacted and changes nothing, but it
+prints every remote command with secrets redacted and changes nothing (the
+generated secrets file also maps `FORGE_DATABASE_URL` and
+`FORGE_MIGRATION_DATABASE_URL` from your environment: this terminal still has
+them from section 4; set the production values before a real deploy), but it
 still asks each host `docker version` over SSH first, so the host must be
 reachable with your SSH key and have Docker installed:
 
@@ -1125,7 +1136,8 @@ chain](supply-chain.md)) and pin its digest in `config/deploy.yml`; set `FORGE_A
 read the production notes in [deployment](deployment.md). The application
 image itself is built from the generated `Dockerfile` (`docker build -t blog
 .`), which needs a framework dependency that resolves inside the build context
-(the release tag, or the vendored copy of the [README](../README.md#quickstart)).
+(the release tag, or the vendored copy described in the "Before the first tag"
+note of the [README](../README.md#traces-metrics-and-logs)).
 
 ## 14. Undo with `forge destroy`
 
