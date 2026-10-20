@@ -20,6 +20,10 @@ clap.workspace = true
 # `forge doctor` validates the same FORGE_* settings the application loads and
 # redacts database URLs with the same helpers (no new package in Cargo.lock).
 forge-config = { path = "../forge-config" }
+# `forge credentials` and the development credentials of `forge new`
+# (ADR 0041): the same file format and key handling the application reads.
+forge-credentials = { path = "../forge-credentials" }
+forge-encryption = { path = "../forge-encryption" }
 # `forge i18n check` loads config/locales with the translator's own parser
 # and rules (no new package in Cargo.lock).
 forge-i18n = { path = "../forge-i18n" }
@@ -30,6 +34,8 @@ serde_json.workspace = true
 # One signal thread (SIGINT/SIGTERM) owned by the commands that run children.
 tokio.workspace = true
 uuid.workspace = true
+# Wipes decrypted credentials held by `forge credentials`.
+zeroize.workspace = true
 
 # Stops the application and its process group on `forge dev` shutdown, without
 # unsafe code or a shell; `process` is the only feature added to the workspace entry.

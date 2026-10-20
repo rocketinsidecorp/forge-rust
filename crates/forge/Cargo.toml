@@ -14,7 +14,9 @@ forge-auth = { path = "../forge-auth" }
 forge-broadcast = { path = "../forge-broadcast", optional = true }
 forge-config = { path = "../forge-config" }
 forge-core = { path = "../forge-core" }
+forge-credentials = { path = "../forge-credentials" }
 forge-db = { path = "../forge-db" }
+forge-encryption = { path = "../forge-encryption" }
 forge-events = { path = "../forge-events", optional = true }
 forge-http = { path = "../forge-http" }
 forge-openapi = { path = "../forge-openapi" }
@@ -43,13 +45,24 @@ default = ["postgres"]
 # Database backends, additive: enable the ones the application declares.
 postgres = [
     "forge-db/postgres",
+    "forge-encryption/postgres",
     "forge-ratelimit?/postgres",
     "forge-cache?/postgres",
     "forge-broadcast?/postgres",
 ]
 # MySQL 8.4+ and MariaDB 11.4+.
-mysql = ["forge-db/mysql", "forge-ratelimit?/mysql", "forge-cache?/mysql"]
-sqlite = ["forge-db/sqlite", "forge-ratelimit?/sqlite", "forge-cache?/sqlite"]
+mysql = [
+    "forge-db/mysql",
+    "forge-encryption/mysql",
+    "forge-ratelimit?/mysql",
+    "forge-cache?/mysql",
+]
+sqlite = [
+    "forge-db/sqlite",
+    "forge-encryption/sqlite",
+    "forge-ratelimit?/sqlite",
+    "forge-cache?/sqlite",
+]
 # `Composition::for_testing` and `forge::db::testing::TestDatabase`.
 testing = [
     "forge-db/testing",

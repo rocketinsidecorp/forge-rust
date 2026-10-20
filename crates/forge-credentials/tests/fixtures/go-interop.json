@@ -1,0 +1,28 @@
+{
+  "address_column": "address",
+  "blind_index": "K1yXnLepFBdbaSioVauUmbNOxdHz_yRxHVyTG3LElIM",
+  "blind_indexes": [
+    "K1yXnLepFBdbaSioVauUmbNOxdHz_yRxHVyTG3LElIM",
+    "aSB-ADDKJh53ZwB6AE8pCUWBpNyEI8Ehn3Ih_j9i_xo"
+  ],
+  "column": "ssn",
+  "derived_key_id_hex": "83f3b6a778d4f8a6",
+  "document": "{\n  \"stripe\": {\n    \"api_key\": \"sk_test_interop\"\n  },\n  \"numbers\": [1, 2.50, -3],\n  \"unicode\": \"ação ✓\",\n  \"encryption\": {\n    \"active\": \"2026-10\",\n    \"keys\": {\n      \"2026-10\": \"MjM0NTY3ODk6Ozw9Pj9AQUJDREVGR0hJSktMTU5PUFE\",\n      \"2025-03\": \"lpeYmZqbnJ2en6ChoqOkpaanqKmqq6ytrq-wsbKztLU\"\n    }\n  }\n}\n",
+  "environment": "production",
+  "key_ids": [
+    "7699aa84b59765cb",
+    "83f3b6a778d4f8a6"
+  ],
+  "master_key_text": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8,ZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXp7fH1-f4CBgoM",
+  "plaintext": "123-45-6789",
+  "record_id": "0199f5c4-3a52-7d1e-9b7e-3f1c2a4d5e6f",
+  "ring_active": "2026-10",
+  "ring_keys": {
+    "2025-03": "lpeYmZqbnJ2en6ChoqOkpaanqKmqq6ytrq-wsbKztLU",
+    "2026-10": "MjM0NTY3ODk6Ozw9Pj9AQUJDREVGR0hJSktMTU5PUFE"
+  },
+  "sealed_active": "fg1.2026-10.Ce0uRfbQfzneP8kj1fQXoeOsQzb2hhAN_lQcmczAm3ANCLGQFQhK",
+  "sealed_address_json": "fg1.2026-10.D6eV7Bv5qh0JT868-tVm4IVhT6oHjdYUkpzcJHlcq3DZcG5JPEb8oWPWe_4LVG9uoBchORbIbvVe",
+  "sealed_previous": "fg1.2025-03.6Z0UjdBNYYjYicflhjiDlFE8p22_BUmmr88vdt3Jh50oQlu7tl2e",
+  "table": "people"
+}

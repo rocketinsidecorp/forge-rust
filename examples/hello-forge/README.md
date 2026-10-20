@@ -192,6 +192,36 @@ FORGE_TELEMETRY_SERVICE_NAME=hello-forge FORGE_TELEMETRY_EXPORTER=otlp \
   FORGE_TELEMETRY_LOGS_EXPORTER=otlp FORGE_TELEMETRY_OTLP_ENDPOINT=http://127.0.0.1:4318 cargo run
 ```
 
+## Credentials
+
+Secrets that do not belong in `.env` files live encrypted in
+`config/credentials/<environment>.json.enc`, which is committed. The key
+stays out of git: `config/credentials/development.key` (created by `forge new`,
+mode 0600) or the `FORGE_MASTER_KEY` variable in deployed environments.
+
+```bash
+forge credentials edit                          # edit development credentials in $EDITOR
+forge credentials show                          # structure only; values are redacted
+forge credentials init --environment production # new key and encrypted file for production
+FORGE_MASTER_KEY="$(cat config/credentials/production.key)"  # what the deployed app needs
+```
+
+Back up every key; without it the encrypted file cannot be read. Read values
+in `src/bootstrap` with `forge::credentials::open` (outside development and
+test a missing file, key or required value stops startup). Encrypt a column
+with `forge::encryption`; its key ring is already in the credentials:
+
+```rust
+let credentials = forge::credentials::open(
+    "production",
+    forge::credentials::Options::default().with_required(["encryption"]),
+)?;
+let cipher = forge::encryption::Cipher::new(&credentials.key_ring(&["encryption"])?)?;
+let ssn = cipher.attribute("people", "ssn"); // a TEXT column, bound to its row id
+let stored = ssn.seal(&id.to_string(), &"123-45-6789".to_owned())?;
+let plain: String = ssn.open(&id.to_string(), &stored)?;
+```
+
 ## Container
 
 ```bash

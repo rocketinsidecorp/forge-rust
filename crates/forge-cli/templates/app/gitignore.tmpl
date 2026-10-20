@@ -2,6 +2,9 @@
 .env
 .env.*
 !.env.example
+# Credential keys: never commit. The encrypted config/credentials/*.json.enc
+# files are meant to be committed.
+/config/credentials/*.key
 %%if sqlite%%
 # Local SQLite databases (and their WAL/SHM files) live in storage/.
 /storage/*

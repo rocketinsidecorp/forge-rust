@@ -39,6 +39,10 @@ fn tree(root: &Path) -> BTreeMap<String, String> {
         };
         for entry in entries.filter_map(Result::ok) {
             let path = entry.path();
+            // `forge new` writes random development credentials.
+            if path.ends_with("config/credentials") {
+                continue;
+            }
             if path.is_dir() {
                 visit(root, &path, files);
             } else if let (Ok(relative), Ok(content)) =

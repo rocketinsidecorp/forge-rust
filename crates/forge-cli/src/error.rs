@@ -89,6 +89,9 @@ pub enum CliError {
     I18n(String),
     /// `forge i18n check` found a locale without a key or a plural form.
     TranslationsMissing,
+    /// `forge credentials` failed; the message names paths and key ids,
+    /// never a key or a credential value.
+    Credentials(String),
 }
 
 impl fmt::Display for CliError {
@@ -173,7 +176,7 @@ impl fmt::Display for CliError {
                 root.display()
             ),
             Self::Reported => formatter.write_str("checks failed"),
-            Self::I18n(reason) => formatter.write_str(reason),
+            Self::I18n(reason) | Self::Credentials(reason) => formatter.write_str(reason),
             Self::TranslationsMissing => formatter.write_str("translations are missing"),
         }
     }
@@ -208,6 +211,7 @@ impl std::error::Error for CliError {
             | Self::TooManyFiles { .. }
             | Self::Reported
             | Self::I18n(_)
+            | Self::Credentials(_)
             | Self::TranslationsMissing
             | Self::CargoFailed { .. } => None,
         }

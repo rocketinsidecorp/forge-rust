@@ -51,7 +51,14 @@ pub use forge_broadcast as broadcast;
 pub use forge_cache as cache;
 pub use forge_config as config;
 pub use forge_core as core;
+/// Encrypted per-environment credentials, `config/credentials/<env>.json.enc`
+/// (ADR 0041): read them in bootstrap with `forge::credentials::open`.
+pub use forge_credentials as credentials;
 pub use forge_db as db;
+/// Attribute encryption with key rotation and blind indexes (ADR 0041).
+/// Infrastructure adapters and the composition root only; the
+/// `EncryptedColumn` re-encryption adapters follow the backend features.
+pub use forge_encryption as encryption;
 /// Integration events, the transactional outbox and idempotent consumers
 /// (feature `events`, ADR 0025).
 #[cfg(feature = "events")]

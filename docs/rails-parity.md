@@ -29,7 +29,7 @@ the work is finished and waiting for its review; **Planned** means not started.
 | Preconfigured Prometheus, Grafana, Tempo, Loki | — | Done (`compose.observability.yaml`, Forge-Go ADR 0038) | Done (`compose.observability.yaml`, [ADR 0034](adr/0034-local-observability-stack.md)) |
 | Zero-downtime deploys, rollback, remote logs | Kamal | Done (`forge deploy`, `forge logs`, `forge-proxy`) | Planned |
 | Live reload and database lifecycle | `bin/dev`, `db:*` | In review (`forge dev`, `forge db`) | In review (`forge dev`, `forge db create\|drop\|reset\|setup\|prepare\|migrate\|rollback\|status\|seed`, `forge migrate\|rollback\|setup\|seed`, `forge doctor`, `forge version`, [ADR 0036](adr/0036-application-lifecycle-commands.md)) |
-| Encrypted credentials, attribute encryption | `credentials:edit`, AR Encryption | Done (`forge credentials`, `encryption`) | Planned |
+| Encrypted credentials, attribute encryption | `credentials:edit`, AR Encryption | Done (`forge credentials`, `encryption`) | Done (`forge credentials init\|edit\|show\|rotate-key`, `forge::credentials`, `forge::encryption`, [ADR 0041](adr/0041-encrypted-credentials-and-attribute-encryption.md), [credentials](credentials.md), [encryption](encryption.md)) |
 | i18n | I18n | Done (`config/locales/*.json`, `t`, CLDR plurals, `forge new --locale`, `forge i18n check`, Forge-Go ADR 0042) | Done (`config/locales/*.json`, `layout.i18n.t`, CLDR plurals, `forge new --locale`, `forge i18n check`, [ADR 0037](adr/0037-internationalization.md), [i18n](i18n.md)) |
 | OpenAPI from typed routes | — | Done (Forge-Go ADR 0043) | Done (`#[derive(OpenApiSchema)]`, `forge::openapi::typed`/`describe`, `GET /openapi.json`, `FORGE_OPENAPI_ENABLED`, `forge openapi`, [ADR 0039](adr/0039-openapi-from-typed-routes.md), [OpenAPI](openapi.md)) |
 | Controller, model, mailer and job generators | `rails g` | Done (Forge-Go ADR 0041) | Done (`forge generate model\|controller\|mailer\|job --queue`, [ADR 0038](adr/0038-generators-and-destroy.md), [generators](generators.md)) |
@@ -87,13 +87,23 @@ the work is finished and waiting for its review; **Planned** means not started.
   `.env.development`/`.env.local` files in `forge dev` and the lifecycle
   commands together with generating them. Planned right after the generators
   ([forge-rust#15](https://github.com/rocketinsidecorp/forge-rust/issues/15)).
-  `forge inspect`, `deploy`, `logs`, `app` and `credentials`
+  `forge inspect`, `deploy`, `logs` and `app`
   stay "Planned" in the table above. Forge-Go reads the target
   database of `db create|drop` from `FORGE_DATABASE_URL` and the credentials
   from `FORGE_MIGRATION_DATABASE_URL`; Forge-Rust uses
   `FORGE_MIGRATION_DATABASE_URL` for both (see
   [cli](cli.md#differences-from-forge-go)); Forge-Go adopts that, or Rust
   adds the split, when the second framework's `db create` is next touched.
+
+- Credentials and attribute encryption
+  ([ADR 0041](adr/0041-encrypted-credentials-and-attribute-encryption.md)):
+  file format, keys, key ids, ciphertexts and blind indexes are
+  byte-compatible with Forge-Go (Go-written fixtures are tested). Neither
+  framework has `forge generate scaffold ... field:string:encrypted` or loads
+  credentials in generated bootstrap; both stay on the roadmap of both
+  frameworks, to be added to Forge-Go first. Forge-Rust refuses symbolic-link
+  key files, which Forge-Go accepts inside the directory
+  ([credentials](credentials.md#compatibility-with-forge-go)).
 
 - Stream signing key rotation (ADR 0031, rocketinsidecorp/forge-rust#14):
   both libraries verify previous keys (`Signer::new(key, previous)`,

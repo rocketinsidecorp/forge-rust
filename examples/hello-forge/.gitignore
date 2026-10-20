@@ -2,3 +2,6 @@
 .env
 .env.*
 !.env.example
+# Credential keys: never commit. The encrypted config/credentials/*.json.enc
+# files are meant to be committed.
+/config/credentials/*.key

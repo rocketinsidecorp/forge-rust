@@ -18,7 +18,8 @@
 //!
 //! PostgreSQL-only capabilities (transaction-scoped advisory locks, row-level
 //! security through `set_config`) are not emulated elsewhere: see
-//! [`advisory_key`] and `DbTransaction::advisory_xact_lock`.
+//! [`advisory_key`], `DbTransaction::advisory_xact_lock` and
+//! `DbTransaction::set_tenant`.
 //!
 //! The `testing` feature adds [`testing::TestDatabase`], an isolated migrated
 //! database per test that is removed even when the test panics.

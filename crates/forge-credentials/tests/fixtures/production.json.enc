@@ -1,0 +1,7 @@
+{
+  "version": 1,
+  "algorithm": "AES-256-GCM",
+  "key_id": "83f3b6a778d4f8a6",
+  "nonce": "5TylLPfSkZBjv_pB",
+  "ciphertext": "5e-iafLvdiBTWk1Y14B0MV1DPg4zjUgEmN2lat_rnvTJ7mgqqk5huZCP8zOEp_evqUW0duy8_W23giMYa0rcwoeWz8QAgh9SZOw_RpzSGMBGUWYaR3zB7Yt-XV0cp__tKhMH4yYVtW6oR80U8ZTP4GMNVijX-6L5NkCWcpk7SWr9iUKCoTb0n943JsZXYjWCbDeg2Co5rlaIjAyu7ejWi6jp1ul5Xc2JUgmtU4gOGnICS5EJvT3V39SV0rETg_kSPyAoi6ITTjQCFK4wBDmwSd7JGd3hpTAfLIoQ8_jU8DKaPjSuKn9LoPQSIEGh2gWjKQbaKPnKR1lpU4XuIk8vox8bwZS3Atiq5ZTjFxWfa2oadbwdwkor1qFZUqExVtMCivKRH4ar80D-2UcBuDTuWuhPBacX2Slbg0AJVt8GL1Bd"
+}
