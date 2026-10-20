@@ -124,6 +124,7 @@ from env files, Kubernetes manifests and unit files.
 | `FORGE_SHUTDOWN_GRACE_SECS` | `15` | Drain deadline for in-flight requests after SIGTERM/SIGINT. |
 | `FORGE_MAX_BODY_BYTES` | `1048576` | Maximum request body size in bytes. |
 | `FORGE_MAX_CONNECTIONS` | `10000` | Maximum concurrent connections. Extra connections wait for a slot (backpressure) instead of being served without bound. |
+| `FORGE_HTTP_TRUSTED_PROXIES` | empty | Comma-separated CIDRs or addresses of reverse proxies whose `X-Forwarded-For` is believed; empty trusts nobody. Empty or malformed entries, `/0`, IPv4 prefixes shorter than `/8`, IPv6 prefixes shorter than `/16`, IPv4-mapped prefixes and zoned addresses stop startup; the error names the entry's position, never its text. See [client addresses behind a proxy](#client-addresses-behind-a-proxy). |
 | `FORGE_LOG` | `info` | `tracing` filter directive, for example `info,shop=debug`. |
 | `FORGE_LOG_FORMAT` | `json` in production, `text` otherwise | `json` or `text`. |
 | `FORGE_DATABASE_URL` | none | Least-privilege PostgreSQL runtime connection URL. Treated as a secret and redacted from ordinary diagnostics. |
@@ -381,6 +382,101 @@ reverse proxy or load balancer in front of the loopback bind. If you use an
 
 See also the [CLI reference](cli.md), [threat model](threat-model.md) and
 [test strategy](test-strategy.md).
+
+## Client addresses behind a proxy
+
+Sign-in and password-reset throttles, `forge::ratelimit::by_client_ip` and
+the anonymous live-update stream cap count the client address
+`Request::client_ip()` returns
+([ADR 0032](adr/0032-trusted-proxies-and-client-ip.md)). By default that is
+the TCP peer, so behind a reverse proxy every client is the proxy and shares
+one budget: 300 sign-in attempts from anyone in 15 minutes refuse every
+sign-in. List the proxies that set `X-Forwarded-For`:
+
+```sh
+export FORGE_HTTP_TRUSTED_PROXIES=10.0.0.0/24,fd00:1::/64   # proxy CIDRs or addresses
+cargo run
+```
+
+- Only when the peer is inside a listed network is the header read, from the
+  right, skipping listed addresses; the first unlisted address is the client.
+  A client that reaches the application directly cannot choose its address.
+- An empty, malformed or non-address entry on that walk (a port, brackets,
+  `for=`) and a chain of more than 32 listed hops fall back to the peer.
+  `Forwarded` and `X-Real-IP` are never read.
+- The value is validated at startup: malformed entries, `/0` and prefixes
+  broader than IPv4 `/8` or IPv6 `/16` stop the process (bare addresses are
+  unaffected). Empty, the default, trusts nobody.
+- List only proxy networks, and keep the application port reachable only
+  through them: anything inside a listed network can claim any client
+  address and spend other clients' budgets.
+- Your proxy must overwrite the header or append the address it received the
+  connection from; a proxy that passes the client's header on unchanged lets
+  clients choose their address.
+
+Forge-Rust has no `forge deploy` yet (Forge-Go's sets this variable from the
+`forge` Docker network automatically); set it yourself.
+
+**nginx on the same host** (the systemd unit above binds to loopback):
+
+```nginx
+location / {
+    proxy_pass http://127.0.0.1:3000;
+    proxy_set_header Host $host;
+    # At the edge, overwrite: clients cannot plant entries.
+    proxy_set_header X-Forwarded-For $remote_addr;
+    # Behind another load balancer you trust, append instead:
+    # proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+}
+```
+
+```sh
+# /etc/shop/shop.env (EnvironmentFile=): only nginx on loopback is trusted
+FORGE_HTTP_TRUSTED_PROXIES=127.0.0.1,::1
+```
+
+**Docker Compose with nginx or Traefik in front**: give the network a fixed
+subnet, publish no application port, and trust that subnet. Traefik replaces
+`X-Forwarded-For` from untrusted clients with the connecting address by
+default (its `forwardedHeaders.trustedIPs` decides whom it believes).
+
+```yaml
+services:
+  app:
+    image: shop:latest
+    environment:
+      FORGE_BIND: 0.0.0.0:3000
+      FORGE_HTTP_TRUSTED_PROXIES: 172.30.0.0/24
+    networks: [edge]            # no `ports:`: only the proxy reaches it
+  proxy:
+    image: traefik:v3.1         # or nginx with the configuration above
+    ports: ["443:443"]
+    networks: [edge]
+networks:
+  edge:
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
+```
+
+The subnet includes the network's gateway (`172.30.0.1`), so processes on
+the host reach the application from a trusted address; the host is
+root-equivalent anyway. Every other container on `edge` is trusted too: keep
+untrusted services on another network.
+
+**Kubernetes**: list the ingress controller's pod CIDR (or the node CIDR for
+a `hostNetwork` controller) and make sure the controller appends or
+overwrites the header (ingress-nginx does; set `use-forwarded-headers` only
+when a trusted load balancer sits in front of it).
+
+Check what the application received without printing other variables:
+
+```sh
+docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' CONTAINER | grep '^FORGE_HTTP_TRUSTED_PROXIES='
+```
+
+A refused value stops startup with, for example,
+`invalid value for FORGE_HTTP_TRUSTED_PROXIES: entry 2 is too broad: IPv4 prefixes shorter than /8 trust too many addresses; list the proxy networks instead`.
 
 ## Live updates behind a proxy
 

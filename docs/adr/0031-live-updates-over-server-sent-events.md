@@ -3,6 +3,7 @@
 - Status: Accepted
 - Date: 2026-10-20
 - Refines: [ADR 0022](0022-server-rendered-views.md) (Turbo), [ADR 0024](0024-scaffold-generator.md) (scaffold)
+- Refined by: [ADR 0032](0032-trusted-proxies-and-client-ip.md) (anonymous viewers counted by the resolved client address)
 - Parity: Forge-Go ADR 0029 ("Broadcasts over Server-Sent Events", "PostgreSQL LISTEN/NOTIFY")
 
 ## Context

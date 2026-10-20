@@ -523,8 +523,10 @@ What protects a stream:
   `403 stream_invalid`.
 - A tenant channel is never served to another tenant (`403 stream_forbidden`);
   the access policy decides first (`401`, `403`, `503`).
-- 16 open streams per principal (anonymous viewers per IP address, IPv6 per
-  `/64`) and 1 000 per tenant (`429 stream_limit`). Generated streams count
+- 16 open streams per principal (anonymous viewers per client address,
+  `Request::client_ip`, so behind a proxy listed in
+  `FORGE_HTTP_TRUSTED_PROXIES` each client has its own; IPv6 per `/64`) and
+  1 000 per tenant (`429 stream_limit`). Generated streams count
   global-channel viewers by the principal their `GlobalAccess` returns, so
   signed-in people behind one proxy each have their own 16; 10 000 per process and
   1 000 per channel (`503 stream_unavailable`); 1 MiB per message.
