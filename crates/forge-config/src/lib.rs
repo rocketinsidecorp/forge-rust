@@ -25,9 +25,9 @@ mod mail;
 mod telemetry;
 
 pub use mail::{
-    AuthConfig, MAIL_KEYS, MailConfig, MailEndpoint, MailTransport, MailboxError,
-    PASSWORD_RESET_URL_KEY, has_text_problem, is_bidi_control, is_local_web_host, is_loopback_host,
-    parse_mailbox, valid_mail_domain, validate_mailbox,
+    AuthConfig, MAIL_KEYS, MFA_KEY_BYTES, MFA_KEY_KEY, MailConfig, MailEndpoint, MailTransport,
+    MailboxError, PASSWORD_RESET_URL_KEY, has_text_problem, is_bidi_control, is_local_web_host,
+    is_loopback_host, parse_mailbox, valid_mail_domain, validate_mailbox,
 };
 pub use telemetry::{
     EndpointScheme, OtlpCompression, OtlpHeader, SampleRatio, TELEMETRY_ENABLED_KEY,
@@ -110,6 +110,8 @@ pub const KNOWN_KEYS: &[&str] = &[
     "FORGE_MAIL_PREVIEW",
     "FORGE_MAIL_TLS_CA_FILE",
     PASSWORD_RESET_URL_KEY,
+    // ADR 0040.
+    MFA_KEY_KEY,
     // TELEMETRY_KEYS, ADR 0033.
     "FORGE_TELEMETRY_ENABLED",
     "FORGE_TELEMETRY_SERVICE_NAME",
@@ -802,7 +804,8 @@ pub struct AppConfig {
     /// Outgoing mail (`FORGE_MAIL_*`, ADR 0035).
     #[serde(default)]
     pub mail: MailConfig,
-    /// Identity settings (`FORGE_AUTH_PASSWORD_RESET_URL`).
+    /// Identity settings (`FORGE_AUTH_PASSWORD_RESET_URL`,
+    /// `FORGE_AUTH_MFA_KEY`).
     #[serde(default)]
     pub auth: AuthConfig,
     /// Translations (`FORGE_I18N_DEFAULT_LOCALE`, ADR 0037).
@@ -1631,6 +1634,7 @@ mod tests {
             "false",
             "/etc/ssl/private-relay.pem",
             "https://billing.example.com/passwords/edit",
+            "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc",
             "true",
             "billing",
             "1.0.0",
