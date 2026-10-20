@@ -203,8 +203,9 @@ These versions are listed in `forge_db::FRAMEWORK_MIGRATIONS` and owned by the
 framework ([ADR 0030](adr/0030-framework-migration-ownership.md)):
 
 - `Database::rollback` (the application's `rollback` command) reverts the
-  application's newest applied migration, never a framework one, even though
-  framework versions are higher than generated ones (`1..3`). With only
+  application's newest applied migration, never a framework one, even when a
+  framework version is higher (for example while the generated `1..3` are the
+  only application migrations). With only
   framework migrations left it fails with `DbError::FrameworkMigrationOnly`
   and reverts nothing.
 - `Database::rollback_framework(&migrations)` is the explicit way to revert the

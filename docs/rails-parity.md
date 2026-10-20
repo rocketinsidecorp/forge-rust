@@ -44,7 +44,8 @@ the work is finished and waiting for its review; **Planned** means not started.
   `migrate` tolerates them once their feature is off. Forge-Go merges its
   framework sets into `forge_schema_migrations`, reverts the most recently
   applied migration of any set and refuses versions this build does not
-  contain; it should adopt the same rule.
+  contain; it adopts the same rule in rocketinsidecorp/forge-go#13 (in
+  progress, next Forge-Go pull request after the observability stack).
 
 ## Review gate
 
