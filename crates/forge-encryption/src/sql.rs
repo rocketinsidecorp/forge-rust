@@ -380,8 +380,8 @@ encrypted_column!(
                 &self,
                 transaction: &mut DbTransaction<sqlx::Postgres>,
             ) -> Result<(), BoxError> {
-                let state: Option<(bool, bool, bool, bool, bool)> = sqlx::query_as(
-                    "SELECT c.relrowsecurity, c.relforcerowsecurity, \
+                let state: Option<(bool, bool, bool, bool, bool, bool)> = sqlx::query_as(
+                    "SELECT c.relkind IN ('r', 'p'), c.relrowsecurity, c.relforcerowsecurity, \
                      pg_has_role(current_user, c.relowner, 'USAGE'), r.rolsuper, r.rolbypassrls \
                      FROM pg_class c JOIN pg_roles r ON r.rolname = current_user \
                      WHERE c.oid = to_regclass($1)",
@@ -390,12 +390,21 @@ encrypted_column!(
                 .fetch_optional(transaction.connection())
                 .await?;
                 let table = self.spec.table();
-                let Some((enabled, forced, owner, superuser, bypass)) = state else {
+                let Some((plain_table, enabled, forced, owner, superuser, bypass)) = state else {
                     return Err(EncryptionError::Configuration(format!(
                         "table {table} does not exist on the search path"
                     ))
                     .into());
                 };
+                // A view, or another relation kind, carries no row-level
+                // security flags of its own while the tables under it may
+                // still hide rows: only a table proves what a rotation sees.
+                if !plain_table {
+                    return Err(EncryptionError::Configuration(format!(
+                        "{table} is not a table: rotate the table that stores the column"
+                    ))
+                    .into());
+                }
                 let security = super::RowSecurity {
                     enabled,
                     forced,

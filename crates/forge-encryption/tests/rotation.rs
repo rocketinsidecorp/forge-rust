@@ -466,6 +466,8 @@ mod postgres_row_level_security {
              WITH CHECK (tenant_id = NULLIF(current_setting('forge.tenant_id', true), '')::uuid)"
                 .to_owned(),
             format!("GRANT SELECT, INSERT, UPDATE ON people TO \"{runtime_role}\""),
+            "CREATE VIEW people_view AS SELECT * FROM people".to_owned(),
+            format!("GRANT SELECT, UPDATE ON people_view TO \"{runtime_role}\""),
         ] {
             sqlx::query(AssertSqlSafe(statement))
                 .execute(db.migrator().pool())
@@ -524,6 +526,20 @@ mod postgres_row_level_security {
             assert_eq!(error.report, Default::default());
         }
         assert_eq!(stale(db.admin(), None, &active).await, all_rows);
+
+        // A view carries no row-level security flags of its own while the
+        // table under it hides every row: it is refused, not scanned empty.
+        let view = EncryptedColumn::new(
+            db.runtime().clone(),
+            SqlColumn::new("people_view", COLUMN).unwrap(),
+        )
+        .unwrap();
+        let error = rotating
+            .reencrypt(&view, RotateOptions::default(), &Cancellation::new())
+            .await
+            .expect_err("unscoped rotation of a view");
+        assert!(error.to_string().contains("not a table"), "{error}");
+        assert_eq!(error.report, Default::default());
 
         // 2. Scoped to the first tenant: its rows rotate, the second
         //    tenant's rows are untouched.

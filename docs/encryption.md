@@ -186,9 +186,16 @@ deterministic encryption mode.
    does not apply: `mysql::EncryptedColumn` and `sqlite::EncryptedColumn` have
    no tenant scope and visit every row of the table.
 
-3. Prove that nothing is left on the old key, then remove it. Run, for every
-   encrypted column, a count of the rows not sealed with the active key
-   (values start with `fg1.<key id>.`):
+3. Prove that nothing is left on the old key, then remove it. The proof is a
+   count, for every encrypted column, of the rows not sealed with the active
+   key (values start with `fg1.<key id>.`), run as a role that sees every row
+   (superuser or `BYPASSRLS` on PostgreSQL; on MySQL, MariaDB and SQLite any
+   role that reads the table). Per-tenant counts as the runtime role are a
+   check during the rotation, not the proof: rows of a tenant missing from
+   your tenant list (an orphaned or deleted tenant) are never rotated nor
+   counted, and without `set_config` that role counts `0` on any table.
+   Pair each count with `count(*)`: a table that shows no row at all to the
+   role counting is not proof either.
 
    ```sql
    -- PostgreSQL tenant table, as the runtime role: once per tenant
@@ -199,9 +206,9 @@ deterministic encryption mode.
    COMMIT;
    ```
 
-   or once without `set_config` as a role that sees every row (superuser,
-   `BYPASSRLS`; on MySQL, MariaDB and SQLite any role that reads the table).
-   Every count must be `0`. Compare a prefix rather than `NOT LIKE
+   and then once without `set_config` as a role that sees every row; that
+   count must be `0`. The rotation refuses views: point it at the table that
+   stores the column. Compare a prefix rather than `NOT LIKE
    'fg1.2026_10.%'`: `_` is a `LIKE` wildcard and key ids may contain it.
 
    A report never proves completion: `scanned == 0`, `rotated == 0` and
