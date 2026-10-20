@@ -632,7 +632,9 @@ dependencies = [
  "clap",
  "forge-auth",
  "forge-config",
+ "forge-credentials",
  "forge-db",
+ "forge-encryption",
  "forge-i18n",
  "rustix",
  "serde",
@@ -640,6 +642,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]

@@ -34,7 +34,7 @@ mod files;
 mod init;
 mod store;
 
-pub use document::{indent, validate_document};
+pub use document::{indent, redact, validate_document};
 pub use envelope::{
     FORMAT_VERSION, MAX_FILE_BYTES, MAX_KEYS, MAX_PLAINTEXT_BYTES, key_id, new_key, parse_keys,
     seal, unseal, validate_environment,

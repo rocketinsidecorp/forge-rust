@@ -187,6 +187,13 @@ pub(crate) enum Command {
         #[arg(long, value_name = "FILE")]
         check: Option<std::path::PathBuf>,
     },
+    /// Encrypted per-environment credentials in
+    /// config/credentials/ENV.json.enc (like `rails credentials:edit`, ADR
+    /// 0041). The key is FORGE_MASTER_KEY or config/credentials/ENV.key.
+    Credentials {
+        #[command(subcommand)]
+        command: CredentialsCommand,
+    },
     /// Translations of config/locales (ADR 0037).
     I18n {
         #[command(subcommand)]
@@ -213,6 +220,51 @@ pub(crate) enum I18nCommand {
         /// Print a schema-versioned JSON report.
         #[arg(long)]
         json: bool,
+    },
+}
+
+/// The environment flag every `forge credentials` command takes.
+#[derive(Clone, Debug, Args)]
+pub(crate) struct CredentialsEnvironment {
+    /// Environment whose credentials to use (default: $FORGE_ENV or
+    /// development).
+    #[arg(short = 'e', long, value_name = "ENV")]
+    pub(crate) environment: Option<String>,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum CredentialsCommand {
+    /// Create a random key in config/credentials/ENV.key (mode 0600) and the
+    /// encrypted ENV.json.enc, and keep *.key out of git and Docker. Never
+    /// overwrites a key or an existing file and never prints the key.
+    Init(CredentialsEnvironment),
+    /// Decrypt into a private temporary file, open $VISUAL or $EDITOR (no
+    /// shell), validate the JSON and re-encrypt atomically. The plaintext is
+    /// wiped on every way out.
+    Edit(CredentialsEnvironment),
+    /// Print the document's structure with every value redacted.
+    Show {
+        #[command(flatten)]
+        environment: CredentialsEnvironment,
+        /// Print the values (interactive terminal only).
+        #[arg(long)]
+        reveal: bool,
+    },
+    /// Re-encrypt the file with a new random key.
+    RotateKey {
+        #[command(flatten)]
+        environment: CredentialsEnvironment,
+        /// Keep the previous keys readable in the new key list (migration
+        /// window).
+        #[arg(long)]
+        keep_old: bool,
+        /// Print the new key list to standard output.
+        #[arg(long)]
+        print_key: bool,
+        /// Store the new keys in the environment's key file even when the key
+        /// came from FORGE_MASTER_KEY.
+        #[arg(long)]
+        write_key_file: bool,
     },
 }
 

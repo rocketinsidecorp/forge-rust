@@ -5,6 +5,10 @@ mod authentication;
 mod cargo;
 mod cli;
 mod controller;
+mod credentials;
+mod credentials_edit;
+#[cfg(test)]
+mod credentials_tests;
 mod destroy;
 mod dev;
 mod doctor;
@@ -31,8 +35,8 @@ pub use error::CliError;
 use crate::application::{Application as _, CargoApplication};
 use crate::cargo::CargoCommand;
 use crate::cli::{
-    Cli, Command, ControllerArgs, DbCommand, DestroyArgs, DestroyCommand, DestructiveArgs,
-    GenerateCommand, I18nCommand, JobArgs, MailerArgs, MigrateView, ResourceArgs,
+    Cli, Command, ControllerArgs, CredentialsCommand, DbCommand, DestroyArgs, DestroyCommand,
+    DestructiveArgs, GenerateCommand, I18nCommand, JobArgs, MailerArgs, MigrateView, ResourceArgs,
 };
 use crate::controller::ControllerOptions;
 use crate::destroy::{DestroyFlags, DestroyPlan};
@@ -208,6 +212,7 @@ fn execute(
         Command::I18n {
             command: I18nCommand::Check { json },
         } => i18n::check(current_dir, json, output),
+        Command::Credentials { command } => run_credentials(current_dir, command, output),
         Command::Doctor { json } => doctor::run(
             json,
             env::vars_os().collect(),
@@ -271,6 +276,58 @@ fn execute(
             lifecycle(current_dir, |app| app.db(&command))
         }
     }
+}
+
+/// `forge credentials ...` against the process: its environment, stderr,
+/// terminal and the user's editor.
+fn run_credentials(
+    root: &std::path::Path,
+    command: CredentialsCommand,
+    output: &mut dyn io::Write,
+) -> Result<(), CliError> {
+    let (action, environment) = match command {
+        CredentialsCommand::Init(flags) => (credentials::Action::Init, flags.environment),
+        CredentialsCommand::Edit(flags) => (credentials::Action::Edit, flags.environment),
+        CredentialsCommand::Show {
+            environment,
+            reveal,
+        } => (
+            credentials::Action::Show { reveal },
+            environment.environment,
+        ),
+        CredentialsCommand::RotateKey {
+            environment,
+            keep_old,
+            print_key,
+            write_key_file,
+        } => (
+            credentials::Action::RotateKey {
+                keep_old,
+                print_key,
+                write_key_file,
+            },
+            environment.environment,
+        ),
+    };
+    // Signals are caught for the whole edit, so its cleanup always runs.
+    let interrupts = if action == credentials::Action::Edit {
+        credentials_edit::Interrupts::install()?
+    } else {
+        credentials_edit::Interrupts::none()
+    };
+    let lookup = |name: &str| env::var(name).ok();
+    let mut stderr = io::stderr();
+    let mut context = credentials::Context {
+        root: root.to_path_buf(),
+        lookup: &lookup,
+        stdout: output,
+        stderr: &mut stderr,
+        stdout_is_terminal: io::stdout().is_terminal(),
+        editor: Box::new(credentials_edit::run_editor_process),
+        interrupts: &interrupts,
+        after_read: None,
+    };
+    context.run(&action, environment)
 }
 
 fn resource_options(resource: ResourceArgs, layers: Layers, broadcast: bool) -> ScaffoldOptions {

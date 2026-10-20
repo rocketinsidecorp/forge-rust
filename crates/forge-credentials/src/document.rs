@@ -129,6 +129,28 @@ impl<'de> Visitor<'de> for StrictVisitor {
     }
 }
 
+/// The document's structure with every value replaced by `"[REDACTED]"`:
+/// keys, nesting and array lengths stay, keys sorted, indented with two
+/// spaces (what `forge credentials show` prints).
+pub fn redact(data: &[u8]) -> Result<Zeroizing<Vec<u8>>, CredentialsError> {
+    fn redact_value(value: &mut Value) {
+        match value {
+            Value::Object(map) => map.values_mut().for_each(redact_value),
+            Value::Array(items) => items.iter_mut().for_each(redact_value),
+            other => {
+                wipe(other);
+                *other = Value::String("[REDACTED]".to_owned());
+            }
+        }
+    }
+    let mut document = Value::Object(parse_document(data)?);
+    redact_value(&mut document);
+    let mut out = serde_json::to_vec_pretty(&document)
+        .map_err(|_| CredentialsError::Document("cannot encode the document".to_owned()))?;
+    out.push(b'\n');
+    Ok(Zeroizing::new(out))
+}
+
 /// Overwrites every string of `value` before it is dropped.
 pub(crate) fn wipe(value: &mut Value) {
     use zeroize::Zeroize as _;
@@ -251,6 +273,16 @@ mod tests {
         assert!(trailing.contains("syntax error"), "{trailing}");
         let large = format!("{{\"a\": \"{}\"}}", "x".repeat(MAX_PLAINTEXT_BYTES));
         assert!(message(&large).contains("exceeds"));
+    }
+
+    #[test]
+    fn redaction_keeps_only_the_structure() {
+        let redacted =
+            redact(br#"{"z": {"key": "sk_live_x", "n": [1, true, null]}, "a": 2}"#).expect("valid");
+        assert_eq!(
+            String::from_utf8(redacted.to_vec()).expect("utf8"),
+            "{\n  \"a\": \"[REDACTED]\",\n  \"z\": {\n    \"key\": \"[REDACTED]\",\n    \"n\": [\n      \"[REDACTED]\",\n      \"[REDACTED]\",\n      \"[REDACTED]\"\n    ]\n  }\n}\n"
+        );
     }
 
     #[test]
