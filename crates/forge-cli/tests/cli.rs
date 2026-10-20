@@ -342,6 +342,63 @@ fn generate_scaffold_refuses_api_and_database_free_applications() {
 }
 
 #[test]
+fn new_locale_writes_the_translations_and_i18n_check_reports_them() {
+    let directory = tempfile::tempdir().expect("temporary directory should be available");
+
+    let created = forge(
+        directory.path(),
+        &[
+            "new",
+            "shop",
+            "--locale",
+            "pt-BR",
+            "--skip-lockfile",
+            "--skip-docker",
+            "--skip-ci",
+        ],
+    );
+    assert!(created.status.success(), "{created:?}");
+    let root = directory.path().join("shop");
+    for path in [
+        "config/locales/en.json",
+        "config/locales/pt-BR.json",
+        "config/locales/authentication.en.json",
+        "config/locales/authentication.pt-BR.json",
+    ] {
+        assert!(root.join(path).is_file(), "{path} should be generated");
+    }
+
+    let complete = forge(&root, &["i18n", "check"]);
+    let report = String::from_utf8_lossy(&complete.stdout);
+    assert!(complete.status.success(), "{complete:?}");
+    assert!(
+        report.starts_with("config/locales: en, pt-BR; "),
+        "{report}"
+    );
+    assert!(report.contains("\npt-BR: complete\n"), "{report}");
+
+    // A key only one locale has is missing in the other: exit 1.
+    std::fs::write(
+        root.join("config/locales/extra.en.json"),
+        r#"{"en": {"extra": {"note": "Only in English"}}}"#,
+    )
+    .expect("extra translations");
+    let incomplete = forge(&root, &["i18n", "check", "--json"]);
+    assert_eq!(incomplete.status.code(), Some(1), "{incomplete:?}");
+    let json = String::from_utf8_lossy(&incomplete.stdout);
+    assert!(
+        json.contains("\"missing\":{\"pt-BR\":[\"extra.note\"]}"),
+        "{json}"
+    );
+    assert!(json.contains("\"unused\":[\"extra.note\"]"), "{json}");
+    assert!(String::from_utf8_lossy(&incomplete.stderr).contains("translations are missing"));
+
+    let outside = forge(directory.path(), &["i18n", "check"]);
+    assert_eq!(outside.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&outside.stderr).contains("Cargo.toml"));
+}
+
+#[test]
 fn new_refuses_unknown_locales_and_api_applications_with_a_locale() {
     let directory = tempfile::tempdir().expect("temporary directory should be available");
 

@@ -626,6 +626,7 @@ dependencies = [
  "forge-db",
  "forge-i18n",
  "rustix",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",
