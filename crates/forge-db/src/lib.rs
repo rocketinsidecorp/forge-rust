@@ -43,7 +43,7 @@ pub use database::PgDatabase;
 pub use database::SqliteDatabase;
 pub use database::{Database, DbTransaction, PoolSettings, expect_rows};
 pub use error::DbError;
-pub use migrate::combine_migrations;
+pub use migrate::{FRAMEWORK_MIGRATIONS, FrameworkMigration, combine_migrations};
 #[cfg(feature = "postgres")]
 pub use postgres::advisory_key;
 pub use prune::{MAX_PRUNE_ROUNDS, PruneGate};

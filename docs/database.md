@@ -198,3 +198,20 @@ with timestamp versions (`20261019000000`, `20261019000100`). They share the
 application's `_sqlx_migrations` table, so merge them with the application's own
 and declare the result: `forge::db::combine_migrations(&[&APP, &forge::cache::postgres::MIGRATIONS])`
 returns one `Migrator` for `App::postgres(..)`; duplicate versions are refused.
+
+These versions are listed in `forge_db::FRAMEWORK_MIGRATIONS` and owned by the
+framework ([ADR 0030](adr/0030-framework-migration-ownership.md)):
+
+- `Database::rollback` (the application's `rollback` command) reverts the
+  application's newest applied migration, never a framework one, even when a
+  framework version is higher (for example while the generated `1..3` are the
+  only application migrations). With only
+  framework migrations left it fails with `DbError::FrameworkMigrationOnly`
+  and reverts nothing.
+- `Database::rollback_framework(&migrations)` is the explicit way to revert the
+  newest framework migration the migrator contains.
+- Removing a set from `combine_migrations` (the feature is turned off) keeps
+  `migrate` working: its applied version is recognized and left alone. A
+  version that no set and no framework crate owns still fails with
+  `VersionMissing`.
+- An application migration may not reuse a listed version.

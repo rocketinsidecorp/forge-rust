@@ -82,6 +82,18 @@ pub enum DbError {
         /// Version of the most recently applied migration.
         version: i64,
     },
+    /// The application `rollback` found no application migration to revert:
+    /// only migrations shipped by Forge crates remain applied, and the
+    /// application rollback never reverts those (ADR 0030).
+    #[error(
+        "no application migration is applied; migration {version} belongs to {owner} and is not reverted by the application rollback"
+    )]
+    FrameworkMigrationOnly {
+        /// Newest applied framework-owned version.
+        version: i64,
+        /// The Forge crate that ships it.
+        owner: &'static str,
+    },
     /// The connection settings do not match what the operation needs.
     ///
     /// The reason is written by Forge and never contains the connection URL.
@@ -117,6 +129,7 @@ impl DbError {
             Self::Unavailable(_) => "unavailable",
             Self::Migration(_) => "migration_failed",
             Self::IrreversibleMigration { .. } => "irreversible_migration",
+            Self::FrameworkMigrationOnly { .. } => "framework_migration_only",
             Self::Configuration { .. } => "invalid_configuration",
             Self::Query(_) => "query_failed",
         }
@@ -133,7 +146,9 @@ impl DbError {
             Self::SerializationFailure | Self::Conflict => DatabaseErrorKind::Conflict,
             Self::PoolTimeout => DatabaseErrorKind::Timeout,
             Self::Unavailable(_) => DatabaseErrorKind::Unavailable,
-            Self::Migration(_) | Self::IrreversibleMigration { .. } => DatabaseErrorKind::Migration,
+            Self::Migration(_)
+            | Self::IrreversibleMigration { .. }
+            | Self::FrameworkMigrationOnly { .. } => DatabaseErrorKind::Migration,
             Self::NotFound | Self::Configuration { .. } | Self::Query(_) => {
                 DatabaseErrorKind::Infrastructure
             }
@@ -172,6 +187,7 @@ impl DbError {
             }
             Self::Migration(_)
             | Self::IrreversibleMigration { .. }
+            | Self::FrameworkMigrationOnly { .. }
             | Self::Configuration { .. }
             | Self::Query(_) => ErrorCategory::Internal,
         }
@@ -573,7 +589,7 @@ mod tests {
 
     #[test]
     fn variants_map_to_contract_kinds_and_retry_semantics() {
-        let cases: [(DbError, DatabaseErrorKind, bool); 6] = [
+        let cases: [(DbError, DatabaseErrorKind, bool); 7] = [
             (
                 DbError::NotNullViolation,
                 DatabaseErrorKind::Constraint,
@@ -588,6 +604,14 @@ mod tests {
             (DbError::PoolTimeout, DatabaseErrorKind::Timeout, true),
             (
                 DbError::IrreversibleMigration { version: 1 },
+                DatabaseErrorKind::Migration,
+                false,
+            ),
+            (
+                DbError::FrameworkMigrationOnly {
+                    version: 20_261_019_000_100,
+                    owner: "forge-cache",
+                },
                 DatabaseErrorKind::Migration,
                 false,
             ),

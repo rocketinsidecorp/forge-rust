@@ -119,7 +119,11 @@ App::new("shop").postgres(migrations) /* ... */;
 let limiter = Arc::new(PostgresLimiter::new(db.clone(), StoreOptions::default())?);
 ```
 
-`cargo run -- migrate` then creates `forge_rate_limits`; `rollback` drops it.
+`cargo run -- migrate` then creates `forge_rate_limits`. `cargo run -- rollback`
+never drops it: the application rollback reverts only the application's own
+migrations, and turning the shared limiter off later does not break `migrate`
+([ADR 0030](adr/0030-framework-migration-ownership.md)). Dropping the table is
+explicit: `database.rollback_framework(&migrations)`.
 A new store should pass `forge_ratelimit::testing::run` (feature `testing`).
 
 ### Memory limits

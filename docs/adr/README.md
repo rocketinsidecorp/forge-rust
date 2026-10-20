@@ -29,6 +29,7 @@ does not mean implementation exists.
 | [0027](0027-rate-limiting.md) | Fixed-window rate limiting: bounded memory limiter, shared stores, fail-closed middleware | Accepted |
 | [0028](0028-cache.md) | Application cache: bounded memory and shared stores, single-flight `fetch`, hashed keys | Accepted |
 | [0029](0029-file-storage.md) | File storage: restricted keys, `openat` disk adapter, signed links, strict uploads | Accepted |
+| [0030](0030-framework-migration-ownership.md) | Framework migration ownership: application `rollback` never reverts framework migrations; disabled features are tolerated | Accepted |
 
 New ADRs use the next four-digit number. A changed decision receives a new ADR
 that marks the prior record `Superseded`; accepted records are not rewritten to

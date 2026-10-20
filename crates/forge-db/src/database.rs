@@ -8,7 +8,8 @@ use sqlx::{Connection, Pool, migrate::Migrator, pool::PoolOptions};
 
 use crate::{
     Backend, DatabaseError, DbError, RowsAffected, Transaction, TransactionManager,
-    backend::ConnectOptions, migrate,
+    backend::ConnectOptions,
+    migrate::{self, RevertScope},
 };
 
 /// PostgreSQL database handle.
@@ -208,18 +209,39 @@ impl<B: Backend> Database<B> {
     /// Concurrent callers are serialized by the backend's migration lock
     /// (PostgreSQL advisory lock, MySQL/MariaDB named lock; SQLite has a
     /// single writer). Applied migrations are checksum-verified and a
-    /// previously failed (dirty) migration is rejected.
+    /// previously failed (dirty) migration is rejected. An applied version the
+    /// migrator does not contain fails with [`MigrateError::VersionMissing`](sqlx::migrate::MigrateError::VersionMissing),
+    /// unless it is a framework migration
+    /// ([`FRAMEWORK_MIGRATIONS`](crate::FRAMEWORK_MIGRATIONS)) whose feature
+    /// was turned off (ADR 0030).
     pub async fn migrate(&self, migrator: &Migrator) -> Result<Vec<i64>, DbError> {
         migrate::apply_pending(&self.pool, migrator).await
     }
 
-    /// Reverts the most recently applied migration with its down migration
-    /// and returns its version, or `None` when nothing is applied.
+    /// Reverts the application's newest applied migration with its down
+    /// migration and returns its version, or `None` when nothing is applied.
     ///
-    /// Fails with [`DbError::IrreversibleMigration`] when that migration has
-    /// no down migration.
+    /// Migrations shipped by Forge crates ([`FRAMEWORK_MIGRATIONS`](crate::FRAMEWORK_MIGRATIONS), merged
+    /// with [`combine_migrations`](crate::combine_migrations)) are outside
+    /// this scope even when their version is higher (ADR 0030): when only
+    /// they remain applied the call fails with
+    /// [`DbError::FrameworkMigrationOnly`] and reverts nothing. Fails with
+    /// [`DbError::IrreversibleMigration`] when the migration has no down
+    /// migration.
     pub async fn rollback(&self, migrator: &Migrator) -> Result<Option<i64>, DbError> {
-        migrate::revert_latest(&self.pool, migrator).await
+        migrate::revert_latest(&self.pool, migrator, RevertScope::Application).await
+    }
+
+    /// Reverts the newest applied framework migration that `migrator`
+    /// contains ([`FRAMEWORK_MIGRATIONS`](crate::FRAMEWORK_MIGRATIONS)) and returns its version, or `None`
+    /// when none is applied; application migrations are never touched.
+    ///
+    /// This is the explicit way to drop a framework table such as
+    /// `forge_cache_entries`; the application's `rollback` command never does.
+    /// Pass the same migrator the application migrates with, so every applied
+    /// version is still recognized.
+    pub async fn rollback_framework(&self, migrator: &Migrator) -> Result<Option<i64>, DbError> {
+        migrate::revert_latest(&self.pool, migrator, RevertScope::Framework).await
     }
 
     /// Closes the pool, waiting for checked-out connections to return.

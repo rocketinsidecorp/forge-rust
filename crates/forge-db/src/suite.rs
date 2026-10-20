@@ -9,12 +9,15 @@ use std::time::Duration;
 
 use forge_config::{DatabaseScheme, SecretString};
 use forge_core::{Id, Version};
-use sqlx::{AssertSqlSafe, Row, migrate::Migrator};
+use sqlx::{
+    AssertSqlSafe, Row, SqlSafeStr,
+    migrate::{MigrateError, Migration, MigrationType, Migrator},
+};
 use uuid::Uuid;
 
 use crate::{
-    Backend, Database, DbError, PoolSettings, Transaction, TransactionManager, expect_rows,
-    testing::TestDatabase,
+    Backend, Database, DbError, FRAMEWORK_MIGRATIONS, PoolSettings, Transaction,
+    TransactionManager, combine_migrations, expect_rows, testing::TestDatabase,
 };
 
 enum Owner {}
@@ -42,6 +45,45 @@ static POSTGRES_MIGRATIONS: Migrator = sqlx::migrate!("tests/migrations/postgres
 static MYSQL_MIGRATIONS: Migrator = sqlx::migrate!("tests/migrations/mysql");
 static SQLITE_MIGRATIONS: Migrator = sqlx::migrate!("tests/migrations/sqlite");
 
+/// Stands in for the migrations Forge crates ship (`forge-db` cannot depend
+/// on them): the registered versions and descriptions, each creating a
+/// `framework_<version>` table with portable SQL. Their versions are higher
+/// than the application's, as in a generated application (`1..3`).
+fn framework_set() -> Migrator {
+    Migrator::with_migrations(
+        FRAMEWORK_MIGRATIONS
+            .iter()
+            .flat_map(|migration| {
+                let table = framework_table(migration.version);
+                [
+                    (
+                        MigrationType::ReversibleUp,
+                        format!("CREATE TABLE {table} (id INTEGER PRIMARY KEY)"),
+                    ),
+                    (MigrationType::ReversibleDown, format!("DROP TABLE {table}")),
+                ]
+                .map(|(kind, sql)| {
+                    Migration::new(
+                        migration.version,
+                        migration.description.into(),
+                        kind,
+                        AssertSqlSafe(sql).into_sql_str(),
+                        false,
+                    )
+                })
+            })
+            .collect(),
+    )
+}
+
+fn framework_table(version: i64) -> String {
+    format!("framework_{version}")
+}
+
+fn framework_versions() -> Vec<i64> {
+    FRAMEWORK_MIGRATIONS.iter().map(|m| m.version).collect()
+}
+
 /// Tests every backend must pass.
 ///
 /// `$names` says whether the backend reports constraint names for unique and
@@ -57,6 +99,22 @@ macro_rules! common_suite {
                 TestDatabase::<Db>::create_from_env($env, &$migrations)
                     .await
                     .expect("provision the test database")
+            }
+
+            async fn table_exists(db: &Database<Db>, table: &str) -> bool {
+                sqlx::query(AssertSqlSafe(format!("SELECT COUNT(*) FROM {table}")))
+                    .execute(db.pool())
+                    .await
+                    .is_ok()
+            }
+
+            async fn framework_tables_exist(db: &Database<Db>) -> bool {
+                for version in framework_versions() {
+                    if !table_exists(db, &framework_table(version)).await {
+                        return false;
+                    }
+                }
+                true
             }
 
             async fn insert_owner(db: &Database<Db>, email: &str) -> Id<Owner> {
@@ -86,6 +144,96 @@ macro_rules! common_suite {
                 assert_eq!(db.rollback(&$migrations).await.expect("rollback"), Some(2));
                 assert_eq!(db.rollback(&$migrations).await.expect("rollback"), Some(1));
                 assert_eq!(db.rollback(&$migrations).await.expect("nothing left"), None);
+                test.cleanup().await.expect("cleanup");
+            }
+
+            /// Regression (rocketinsidecorp/forge-rust#10): the framework
+            /// versions are higher, yet the application rollback reverts the
+            /// application's newest migration and never a framework one.
+            #[tokio::test]
+            $(#[$attr])*
+            async fn application_rollback_never_reverts_framework_migrations() {
+                let test = TestDatabase::<Db>::create_empty_from_env($env).await.expect("provision");
+                let db = test.database();
+                let combined = combine_migrations(&[&$migrations, &framework_set()]).expect("combine");
+
+                let mut all = vec![1, 2];
+                all.extend(framework_versions());
+                assert_eq!(db.migrate(&combined).await.expect("migrate"), all);
+
+                assert_eq!(db.rollback(&combined).await.expect("rollback"), Some(2));
+                assert!(!table_exists(db, "notes").await);
+                assert!(framework_tables_exist(db).await);
+                assert_eq!(db.rollback(&combined).await.expect("rollback"), Some(1));
+                assert!(!table_exists(db, "owners").await);
+
+                // Only framework migrations remain: refused, nothing reverted.
+                let newest = FRAMEWORK_MIGRATIONS.iter().max_by_key(|m| m.version).expect("listed");
+                let error = db.rollback(&combined).await.expect_err("refused");
+                assert!(
+                    matches!(
+                        error,
+                        DbError::FrameworkMigrationOnly { version, owner }
+                            if version == newest.version && owner == newest.owner
+                    ),
+                    "{error:?}"
+                );
+                assert!(error.to_string().contains("not reverted by the application rollback"));
+                assert!(framework_tables_exist(db).await);
+
+                // The explicit framework rollback is the only way to revert them,
+                // and it never touches application migrations.
+                assert_eq!(db.migrate(&combined).await.expect("re-migrate"), vec![1, 2]);
+                let mut framework = framework_versions();
+                framework.sort_unstable();
+                for version in framework.into_iter().rev() {
+                    assert_eq!(
+                        db.rollback_framework(&combined).await.expect("framework rollback"),
+                        Some(version)
+                    );
+                    assert!(!table_exists(db, &framework_table(version)).await);
+                }
+                assert_eq!(db.rollback_framework(&combined).await.expect("none left"), None);
+                assert!(table_exists(db, "notes").await);
+                assert_eq!(db.rollback(&combined).await.expect("rollback"), Some(2));
+                test.cleanup().await.expect("cleanup");
+            }
+
+            /// Turning a framework feature off leaves its versions applied:
+            /// they are tolerated, while a version nobody owns fails closed.
+            #[tokio::test]
+            $(#[$attr])*
+            async fn disabled_framework_migrations_are_tolerated_and_unknown_versions_refused() {
+                let test = TestDatabase::<Db>::create_empty_from_env($env).await.expect("provision");
+                let db = test.database();
+                let combined = combine_migrations(&[&$migrations, &framework_set()]).expect("combine");
+                db.migrate(&combined).await.expect("migrate");
+
+                // The application's own migrator, without the framework sets.
+                assert!(db.migrate(&$migrations).await.expect("migrate").is_empty());
+                assert_eq!(db.rollback(&$migrations).await.expect("rollback"), Some(2));
+                assert_eq!(db.migrate(&$migrations).await.expect("re-migrate"), vec![2]);
+                assert_eq!(db.rollback_framework(&$migrations).await.expect("no set"), None);
+                assert!(framework_tables_exist(db).await);
+
+                // Re-enabling the features finds them applied and unchanged.
+                assert!(db.migrate(&combined).await.expect("re-enabled").is_empty());
+
+                // Version 2 belongs to nobody this build knows: refused.
+                let stale = Migrator::with_migrations(
+                    $migrations.iter().filter(|m| m.version == 1).cloned().collect(),
+                );
+                for result in [
+                    db.migrate(&stale).await.map(|_| None),
+                    db.rollback(&stale).await,
+                    db.rollback_framework(&stale).await,
+                ] {
+                    assert!(
+                        matches!(result, Err(DbError::Migration(MigrateError::VersionMissing(2)))),
+                        "{result:?}"
+                    );
+                }
+                assert!(table_exists(db, "notes").await);
                 test.cleanup().await.expect("cleanup");
             }
 

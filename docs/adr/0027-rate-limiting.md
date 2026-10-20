@@ -2,6 +2,7 @@
 
 - Status: Accepted
 - Date: 2026-10-19
+- Refined by: [ADR 0030](0030-framework-migration-ownership.md) (migration ownership and rollback scope)
 - Refines: [ADR 0021](0021-selectable-database-backends.md) (store per backend)
 - Ported from: Forge-Go ADR 0031 (same contracts and negative tests)
 

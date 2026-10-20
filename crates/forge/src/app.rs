@@ -1366,12 +1366,17 @@ mod tests {
         }
 
         async fn table_exists(url: &str) -> bool {
+            has_table(url, "notes").await
+        }
+
+        async fn has_table(url: &str, table: &str) -> bool {
             let database = forge_db::SqliteDatabase::connect(&SecretString::new(url))
                 .await
                 .expect("connect");
             let exists = sqlx::query_scalar::<_, i64>(
-                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'notes'",
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?",
             )
+            .bind(table)
             .fetch_one(database.pool())
             .await
             .expect("query")
@@ -1401,6 +1406,78 @@ mod tests {
             assert_eq!(run("rollback").await.expect("join"), ExitCode::SUCCESS);
             assert!(!table_exists(&url).await);
             assert_eq!(run("rollback").await.expect("join"), ExitCode::SUCCESS);
+        }
+
+        /// Regression (rocketinsidecorp/forge-rust#10): with the shipped
+        /// cache and rate-limit migrations merged in (versions higher than the
+        /// application's), `rollback` reverts the application's migration and
+        /// refuses instead of dropping a framework table; `migrate` keeps
+        /// working after the features are turned off.
+        #[cfg(all(feature = "cache", feature = "ratelimit"))]
+        #[tokio::test(flavor = "multi_thread")]
+        async fn rollback_keeps_framework_tables_and_migrate_tolerates_disabled_features() {
+            let directory = tempfile::tempdir().expect("tempdir");
+            let url = url(&directory);
+            let run = |command: &'static str, with_framework: bool| {
+                let url = url.clone();
+                tokio::task::spawn_blocking(move || {
+                    let app = migrations();
+                    let migrator = if with_framework {
+                        forge_db::combine_migrations(&[
+                            &app,
+                            &forge_cache::sqlite::MIGRATIONS,
+                            &forge_ratelimit::sqlite::MIGRATIONS,
+                        ])
+                        .expect("combine")
+                    } else {
+                        app
+                    };
+                    App::new("demo")
+                        .sqlite(migrator)
+                        .run_with(args(&[command]), || {
+                            config_with(&[("FORGE_MIGRATION_DATABASE_URL", url.as_str())])
+                        })
+                })
+            };
+            let framework_tables = || async {
+                has_table(&url, "forge_cache_entries").await
+                    && has_table(&url, "forge_rate_limits").await
+            };
+
+            assert_eq!(run("migrate", true).await.expect("join"), ExitCode::SUCCESS);
+            assert!(table_exists(&url).await && framework_tables().await);
+
+            assert_eq!(
+                run("rollback", true).await.expect("join"),
+                ExitCode::SUCCESS
+            );
+            assert!(
+                !table_exists(&url).await,
+                "the application migration was reverted"
+            );
+            assert!(
+                framework_tables().await,
+                "framework tables survive rollback"
+            );
+
+            // Only framework migrations remain: rollback fails, reverts nothing.
+            assert_eq!(
+                run("rollback", true).await.expect("join"),
+                ExitCode::FAILURE
+            );
+            assert!(framework_tables().await);
+
+            // The features are turned off: their applied versions are tolerated.
+            assert_eq!(
+                run("migrate", false).await.expect("join"),
+                ExitCode::SUCCESS
+            );
+            assert!(table_exists(&url).await);
+            assert_eq!(
+                run("rollback", false).await.expect("join"),
+                ExitCode::SUCCESS
+            );
+            assert!(!table_exists(&url).await && framework_tables().await);
         }
 
         fn request(path: &str) -> Request {

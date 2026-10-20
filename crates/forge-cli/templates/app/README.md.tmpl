@@ -171,8 +171,9 @@ forge check && forge lint && forge test
 Binary commands: `serve` (default), `healthcheck`, `version`, `help`.
 %%if database%%
 Database-enabled binaries also support `migrate` and `rollback`.
-`migrate` applies pending embedded migrations; `rollback` reverts the latest
-reversible migration. `seed` runs `seed` in `src/bootstrap/seeds.rs` in one
+`migrate` applies pending embedded migrations; `rollback` reverts the
+application's latest reversible migration, never one shipped by Forge (such as
+the cache or rate-limit tables). `seed` runs `seed` in `src/bootstrap/seeds.rs` in one
 transaction with `FORGE_MIGRATION_DATABASE_URL`; keep it idempotent.
 %%end%%
 %%if authentication%%
