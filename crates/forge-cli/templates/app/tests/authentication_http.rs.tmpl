@@ -5,6 +5,8 @@
 
 use std::collections::HashMap;
 use std::error::Error;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -52,6 +54,10 @@ struct Reset {
     used: bool,
 }
 
+/// Work that runs inside the next session insert, before the session is
+/// stored: what another request committing meanwhile looks like.
+type BeforeInsert = Pin<Box<dyn Future<Output = ()> + Send>>;
+
 /// Every fake port over one shared state.
 #[derive(Default)]
 struct World {
@@ -67,6 +73,8 @@ struct World {
     deliver_fails: bool,
     /// Delivers through the real mail adapter instead of recording tokens.
     mailer: Option<forge::mail::PasswordResetMailer>,
+    /// Runs once, inside the next session insert.
+    before_session_insert: Mutex<Option<BeforeInsert>>,
 }
 
 /// PostgreSQL's `lower()` under common collations folds `İ` to `i` (no
@@ -167,6 +175,10 @@ impl SessionStore for World {
         credential: &SessionCredentialDigest,
         csrf: &CsrfTokenDigest,
     ) -> Result<(), SessionStoreError> {
+        let before = lock(&self.before_session_insert).take();
+        if let Some(before) = before {
+            before.await;
+        }
         lock(&self.sessions).push((session.clone(), *credential, *csrf));
         Ok(())
     }
@@ -406,25 +418,28 @@ fn seed(world: &World) -> Result<PrincipalId, Box<dyn Error>> {
 /// The `FORGE_AUTH_MFA_KEY` of the tests.
 const MFA_KEY: [u8; 32] = [7; 32];
 
-/// Two-factor authentication over an in-memory store that revokes the
-/// world's sessions as the PostgreSQL adapter does.
+/// An in-memory MFA store that revokes the world's sessions as the
+/// PostgreSQL adapter does.
+fn revoking_store(world: &Arc<World>) -> Arc<MemoryMfaStore> {
+    let sessions = Arc::clone(world);
+    Arc::new(
+        MemoryMfaStore::new().with_session_revoker(Arc::new(move |principal, now| {
+            for (session, _, _) in lock(&sessions.sessions).iter_mut() {
+                if session.principal_id() == principal {
+                    let _ = session.revoke(now);
+                }
+            }
+        })),
+    )
+}
+
+/// Two-factor authentication over `store`, or over a [`revoking_store`].
 fn mfa_service(
     world: &Arc<World>,
     key: Option<[u8; 32]>,
     store: Option<Arc<MemoryMfaStore>>,
 ) -> Result<MfaService, Box<dyn Error>> {
-    let sessions = Arc::clone(world);
-    let store = store.unwrap_or_else(|| {
-        Arc::new(
-            MemoryMfaStore::new().with_session_revoker(Arc::new(move |principal, now| {
-                for (session, _, _) in lock(&sessions.sessions).iter_mut() {
-                    if session.principal_id() == principal {
-                        let _ = session.revoke(now);
-                    }
-                }
-            })),
-        )
-    });
+    let store = store.unwrap_or_else(|| revoking_store(world));
     let cipher = match key {
         Some(key) => Some(Arc::new(forge::auth::Aes256GcmSecretCipher::new(&key)?)
             as Arc<dyn forge::auth::SecretCipher>),
@@ -646,9 +661,14 @@ async fn settle() {
 }
 
 fn audited(world: &World, action: &str, outcome: AuditOutcome) -> bool {
+    audit_count(world, action, outcome) > 0
+}
+
+fn audit_count(world: &World, action: &str, outcome: AuditOutcome) -> usize {
     lock(&world.audit)
         .iter()
-        .any(|(recorded, result)| recorded == action && *result == outcome)
+        .filter(|(recorded, result)| recorded == action && *result == outcome)
+        .count()
 }
 
 fn live_sessions(world: &World, principal: PrincipalId) -> usize {
@@ -2071,5 +2091,122 @@ async fn without_the_key_an_enrolled_account_cannot_sign_in() -> TestResult {
     assert!(browser.cookie("__Host-forge_session").is_none());
     let settings = Browser::default().get(&fixture.router, "/mfa").await?;
     assert_eq!(settings.status(), StatusCode::SEE_OTHER);
+    Ok(())
+}
+
+/// `POST /mfa` and `POST /mfa/confirm` need no code, so for an account that
+/// already has a factor a right and a wrong password must get the same
+/// answer, or a session holder could test passwords through them. Both are
+/// audited as denied.
+#[tokio::test]
+async fn enrollment_routes_do_not_reveal_the_password_of_an_enrolled_account() -> TestResult {
+    let fixture = fixture()?;
+    let (key, codes) = enroll_ada(&fixture).await?;
+    let mut browser = Browser::default();
+    password_step(&fixture, &mut browser).await?;
+    browser
+        .post(&fixture.router, "/session/mfa", &[("code", &codes[0])])
+        .await?;
+    for (path, action) in [
+        ("/mfa", "auth.mfa.enrollment_started"),
+        ("/mfa/confirm", "auth.mfa.enabled"),
+    ] {
+        let denied = audit_count(&fixture.world, action, AuditOutcome::Denied);
+        let mut answers = Vec::new();
+        for password in [PASSWORD, "not the password"] {
+            let code = totp(&key, 0)?;
+            let refused = browser
+                .post(
+                    &fixture.router,
+                    path,
+                    &[("password", password), ("code", code.as_str())],
+                )
+                .await?;
+            let body = text(&refused);
+            assert!(!body.contains("mfa_key"), "{path}: {body}");
+            assert!(!body.contains("otpauth://"), "{path}: {body}");
+            let settings = browser.get(&fixture.router, "/mfa").await?;
+            answers.push((
+                refused.status(),
+                header_of(&refused, header::LOCATION),
+                body,
+                text(&settings).contains("Two-factor authentication changed meanwhile."),
+            ));
+        }
+        assert_eq!(answers[0], answers[1], "{path}");
+        assert_eq!(answers[0].0, StatusCode::SEE_OTHER, "{path}");
+        assert_eq!(answers[0].1.as_deref(), Some("/mfa"), "{path}");
+        assert!(answers[0].3, "{path}: the settings page says why");
+        assert_eq!(
+            audit_count(&fixture.world, action, AuditOutcome::Denied),
+            denied + 2,
+            "{path}: both refusals are audited"
+        );
+    }
+    // Nothing changed: the factor is on and the session still works.
+    let on = browser.get(&fixture.router, "/mfa").await?;
+    assert!(text(&on).contains("Two-factor authentication is on."));
+    assert!(!audited(
+        &fixture.world,
+        "auth.mfa.enrollment_started",
+        AuditOutcome::Failed
+    ));
+    Ok(())
+}
+
+/// A factor installed while a password sign-in is storing its session
+/// revoked every session before that one existed: the sign-in checks again
+/// once the session is stored, ends it and asks for the code instead.
+#[tokio::test]
+async fn a_factor_installed_during_a_sign_in_ends_its_password_only_session() -> TestResult {
+    let world = Arc::new(World::default());
+    let store = revoking_store(&world);
+    let fixture = fixture_with_mfa(
+        Arc::clone(&world),
+        10,
+        Some(MFA_KEY),
+        Some(Arc::clone(&store)),
+    )?;
+    let ada = fixture.ada;
+    let other = mfa_service(&world, Some(MFA_KEY), Some(Arc::clone(&store)))?;
+    let check = mfa_service(&world, Some(MFA_KEY), Some(store))?;
+    *lock(&world.before_session_insert) = Some(Box::pin(async move {
+        let Some(now) = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .map(|elapsed| UnixTimestamp::from_secs(elapsed.as_secs()))
+        else {
+            return;
+        };
+        let change = forge::tenancy::MfaChange::Enrollment;
+        if let Ok(enrollment) = other
+            .begin(ada, change, "app", "ada@example.com", now)
+            .await
+        {
+            let code = enrollment.secret.code_at(now);
+            let _ = other.confirm(ada, change, &code, now).await;
+        }
+    }));
+    let mut browser = Browser::default();
+    let response = browser
+        .sign_in(&fixture.router, "acme", "ada@example.com", PASSWORD)
+        .await?;
+    assert!(
+        lock(&world.before_session_insert).is_none(),
+        "the enrollment ran inside the session insert"
+    );
+    assert!(
+        check.status(ada).await?.is_some(),
+        "the enrollment committed"
+    );
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        header_of(&response, header::LOCATION).as_deref(),
+        Some("/session/mfa")
+    );
+    assert!(browser.cookie("__Host-forge_session").is_none());
+    assert!(browser.cookie("__Host-forge_mfa").is_some());
+    assert_eq!(live_sessions(&world, ada), 0);
+    assert!(!audited(&world, "auth.sign_in", AuditOutcome::Succeeded));
     Ok(())
 }

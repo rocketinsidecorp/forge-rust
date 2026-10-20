@@ -65,6 +65,7 @@
         "enable": "Turn on two-factor authentication",
         "rotate_title": "Replace your authenticator",
         "rotate": "Replace authenticator",
+        "rotate_hint": "Starting a replacement uses up the current code of your authenticator app. To finish, wait for the next code or use a backup code.",
         "backup_codes_title": "Backup codes",
         "regenerate": "Create new backup codes",
         "disable_title": "Turn off",

@@ -43,8 +43,24 @@ keys) and `mfa.*` in `config/locales/authentication.LOCALE.json` (`en`, `es`,
 
 Confirming a new key asks for the password again (and, for a rotation, a
 current code), so a stolen session can neither read the pending key nor
-confirm it. A TOTP code works once: for the current code of a rotation, wait
-for the next code of the old authenticator or use a backup code.
+confirm it. A TOTP code works once, so starting a rotation uses up the
+current code of the authenticator app: to confirm it, wait for the next code
+or use a backup code (the pages say so).
+
+Every change counts one attempt on the second-factor throttle (five per
+account in five minutes) before anything is checked, and is audited, refusals
+as the action with outcome `denied`. `POST /mfa` and `POST /mfa/confirm` need
+no code, so for an account that already has a factor they answer the same
+way whatever the password (`303` back to `/mfa`, "changed meanwhile"): the
+account is refused before the password is checked, so these routes cannot
+tell a right password from a wrong one.
+
+New backup codes (`POST /mfa/backup_codes`) replace the old ones at once, but,
+as in Forge-Go, they neither sign out other sessions nor void a pending
+sign-in challenge: neither depends on the backup codes, and a challenge can
+no longer be completed with an old code because it is gone. If you think a
+session or the password is compromised, reset the password or replace the
+authenticator: both sign out everywhere.
 
 ## How sign-in works
 
@@ -57,6 +73,12 @@ for the next code of the old authenticator or use a backup code.
 3. The challenge and the code are consumed in one transaction: a code (its
    period) and a backup code work once, also under concurrent requests. Then
    the session and a new CSRF token are issued as for a password sign-in.
+
+A factor turned on while a password sign-in of the same account is storing
+its session signs out every session before that one exists. The sign-in
+therefore checks for a factor again once its session is stored (on
+PostgreSQL, the insert waits for the account row the change locks), ends
+that session and asks for the code instead.
 
 A challenge stops working when it expires, when the account signs in again,
 changes its password, is disabled, loses its membership of the tenant, or

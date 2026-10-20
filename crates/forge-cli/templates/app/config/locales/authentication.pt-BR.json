@@ -65,6 +65,7 @@
         "enable": "Ativar a autenticação em dois fatores",
         "rotate_title": "Substituir seu autenticador",
         "rotate": "Substituir o autenticador",
+        "rotate_hint": "Iniciar a substituição consome o código atual do seu aplicativo autenticador. Para concluir, aguarde o próximo código ou use um código de backup.",
         "backup_codes_title": "Códigos de backup",
         "regenerate": "Criar novos códigos de backup",
         "disable_title": "Desativar",
