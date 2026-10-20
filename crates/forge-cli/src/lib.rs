@@ -217,7 +217,6 @@ fn lifecycle(
     command: impl FnOnce(&mut Lifecycle<'_, CargoApplication>) -> Result<(), CliError>,
 ) -> Result<(), CliError> {
     let project = Project::discover(current_dir)?;
-    let signals = Signals::install()?;
     let stdin = io::stdin();
     let mut input = stdin.lock();
     let mut messages = io::stderr();
@@ -226,7 +225,7 @@ fn lifecycle(
     let environment =
         |key: &str| env::var_os(key).map(|value| value.to_string_lossy().into_owned());
     let mut lifecycle = Lifecycle {
-        app: CargoApplication::new(project.clone(), signals.shutdown()),
+        app: CargoApplication::new(project.clone()),
         name: &project.name,
         environment: &environment,
         input: &mut input,
@@ -251,10 +250,9 @@ fn run_dev(
         }
         project.name = name;
     }
-    let signals = Signals::install()?;
     if no_reload {
         let name = project.name.clone();
-        let mut app = CargoApplication::new(project, signals.shutdown());
+        let mut app = CargoApplication::new(project);
         return match app.run(&[])? {
             Some(0) => Ok(()),
             code => Err(CliError::AppCommandFailed {
@@ -263,6 +261,7 @@ fn run_dev(
             }),
         };
     }
+    let signals = Signals::install()?;
     let log = |line: &str| {
         use std::io::Write as _;
         // Progress goes to stderr, next to the application's own logs.

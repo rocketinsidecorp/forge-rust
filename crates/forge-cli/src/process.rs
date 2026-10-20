@@ -70,7 +70,11 @@ impl Signals {
     /// Installs the handlers for SIGINT and SIGTERM (Ctrl-C elsewhere) and
     /// returns once they are registered.
     pub(crate) fn install() -> Result<Self, CliError> {
-        let shutdown = Shutdown::new();
+        Self::install_for(Shutdown::new())
+    }
+
+    /// [`install`](Self::install), setting an existing flag.
+    pub(crate) fn install_for(shutdown: Shutdown) -> Result<Self, CliError> {
         let (stop, stopped) = oneshot::channel();
         let (ready, registered) = std::sync::mpsc::channel();
         let flag = shutdown.clone();

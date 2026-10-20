@@ -13,7 +13,7 @@ use serde_json::Value;
 
 use crate::CliError;
 use crate::lifecycle::ALLOW_DESTRUCTIVE;
-use crate::process::{OwnedChild, STOP_GRACE, Shutdown};
+use crate::process::{OwnedChild, STOP_GRACE, Shutdown, Signals};
 use crate::project::Project;
 
 /// The result of `cargo build`.
@@ -123,19 +123,26 @@ pub(crate) trait Application {
 pub(crate) struct CargoApplication {
     project: Project,
     shutdown: Shutdown,
+    /// The SIGINT/SIGTERM handlers, installed when the first child starts: a
+    /// Ctrl-C at a confirmation prompt, before that, ends the CLI as usual.
+    signals: Option<Signals>,
     binary: Option<PathBuf>,
 }
 
 impl CargoApplication {
-    pub(crate) fn new(project: Project, shutdown: Shutdown) -> Self {
+    pub(crate) fn new(project: Project) -> Self {
         Self {
             project,
-            shutdown,
+            shutdown: Shutdown::new(),
+            signals: None,
             binary: None,
         }
     }
 
     fn binary(&mut self) -> Result<PathBuf, CliError> {
+        if self.signals.is_none() {
+            self.signals = Some(Signals::install_for(self.shutdown.clone())?);
+        }
         if let Some(binary) = &self.binary {
             return Ok(binary.clone());
         }
@@ -236,6 +243,7 @@ not json at all
                 name: "app".to_owned(),
             },
             shutdown: Shutdown::new(),
+            signals: None,
             binary: Some(script),
         };
 
