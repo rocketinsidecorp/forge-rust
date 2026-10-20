@@ -1401,3 +1401,109 @@ async fn renewal_skips_rows_locked_by_transactional_completion() {
     );
     db.cleanup().await.expect("cleanup");
 }
+
+#[derive(Serialize, Deserialize)]
+struct Quick;
+
+impl Job for Quick {
+    const NAME: &'static str = "test.quick";
+    const QUEUE: &'static str = "long";
+}
+
+struct QuickHandler(Arc<AtomicUsize>);
+
+#[async_trait]
+impl JobHandler for QuickHandler {
+    type Job = Quick;
+
+    async fn perform(&self, _: &JobContext, _: Quick) -> Result<(), JobError> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+/// Makes every lease renewal fail, like an unreachable database would.
+async fn break_renewal(db: &RlsTestDatabase) {
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "REVOKE EXECUTE ON FUNCTION forge_jobs_heartbeat(uuid[], uuid[], bigint) FROM \"{}\"",
+        db.runtime_role()
+    )))
+    .execute(db.admin().pool())
+    .await
+    .expect("revoke");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs FORGE_TEST_DATABASE_URL"]
+async fn attempts_are_cancelled_when_their_lease_cannot_be_renewed() {
+    let db = fresh().await;
+    let store = PgJobStore::new(db.runtime().clone());
+    let id = store
+        .enqueue(&Long { cooperative: true }, EnqueueOptions::new())
+        .await
+        .expect("enqueue")
+        .id();
+    let started = Arc::new(AtomicUsize::new(0));
+    let mut jobs = Jobs::new();
+    jobs.register(Lingers(Arc::clone(&started)))
+        .expect("register");
+    jobs.settings(fast()); // 3 s lease
+    let (shutdown, handle) = spawn_runtime(jobs, store.database());
+    wait_until("the attempt to start", || async {
+        started.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    break_renewal(&db).await;
+    let begun = std::time::Instant::now();
+    // The attempt stops before its 3 s lease could expire, and its failure
+    // is recorded while the lease is still held.
+    wait_until("the attempt to be cancelled", || async {
+        job_row(&db, id).await.last_error.as_deref() == Some("cancelled")
+    })
+    .await;
+    assert!(
+        begun.elapsed() < Duration::from_secs(4),
+        "{:?}",
+        begun.elapsed()
+    );
+    stop(shutdown, handle).await;
+    db.cleanup().await.expect("cleanup");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs FORGE_TEST_DATABASE_URL"]
+async fn attempts_ignoring_cancellation_after_losing_the_lease_free_their_slot() {
+    let db = fresh().await;
+    let store = PgJobStore::new(db.runtime().clone());
+    store
+        .enqueue(&Long { cooperative: false }, EnqueueOptions::new())
+        .await
+        .expect("enqueue");
+    let started = Arc::new(AtomicUsize::new(0));
+    let quick = Arc::new(AtomicUsize::new(0));
+    let mut jobs = Jobs::new();
+    jobs.register(Lingers(Arc::clone(&started)))
+        .expect("register");
+    jobs.register(QuickHandler(Arc::clone(&quick)))
+        .expect("register");
+    jobs.concurrency("long", 1).expect("concurrency");
+    jobs.settings(fast());
+    let (shutdown, handle) = spawn_runtime(jobs, store.database());
+    wait_until("the stubborn attempt to start", || async {
+        started.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    break_renewal(&db).await;
+    store
+        .enqueue(&Quick, EnqueueOptions::new())
+        .await
+        .expect("enqueue");
+    // The stubborn attempt (TIMEOUT 5 minutes) is cancelled, ignores it, and
+    // is aborted after the cancel grace: the only slot runs the next job.
+    wait_until("the queued job to get the slot", || async {
+        quick.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    stop(shutdown, handle).await;
+    db.cleanup().await.expect("cleanup");
+}

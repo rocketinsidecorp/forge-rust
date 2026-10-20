@@ -170,7 +170,11 @@ Each queue runs at most `concurrency` attempts (default 5,
 `Jobs::concurrency`, at most 256). Idle queues poll every `poll_interval`
 (default 1 s, jittered). Leases last `lease` (default 30 s) and are renewed
 every 10 s; a worker that stops renewing loses its jobs to other workers
-after at most one lease.
+after at most one lease. An attempt whose lease has not been renewed for two
+thirds of it (database unreachable, for example) is cancelled before the
+lease can expire, and aborted after `cancel_grace` if it ignores the
+cancellation, so it never runs alongside a reclaimed copy for long nor keeps
+its concurrency slot until `TIMEOUT`.
 
 ## Failures and dead jobs
 

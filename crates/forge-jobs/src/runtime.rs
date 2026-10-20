@@ -28,7 +28,10 @@ pub struct WorkerSettings {
     pub poll_interval: Duration,
     /// Lease granted per claim and per renewal (default 30 s). Leases are
     /// renewed every third of it while the attempt runs; a worker that stops
-    /// renewing loses its jobs to other workers after at most this long.
+    /// renewing loses its jobs to other workers after at most this long. An
+    /// attempt whose lease has not been renewed for two thirds of it (for
+    /// example while the database is unreachable) is cancelled, and aborted
+    /// after `cancel_grace` if it ignores the cancellation.
     pub lease: Duration,
     /// How long shutdown waits for in-flight attempts before cancelling them
     /// (default 20 s).
@@ -91,6 +94,13 @@ impl WorkerSettings {
 
     pub(crate) fn heartbeat_interval(&self) -> Duration {
         self.lease / 3
+    }
+
+    /// How long after the last successful renewal an attempt is cancelled:
+    /// one renewal interval before the lease can expire, leaving the attempt
+    /// time to stop and record its outcome while the lease is still held.
+    pub(crate) fn renewal_deadline(&self) -> Duration {
+        self.lease - self.heartbeat_interval()
     }
 
     fn validate(&self) -> Result<(), JobsError> {

@@ -14,7 +14,7 @@ use std::{
 use async_trait::async_trait;
 use forge_core::Cancellation;
 use tokio::{
-    task::{self, JoinError, JoinSet},
+    task::{self, AbortHandle, JoinError, JoinSet},
     time::MissedTickBehavior,
 };
 use tracing::{debug, error, info, warn};
@@ -75,6 +75,13 @@ struct InFlight {
     lease_lost: bool,
     /// Set when the attempt completed itself with `complete_in`.
     completed: Arc<AtomicBool>,
+    /// When the lease was last known to be held: the claim, then every
+    /// successful renewal.
+    last_renewed: Instant,
+    /// When the attempt was cancelled because its lease was (or could be)
+    /// lost; it is aborted if it is still running after the cancel grace.
+    cancelled_at: Option<Instant>,
+    abort: AbortHandle,
 }
 
 pub(crate) struct QueueWorker {
@@ -110,6 +117,8 @@ impl QueueWorker {
             let free = self.concurrency.saturating_sub(tasks.len());
             if free > 0 {
                 let token = LeaseToken::new();
+                // The database grants the lease after this instant.
+                let claimed_at = Instant::now();
                 match self
                     .store
                     .claim(self.queue, &names, free, self.settings.lease, token)
@@ -117,7 +126,14 @@ impl QueueWorker {
                 {
                     Ok(claimed) => {
                         for job in claimed {
-                            self.start(job, token, &interrupt, &mut tasks, &mut in_flight);
+                            self.start(
+                                job,
+                                token,
+                                claimed_at,
+                                &interrupt,
+                                &mut tasks,
+                                &mut in_flight,
+                            );
                         }
                     }
                     Err(failure) => {
@@ -134,6 +150,7 @@ impl QueueWorker {
                     self.finished(joined, &mut in_flight).await;
                 }
                 _ = heartbeat.tick() => self.renew(&mut in_flight).await,
+                () = sleep_until_opt(self.next_check(&in_flight)) => self.expire(&mut in_flight),
                 () = tokio::time::sleep(jitter(self.settings.poll_interval)), if below_capacity => {}
             }
         }
@@ -170,6 +187,7 @@ impl QueueWorker {
         &self,
         job: ClaimedJob,
         token: LeaseToken,
+        claimed_at: Instant,
         interrupt: &Cancellation,
         tasks: &mut JoinSet<()>,
         in_flight: &mut HashMap<task::Id, InFlight>,
@@ -215,6 +233,9 @@ impl QueueWorker {
                 cancel,
                 lease_lost: false,
                 completed,
+                last_renewed: claimed_at,
+                cancelled_at: None,
+                abort,
             },
         );
     }
@@ -287,27 +308,35 @@ impl QueueWorker {
             .map(|job| (job.id, job.token))
             .collect();
         if leases.is_empty() {
+            self.expire(in_flight);
             return;
         }
         // Bounded so an unreachable database never stalls the loop; the
         // renewal itself skips rows locked by other transactions.
         let renewal = tokio::time::timeout(
-            self.settings.heartbeat_interval(),
+            self.settings.heartbeat_interval() / 2,
             self.store.heartbeat(&leases, self.settings.lease),
         )
         .await;
         match renewal {
             Ok(Ok(statuses)) => {
+                let now = Instant::now();
                 for job in in_flight.values_mut().filter(|job| !job.lease_lost) {
                     let status = statuses
                         .iter()
                         .find(|(id, _)| *id == job.id)
                         .map(|(_, status)| *status);
+                    // Busy rows are locked by the attempt's own completing
+                    // transaction, which keeps other workers from reclaiming them.
+                    if matches!(status, Some(LeaseStatus::Renewed | LeaseStatus::Busy)) {
+                        job.last_renewed = now;
+                    }
                     // Completed by its own transaction: the lease ended
                     // normally.
                     if status == Some(LeaseStatus::Lost) && !job.completed.load(Ordering::Acquire) {
                         job.lease_lost = true;
                         job.cancel.cancel();
+                        job.cancelled_at = Some(now);
                         warn!(
                             queue = self.queue,
                             job = job.name,
@@ -322,6 +351,61 @@ impl QueueWorker {
             }
             Err(_) => warn!(queue = self.queue, "lease renewal timed out"),
         }
+        self.expire(in_flight);
+    }
+
+    /// Cancels attempts whose lease may have expired because renewal has not
+    /// succeeded in time (database unreachable or slow), whether or not the
+    /// last renewal call returned; then aborts cancelled attempts that are
+    /// still running after the cancel grace, so they stop occupying a
+    /// concurrency slot until their timeout.
+    fn expire(&self, in_flight: &mut HashMap<task::Id, InFlight>) {
+        let now = Instant::now();
+        let deadline = self.settings.renewal_deadline();
+        for job in in_flight.values_mut() {
+            if !job.lease_lost
+                && !job.completed.load(Ordering::Acquire)
+                && now.duration_since(job.last_renewed) >= deadline
+            {
+                job.lease_lost = true;
+                job.cancel.cancel();
+                job.cancelled_at = Some(now);
+                warn!(
+                    queue = self.queue,
+                    job = job.name,
+                    job_id = %job.id,
+                    "lease could not be renewed in time; cancelling the attempt"
+                );
+            }
+            if let Some(cancelled_at) = job.cancelled_at
+                && !job.abort.is_finished()
+                && now.duration_since(cancelled_at) >= self.settings.cancel_grace
+            {
+                job.abort.abort();
+                job.cancelled_at = None;
+                warn!(
+                    queue = self.queue,
+                    job = job.name,
+                    job_id = %job.id,
+                    "attempt ignored cancellation after losing its lease; aborted"
+                );
+            }
+        }
+    }
+
+    /// The next renewal deadline or cancel-grace expiry among the attempts.
+    fn next_check(&self, in_flight: &HashMap<task::Id, InFlight>) -> Option<Instant> {
+        let deadline = self.settings.renewal_deadline();
+        in_flight
+            .values()
+            .filter_map(|job| match job.cancelled_at {
+                Some(cancelled_at) => Some(cancelled_at + self.settings.cancel_grace),
+                None if !job.lease_lost && !job.completed.load(Ordering::Acquire) => {
+                    Some(job.last_renewed + deadline)
+                }
+                None => None,
+            })
+            .min()
     }
 
     async fn drain_until(
@@ -508,5 +592,13 @@ impl fmt::Display for Chain<'_> {
             source = error.source();
         }
         Ok(())
+    }
+}
+
+/// Sleeps until `instant`, or forever when there is none.
+async fn sleep_until_opt(instant: Option<Instant>) {
+    match instant {
+        Some(instant) => tokio::time::sleep_until(tokio::time::Instant::from_std(instant)).await,
+        None => std::future::pending().await,
     }
 }
