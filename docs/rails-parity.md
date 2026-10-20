@@ -13,15 +13,15 @@ the work is finished and waiting for its review; **Planned** means not started.
 | Database selection | `rails new -d` | Done (PostgreSQL, MySQL, MariaDB, SQLite) | Done (PostgreSQL, MySQL, MariaDB, SQLite) |
 | Server-rendered HTML, layouts, partials, forms, flash, CSRF | Action View | Done | Done |
 | HTML + JSON CRUD generator | `rails g scaffold` | Done | Done |
-| Authentication pages, password reset | `rails g authentication` | Done | In review |
-| First tenant and owner, seeds | `db:seed` | Done (`forge setup`, `forge seed`) | In review (`setup`, `seed`) |
+| Authentication pages, password reset | `rails g authentication` | Done | Done |
+| First tenant and owner, seeds | `db:seed` | Done (`forge setup`, `forge seed`) | Done (`setup`, `seed`) |
 | Multi-tenancy with database enforcement | (gems) | Done (PostgreSQL RLS) | Done (PostgreSQL RLS) |
 | TOTP MFA | (gems) | Done | Planned |
-| Persistent jobs, cron, outbox | Solid Queue | Done | In review |
+| Persistent jobs, cron, outbox | Solid Queue | Done | Done |
 | Mailer with previews | Action Mailer | Done | Planned |
-| Rate limiting | `rate_limit` | Done | In review |
-| Cache | Solid Cache | Done | In review |
-| File storage with signed URLs | Active Storage | Done (disk) | In review (disk) |
+| Rate limiting | `rate_limit` | Done | Done |
+| Cache | Solid Cache | Done | Done |
+| File storage with signed URLs | Active Storage | Done (disk) | Done (disk) |
 | Import maps, Turbo, Stimulus | Hotwire | In review | Done |
 | Turbo Streams over SSE | Action Cable | In review | Planned |
 | Traces, metrics, log correlation | (gems) | Done (OpenTelemetry, Prometheus) | Planned |

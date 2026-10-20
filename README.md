@@ -223,6 +223,13 @@ Enable the `jobs` (and optionally `events`) feature of `forge`, declare them on
 the `App`, and register handlers in a composition hook. Generated applications
 do not include this wiring yet. Full guide: [docs/jobs.md](docs/jobs.md).
 
+```toml
+# Cargo.toml of the application (jobs and the outbox need PostgreSQL)
+forge = { version = "0.1", features = ["jobs", "events"] }
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+```
+
 ```rust
 use forge::{App, ComposeError, WorkerMode};
 use forge::jobs::{Job, JobContext, JobError, JobHandler, Schedule};
@@ -306,7 +313,8 @@ Kubernetes and systemd deployment is covered in
   `/health`, `/health/live` and `/health/ready` routes.
 - Binary subcommands: `serve` (default), `healthcheck`, `migrate`,
   `rollback`, `seed` (database applications), `setup` (full-stack
-  PostgreSQL), `version`, `help`.
+  PostgreSQL), `jobs` (applications that declare `App::jobs`), `version`,
+  `help`.
 - Sign-in, sign-out and password-reset pages on full-stack PostgreSQL
   applications, like `rails generate authentication`: tenant slug + email +
   password, uniform failures, per-account and per-source throttling, session
@@ -393,6 +401,21 @@ router.layer(StorageHandler::new(store.clone(), signer.clone(), HandlerOptions::
 let options = UploadOptions::new("avatar", &["image/png", "image/jpeg"], config.storage.max_upload_bytes)?;
 let received = receive(&request, store.as_ref(), &options).await?;
 let url = signer.url("/files", &received.files[0].key, &SignOptions::default().inline(true))?;
+```
+
+Configure them through the environment (defaults shown; every key is
+optional except the signing key in `production` when a storage root is set):
+
+```sh
+export FORGE_RATE_LIMIT_MAX_KEYS=100000          # live buckets of the in-memory limiter
+export FORGE_CACHE_MAX_ENTRIES=10000             # entry bound of every cache
+export FORGE_CACHE_MAX_BYTES=67108864            # memory bound of the in-memory cache
+export FORGE_CACHE_MAX_VALUE_BYTES=1048576       # largest cached value (at most 8388608)
+export FORGE_CACHE_DEFAULT_TTL_SECS=3600         # ttl of writes that pass none
+export FORGE_STORAGE_ROOT=/var/lib/shop/storage  # absolute in production
+export FORGE_STORAGE_SIGNING_KEY=$(openssl rand -base64 32 | tr '+/' '-_' | tr -d '=')
+export FORGE_STORAGE_MAX_UPLOAD_BYTES=524288     # must not exceed FORGE_MAX_BODY_BYTES
+export FORGE_STORAGE_LINK_TTL_SECS=900           # default signed link lifetime
 ```
 
 Shared stores need their tables: merge the crate migration into your own with
