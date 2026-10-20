@@ -1,6 +1,10 @@
 //! The job contract: typed jobs, handlers, execution context and errors.
 
-use std::{fmt, sync::atomic::AtomicBool, time::Duration};
+use std::{
+    fmt,
+    sync::{Arc, atomic::AtomicBool},
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use forge_core::{Cancellation, Id, Timestamp};
@@ -146,9 +150,10 @@ pub struct JobContext {
     tenant: Option<JobTenant>,
     pub(crate) lease: LeaseToken,
     cancellation: Cancellation,
-    /// Set by `postgres::complete_in`; only used to classify a later
-    /// fenced-out acknowledgement in logs.
-    pub(crate) completed_in_transaction: AtomicBool,
+    /// Set by `postgres::complete_in`. Shared with the worker so a lease
+    /// that disappears because the attempt completed itself is not taken
+    /// for a lost lease.
+    pub(crate) completed_in_transaction: Arc<AtomicBool>,
 }
 
 impl JobContext {
@@ -172,7 +177,7 @@ impl JobContext {
             tenant,
             lease,
             cancellation,
-            completed_in_transaction: AtomicBool::new(false),
+            completed_in_transaction: Arc::new(AtomicBool::new(false)),
         }
     }
 

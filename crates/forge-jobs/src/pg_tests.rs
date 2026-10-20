@@ -28,8 +28,8 @@ use crate::{
     JobsError, Schedule, WorkerSettings,
     job::LeaseToken,
     postgres::{
-        self, JobState, NewJob, PgJobStore, Pruning, TickOutcome, begin_job_transaction,
-        complete_in, enqueue, enqueue_for_tenant, migrator,
+        self, JobState, LeaseStatus, NewJob, PgJobStore, Pruning, TickOutcome,
+        begin_job_transaction, complete_in, enqueue, enqueue_for_tenant, migrator,
     },
     testing::RlsTestDatabase,
 };
@@ -440,19 +440,19 @@ async fn expired_leases_are_reclaimed_and_stale_workers_are_fenced_out() {
         None
     );
     assert!(!store.release(id, stale).await.expect("release"));
-    assert!(
+    assert_eq!(
         store
             .heartbeat(&[(id, stale)], lease)
             .await
-            .expect("heartbeat")
-            .is_empty()
+            .expect("heartbeat"),
+        vec![(id, LeaseStatus::Lost)]
     );
     assert_eq!(
         store
             .heartbeat(&[(id, fresh_token)], lease)
             .await
             .expect("heartbeat"),
-        vec![id]
+        vec![(id, LeaseStatus::Renewed)]
     );
     assert!(store.complete(id, fresh_token).await.expect("complete"));
     assert_eq!(job_row(&db, id).await.state, "completed");
@@ -1283,5 +1283,121 @@ async fn worker_functions_refuse_tenant_scope_and_can_be_split_from_the_runtime_
     })
     .await;
     stop(shutdown, handle).await;
+    db.cleanup().await.expect("cleanup");
+}
+
+#[derive(Serialize, Deserialize)]
+struct Holder {
+    hold: bool,
+}
+
+impl Job for Holder {
+    const NAME: &'static str = "test.holder";
+}
+
+#[derive(Default)]
+struct HolderProbe {
+    locked: AtomicUsize,
+    committed: AtomicUsize,
+    quick_done: AtomicUsize,
+    cancelled_after_commit: AtomicUsize,
+    lease: Mutex<Option<(JobId, LeaseToken)>>,
+}
+
+/// `hold: true` completes in its own transaction and keeps it open across
+/// several heartbeats; `hold: false` finishes immediately.
+struct HoldsCompletion {
+    database: PgDatabase,
+    probe: Arc<HolderProbe>,
+}
+
+#[async_trait]
+impl JobHandler for HoldsCompletion {
+    type Job = Holder;
+
+    async fn perform(&self, context: &JobContext, job: Holder) -> Result<(), JobError> {
+        if !job.hold {
+            self.probe.quick_done.fetch_add(1, Ordering::SeqCst);
+            return Ok(());
+        }
+        let mut transaction = begin_job_transaction(&self.database, context).await?;
+        complete_in(&mut transaction, context).await?;
+        *self.probe.lease.lock().expect("lock") = Some((context.id(), context.lease));
+        self.probe.locked.fetch_add(1, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        transaction.commit().await?;
+        self.probe.committed.fetch_add(1, Ordering::SeqCst);
+        // Heartbeats after the commit see the lease gone; that is not a loss.
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        if context.cancellation().is_cancelled() {
+            self.probe
+                .cancelled_after_commit
+                .fetch_add(1, Ordering::SeqCst);
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs FORGE_TEST_DATABASE_URL"]
+async fn renewal_skips_rows_locked_by_transactional_completion() {
+    let db = fresh().await;
+    let store = PgJobStore::new(db.runtime().clone());
+    let probe = Arc::new(HolderProbe::default());
+    store
+        .enqueue(&Holder { hold: true }, EnqueueOptions::new())
+        .await
+        .expect("enqueue");
+    let mut jobs = Jobs::new();
+    jobs.register(HoldsCompletion {
+        database: db.runtime().clone(),
+        probe: Arc::clone(&probe),
+    })
+    .expect("register");
+    jobs.concurrency("default", 2).expect("concurrency");
+    jobs.settings(fast()); // 3 s lease: renewal every second
+    let (shutdown, handle) = spawn_runtime(jobs, store.database());
+    wait_until("the completion transaction to hold its row", || async {
+        probe.locked.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    // Renewing the locked row answers at once, as busy rather than lost.
+    let held = probe.lease.lock().expect("lock").expect("lease");
+    let renewal = tokio::time::timeout(
+        Duration::from_millis(500),
+        store.heartbeat(&[held], Duration::from_secs(3)),
+    )
+    .await
+    .expect("renewal does not wait for the row lock")
+    .expect("heartbeat");
+    assert_eq!(renewal, vec![(held.0, LeaseStatus::Busy)]);
+    // Let a renewal hit the locked row, then enqueue more work: the worker
+    // loop must not be stuck behind that row lock.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    store
+        .enqueue(&Holder { hold: false }, EnqueueOptions::new())
+        .await
+        .expect("enqueue");
+    wait_until("the second job", || async {
+        probe.quick_done.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    assert_eq!(
+        probe.committed.load(Ordering::SeqCst),
+        0,
+        "the second job ran while the first transaction still held its row"
+    );
+    wait_until("the holder to finish", || async {
+        count_state(&db, "completed").await == 2
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    stop(shutdown, handle).await;
+    assert_eq!(probe.committed.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        probe.cancelled_after_commit.load(Ordering::SeqCst),
+        0,
+        "a lease ended by complete_in is not reported as lost"
+    );
     db.cleanup().await.expect("cleanup");
 }

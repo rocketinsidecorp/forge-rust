@@ -341,6 +341,18 @@ impl ClaimedJob {
     }
 }
 
+/// Result of renewing one lease.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LeaseStatus {
+    /// Extended.
+    Renewed,
+    /// The row is locked by another transaction (usually the attempt's own
+    /// `complete_in`); not extended, not lost.
+    Busy,
+    /// The token no longer matches: reclaimed, or finished.
+    Lost,
+}
+
 /// State after a failed attempt was recorded.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AfterFailure {
@@ -633,16 +645,26 @@ impl PgJobStore {
         &self,
         leases: &[(JobId, LeaseToken)],
         lease: Duration,
-    ) -> Result<Vec<JobId>, JobsError> {
+    ) -> Result<Vec<(JobId, LeaseStatus)>, JobsError> {
         let ids: Vec<Uuid> = leases.iter().map(|(id, _)| id.into_uuid()).collect();
         let tokens: Vec<Uuid> = leases.iter().map(|(_, token)| token.0).collect();
-        let held: Vec<Uuid> = sqlx::query_scalar("SELECT forge_jobs_heartbeat($1, $2, $3)")
+        let rows = sqlx::query("SELECT job_id, status FROM forge_jobs_heartbeat($1, $2, $3)")
             .bind(ids)
             .bind(tokens)
             .bind(millis(lease))
             .fetch_all(self.database.pool())
             .await?;
-        held.into_iter().map(job_id).collect()
+        rows.iter()
+            .map(|row| {
+                let status = match row.try_get::<&str, _>("status")? {
+                    "renewed" => LeaseStatus::Renewed,
+                    "busy" => LeaseStatus::Busy,
+                    "lost" => LeaseStatus::Lost,
+                    _ => return Err(JobsError::Corrupt),
+                };
+                Ok((job_id(row.try_get("job_id")?)?, status))
+            })
+            .collect()
     }
 
     pub(crate) async fn complete(&self, id: JobId, token: LeaseToken) -> Result<bool, JobsError> {

@@ -212,22 +212,45 @@ BEGIN
 END;
 $$;
 
--- Extends the leases still held with the presented tokens; returns their ids.
--- A missing id means the lease was lost and the worker must stop the job.
+-- Extends the leases still held with the presented tokens. Each presented id
+-- comes back with 'renewed'; 'busy' when its row is locked by another
+-- transaction (typically the handler's own transaction completing it with
+-- forge_jobs_complete), so renewal never waits; or 'lost' when the lease no
+-- longer matches and the worker must stop the attempt.
 CREATE FUNCTION forge_jobs_heartbeat(p_ids uuid[], p_tokens uuid[], p_lease_ms bigint)
-RETURNS SETOF uuid
+RETURNS TABLE (job_id uuid, status text)
 LANGUAGE sql
 SECURITY DEFINER
 AS $$
     SELECT forge_jobs_require_worker_scope();
-    UPDATE forge_jobs AS j
-    SET locked_until = now() + least(greatest(p_lease_ms, 1000), 86400000) * interval '1 millisecond',
-        updated_at = now()
-    FROM unnest(p_ids, p_tokens) AS held(id, token)
-    WHERE j.id = held.id
-      AND j.lease_token = held.token
-      AND j.state = 'running'
-    RETURNING j.id;
+    WITH held AS (
+        SELECT h.id, h.token FROM unnest(p_ids, p_tokens) AS h(id, token)
+    ),
+    lockable AS MATERIALIZED (
+        SELECT j.id
+        FROM forge_jobs AS j
+        JOIN held ON j.id = held.id AND j.lease_token = held.token
+        WHERE j.state = 'running'
+        FOR UPDATE OF j SKIP LOCKED
+    ),
+    renewed AS (
+        UPDATE forge_jobs AS j
+        SET locked_until = now() + least(greatest(p_lease_ms, 1000), 86400000) * interval '1 millisecond',
+            updated_at = now()
+        FROM lockable
+        WHERE j.id = lockable.id
+        RETURNING j.id
+    )
+    SELECT held.id,
+           CASE
+               WHEN held.id IN (SELECT renewed.id FROM renewed) THEN 'renewed'
+               WHEN EXISTS (
+                   SELECT 1 FROM forge_jobs AS j
+                   WHERE j.id = held.id AND j.lease_token = held.token AND j.state = 'running'
+               ) THEN 'busy'
+               ELSE 'lost'
+           END
+    FROM held;
 $$;
 
 -- Marks a job completed. False when the lease token no longer matches.

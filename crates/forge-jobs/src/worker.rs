@@ -4,7 +4,10 @@
 use std::{
     collections::HashMap,
     fmt,
-    sync::{Arc, atomic::Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -20,7 +23,7 @@ use crate::{
     Backoff, JobContext, JobError, JobHandler, JobId, WorkerSettings,
     backoff::jitter,
     job::{Disposition, LeaseToken},
-    postgres::{AfterFailure, ClaimedJob, PgJobStore},
+    postgres::{AfterFailure, ClaimedJob, LeaseStatus, PgJobStore},
 };
 
 /// A handler with its job type erased: decodes the payload, then performs.
@@ -70,6 +73,8 @@ struct InFlight {
     backoff: Backoff,
     cancel: Cancellation,
     lease_lost: bool,
+    /// Set when the attempt completed itself with `complete_in`.
+    completed: Arc<AtomicBool>,
 }
 
 pub(crate) struct QueueWorker {
@@ -189,6 +194,7 @@ impl QueueWorker {
             token,
             cancel.clone(),
         );
+        let completed = Arc::clone(&context.completed_in_transaction);
         let execution = Execution {
             store: self.store.clone(),
             handler: Arc::clone(&handler),
@@ -208,6 +214,7 @@ impl QueueWorker {
                 backoff: handler.backoff(),
                 cancel,
                 lease_lost: false,
+                completed,
             },
         );
     }
@@ -282,10 +289,23 @@ impl QueueWorker {
         if leases.is_empty() {
             return;
         }
-        match self.store.heartbeat(&leases, self.settings.lease).await {
-            Ok(held) => {
+        // Bounded so an unreachable database never stalls the loop; the
+        // renewal itself skips rows locked by other transactions.
+        let renewal = tokio::time::timeout(
+            self.settings.heartbeat_interval(),
+            self.store.heartbeat(&leases, self.settings.lease),
+        )
+        .await;
+        match renewal {
+            Ok(Ok(statuses)) => {
                 for job in in_flight.values_mut().filter(|job| !job.lease_lost) {
-                    if !held.contains(&job.id) {
+                    let status = statuses
+                        .iter()
+                        .find(|(id, _)| *id == job.id)
+                        .map(|(_, status)| *status);
+                    // Completed by its own transaction: the lease ended
+                    // normally.
+                    if status == Some(LeaseStatus::Lost) && !job.completed.load(Ordering::Acquire) {
                         job.lease_lost = true;
                         job.cancel.cancel();
                         warn!(
@@ -297,7 +317,10 @@ impl QueueWorker {
                     }
                 }
             }
-            Err(error) => warn!(queue = self.queue, error = %Chain(&error), "lease renewal failed"),
+            Ok(Err(error)) => {
+                warn!(queue = self.queue, error = %Chain(&error), "lease renewal failed");
+            }
+            Err(_) => warn!(queue = self.queue, "lease renewal timed out"),
         }
     }
 
