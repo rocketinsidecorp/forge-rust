@@ -640,11 +640,7 @@ async fn update_password(pages: Arc<Pages>, request: Request) -> Response {
         ));
     };
     let ports = &pages.ports;
-    let key = ThrottleKey::new(
-        "password_update",
-        token.expose(),
-        Some(request.client_ip()),
-    );
+    let key = ThrottleKey::new("password_update", token.expose(), Some(request.client_ip()));
     match ports.reset_throttle.attempt(&key).await {
         Ok(ThrottleDecision::Allowed) => {}
         Ok(ThrottleDecision::Throttled { retry_after }) => {

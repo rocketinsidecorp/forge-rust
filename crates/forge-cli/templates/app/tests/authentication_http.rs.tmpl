@@ -710,9 +710,9 @@ async fn attempts_are_throttled_even_with_the_right_password() -> TestResult {
 async fn clients_behind_one_trusted_proxy_have_their_own_sign_in_counters() -> TestResult {
     let mut fixture = fixture()?;
     // What the server does for FORGE_HTTP_TRUSTED_PROXIES=172.18.0.0/16.
-    fixture
-        .router
-        .layer(TrustedProxies::new(["172.18.0.0/16".parse::<TrustedProxy>()?]));
+    fixture.router.layer(TrustedProxies::new([
+        "172.18.0.0/16".parse::<TrustedProxy>()?
+    ]));
     let proxy = "172.18.0.2:5000";
 
     let mut guesser = Browser::via(proxy, "203.0.113.9");
