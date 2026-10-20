@@ -97,6 +97,12 @@ impl JobInstrumentation {
             }
         }
         span.end();
+        self.record(queue, kind, outcome, elapsed);
+    }
+
+    /// Records the duration of an attempt whose span already ended (a
+    /// panicking or aborted attempt).
+    pub fn record(&self, queue: &str, kind: &str, outcome: &str, elapsed: Duration) {
         self.duration
             .record(elapsed.as_secs_f64(), &[queue, kind, outcome]);
     }

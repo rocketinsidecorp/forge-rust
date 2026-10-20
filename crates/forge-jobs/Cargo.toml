@@ -14,6 +14,7 @@ forge-config = { path = "../forge-config" }
 forge-core = { path = "../forge-core", features = ["postgres"] }
 forge-db = { path = "../forge-db", features = ["postgres"] }
 forge-security = { path = "../forge-security" }
+forge-telemetry = { path = "../forge-telemetry" }
 forge-tenancy = { path = "../forge-tenancy" }
 getrandom.workspace = true
 serde.workspace = true
@@ -34,6 +35,8 @@ forge-auth = { path = "../forge-auth" }
 # Integration tests (tests/) use the `testing` fixture.
 forge-jobs = { path = ".", features = ["testing"] }
 forge-db = { path = "../forge-db", features = ["postgres", "testing"] }
+forge-telemetry = { path = "../forge-telemetry", features = ["testing"] }
+http.workspace = true
 
 [lints]
 workspace = true
