@@ -715,6 +715,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "forge-i18n"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "forge-jobs"
 version = "0.1.0"
 dependencies = [
