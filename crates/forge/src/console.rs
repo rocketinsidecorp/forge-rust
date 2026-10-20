@@ -1,25 +1,36 @@
 //! Reading a secret from the controlling terminal without echoing it.
 //!
-//! On Unix the terminal's `ECHO` mode is switched off with `tcsetattr`
-//! (through `rustix`, no `unsafe` here) while one line is read, and the
-//! original mode is restored afterwards, including when reading fails. The
-//! prompt goes to standard error so standard output stays machine-readable.
-//! Other platforms refuse the prompt; commands then accept the secret from
-//! piped standard input or an environment variable.
+//! On Unix the terminal is switched (through `rustix`, no `unsafe` here) to
+//! a mode without echo, line editing or signal keys while one line is read
+//! byte by byte, and the original mode is restored by a guard on every path.
+//! Because the terminal does not turn Ctrl-C into `SIGINT` in that mode, the
+//! process is never killed with echo turned off: Ctrl-C is read as a byte
+//! and ends the prompt with [`io::ErrorKind::Interrupted`] after the mode is
+//! restored. Ctrl-D ends it as end of input. The prompt goes to standard
+//! error so standard output stays machine-readable. Other platforms refuse
+//! the prompt; commands then accept the secret from piped standard input or
+//! an environment variable.
 
-use std::io::{self, BufRead, Write};
+use std::io::{self, Read, Write};
 
-/// Prints `prompt` on standard error and reads one line from standard input
-/// with echo turned off. The line ending is removed.
+const CTRL_C: u8 = 0x03;
+const CTRL_D: u8 = 0x04;
+const BACKSPACE: u8 = 0x08;
+const DELETE: u8 = 0x7f;
+
+/// Prints `prompt` on standard error and reads one line from the terminal
+/// with echo turned off.
 #[cfg(unix)]
 pub(crate) fn prompt_hidden(prompt: &str) -> io::Result<String> {
     use std::os::fd::AsFd;
 
-    use rustix::termios::{LocalModes, OptionalActions, tcgetattr, tcsetattr};
+    use rustix::termios::{
+        LocalModes, OptionalActions, SpecialCodeIndex, Termios, tcgetattr, tcsetattr,
+    };
 
     /// Restores the saved terminal mode when dropped.
     struct Restore {
-        original: rustix::termios::Termios,
+        original: Termios,
     }
 
     impl Drop for Restore {
@@ -33,22 +44,23 @@ pub(crate) fn prompt_hidden(prompt: &str) -> io::Result<String> {
     let stdin = io::stdin();
     let original = tcgetattr(stdin.as_fd())?;
     let mut hidden = original.clone();
-    hidden.local_modes.remove(LocalModes::ECHO);
-    // Keep echoing the newline so the next prompt starts on its own line.
-    hidden.local_modes.insert(LocalModes::ECHONL);
+    hidden
+        .local_modes
+        .remove(LocalModes::ECHO | LocalModes::ICANON | LocalModes::ISIG);
+    hidden.special_codes[SpecialCodeIndex::VMIN] = 1;
+    hidden.special_codes[SpecialCodeIndex::VTIME] = 0;
     let restore = Restore { original };
     tcsetattr(stdin.as_fd(), OptionalActions::Flush, &hidden)?;
 
     let mut stderr = io::stderr().lock();
     stderr.write_all(prompt.as_bytes())?;
     stderr.flush()?;
-    drop(stderr);
-
-    let mut line = String::new();
-    let read = stdin.lock().read_line(&mut line);
+    let line = read_hidden_line(&mut stdin.lock());
     drop(restore);
-    read?;
-    Ok(strip_line_ending(line))
+    // The terminal did not echo the line ending.
+    stderr.write_all(b"\n")?;
+    stderr.flush()?;
+    line
 }
 
 /// Without a Unix terminal API the prompt is refused.
@@ -60,24 +72,70 @@ pub(crate) fn prompt_hidden(_prompt: &str) -> io::Result<String> {
     ))
 }
 
-fn strip_line_ending(mut line: String) -> String {
-    if line.ends_with('\n') {
-        line.pop();
-        if line.ends_with('\r') {
-            line.pop();
+/// Reads one line typed in non-canonical mode: Enter ends it, Backspace
+/// removes the last character, Ctrl-C interrupts, Ctrl-D or end of input
+/// fails.
+fn read_hidden_line(input: &mut impl Read) -> io::Result<String> {
+    let mut line: Vec<u8> = Vec::new();
+    let mut byte = [0_u8; 1];
+    loop {
+        if input.read(&mut byte)? == 0 {
+            return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
+        }
+        match byte[0] {
+            b'\n' | b'\r' => break,
+            CTRL_C => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "interrupted at the password prompt",
+                ));
+            }
+            CTRL_D => return Err(io::Error::from(io::ErrorKind::UnexpectedEof)),
+            BACKSPACE | DELETE => {
+                // Remove one whole UTF-8 character.
+                while let Some(last) = line.pop() {
+                    if last & 0b1100_0000 != 0b1000_0000 {
+                        break;
+                    }
+                }
+            }
+            other => line.push(other),
         }
     }
-    line
+    String::from_utf8(line).map_err(|_| io::Error::from(io::ErrorKind::InvalidData))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn read(bytes: &[u8]) -> io::Result<String> {
+        read_hidden_line(&mut io::Cursor::new(bytes.to_vec()))
+    }
+
     #[test]
-    fn line_endings_are_removed_and_nothing_else() {
-        assert_eq!(strip_line_ending("secret\n".to_owned()), "secret");
-        assert_eq!(strip_line_ending("secret\r\n".to_owned()), "secret");
-        assert_eq!(strip_line_ending(" secret ".to_owned()), " secret ");
+    fn a_line_ends_at_enter_and_backspace_edits_it() {
+        assert_eq!(read(b"secret\r").ok().as_deref(), Some("secret"));
+        assert_eq!(
+            read(b"secrex\x7ft\nignored").ok().as_deref(),
+            Some("secret")
+        );
+        assert_eq!(
+            read("pass\u{e7}\x08c\n".as_bytes()).ok().as_deref(),
+            Some("passc")
+        );
+        assert_eq!(read(b"\x7f\x7fok\n").ok().as_deref(), Some("ok"));
+    }
+
+    #[test]
+    fn ctrl_c_interrupts_and_end_of_input_fails() {
+        let interrupted = read(b"half\x03rest\n").expect_err("Ctrl-C");
+        assert_eq!(interrupted.kind(), io::ErrorKind::Interrupted);
+        for ended in [&b"half"[..], &b"half\x04"[..]] {
+            assert_eq!(
+                read(ended).expect_err("no Enter").kind(),
+                io::ErrorKind::UnexpectedEof
+            );
+        }
     }
 }

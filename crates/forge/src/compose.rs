@@ -1,12 +1,13 @@
 //! Composition root hook: wiring adapters and routes with infrastructure.
 
-use std::{error::Error, fmt};
+use std::{error::Error, fmt, future::Future};
 
 use forge_config::AppConfig;
 use forge_http::{RouteError, Router};
 use thiserror::Error;
 
 use crate::database::DatabaseHandle;
+use crate::worker::{self, Shutdown, WorkQueue, Worker};
 
 /// A registered composition step, run once at startup.
 pub(crate) type ComposeHook =
@@ -28,6 +29,7 @@ pub struct Composition<'a> {
     router: &'a mut Router,
     config: &'a AppConfig,
     database: Option<DatabaseHandle>,
+    workers: Vec<Worker>,
 }
 
 impl<'a> Composition<'a> {
@@ -40,7 +42,53 @@ impl<'a> Composition<'a> {
             router,
             config,
             database,
+            workers: Vec::new(),
         }
+    }
+
+    /// The workers registered so far, for the process lifecycle.
+    pub(crate) fn into_workers(self) -> Vec<Worker> {
+        self.workers
+    }
+
+    /// Registers a background worker owned by the process lifecycle.
+    ///
+    /// `run` starts when the server starts. Its [`Shutdown`] completes once
+    /// the server has drained its connections; the worker should then
+    /// return. Forge waits up to 5 seconds for it and aborts it after that.
+    pub fn worker<F, Fut>(&mut self, name: &'static str, run: F)
+    where
+        F: FnOnce(Shutdown) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        self.workers.push(Worker {
+            name,
+            run: Box::new(move |shutdown| Box::pin(run(shutdown))),
+        });
+    }
+
+    /// Registers a bounded queue and the worker that handles its items one
+    /// at a time, and returns the queue's sending side.
+    ///
+    /// [`WorkQueue::submit`] never waits: when `capacity` items are queued it
+    /// refuses the item. At shutdown the worker finishes the item in hand;
+    /// items still queued are dropped and counted in the log. Use it for work
+    /// a request must not wait for (or must not be timed by), such as
+    /// delivering a password-reset link; it is not a durable job queue.
+    pub fn work_queue<T, F, Fut>(
+        &mut self,
+        name: &'static str,
+        capacity: usize,
+        handle: F,
+    ) -> WorkQueue<T>
+    where
+        T: Send + 'static,
+        F: Fn(T) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let (queue, worker) = worker::queue(name, capacity, handle);
+        self.workers.push(worker);
+        queue
     }
 
     /// Returns the route table for registering application routes.
@@ -135,6 +183,13 @@ impl<'a> Composition<'a> {
         Self::new(router, config, None)
     }
 
+    /// Starts the registered workers on the current Tokio runtime, as
+    /// `serve` does; stop them with [`RunningWorkers::stop`](crate::RunningWorkers::stop).
+    #[must_use]
+    pub fn start_workers(self) -> crate::RunningWorkers {
+        crate::RunningWorkers::start(self.workers)
+    }
+
     /// Makes `database` available through [`Composition::postgres`].
     #[cfg(feature = "postgres")]
     #[must_use]
@@ -166,6 +221,7 @@ impl fmt::Debug for Composition<'_> {
             .debug_struct("Composition")
             .field("router", &self.router)
             .field("database", &self.database)
+            .field("workers", &self.workers.len())
             .finish_non_exhaustive()
     }
 }

@@ -24,6 +24,7 @@ use crate::{
     compose::{ComposeError, ComposeHook, Composition},
     database::{DatabaseHandle, Declaration, MigrationCommand, UrlPurpose, register_health},
     logging, probe, signal,
+    worker::{RunningWorkers, Worker},
 };
 
 /// `sysexits.h` `EX_USAGE`-style code for an invalid command line.
@@ -378,12 +379,14 @@ impl App {
                 declaration.zip(url),
             )
         };
-        let (router, database) = match composed {
+        let (router, database, workers) = match composed {
             Ok(composed) => composed,
             Err(code) => return code,
         };
 
-        let result = runtime.block_on(serve_until_signal(name, version, config, router, database));
+        let result = runtime.block_on(serve_until_signal(
+            name, version, config, router, database, workers,
+        ));
         runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
 
         match result {
@@ -568,7 +571,7 @@ fn compose(
     registrations: Vec<RouteRegistration>,
     hooks: Vec<ComposeHook>,
     declared: Option<(Declaration, &forge_config::SecretString)>,
-) -> Result<(Router, Option<DatabaseHandle>), ExitCode> {
+) -> Result<(Router, Option<DatabaseHandle>, Vec<Worker>), ExitCode> {
     let database = match declared {
         Some((declaration, url)) => match declaration.connect_lazy(url) {
             Ok(database) => Some(database),
@@ -586,6 +589,7 @@ fn compose(
             return Err(ExitCode::FAILURE);
         }
     };
+    let mut workers = Vec::new();
     if !hooks.is_empty() {
         let mut composition = Composition::new(&mut router, config, database.clone());
         for hook in hooks {
@@ -594,8 +598,9 @@ fn compose(
                 return Err(ExitCode::FAILURE);
             }
         }
+        workers = composition.into_workers();
     }
-    Ok((router, database))
+    Ok((router, database, workers))
 }
 
 #[derive(Clone, Copy)]
@@ -648,8 +653,12 @@ async fn serve_until_signal(
     config: AppConfig,
     router: Router,
     database: Option<DatabaseHandle>,
+    workers: Vec<Worker>,
 ) -> Result<(), ServeError> {
+    let workers = RunningWorkers::start(workers);
     let result = serve(name, version, config, router).await;
+    // Workers stop after the server drained, before the pool closes.
+    workers.stop().await;
     if let Some(database) = database {
         database.close().await;
     }
@@ -1197,7 +1206,7 @@ mod tests {
                     })?;
                 Ok(())
             });
-            let (router, database) = compose(
+            let (router, database, _workers) = compose(
                 "demo",
                 &config,
                 Vec::new(),

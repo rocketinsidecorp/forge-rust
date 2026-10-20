@@ -30,6 +30,7 @@ mod logging;
 mod probe;
 mod signal;
 pub mod web;
+mod worker;
 
 pub use forge_audit as audit;
 pub use forge_auth as auth;
@@ -49,3 +50,4 @@ pub use forge_views as views;
 pub use app::App;
 pub use command::{CommandContext, CommandError, CommandOptions};
 pub use compose::{ComposeError, Composition};
+pub use worker::{RunningWorkers, Shutdown, SubmitError, WorkQueue};

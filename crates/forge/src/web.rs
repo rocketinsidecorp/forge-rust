@@ -69,6 +69,16 @@ pub fn report(failure: &ForgeError) {
     }
 }
 
+/// Runs `work` and returns its output no sooner than `minimum` after the
+/// call, so a response's timing does not tell which branch it took (for
+/// example whether an account exists). It never shortens `work`.
+pub async fn at_least<F: std::future::Future>(minimum: std::time::Duration, work: F) -> F::Output {
+    let started = tokio::time::Instant::now();
+    let output = work.await;
+    tokio::time::sleep_until(started + minimum).await;
+    output
+}
+
 /// Decodes a JSON request body, mapping malformed input to a `Validation`
 /// error with code `invalid_json` (the decoder's detail is not exposed).
 pub fn decode_json<T: DeserializeOwned>(request: &Request) -> Result<T, ForgeError> {
@@ -223,6 +233,14 @@ mod tests {
     use bytes::Bytes;
     use forge_http::{HeaderMap, Method, Request, Response, StatusCode, Uri};
     use uuid::Uuid;
+
+    #[tokio::test]
+    async fn at_least_pads_fast_work_and_never_shortens_it() {
+        let minimum = std::time::Duration::from_millis(30);
+        let started = std::time::Instant::now();
+        assert_eq!(at_least(minimum, async { 7 }).await, 7);
+        assert!(started.elapsed() >= minimum);
+    }
 
     fn request(method: Method, path: &str) -> Request {
         Request::new_for_test(
