@@ -23,7 +23,7 @@ the work is finished and waiting for its review; **Planned** means not started.
 | Cache | Solid Cache | Done | Done |
 | File storage with signed URLs | Active Storage | Done (disk) | Done (disk) |
 | Import maps, Turbo, Stimulus | Hotwire | In review | Done |
-| Turbo Streams over SSE | Action Cable | In review | Planned |
+| Turbo Streams over SSE | Action Cable | In review | Done (`scaffold --broadcast`, ADR 0031) |
 | Traces, metrics, log correlation | (gems) | Done (OpenTelemetry, Prometheus) | Planned |
 | Preconfigured Prometheus, Grafana, Tempo, Loki | — | Planned | Planned |
 | Zero-downtime deploys, rollback, remote logs | Kamal | In review (`forge deploy`) | Planned |

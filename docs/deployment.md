@@ -138,6 +138,7 @@ from env files, Kubernetes manifests and unit files.
 | `FORGE_STORAGE_SIGNING_KEY` | none | HMAC key of signed links: unpadded base64url of 32 to 1024 random bytes. Redacted. **Required in `production` whenever `FORGE_STORAGE_ROOT` is set**; there is no default key. |
 | `FORGE_STORAGE_MAX_UPLOAD_BYTES` | `524288` | Largest uploaded file, at most `1073741824`; when storage is configured it must not exceed `FORGE_MAX_BODY_BYTES`. |
 | `FORGE_STORAGE_LINK_TTL_SECS` | `900` | Default lifetime of signed links, `1` to `604800`. |
+| `FORGE_STREAMS_KEY` | none | HMAC key of signed live-update stream names: base64 (standard or URL-safe, padded or not) of at least 32 random bytes, as `openssl rand -base64 32` prints; the same on every replica. Redacted. **Required in `production` by applications that serve live updates** (`scaffold --broadcast`); development and test use a random per-process key ([views](views.md#live-updates)). |
 
 Logs go to standard output, and the platform (Docker, Kubernetes, journald)
 collects them. The HTTP layer also enforces a header-read timeout and adds
@@ -380,3 +381,23 @@ reverse proxy or load balancer in front of the loopback bind. If you use an
 
 See also the [CLI reference](cli.md), [threat model](threat-model.md) and
 [test strategy](test-strategy.md).
+
+## Live updates behind a proxy
+
+Live updates (`forge generate scaffold --broadcast`, [ADR 0031](adr/0031-live-updates-over-server-sent-events.md))
+are long-lived `text/event-stream` responses on `/streams` and
+`/tenants/{tenant_id}/streams`. A reverse proxy must not buffer them (Forge
+sends `X-Accel-Buffering: no` for nginx) and its idle timeout must exceed the
+20 second heartbeat. Each open stream holds one connection slot
+(`FORGE_MAX_CONNECTIONS`); streams end after 30 minutes and when shutdown
+begins, and a client that stops reading is disconnected once a write makes no
+progress for `FORGE_REQUEST_TIMEOUT_SECS`. With several replicas on
+PostgreSQL, the generated wiring fans updates out with `LISTEN/NOTIFY`, which
+holds one database connection per replica and does not work through
+PgBouncer in transaction pooling mode. Set the same `FORGE_STREAMS_KEY` on
+every replica:
+
+```sh
+export FORGE_STREAMS_KEY=$(openssl rand -base64 32)
+```
+

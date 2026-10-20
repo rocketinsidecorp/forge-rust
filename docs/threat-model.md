@@ -312,6 +312,31 @@ Residual risks beyond the rows above: the disk adapter assumes a trusted volume
 escape the root); `MemoryLimiter` and `MemoryCache` state is per process;
 byte-range serving is not available.
 
+## Live updates review
+
+Review date: 2026-10-20 ([ADR 0031](adr/0031-live-updates-over-server-sent-events.md);
+guide: [views](views.md#live-updates)). Ported from the reviewed Forge-Go design
+(its ADR 0029); the token format, limits and negative tests are the same unless a
+difference is stated.
+
+| Threat | STRIDE | Control | Verification |
+| --- | --- | --- | --- |
+| Subscribing to a channel the server never rendered (guessing or editing a stream name) | S, I, E | Channel names are HMAC-SHA256 tokens (RustCrypto, 32-byte minimum key, domain-separated label) compared in constant time (`subtle`) against every key; expiring (24 h default, 7 days maximum); at most 512 bytes; strict unpadded base64url; exactly one `stream` parameter. Forged, tampered, foreign-key and expired tokens get the same `403 stream_invalid` | signer forgery table (tampered MAC and claims, other key, padding, trailing bytes, oversize), expiry tests, handler test that every refusal body is identical; tokens pinned byte for byte against Forge-Go |
+| Cross-tenant disclosure: a member of tenant B reads tenant A's channel | I, E | A tenant channel is a distinct key; the handler serves it only to a `StreamViewer::member` built from a `TenantContext` of the same tenant (which needs a session, an active membership and a grant); generated apps serve tenant channels at `/tenants/{tenant_id}/streams` through the resource's own `TenantAccess`, so a token for A under B's path is refused; `NOTIFY` payloads carry the tenant in the channel key | handler other-tenant/principal/anonymous tests, generated `broadcasts_stay_in_their_tenant`, broker isolation test, PostgreSQL fanout test with another tenant's subscriber |
+| A leaked stream URL (logs, referrer) used by someone else | I | The token is a capability, never an identity: the access policy still authenticates the caller and checks `<plural>:read`; streams end after 30 minutes and reconnects re-run every check. **Residual:** URLs appear in access logs for the token lifetime | generated `streams_refuse_forged_unknown_and_unauthorized_subscriptions` (DenyAll, unregistered channel), running-server `401` without a session |
+| Channels without a reader policy | E | Generated `Readers` deny every channel no resource registered; global channels follow the resource's `GlobalAccess` (`DenyAll` by default) | generated unknown-channel and DenyAll tests |
+| Script or field injection through broadcast content or stream targets | T | Targets are `DomId`s (`[A-Za-z][A-Za-z0-9_:-]*`), content comes from auto-escaping Askama views; SSE framing splits every line terminator into its own `data:` field, so a payload cannot end an event or add `id:`/`event:`/comment lines; the source element escapes its URL and the path is restricted | `events_frame_every_line_and_cannot_be_ended_early`, `dom_ids_reject_injection_attempts`, `from_view_escapes_user_data`, path validation test |
+| Request-bound secrets broadcast to everyone | I | Fragments are rendered from views that take no request; generated tests assert broadcasts carry no CSRF token | generated `changes_are_broadcast_to_open_lists` |
+| Memory or connection exhaustion by many or slow subscribers | D | No task per subscriber; bounded per-subscriber queues (64) with slow consumers dropped, never awaited; 10 000 subscribers per process, 1 000 per channel, 1 MiB per message; 16 open streams per principal (anonymous: per IP, IPv6 per `/64`) and 1 000 per tenant (`429`); the HTTP server ends a connection whose writes make no progress for a request timeout; streams end at 30 minutes and when shutdown begins. **Residual:** anonymous viewers behind a reverse proxy share the proxy's slots until a trusted-proxy resolver is configured (Forge-Go PR #12) | slow-consumer, subscriber-cap, per-principal, per-tenant, IPv6 `/64`, full-broker and stalled-reader (real socket) tests |
+| Open streams holding up shutdown | D | The broker is bound to the shutdown-start signal; streams end before the server drains | real-server drain test with a 60 s grace that finishes at once |
+| Forged or oversized `NOTIFY` payloads | T, D | Notifications are parsed strictly, bounded in chunk count, chunk size, pending messages (64), bytes and age (30 s); malformed or inconsistent ones are logged and ignored; payloads above 7 500 bytes are never sent; messages above 256 KiB are refused. **Residual:** whoever can `NOTIFY` on the database can publish; the database role is the trust boundary | envelope malformed/out-of-order/budget tests, PostgreSQL malformed-notification and oversize tests |
+| LISTEN/NOTIFY emulated insecurely on other backends | T | `Fanout::Postgres` is refused on MySQL, MariaDB and SQLite (`UnsupportedBackend`); they use the in-process broker | `postgres_fanout_is_refused_on_sqlite_not_emulated`, `ensure_fanout_supported` doctest |
+| Missing or shared signing key | S, E | `FORGE_STREAMS_KEY` is validated (base64 of at least 32 bytes), redacted and never echoed; production refuses to start without it; development and test use a random per-process key | config and `from_config` tests, generated `production_refuses_to_start_without_a_signing_key` |
+
+Residual risks beyond the rows above: delivery is at most once without
+replay; the in-process broker reaches one process only; each open stream
+holds a connection slot.
+
 ## Review cadence
 
 Update this model when adding a trust boundary, privileged capability, protocol,

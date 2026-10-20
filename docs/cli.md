@@ -412,6 +412,7 @@ application's database backend, with tests. The walkthrough is in
 | `--global` | Rows are shared by every tenant. Routes `/<plural>/...`, closed by `DenyAll` until the application decides who may use them. |
 | `--tenant-scoped` | Rows belong to a tenant. Routes `/tenants/{tenant_id}/<plural>/...`, `tenant_id` bound from the authorized `TenantContext` in every statement, plus forced row-level security on PostgreSQL. Exactly one of `--global` and `--tenant-scoped` is required. |
 | `--plural <PLURAL>` | The plural when the English rules (`-y` to `-ies`; `-s`, `-x`, `-z`, `-ch`, `-sh` take `-es`; otherwise `-s`) get it wrong. A name that already looks plural is refused unless `--plural` is given. |
+| `--broadcast` | Live updates ([ADR 0031](adr/0031-live-updates-over-server-sent-events.md)): create, update and delete publish Turbo Streams and the index page subscribes over Server-Sent Events. Writes `src/adapters/http/streams.rs` once and `templates/<plural>/_row.html`; production needs `FORGE_STREAMS_KEY` ([views](views.md#live-updates)). |
 | `--dry-run` | Print the files that would be created and the wiring; write nothing. |
 
 Names are validated before anything is read: snake_case ASCII, at most 40
@@ -474,6 +475,18 @@ and the statements to append to the `compose` function in
         std::sync::Arc::new(crate::adapters::http::access::DenyAll),
     )?;
 ```
+
+With `--broadcast` the first broadcasting scaffold also prints
+`pub mod streams;` and, before its routes,
+
+```rust
+    let streams =
+        crate::adapters::http::streams::Streams::register(composition, forge::Fanout::Postgres)?;
+```
+
+(`forge::Fanout::InProcess` on MySQL, MariaDB and SQLite, which have no
+`LISTEN/NOTIFY`); every broadcasting resource passes `&streams` as the last
+argument of its `routes` call.
 
 ### Access
 

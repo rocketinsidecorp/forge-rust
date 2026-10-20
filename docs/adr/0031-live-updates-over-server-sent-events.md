@@ -1,0 +1,177 @@
+# ADR 0031: Live updates: Turbo Streams over Server-Sent Events
+
+- Status: Accepted
+- Date: 2026-10-20
+- Refines: [ADR 0022](0022-server-rendered-views.md) (Turbo), [ADR 0024](0024-scaffold-generator.md) (scaffold)
+- Parity: Forge-Go ADR 0029 ("Broadcasts over Server-Sent Events", "PostgreSQL LISTEN/NOTIFY")
+
+## Context
+
+Server-rendered pages (ADR 0022) answer form submissions with redirects or
+Turbo Streams, but nothing pushed a change to the other pages that show it.
+Rails answers with `turbo_stream_from` and Action Cable broadcasts. Forge-Go
+ships the same feature over Server-Sent Events, with signed channel names,
+fail-closed tenant channels, bounded brokers and PostgreSQL `LISTEN/NOTIFY`
+fanout; the two frameworks must expose the same commands, names and
+configuration (owner decision, 2026-10-20).
+
+`forge-http` buffered whole responses and had no write timeout, so a
+long-lived response was impossible and a client that stopped reading could
+hold a connection slot forever. The process shutdown signal existed only
+inside `serve`, after composition, and workers are told to stop after the
+HTTP server drained, which is too late for open streams.
+
+## Decision
+
+### Transport
+
+Server-Sent Events, not WebSockets, for Forge-Go's reasons: Turbo supports
+them natively (`<turbo-stream-source>`), they are plain HTTP through every
+proxy and middleware layer, need no upgrade handshake or origin protocol, and
+the `turbo_stream_from` case is server to client only.
+
+`forge-http` gains `Response::stream(status, state, step)`: an unfold body
+whose chunks are written with chunked transfer encoding by the connection's
+own task (no spawned task), and `Response::next_chunk` for in-process
+readers. Every connection's socket is wrapped in a stalled-write guard: a
+write that makes **no progress** for a whole request timeout fails and ends
+the connection. Progress resets the clock, so slow but live clients are
+unaffected; this replaces Forge-Go's per-write deadline. Forge-Rust serves
+HTTP/1.1; the event stream sets no hop-by-hop header, so an HTTP/2 proxy in
+front passes it unchanged.
+
+### Crate `forge-broadcast` (facade feature `broadcast`)
+
+| Item | Role |
+| ---- | ---- |
+| `Channel` | `global(name)` or `for_tenant(tenant, name)`; name `[a-z0-9][a-z0-9_.:-]{0,95}`; key `global/NAME` or `TENANT/NAME` |
+| `Signer` | HMAC-SHA256 signed, expiring channel names; `turbo_stream_from` renders the source element |
+| `MemoryBroker` | in-process fanout with bounded queues |
+| `postgres::PgBroker` | `LISTEN/NOTIFY` fanout across replicas (feature `postgres`) |
+| `EventStreams` | the `GET /streams?stream=TOKEN` endpoint |
+| `StreamAccess` | the application's decision about who may read a channel |
+| `publish` | renders `TurboStreamAction`s and publishes them |
+
+It depends on `forge-http`, `forge-views`, `forge-tenancy`, `forge-security`,
+`forge-config` and the RustCrypto `hmac`/`sha2` and `subtle` crates already in
+the workspace. No new third-party dependency.
+
+### Signed stream names
+
+The token format is Forge-Go's byte for byte (a test pins tokens Forge-Go
+printed): `v1.<base64url(JSON {"t","n","e"})>.<base64url(HMAC-SHA256)>`, the
+MAC over the label `forge-broadcast-stream-v1.` and `v1.<claims>`. It is
+verified in constant time (`subtle`) against every configured key (rotation),
+expires (24 hours by default, 7 days at most), and is at most 512 bytes. A
+forged, tampered or expired token gets the same `403 stream_invalid`.
+
+`FORGE_STREAMS_KEY` has Forge-Go's name and format: base64 (standard or
+URL-safe, padded or not) of at least 32 bytes, as `openssl rand -base64 32`
+prints. `forge-config` validates it and never echoes it; it is optional at
+load time because only applications that serve streams need it.
+`Signer::from_config` refuses to start in `production` without it and uses a
+random per-process key (with a warning) in development and test. Forge-Rust
+has no `staging` environment; Forge-Go also requires the key there.
+
+### Tenancy and authorization, fail closed
+
+A token is a bearer capability for one channel, not an identity. After it
+verifies, the application's `StreamAccess` authenticates the caller and
+returns a `StreamViewer`. A tenant channel is served only to
+`StreamViewer::member(&TenantContext)` of the same tenant; a `TenantContext`
+cannot be built without an authenticated principal, an active membership and
+a policy grant. Global channels accept principals and, only when the
+application says so, anonymous viewers. Denials are `401` or
+`403 stream_forbidden` without saying which check failed.
+
+Generated applications reuse the resource's own access policy: a scaffold
+registers its channel with its `TenantAccess`/`GlobalAccess` and read
+permission; channels no resource registered are refused. Because tenant
+access in Forge-Rust is derived from the route (`/tenants/{tenant_id}/...`),
+tenant channels are served at `/tenants/{tenant_id}/streams` and global ones
+at `/streams` (Forge-Go: one `/streams` with the tenant in the request
+context). A token for tenant A presented under tenant B's path is refused.
+
+### Limits and backpressure
+
+- `MemoryBroker` starts no task. Publishing does a non-blocking `try_send` to
+  each subscriber's bounded queue (64 messages); a subscriber whose queue is
+  full is **dropped** (`SlowConsumer`): its stream ends after the queued
+  messages and the browser reconnects. Publishers never wait.
+- 10 000 subscribers per process, 1 000 per channel, 1 MiB per message.
+- Per account: 16 open streams per principal (anonymous viewers by peer
+  address, IPv4-mapped IPv6 as IPv4, IPv6 by `/64`) and 1 000 per tenant:
+  `429 stream_limit` with `Retry-After: 5`. A full broker is
+  `503 stream_unavailable`. The client-address function is replaceable
+  (`EventStreams::client_address`) so a trusted-proxy resolver can be used
+  once Forge-Rust has one (Forge-Go ADR 0037); forwarded headers are never
+  read today.
+- Events are `retry: 3000`, `: connected`, `: ping` every 20 seconds, and
+  `data:` lines: payloads are split on `\n`, `\r\n` and `\r`, so they cannot
+  end an event or inject fields. The SSE framing of a message is computed
+  once and shared by every subscriber.
+- Streams end after 30 minutes; the browser reconnects, which re-runs every
+  check, so a revoked session or permission stops receiving.
+- `Cache-Control: no-store`, `X-Accel-Buffering: no`.
+- Delivery is at most once; there is no replay (Last-Event-ID would need a
+  retained, tenant-partitioned log). Pages re-render on navigation.
+
+### Lifecycle
+
+`App::serve` creates the shutdown signal before composition.
+`Composition::shutdown_started` hands adapters a child of it;
+`Composition::broadcast(Fanout::InProcess | Fanout::Postgres)` builds the
+broker on it. When shutdown begins the broker closes, every open stream ends
+and the HTTP server drains at once instead of waiting for the grace period
+(a test runs a real server and proves it).
+
+### PostgreSQL fanout
+
+`PgBroker` wraps a `MemoryBroker`: publishing delivers locally at once and
+sends `NOTIFY` on the `forge_broadcast` channel (a validated lowercase
+identifier); each broker skips notifications carrying its own origin id.
+The envelope is Forge-Go's: chunks of 4 500 bytes base64 encoded
+(`v1 ORIGIN ID INDEX COUNT KEY DATA`, under PostgreSQL's 8 000 byte limit),
+sent in one transaction, reassembled with bounded buffers (64 partial
+messages, the 256 KiB message limit, 30 seconds). `publish_in` queues a
+message in the caller's transaction (delivered everywhere only on commit).
+The listener is a future (`PgBroker::listen`) that `Composition::broadcast`
+registers as a lifecycle worker; it holds one pool connection through
+`sqlx::PgListener`, reconnects with 1-30 second backoff and logs the gap,
+ignores malformed notifications, and returns when the broker closes.
+
+`NOTIFY` is database-wide and not tenant-aware: the channel key, which
+carries the tenant, separates tenants exactly as in memory, and whoever can
+`NOTIFY` on the database can publish (the database role is the trust
+boundary). MySQL, MariaDB and SQLite have no `LISTEN/NOTIFY`:
+`Fanout::Postgres` is refused there with `UnsupportedBackend` rather than
+emulated (CLAUDE.md, ADR 0021), and those applications use the in-process
+broker, which reaches one process only.
+
+### Scaffold
+
+`forge generate scaffold ... --broadcast` is opt-in, as in Forge-Go. The
+pages publish after the change is stored (create appends the row and removes
+the empty-list row, because Forge-Rust lists are oldest first; update
+replaces the row; delete removes it); a publish failure is logged and never
+fails the request. Fragments are rendered from a `_row.html` partial without
+a request, so no CSRF token or per-user data enters a broadcast. The first
+broadcasting scaffold writes `src/adapters/http/streams.rs`; the printed
+wiring uses `Fanout::Postgres` on PostgreSQL and `Fanout::InProcess`
+elsewhere. `forge new` enables the `broadcast` feature for database HTML
+applications; older applications are refused with instructions. The plural
+`streams` is reserved.
+
+## Consequences
+
+- Open pages show other people's changes without polling, across replicas on
+  PostgreSQL, with tenant isolation enforced by the channel key, the signed
+  name, the route's authorized tenant and the handler's own check.
+- Each open stream holds one connection slot (`FORGE_MAX_CONNECTIONS`) until
+  it ends; capacity is bounded by the subscriber and per-account limits.
+  Behind a proxy, streams need buffering disabled and an idle timeout above
+  the heartbeat.
+- Stream URLs carry the token and therefore appear in access logs for its
+  lifetime; it grants reading one channel to an otherwise authorized caller.
+- Not provided: WebSockets, replay of missed messages, presence, per-user
+  channels, a `staging` environment, trusted-proxy client addresses.

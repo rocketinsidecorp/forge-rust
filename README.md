@@ -171,6 +171,7 @@ forge generate authentication --dry-run
 forge generate scaffold post title:string body:text? published:boolean --global
 forge generate scaffold person name:string --tenant-scoped --plural people
 forge generate scaffold post title:string --global --dry-run
+forge generate scaffold event name:string starts_at:timestamp --tenant-scoped --broadcast  # live updates
 forge check && forge lint && forge test        # cargo check / clippy -D warnings / test
 forge format                                   # cargo fmt --all
 forge build                                    # cargo build --release --locked
@@ -336,6 +337,10 @@ Kubernetes and systemd deployment is covered in
   and tests for the application's backend, deny-by-default access, tenant
   predicates plus forced RLS on PostgreSQL, and printed wiring instead of
   edits to existing files ([ADR 0024](docs/adr/0024-scaffold-generator.md)).
+  With `--broadcast`, open index pages update live: Turbo Streams over
+  Server-Sent Events with signed, tenant-bound stream names and PostgreSQL
+  `LISTEN/NOTIFY` fanout across replicas
+  ([ADR 0031](docs/adr/0031-live-updates-over-server-sent-events.md)).
 - Typed `FORGE_*` environment configuration. Database URLs are redacted from
   normal debug/serialization output, and unknown `FORGE_*` keys are
   rejected at startup.
@@ -429,6 +434,42 @@ Limits and keys are configured with
 ([deployment guide](docs/deployment.md)); in `production` a storage root must be
 absolute and `FORGE_STORAGE_SIGNING_KEY` is required.
 
+## Live updates
+
+Like Rails' `turbo_stream_from` with Action Cable, pages update when someone
+else changes their data: Turbo Streams over Server-Sent Events, with signed,
+expiring, tenant-bound stream names, bounded per-subscriber queues and
+PostgreSQL `LISTEN/NOTIFY` fanout across replicas (in-process on MySQL,
+MariaDB and SQLite)
+([ADR 0031](docs/adr/0031-live-updates-over-server-sent-events.md),
+[docs/views.md](docs/views.md#live-updates)). In a `forge new` application:
+
+```sh
+forge generate scaffold event name:string starts_at:timestamp --tenant-scoped --broadcast
+# add the printed wiring (it registers the streams once), then:
+export FORGE_MIGRATION_DATABASE_URL='postgres://app_migrator:app_migrator@127.0.0.1:5432/shop'
+cargo run -- migrate
+cargo run -- setup --tenant acme --email owner@example.com
+unset FORGE_MIGRATION_DATABASE_URL
+export FORGE_DATABASE_URL='postgres://app_runtime:app_runtime@127.0.0.1:5432/shop'
+export FORGE_STREAMS_KEY=$(openssl rand -base64 32)   # required in production; same on every replica
+cargo run
+# sign in at http://127.0.0.1:3000/session/new?tenant=acme in two browsers,
+# open /tenants/<tenant id>/events in both and create an event in one
+cargo test changes_are_broadcast   # the generated live-update tests
+```
+
+From a composition root by hand (`forge` feature `broadcast`):
+
+```rust
+let broker = composition.broadcast(forge::Fanout::Postgres)?; // or Fanout::InProcess
+let signer = Arc::new(forge::broadcast::Signer::from_config(composition.config())?);
+forge::broadcast::EventStreams::new(broker.clone(), signer.clone(), Arc::new(my_access))
+    .register(composition.router(), "/streams")?;
+let source = signer.turbo_stream_from(&Channel::for_tenant(tenant_id, "events")?)?; // render |safe
+forge::broadcast::publish(broker.as_ref(), &channel, &[TurboStreamAction::remove(target)]).await?;
+```
+
 ## Workspace layout
 
 ```text
@@ -436,6 +477,7 @@ crates/
 ├── forge          # facade: forge::App and framework-owned re-exports
 ├── forge-audit    # immutable security audit events and append-only sink contract
 ├── forge-auth     # sessions, sign-in throttling, password policy, reset tokens
+├── forge-broadcast # live updates: Turbo Streams over SSE, signed streams, LISTEN/NOTIFY fanout
 ├── forge-cache    # application cache: memory and shared stores, single-flight fetch
 ├── forge-core     # lifecycle, errors, UUIDv7 identifiers
 ├── forge-config   # typed FORGE_* configuration and secret redaction
@@ -512,6 +554,7 @@ Contribution rules:
 - [Jobs, schedules, outbox and consumers](docs/jobs.md)
 - [Deployment](docs/deployment.md)
 - [Rate limiting](docs/rate-limiting.md), [caching](docs/caching.md) and [file storage](docs/storage.md)
+- [Views, Turbo and live updates](docs/views.md)
 - [Threat model](docs/threat-model.md)
 - [Dependency policy](docs/dependency-policy.md)
 - [Test strategy](docs/test-strategy.md)

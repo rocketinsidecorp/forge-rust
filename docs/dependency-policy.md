@@ -204,6 +204,22 @@ serde_json type appears in a stable domain/application contract: handlers see
 `Job`, `JobContext`, `JobError`, `Timestamp` and Forge ids; SQLx types appear
 only in the PostgreSQL adapter functions that take a `forge_db::DbTransaction`.
 
+## Live updates dependency decision
+
+[ADR 0031](adr/0031-live-updates-over-server-sent-events.md) adds the workspace
+crate `forge-broadcast` and **no third-party package to `Cargo.lock`**. It
+declares only crates already admitted for the workspace: `hmac`, `sha2` and
+`subtle` (HMAC-SHA256 stream tokens, constant-time compare), `base64` (token
+encoding; `forge-config` also decodes `FORGE_STREAMS_KEY` with it), `getrandom`
+(per-process development keys and notification ids), `tokio`, `bytes`,
+`serde`, `serde_json`, `async-trait`, `thiserror`, `tracing`, and, behind its
+`postgres` feature, `sqlx` with `postgres` (already enabled by `forge-db`) for
+`PgListener` and `pg_notify`. No `hmac`, `sqlx` or `tokio` type appears in the
+stable channel, signer or access contracts; `PgBroker::publish_in` takes a
+`sqlx::PgConnection` in the PostgreSQL infrastructure module, like the other
+transactional adapters. `forge-http` streams response bodies with its own
+unfold body over the existing `hyper` `Body` trait, without `futures`.
+
 ## Rate limiting, cache and storage dependency decision
 
 [ADR 0027](adr/0027-rate-limiting.md), [0028](adr/0028-cache.md) and
