@@ -50,21 +50,21 @@ forge new shop
 cd shop
 docker compose up -d db
 export FORGE_MIGRATION_DATABASE_URL='postgres://app_migrator:app_migrator@127.0.0.1:5432/shop'
-cargo run -- migrate
-cargo run -- setup --tenant acme --email owner@example.com --organization "Acme Inc"
+forge db prepare        # create the database if missing, migrate, seed a new one; or: forge migrate
+forge setup --tenant acme --email owner@example.com --organization "Acme Inc"
 # setup asks for the owner password twice (at least 12 characters, echo off)
 # and prints the tenant id; scripts pipe it instead:
-#   printf '%s\n' "$OWNER_PASSWORD" | cargo run -- setup --tenant acme --email owner@example.com --password-stdin
+#   printf '%s\n' "$OWNER_PASSWORD" | forge setup --tenant acme --email owner@example.com --password-stdin
 unset FORGE_MIGRATION_DATABASE_URL
 export FORGE_DATABASE_URL='postgres://app_runtime:app_runtime@127.0.0.1:5432/shop'
-cargo run
+forge dev               # rebuilds and restarts when files change; or: cargo run
 curl localhost:3000/health/live
 # open http://127.0.0.1:3000/session/new?tenant=acme and sign in as owner@example.com
 ```
 
 Like `rails generate authentication`, `forge new` generates the sign-in,
 sign-out and password-reset pages (`/session/new`, `/passwords/new`), the
-`setup` command and an idempotent `seed` command (`cargo run -- seed` runs
+`setup` command and an idempotent `seed` command (`forge seed` runs
 `src/bootstrap/seeds.rs` in one transaction). The organization field is the
 tenant slug; every failure shows the same message; attempts are throttled;
 signing in issues a fresh session and CSRF token. Password-reset links are
@@ -144,16 +144,16 @@ application gets the same files with `forge generate authentication`
 3. Migrate, test, run and use it as the owner:
 
    ```sh
-   FORGE_MIGRATION_DATABASE_URL='postgres://app_migrator:app_migrator@127.0.0.1:5432/shop' cargo run -- migrate
-   cargo test
+   FORGE_MIGRATION_DATABASE_URL='postgres://app_migrator:app_migrator@127.0.0.1:5432/shop' forge migrate
+   forge test
    export FORGE_DATABASE_URL='postgres://app_runtime:app_runtime@127.0.0.1:5432/shop'
-   cargo run
+   forge dev
    # open http://127.0.0.1:3000/tenants/<tenant id printed by setup>/invoices
    ```
 
    A signed-out browser is sent to `/session/new` and comes back to the
    invoices after signing in; the sign-in page also has the sign-out button.
-   `cargo run -- rollback` reverts the application's latest migration (never a
+   `forge rollback` reverts the application's latest migration (never a
    framework table such as the cache or rate-limit store). Repository and
    authentication tests against a database server are ignored by default;
    run them with
@@ -174,15 +174,50 @@ forge generate scaffold post title:string body:text? published:boolean --global
 forge generate scaffold person name:string --tenant-scoped --plural people
 forge generate scaffold post title:string --global --dry-run
 forge generate scaffold event name:string starts_at:timestamp --tenant-scoped --broadcast  # live updates
+forge version                                  # the CLI version (also forge --version)
+forge doctor                                   # toolchain, FORGE_* settings, is the database server answering?
+forge doctor --json                            # versioned, secret-free report for scripts and CI
 forge check && forge lint && forge test        # cargo check / clippy -D warnings / test
+forge test --lib orders -- --nocapture         # arguments replace the defaults and go to cargo test
 forge format                                   # cargo fmt --all
 forge build                                    # cargo build --release --locked
-cargo run -- migrate                           # application binary: migrate, rollback,
-cargo run -- rollback                          #   setup, seed, healthcheck, version, help, serve
-cargo run -- setup --tenant acme --email owner@example.com   # first tenant + owner
-cargo run -- seed                              # src/bootstrap/seeds.rs, idempotent
-cargo run -- healthcheck
+forge build shop                               # ... of one binary (cargo build --bin shop)
+forge dev                                      # run; rebuild and restart gracefully when files change
+forge dev --poll-interval 1s --debounce 500ms  # scan less often, wait longer after a save
+forge dev --no-reload                          # build and run once, no watching
+forge migrate                                  # apply pending migrations (the application's own command)
+forge migrate status                           # applied / pending / modified / disabled / missing
+forge rollback                                 # revert the latest application migration
+forge rollback --steps 2                       # ... the latest two; never a Forge-owned table
+forge setup --tenant acme --email owner@example.com   # first tenant + owner (password prompted, never an argument)
+forge seed                                     # src/bootstrap/seeds.rs, idempotent
+forge db create                                # create the database (migration role needs CREATEDB)
+forge db setup                                 # create + migrate + seed
+forge db prepare                               # setup if the database is missing, else migrate; safe to repeat
+forge db status                                # same as forge migrate status
+forge db migrate                               # same as forge migrate
+forge db seed                                  # same as forge seed
+forge db rollback --steps 1                    # guarded like drop
+forge db reset                                 # drop + setup: a clean development database
+forge db drop                                  # refused when FORGE_ENV=production or the server is remote
+FORGE_ALLOW_DESTRUCTIVE=true forge db drop --force-production --yes   # the only way in production
+cargo run -- healthcheck                       # application binary: serve, healthcheck, version, help,
+cargo run -- migrate                           #   migrate [status], rollback [--steps N], db create|exists|drop,
+cargo run -- seed                              #   setup, seed: what the forge commands above run
 ```
+
+The commands above that are not `new`, `generate`, `id`, `version`, `doctor`,
+`check`, `lint`, `test`, `format` or `build` run the generated application's own
+subcommands: the CLI builds it with `cargo build --locked`, runs the binary it
+produced with your terminal and environment, and reads no database URL itself
+(`forge doctor` only describes it, redacted, and opens a TCP connection to its
+host). `drop`, `reset` and `db rollback` refuse `FORGE_ENV=production`; with
+`--force-production` you type the application name at the prompt, or pass `--yes`
+with `FORGE_ALLOW_DESTRUCTIVE=true` in the process environment (an
+application's own `db drop` also refuses a database server that is not on this
+machine without `--force-production`). Details and deviations from Forge-Go:
+[docs/cli.md](docs/cli.md#application-lifecycle-commands) and
+[ADR 0036](docs/adr/0036-application-lifecycle-commands.md).
 
 Field types for `field:type`: `string`, `text`, `integer`, `boolean`,
 `timestamp` and `uuid`, with `?` for an optional field
@@ -377,7 +412,7 @@ fn main() -> std::process::ExitCode {
 ```
 
 ```sh
-cargo run -- migrate                    # app migrations + framework job/outbox schemas
+forge migrate                           # app migrations + framework job/outbox schemas
 cargo run -- serve                      # HTTP + workers + cron + outbox dispatcher (InServe)
 cargo run -- jobs work                  # workers, cron and dispatcher without HTTP
 cargo run -- jobs status                # job counts per queue and state

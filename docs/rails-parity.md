@@ -14,7 +14,7 @@ the work is finished and waiting for its review; **Planned** means not started.
 | Server-rendered HTML, layouts, partials, forms, flash, CSRF | Action View | Done | Done |
 | HTML + JSON CRUD generator | `rails g scaffold` | Done | Done |
 | Authentication pages, password reset | `rails g authentication` | Done | Done |
-| First tenant and owner, seeds | `db:seed` | Done (`forge setup`, `forge seed`) | Done (`setup`, `seed`) |
+| First tenant and owner, seeds | `db:seed` | Done (`forge setup`, `forge seed`) | In review (`forge setup`, `forge seed`; the application commands `setup` and `seed` are Done) |
 | Multi-tenancy with database enforcement | (gems) | Done (PostgreSQL RLS) | Done (PostgreSQL RLS) |
 | TOTP MFA | (gems) | Done | Planned |
 | Persistent jobs, cron, outbox | Solid Queue | Done | Done (framework crates; `forge new` wiring planned) |
@@ -28,7 +28,7 @@ the work is finished and waiting for its review; **Planned** means not started.
 | Traces, metrics, log correlation | (gems) | Done (OpenTelemetry, Prometheus) | Done (OpenTelemetry, Prometheus; ADR 0033) |
 | Preconfigured Prometheus, Grafana, Tempo, Loki | — | Done (`compose.observability.yaml`, Forge-Go ADR 0038) | Done (`compose.observability.yaml`, [ADR 0034](adr/0034-local-observability-stack.md)) |
 | Zero-downtime deploys, rollback, remote logs | Kamal | In review (`forge deploy`) | Planned |
-| Live reload and database lifecycle | `bin/dev`, `db:*` | In review (`forge dev`, `forge db`) | Planned |
+| Live reload and database lifecycle | `bin/dev`, `db:*` | In review (`forge dev`, `forge db`) | In review (`forge dev`, `forge db create\|drop\|reset\|setup\|prepare\|migrate\|rollback\|status\|seed`, `forge migrate\|rollback\|setup\|seed`, `forge doctor`, `forge version`, [ADR 0036](adr/0036-application-lifecycle-commands.md)) |
 | Encrypted credentials, attribute encryption | `credentials:edit`, AR Encryption | In review | Planned |
 | i18n | I18n | Planned | Planned |
 | OpenAPI from typed routes | — | Planned | Planned |
@@ -62,6 +62,27 @@ the work is finished and waiting for its review; **Planned** means not started.
   pool exposes no wait counters), `http.client.request.duration` (no
   instrumented client). See
   [observability](observability.md#differences-from-forge-go).
+
+- Application lifecycle ([ADR 0036](adr/0036-application-lifecycle-commands.md)):
+  the Rust CLI now has `version`, `doctor`, `dev`, `migrate`, `rollback`,
+  `setup`, `seed` and `db create|drop|reset|setup|prepare|migrate|rollback|status|seed`
+  with Forge-Go's names, flags and refusals. Still open, in this order, each
+  an application subcommand so the CLI keeps holding no credentials:
+  `forge routes` (a `Router::routes()` accessor in `forge-http` and a built-in
+  `routes` command that composes the application without serving it; Forge-Go
+  scans the source, which cannot see Rust's code-built routes), `db
+  schema:dump|schema:load|console`, browser reload in `forge dev` (the Go
+  proxy needs a reviewed Rust port with the same CSP rules), and
+  `.env.development`/`.env.local` files in `forge dev` and the lifecycle
+  commands together with generating them. Planned right after the generators
+  ([forge-rust#15](https://github.com/rocketinsidecorp/forge-rust/issues/15)).
+  `forge inspect`, `destroy`, `deploy`, `logs`, `app`, `credentials` and
+  `i18n` stay "Planned" in the table above. Forge-Go reads the target
+  database of `db create|drop` from `FORGE_DATABASE_URL` and the credentials
+  from `FORGE_MIGRATION_DATABASE_URL`; Forge-Rust uses
+  `FORGE_MIGRATION_DATABASE_URL` for both (see
+  [cli](cli.md#differences-from-forge-go)); Forge-Go adopts that, or Rust
+  adds the split, when the second framework's `db create` is next touched.
 
 - Stream signing key rotation (ADR 0031, rocketinsidecorp/forge-rust#14):
   both libraries verify previous keys (`Signer::new(key, previous)`,

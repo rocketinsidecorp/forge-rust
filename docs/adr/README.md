@@ -35,6 +35,7 @@ does not mean implementation exists.
 | [0033](0033-telemetry.md) | Forge-owned telemetry over OpenTelemetry protocols: `FORGE_TELEMETRY_*`, W3C propagation, OTLP/HTTP JSON, Prometheus listener, correlated log export | Accepted |
 | [0034](0034-local-observability-stack.md) | Preconfigured local observability stack: `compose.observability.yaml` with the Collector, Prometheus, Tempo, Loki and Grafana | Accepted |
 | [0035](0035-mail.md) | Mail: validated MIME, a Forge-owned TLS-enforcing SMTP client, development and test senders, askama templates, previews, password reset emails | Accepted |
+| [0036](0036-application-lifecycle-commands.md) | Application lifecycle commands: `forge dev`, `migrate`, `rollback`, `setup`, `seed`, `db`, `doctor`, `version` delegate to the application's own subcommands; destructive-command protection; process ownership | Accepted |
 
 New ADRs use the next four-digit number. A changed decision receives a new ADR
 that marks the prior record `Superseded`; accepted records are not rewritten to

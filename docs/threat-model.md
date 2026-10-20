@@ -180,6 +180,28 @@ throttle, password-reset delivery, MFA, audit integrity chaining/retention and
 privileged reader workflows, and administrative cross-tenant role separation
 still require implementation and abuse tests.
 
+## Application lifecycle commands review
+
+[ADR 0036](adr/0036-application-lifecycle-commands.md): `forge dev`, `migrate`,
+`rollback`, `setup`, `seed`, `db ...` and `doctor` run next to production
+credentials and can destroy a database.
+
+| Threat | Control | Verification |
+| --- | --- | --- |
+| Dropping, resetting or rolling back a production database by mistake or by a pasted command | `db drop`, `db reset` and `db rollback` refuse `FORGE_ENV` other than development or test (an unknown value counts as protected) before anything is built; `--force-production` plus the application name typed at a terminal, or `--yes` with `FORGE_ALLOW_DESTRUCTIVE=true` in the process environment; `--yes` alone is a usage error; the application's own `db drop` refuses production and non-local servers unless `--force-production`, so a container is guarded without the CLI | `lifecycle` unit tests for every environment value, flag combination and wrong confirmation; `tests/lifecycle.rs` (no build, no application run on refusal); the `forge` crate's SQLite `db` test; the PostgreSQL scaffold test |
+| Destructive switch granted by a file | `FORGE_ALLOW_DESTRUCTIVE` is read from the process environment only, any value but `true` is refused, and it is removed from the application's environment | `yes_needs_the_process_environment_to_allow_it`, `the_clis_own_switch_never_reaches_the_application`, `the_database_url_is_passed_through_and_the_clis_switch_is_not` |
+| Credential exposure by the CLI | The CLI reads no database URL for lifecycle commands (the application inherits the environment); `forge doctor` prints engine, database and host only, never user, password or query, and `--json` omits values; no URL appears in any error | `describe_never_includes_credentials_or_query`, doctor tests that grep the output for the secret, `tests/lifecycle.rs` |
+| Running the wrong project's code | Lifecycle commands require a `Cargo.toml` with a `[package]` name and a `forge` dependency; the application is built with `--locked`; the binary run is the one Cargo reported | `project` tests, `other_directories_and_packages_are_refused` |
+| Injection through a database name | `db create|drop` accept `[A-Za-z0-9_$-]{1,63}` only, never the engines' system databases, and quote nothing else | `names_are_restricted_to_what_every_tool_accepts`, `system_databases_and_bad_names_are_refused_without_echoing_the_url` |
+| Orphaned or runaway processes | The application and each build run in their own process group, stopped with SIGTERM, a 35-second grace and SIGKILL (at once on a second Ctrl-C); an owned child is killed when dropped; one signal thread, joined on exit; no detached tasks | `process` tests (stop, ignore-TERM kill, drop kills), `tests/lifecycle.rs` SIGTERM and SIGINT while `forge dev` runs |
+| Dev loop breaking a healthy server | The old process keeps serving until a build succeeds; a failed or stale build never replaces it; a crashed application is not restarted in a loop | supervisor tests with a fake host, `dev_keeps_the_running_application_when_a_build_fails` |
+| Resource exhaustion by the watcher | Trees beyond 50 000 files are refused; build output and hidden directories are skipped; one thread polls | `scan_skips_build_output_hidden_and_non_code_directories` |
+
+Residual: `forge dev` is for development; its restart replaces the binary under
+`target/` and has no browser-reload proxy. The CLI does not authenticate the
+application it runs beyond the project check above; run lifecycle commands only
+in code you trust, as with `cargo run`.
+
 ## Server-rendered views review
 
 Review date: 2026-10-19 ([ADR 0022](adr/0022-server-rendered-views.md),
