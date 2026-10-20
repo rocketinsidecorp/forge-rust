@@ -17,7 +17,7 @@ from a checkout.
 
 ```text
 forge id
-forge new <name> [-d <DATABASE>] [--api] [--skip-docker] [--skip-ci] [--skip-lockfile] [--forge-path <PATH>]
+forge new <name> [-d <DATABASE>] [--api] [--locale en|es|pt-BR] [--skip-docker] [--skip-ci] [--skip-lockfile] [--forge-path <PATH>]
 forge generate migration <name>
 forge generate authentication [--dry-run]
 forge generate scaffold <name> <field:type>... (--global | --tenant-scoped) [--plural <PLURAL>] [--dry-run]
@@ -35,6 +35,7 @@ forge setup --tenant SLUG --email EMAIL [--organization NAME] [--password-stdin]
 forge seed
 forge db create | drop | reset | setup | prepare | migrate | status | seed
 forge db rollback [--steps N]
+forge i18n check [--json]
 ```
 
 The quality and build commands run `cargo` directly (no shell) in the current
@@ -329,6 +330,16 @@ override, flash messages). The CSRF and flash cookies are `__Host-` cookies:
 browsers accept them on HTTPS origins and on `http://localhost` and
 `http://127.0.0.1`.
 
+### Translations
+
+The pages are translated ([ADR 0037](adr/0037-internationalization.md),
+[i18n](i18n.md)): `config/locales/en.json` holds the layout and welcome page
+text and the number and date formats, `authentication.en.json` the sign-in
+pages (PostgreSQL). `--locale es` or `--locale pt-BR` adds that locale's
+files and makes it the default locale (`DEFAULT_LOCALE` in
+`src/adapters/http/views/locales.rs`); `FORGE_I18N_DEFAULT_LOCALE` overrides
+it per deployment. `--locale` cannot be combined with `--api`.
+
 ### Database backends
 
 Like `rails new -d`, `forge new -d <DATABASE>` selects the backend
@@ -585,6 +596,24 @@ The scaffold refuses, with an explanation and without writing:
   `begin_tenant_transaction`, all of which `forge new` generates.
 - An `src/adapters/http/access.rs` that lacks the generated traits.
 
+## `forge i18n check`
+
+```sh
+forge i18n check          # human report; exit 1 when a locale lacks keys or plural forms
+forge i18n check --json   # {"schema_version":1,"locales":[...],"keys":N,"referenced":N,"missing":{...},"plural_forms_missing":{...},"unused":[...]}
+```
+
+Loads `config/locales` with the application's own rules (a malformed file,
+a duplicate key or a non-canonical file name is an error, exit 1), compares
+every locale with the keys of all the others and with the literal keys of
+`.t("KEY")` in `*.html` and `*.rs` files and of `translate(LOCALE, "KEY")` /
+`translate_html(LOCALE, "KEY")` (the `tests`, `target`, `vendor`,
+`node_modules`, `tmp`, `bin`, `storage` and dot directories are skipped),
+reports the plural forms each locale's rule needs for 0 to 1000, and lists
+keys nothing references (informational; `date.`, `time.` and `number.` are
+data). It reads files only. Same report and exit status as Forge-Go
+([i18n](i18n.md#forge-i18n-check)).
+
 ## `forge check`, `forge test`, `forge format`, `forge lint`
 
 | Command | Runs |
@@ -771,8 +800,8 @@ Same command names, flags, messages and exit codes, except:
   accurate listing needs the application's composition, which needs its
   configuration), `forge inspect`, `db schema:dump`, `db schema:load` and
   `db console` (they run `pg_dump`, `psql` and friends with the database
-  credential), `destroy`, `deploy`, `logs`, `app`, `credentials`, `i18n`. They
-  are tracked in [Rails parity](rails-parity.md).
+  credential), `destroy`, `deploy`, `logs`, `app`, `credentials`. They are
+  tracked in [Rails parity](rails-parity.md).
 - `forge doctor` also checks the toolchain and that the database server answers.
 - Progress lines of `forge dev` carry no time stamp.
 

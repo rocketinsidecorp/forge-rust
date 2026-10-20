@@ -30,7 +30,7 @@ the work is finished and waiting for its review; **Planned** means not started.
 | Zero-downtime deploys, rollback, remote logs | Kamal | In review (`forge deploy`) | Planned |
 | Live reload and database lifecycle | `bin/dev`, `db:*` | In review (`forge dev`, `forge db`) | In review (`forge dev`, `forge db create\|drop\|reset\|setup\|prepare\|migrate\|rollback\|status\|seed`, `forge migrate\|rollback\|setup\|seed`, `forge doctor`, `forge version`, [ADR 0036](adr/0036-application-lifecycle-commands.md)) |
 | Encrypted credentials, attribute encryption | `credentials:edit`, AR Encryption | In review | Planned |
-| i18n | I18n | Planned | Planned |
+| i18n | I18n | Done (`config/locales/*.json`, `t`, CLDR plurals, `forge new --locale`, `forge i18n check`, Forge-Go ADR 0042) | Done (`config/locales/*.json`, `layout.i18n.t`, CLDR plurals, `forge new --locale`, `forge i18n check`, [ADR 0037](adr/0037-internationalization.md), [i18n](i18n.md)) |
 | OpenAPI from typed routes | — | Planned | Planned |
 | Controller, model and mailer generators | `rails g` | Planned | Planned |
 | Continuous fuzzing, SBOM, signed images | — | Planned | Planned |
@@ -76,8 +76,8 @@ the work is finished and waiting for its review; **Planned** means not started.
   `.env.development`/`.env.local` files in `forge dev` and the lifecycle
   commands together with generating them. Planned right after the generators
   ([forge-rust#15](https://github.com/rocketinsidecorp/forge-rust/issues/15)).
-  `forge inspect`, `destroy`, `deploy`, `logs`, `app`, `credentials` and
-  `i18n` stay "Planned" in the table above. Forge-Go reads the target
+  `forge inspect`, `destroy`, `deploy`, `logs`, `app` and `credentials`
+  stay "Planned" in the table above. Forge-Go reads the target
   database of `db create|drop` from `FORGE_DATABASE_URL` and the credentials
   from `FORGE_MIGRATION_DATABASE_URL`; Forge-Rust uses
   `FORGE_MIGRATION_DATABASE_URL` for both (see

@@ -458,6 +458,38 @@ SMTPUTF8 or IDNA, so non-ASCII addresses are undeliverable rather than
 converted; the test CA and key under `crates/forge-mail/tests/fixtures/tls`
 are public test material and trusted only by the tests.
 
+## Internationalization review
+
+Review date: 2026-10-20 ([ADR 0037](adr/0037-internationalization.md), port
+of Forge-Go ADR 0042 and its review follow-ups). Scope: `forge-i18n` (catalog
+loading, translation, plural rules, locale matching, formatting),
+`LocaleNegotiation`, `I18n` and `Translation` in `forge-views`,
+`FORGE_I18N_DEFAULT_LOCALE`, `forge i18n check` and the generated
+translations. Guide: [i18n](i18n.md).
+
+| Threat | STRIDE | Control | Verification |
+| --- | --- | --- | --- |
+| Path traversal through a locale name (`Accept-Language`, the `locale` cookie, `?locale=`, a path prefix, `FORGE_I18N_DEFAULT_LOCALE`) | T, I | Locale names are validated against a BCP 47 subset (`language[-Script][-REGION]`, ASCII letters and digits only) and canonicalized before any use; only locales loaded at start-up from the files embedded at build time can be selected, so request input never reaches the file system. File names must be canonical (`pt-br.json` is refused); the build helper and the directory loader refuse symbolic links | `refuses_everything_else` (`../`, `%2e%2e`, `/`, `\`, NUL, `_`), `file_names_carry_a_canonical_locale`, `negotiation_follows_the_forge_go_order` (traversal cookie and parameter), `i18n_default_locale_is_validated_and_canonical`, `directories_are_read_flat_and_links_are_refused`, `locales_are_embedded_flat_sorted_and_without_links` |
+| XSS through translated text or its arguments | T, E | `Translation` renders HTML: a plain key's text and arguments are escaped, and it is `HtmlSafe`, so `|safe` cannot make it markup; only keys ending in `_html` are markup, and in them every argument is escaped unless passed with `with_markup`; a missing `_html` key is never markup; the missing-key text is escaped. `.text()` is plain text that Askama escapes where it is rendered (flash) | `html_escapes_interpolation_outside_trusted_keys`, `templates_escape_every_argument_and_plain_keys_are_never_markup` (element, attribute, `_html`, `|safe`), generated `every_locale_translates_the_welcome_page` |
+| Recursive or injected interpolation through argument values | T | Interpolation is one pass over the translation; values are never re-scanned for `%{...}` | `interpolation_is_not_recursive` |
+| Memory or log exhaustion through missing keys built from input | D | Missing-translation warnings are logged once per locale and key, for at most 1,024 distinct problems, then one "missing-translation warnings suppressed" line and a counter (`suppressed_warnings`); keys longer than 256 bytes or with invalid segments are refused before lookup and truncated in logs | `missing_translation_warnings_are_bounded_and_the_cap_is_announced`, `missing_translations_in_production_fall_back_and_log_once` |
+| Oversized or hostile request headers | D | `Accept-Language` over 4096 bytes is ignored; only its first 32 entries are parsed; tags over 64 bytes, malformed q-values and subtags are skipped | `accept_language_parsing_matches_forge_go` |
+| Path prefix confusion between the routed and the escaped path | T, E | The URI holds only the escaped path, which routing matches; the locale segment is read from it and must be an available locale, so `/pt-BR%2F..%2Fadmin` is not stripped; the rest of the path and the query are kept byte for byte | `the_layer_binds_the_locale_and_strips_the_prefix` |
+| Oversized or ambiguous translation files | D, T | 1 MiB per file, 512 files, 16 levels, 50,000 keys per locale; duplicate keys (in one object or across files, which `serde_json` alone would overwrite) and a second top-level key are start-up errors naming the files, so review sees exactly what is served | `unsafe_or_ambiguous_files_are_refused` |
+| Shared caches serve one visitor's language to another | I | Responses that used the request's translations carry `Content-Language` and `Vary: Accept-Language, Cookie` (merged with an existing `Vary`, never duplicated); assets and JSON are not marked and stay cacheable | `only_translated_responses_carry_content_language_and_vary`, `vary_is_merged_not_duplicated`, generated `turbo_and_stimulus_are_served_digested` |
+| Locale cookie tampering | T | The cookie only selects among available locales; invalid values are ignored; `locale_cookie` writes only an available locale, `Secure`, `HttpOnly`, `SameSite=Lax`, `Path=/`, a year | `the_locale_cookie_is_strict_and_only_names_available_locales` |
+| Wrong-language or missing text hides a security message in production | I | Missing translations fall back to the default locale, then the humanized key, and are logged; development and test show `translation missing: LOCALE.KEY`, which the generated tests reject; `forge i18n check` exits 1 on any missing key or plural form. The failed sign-in message stays one key (`sessions.invalid_credentials`) for every wrong field and the reset answer one key (`passwords.reset_requested`), in every locale, so translation cannot reintroduce account enumeration | `the_pages_are_translated_in_every_locale`, `generated_applications_are_complete_in_every_locale`, `reports_missing_plural_and_unused_keys` |
+
+Residual risks: `_html` translations are trusted code; a malicious or
+careless translator can inject markup, and an argument interpolated into
+`href="%{url}"` of an `_html` translation is HTML-escaped but not URL-checked
+(`javascript:` is not filtered, as in Rails), so authors must never pass a
+user-supplied URL there and review translation files like templates (the
+page CSP still blocks inline scripts). A translated response built without
+the request's `I18n` (or before the negotiation layer) gets no `Vary` unless
+the handler calls `set_content_language`. Live-update fragments render in
+the default locale for every subscriber.
+
 ## Review cadence
 
 Update this model when adding a trust boundary, privileged capability, protocol,

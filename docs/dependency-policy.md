@@ -349,6 +349,22 @@ askama type appears in a stable `forge-mail` signature except askama's
 The test CA and key in `crates/forge-mail/tests/fixtures/tls` are test
 material, not secrets.
 
+## Internationalization dependency decision
+
+[ADR 0037](adr/0037-internationalization.md) adds the workspace crate
+`forge-i18n` and **no new package to `Cargo.lock`**. It declares `serde` and
+`serde_json` (the translation files are parsed by a serde visitor of Forge's
+own, which refuses the duplicate keys `serde_json` would silently overwrite),
+`thiserror` and `tracing`; dev-dependencies `tempfile` and
+`tracing-subscriber`. CLDR plural rules are code, not data, so no CLDR or ICU
+package (`icu_*`, `fluent`, `rust-i18n`) was admitted: they would add data
+crates or macros whose behavior differs from Forge-Go's, which reads the same
+files. Dates are a Forge-owned `DateTime`, so the core needs no date library.
+`forge-config` (to validate `FORGE_I18N_DEFAULT_LOCALE`), `forge-views` (the
+request layer and template helpers, feature `runtime`) and `forge-cli`
+(`forge i18n check`, which also adds `serde` for its JSON report) depend on
+`forge-i18n`; the `forge` facade exposes it behind the feature `i18n`.
+
 ## CLI lifecycle dependencies
 
 [ADR 0036](adr/0036-application-lifecycle-commands.md) adds **no package to
