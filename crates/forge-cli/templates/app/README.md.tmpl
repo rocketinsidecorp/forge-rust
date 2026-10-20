@@ -94,14 +94,35 @@ Apply the migrations, then run the application:
 
 ```bash
 export FORGE_MIGRATION_DATABASE_URL='%%DATABASE_MIGRATION_URL_LOCAL%%'
-forge migrate                 # or: cargo run -- migrate
+forge db prepare              # create the database if missing, then migrate (and seed a new one)
+forge migrate                 # or just migrate; same as: cargo run -- migrate
 
 export FORGE_DATABASE_URL='%%DATABASE_RUNTIME_URL_LOCAL%%'
-cargo run
+forge dev                     # rebuilds and restarts when files change; or: cargo run
 ```
 
 `serve` requires `FORGE_DATABASE_URL`; a URL for another database engine exits
 with code 78.
+
+The `forge db` commands run this application's own subcommands (the CLI builds
+it with Cargo and never reads the database URL), like Rails' `db:*` tasks:
+
+```bash
+forge db status               # applied and pending migrations; or: cargo run -- migrate status
+forge db rollback --steps 1   # your newest migration, never a Forge-owned table; or: cargo run -- rollback --steps 1
+forge db setup                # create + migrate + seed
+forge db reset                # drop + setup: a clean development database
+forge db drop                 # or: cargo run -- db drop
+forge doctor                  # toolchain, FORGE_* settings, is the database server answering?
+```
+
+`drop`, `reset` and `db rollback` are refused when `FORGE_ENV` is not
+`development` or `test` (and `drop` also when the server is not on this
+machine) unless you pass `--force-production` and either type the application
+name at the prompt or pass `--yes` with `FORGE_ALLOW_DESTRUCTIVE=true` in the
+process environment. `db create` and `db drop` use
+`FORGE_MIGRATION_DATABASE_URL`; its role needs the privilege to create or drop
+databases (the Compose migration role has it).
 
 %%if postgresql%%
 Database-enabled applications include `infrastructure::audit::PgAuditSink`,
@@ -159,10 +180,11 @@ first tenant and its owner with the migration role, then sign in:
 
 ```bash
 export FORGE_MIGRATION_DATABASE_URL='%%DATABASE_MIGRATION_URL_LOCAL%%'
-cargo run -- setup --tenant acme --email owner@example.com --organization "Acme Inc"
+forge setup --tenant acme --email owner@example.com --organization "Acme Inc"
+# or: cargo run -- setup --tenant acme --email owner@example.com --organization "Acme Inc"
 unset FORGE_MIGRATION_DATABASE_URL
 export FORGE_DATABASE_URL='%%DATABASE_RUNTIME_URL_LOCAL%%'
-cargo run
+forge dev                     # or: cargo run
 # open http://127.0.0.1:3000/session/new?tenant=acme
 ```
 
@@ -216,21 +238,35 @@ it with `forge::mail::testing::Recorder` (see the Forge mail guide,
 
 %%end%%
 ```bash
-cargo run                     # serves on http://127.0.0.1:3000
+forge dev                     # serves on http://127.0.0.1:3000; or: cargo run
 curl http://127.0.0.1:3000/health/live
 forge check && forge lint && forge test
+forge doctor                  # toolchain, FORGE_* settings and database reachability
 ```
+
+`forge dev` rebuilds and restarts the application when sources, templates,
+assets or migrations change: the old process keeps serving until the new build
+succeeds, a failed build is printed and leaves it running, and Ctrl-C stops it
+gracefully. `forge dev --no-reload` builds and runs once; `forge test ARGS`
+passes `ARGS` to `cargo test`; `forge build` is the locked release build.
 
 Binary commands: `serve` (default), `healthcheck`, `version`, `help`.
 %%if database%%
-Database-enabled binaries also support `migrate` and `rollback`.
-`migrate` applies pending embedded migrations; `rollback` reverts the
-application's latest reversible migration, never one shipped by Forge (such as
+Database-enabled binaries also support `migrate [status]`, `rollback [--steps N]`
+and `db create|exists|drop` (what `forge migrate`, `forge rollback` and
+`forge db ...` run).
+`migrate` applies pending embedded migrations and `migrate status` lists them;
+`rollback` reverts the application's latest reversible migration (`--steps N`
+reverts N), never one shipped by Forge (such as
 the cache or rate-limit tables). `seed` runs `seed` in `src/bootstrap/seeds.rs` in one
 transaction with `FORGE_MIGRATION_DATABASE_URL`; keep it idempotent.
+`db drop` refuses `FORGE_ENV=production` and servers that are not on this
+machine unless `--force-production` is given; `db exists` exits 3 when the
+database is missing.
 %%end%%
 %%if authentication%%
-`setup` creates the first tenant and its owner (see Sign in).
+`setup` creates the first tenant and its owner (see Sign in); `forge setup`
+runs it.
 %%end%%
 
 Configuration uses `FORGE_*` environment variables; unknown `FORGE_*` keys are

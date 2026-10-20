@@ -46,10 +46,17 @@ and are `Secure`: browsers accept them on `https://` and on
 ## Development
 
 ```bash
-cargo run                     # serves on http://127.0.0.1:3000
+forge dev                     # serves on http://127.0.0.1:3000; or: cargo run
 curl http://127.0.0.1:3000/health/live
 forge check && forge lint && forge test
+forge doctor                  # toolchain, FORGE_* settings and database reachability
 ```
+
+`forge dev` rebuilds and restarts the application when sources, templates,
+assets or migrations change: the old process keeps serving until the new build
+succeeds, a failed build is printed and leaves it running, and Ctrl-C stops it
+gracefully. `forge dev --no-reload` builds and runs once; `forge test ARGS`
+passes `ARGS` to `cargo test`; `forge build` is the locked release build.
 
 Binary commands: `serve` (default), `healthcheck`, `version`, `help`.
 
