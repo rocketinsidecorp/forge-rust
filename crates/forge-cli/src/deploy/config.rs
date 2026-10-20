@@ -40,11 +40,12 @@ pub(crate) mod patterns {
     pub(crate) const VOLUME: &str = "^[A-Za-z0-9_./-]+:/[A-Za-z0-9_./-]*(:(ro|rw))?$";
     pub(crate) const HEALTH_PATH: &str = "^/[A-Za-z0-9._~/-]*$";
     pub(crate) const EMAIL: &str = r"^[^@\s]+@[^@\s]+$";
-    pub(crate) const REGISTRY_HOST: &str = "^[A-Za-z0-9.-]+(:[0-9]{1,5})?$";
+    pub(crate) const REGISTRY_HOST: &str = "^[A-Za-z0-9][A-Za-z0-9.-]*(:[0-9]{1,5})?$";
     pub(crate) const PLATFORM: &str =
         "^[a-z0-9]+/[a-z0-9]+(/[a-z0-9]+)?(,[a-z0-9]+/[a-z0-9]+(/[a-z0-9]+)?)*$";
     pub(crate) const ARG: &str = "^[^\\x00-\\x1f]*$";
-    pub(crate) const PROXY_JUMP: &str = "^([a-z_][a-z0-9_.-]*@)?[A-Za-z0-9._-]+(:[0-9]{1,5})?$";
+    pub(crate) const PROXY_JUMP: &str =
+        "^([a-z_][a-z0-9_.-]*@)?[A-Za-z0-9_][A-Za-z0-9._-]*(:[0-9]{1,5})?$";
     pub(crate) const VERSION: &str = "^[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}$";
     pub(crate) const SINCE: &str = "^[0-9A-Za-z:.+-]{1,40}$";
     pub(crate) const PASSTHROUGH: &str = r"^\$(\{[A-Za-z_][A-Za-z0-9_]*\}|[A-Za-z_][A-Za-z0-9_]*)$";
@@ -587,6 +588,10 @@ fn go_duration(nanos: i64) -> GoDuration {
 }
 
 const MILLISECOND: i64 = 1_000_000;
+/// The largest `config/deploy.yml` read: deploy files are a few kilobytes,
+/// and a bounded read keeps a wrong path from filling memory.
+const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
+
 const SECOND: i64 = 1_000 * MILLISECOND;
 const MINUTE: i64 = 60 * SECOND;
 const HOUR: i64 = 60 * MINUTE;
@@ -594,8 +599,19 @@ const HOUR: i64 = 60 * MINUTE;
 impl Config {
     /// Reads and validates the configuration at `path`.
     pub(crate) fn load(path: &std::path::Path) -> Result<Self, String> {
-        let content = std::fs::read(path)
+        use std::io::Read as _;
+        let file = std::fs::File::open(path)
             .map_err(|error| format!("read deploy config: {}", go_io_error(path, &error)))?;
+        let mut content = Vec::new();
+        file.take(MAX_CONFIG_BYTES + 1)
+            .read_to_end(&mut content)
+            .map_err(|error| format!("read deploy config: {}", go_io_error(path, &error)))?;
+        if content.len() as u64 > MAX_CONFIG_BYTES {
+            return Err(format!(
+                "read deploy config: {} is larger than {MAX_CONFIG_BYTES} bytes",
+                path.display()
+            ));
+        }
         Self::parse(&content)
     }
 
@@ -1152,4 +1168,23 @@ pub(crate) fn go_io_error(path: &std::path::Path, error: &std::io::Error) -> Str
         _ => error.to_string(),
     };
     format!("open {}: {reason}", path.display())
+}
+
+#[cfg(test)]
+mod option_like_values {
+    use super::{PROXY_JUMP, REGISTRY_HOST};
+
+    #[test]
+    fn jump_and_registry_hosts_never_start_with_a_dash() {
+        // `ssh -J VALUE` and `docker login VALUE` would read a leading `-` as
+        // an option.
+        for value in ["-Fevil", "ops@-Fevil", "--help", "-x:22"] {
+            assert!(!PROXY_JUMP.matches(value), "proxy_jump {value:?}");
+            assert!(!REGISTRY_HOST.matches(value), "registry {value:?}");
+        }
+        assert!(PROXY_JUMP.matches("ops@bastion.example.com:2222"));
+        assert!(PROXY_JUMP.matches("_bastion"));
+        assert!(REGISTRY_HOST.matches("registry.example.com:5000"));
+        assert!(REGISTRY_HOST.matches("ghcr.io"));
+    }
 }

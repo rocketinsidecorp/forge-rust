@@ -19,6 +19,11 @@
 
 use std::fmt;
 
+/// How deeply collections may nest, block and flow each: deeper documents
+/// are refused with a line number instead of exhausting the stack (yaml.v3
+/// refuses past its own maximum depth). Deploy files nest a few levels.
+const MAX_DEPTH: usize = 100;
+
 /// A parsed value and the line it starts on (1-based).
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Node {
@@ -187,7 +192,11 @@ pub(crate) fn parse(text: &str) -> Result<Option<Node>, SyntaxError> {
     if lines.is_empty() {
         return Ok(None);
     }
-    let mut parser = Parser { lines, index: 0 };
+    let mut parser = Parser {
+        lines,
+        index: 0,
+        depth: 0,
+    };
     let indent = parser.lines[0].indent;
     let node = parser.node(indent)?;
     if let Some(line) = parser.peek() {
@@ -315,6 +324,8 @@ fn strip_comment(text: &str) -> &str {
 struct Parser {
     lines: Vec<Line>,
     index: usize,
+    /// Collections being read, for [`MAX_DEPTH`].
+    depth: usize,
 }
 
 /// Where a mapping key ends: the `:` followed by a space or the end.
@@ -454,6 +465,17 @@ impl Parser {
     }
 
     fn node(&mut self, indent: usize) -> Result<Node, SyntaxError> {
+        if self.depth >= MAX_DEPTH {
+            let line = self.peek().map_or(1, |line| line.number);
+            return error(line, format!("exceeded max depth of {MAX_DEPTH}"));
+        }
+        self.depth += 1;
+        let node = self.node_at(indent);
+        self.depth -= 1;
+        node
+    }
+
+    fn node_at(&mut self, indent: usize) -> Result<Node, SyntaxError> {
         let Some(line) = self.peek().cloned() else {
             return Ok(Node {
                 value: Value::Null,
@@ -627,6 +649,7 @@ impl Parser {
                 text,
                 position: 0,
                 line,
+                depth: 0,
             };
             let node = flow.value()?;
             flow.skip_spaces();
@@ -717,6 +740,8 @@ struct Flow<'a> {
     text: &'a str,
     position: usize,
     line: usize,
+    /// Collections being read, for [`MAX_DEPTH`].
+    depth: usize,
 }
 
 impl Flow<'_> {
@@ -734,6 +759,16 @@ impl Flow<'_> {
     }
 
     fn value(&mut self) -> Result<Node, SyntaxError> {
+        if self.depth >= MAX_DEPTH {
+            return self.fail(&format!("exceeded max depth of {MAX_DEPTH}"));
+        }
+        self.depth += 1;
+        let node = self.value_at();
+        self.depth -= 1;
+        node
+    }
+
+    fn value_at(&mut self) -> Result<Node, SyntaxError> {
         self.skip_spaces();
         let line = self.line;
         match self.rest().as_bytes().first() {
@@ -971,6 +1006,23 @@ mod tests {
                 "{error}"
             );
         }
+    }
+
+    #[test]
+    fn refuses_deep_nesting_instead_of_exhausting_the_stack() {
+        for text in [
+            format!("hosts:\n{}x\n", "- ".repeat(200_000)),
+            format!("a: {}{}\n", "[".repeat(100_000), "]".repeat(100_000)),
+            format!("a: {}1{}\n", "{b: ".repeat(1_000), "}".repeat(1_000)),
+        ] {
+            let error = parse(&text).expect_err("deep nesting");
+            assert!(
+                error.to_string().contains("exceeded max depth of 100"),
+                "{error}"
+            );
+        }
+        let nested = format!("a: {}1{}\n", "[".repeat(50), "]".repeat(50));
+        assert!(parse(&nested).is_ok(), "moderate nesting stays valid");
     }
 
     #[test]
