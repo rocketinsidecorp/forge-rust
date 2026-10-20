@@ -7,7 +7,7 @@
 
 use std::{sync::Arc, time::Duration};
 
-use forge_db::{Database, testing::TestDatabase};
+use forge_db::{Database, DbError, FRAMEWORK_MIGRATIONS, testing::TestDatabase};
 use forge_ratelimit::{
     Limit, LimitError, Limiter, MAX_PRUNE_ROUNDS, Pruner, StoreOptions,
     testing::{Subject, run},
@@ -124,7 +124,20 @@ macro_rules! store_tests {
                     !second.allow("shared", l).await.expect("allow").allowed,
                     "a second replica sees the first one's hit"
                 );
-                assert_eq!(test.database().rollback(&$migrations).await.expect("rollback"), Some(20_261_019_000_000));
+                // The application rollback never reverts a framework migration (ADR 0030).
+                let error = test.database().rollback(&$migrations).await.expect_err("refused");
+                assert!(
+                    matches!(
+                        error,
+                        DbError::FrameworkMigrationOnly { version: 20_261_019_000_000, owner: "forge-ratelimit" }
+                    ),
+                    "{error:?}"
+                );
+                assert!(second.allow("x", l).await.is_ok(), "the table survives the application rollback");
+                assert_eq!(
+                    test.database().rollback_framework(&$migrations).await.expect("rollback"),
+                    Some(20_261_019_000_000)
+                );
                 assert!(second.allow("x", l).await.is_err(), "the table is gone after rollback");
             }
 
@@ -177,3 +190,25 @@ store_tests!(
     "FORGE_TEST_MARIADB_URL", forge_ratelimit::mysql::MIGRATIONS;
     #[ignore = "needs FORGE_TEST_MARIADB_URL"]
 );
+
+/// Every shipped migration is a registered framework migration (ADR 0030), so
+/// an application rollback never reverts it and turning the store off never
+/// breaks `migrate`.
+#[test]
+fn shipped_migrations_are_registered_framework_migrations() {
+    for set in [
+        &forge_ratelimit::postgres::MIGRATIONS,
+        &forge_ratelimit::mysql::MIGRATIONS,
+        &forge_ratelimit::sqlite::MIGRATIONS,
+    ] {
+        assert!(set.iter().count() > 0);
+        for migration in set.iter() {
+            let registered = FRAMEWORK_MIGRATIONS
+                .iter()
+                .find(|framework| framework.version == migration.version)
+                .expect("registered in forge_db::FRAMEWORK_MIGRATIONS");
+            assert_eq!(registered.description, migration.description);
+            assert_eq!(registered.owner, "forge-ratelimit");
+        }
+    }
+}

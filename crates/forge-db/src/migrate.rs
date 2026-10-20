@@ -5,6 +5,11 @@
 //! or reverted, and never leaves a session-scoped migration lock on a pooled
 //! connection: after any failure the connection is closed instead of being
 //! returned to the pool.
+//!
+//! Migrations shipped by Forge crates share the application's bookkeeping
+//! table (ADR 0030): they are listed in [`FRAMEWORK_MIGRATIONS`], never
+//! reverted by the application rollback, and tolerated when their feature is
+//! no longer part of the migrator.
 
 use std::collections::HashMap;
 
@@ -17,6 +22,59 @@ use tracing::debug;
 
 use crate::{Backend, DbError};
 
+/// A migration that a Forge crate records in the application's migration
+/// table, merged in with [`combine_migrations`] (ADR 0030).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct FrameworkMigration {
+    /// The version, reserved for this migration on every backend.
+    pub version: i64,
+    /// The description SQLx derives from the file name (`rate limits` for
+    /// `20261019000000_rate_limits.up.sql`).
+    pub description: &'static str,
+    /// The Forge crate that ships the migration.
+    pub owner: &'static str,
+}
+
+/// Every migration that Forge crates record in the application's migration
+/// table (ADR 0030).
+///
+/// The versions are reserved: an application migration with one of them and
+/// another description is refused. An applied version listed here is
+/// framework-owned, so [`Database::rollback`](crate::Database::rollback)
+/// never reverts it, and [`Database::migrate`](crate::Database::migrate)
+/// tolerates it when the migrator no longer contains it (the feature was
+/// turned off). Released entries are immutable; framework schemas added later
+/// use their own bookkeeping table, like `forge-jobs` and `forge-events`.
+pub const FRAMEWORK_MIGRATIONS: &[FrameworkMigration] = &[
+    FrameworkMigration {
+        version: 20_261_019_000_000,
+        description: "rate limits",
+        owner: "forge-ratelimit",
+    },
+    FrameworkMigration {
+        version: 20_261_019_000_100,
+        description: "cache",
+        owner: "forge-cache",
+    },
+];
+
+fn framework_migration(version: i64) -> Option<&'static FrameworkMigration> {
+    FRAMEWORK_MIGRATIONS
+        .iter()
+        .find(|migration| migration.version == version)
+}
+
+/// Which applied migrations a revert may touch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RevertScope {
+    /// The application's own migrations: every version not listed in
+    /// [`FRAMEWORK_MIGRATIONS`].
+    Application,
+    /// The framework migrations the migrator contains.
+    Framework,
+}
+
 /// Applies pending migrations; returns the versions applied, ascending.
 pub(crate) async fn apply_pending<B: Backend>(
     pool: &Pool<B>,
@@ -27,13 +85,14 @@ pub(crate) async fn apply_pending<B: Backend>(
     finish(connection, result).await
 }
 
-/// Reverts the most recently applied migration.
+/// Reverts the most recently applied migration within `scope`.
 pub(crate) async fn revert_latest<B: Backend>(
     pool: &Pool<B>,
     migrator: &Migrator,
+    scope: RevertScope,
 ) -> Result<Option<i64>, DbError> {
     let mut connection = pool.acquire().await?;
-    let result = revert_locked(&mut *connection, migrator).await;
+    let result = revert_locked(&mut *connection, migrator, scope).await;
     finish(connection, result).await
 }
 
@@ -72,10 +131,33 @@ async fn apply_locked<C: Migrate>(
 async fn revert_locked<C: Migrate>(
     connection: &mut C,
     migrator: &Migrator,
+    scope: RevertScope,
 ) -> Result<Option<i64>, DbError> {
     let applied = prepare(connection, migrator).await?;
-    let Some(latest) = applied.keys().copied().max() else {
+    let latest = applied
+        .keys()
+        .copied()
+        .filter(|version| match scope {
+            RevertScope::Application => framework_migration(*version).is_none(),
+            RevertScope::Framework => {
+                framework_migration(*version).is_some() && migrator.version_exists(*version)
+            }
+        })
+        .max();
+    let Some(latest) = latest else {
         release(connection, migrator).await?;
+        if scope == RevertScope::Application
+            && let Some(framework) = applied
+                .keys()
+                .copied()
+                .filter_map(framework_migration)
+                .max_by_key(|migration| migration.version)
+        {
+            return Err(DbError::FrameworkMigrationOnly {
+                version: framework.version,
+                owner: framework.owner,
+            });
+        }
         return Ok(None);
     };
     let down = migrator
@@ -93,6 +175,7 @@ async fn prepare<C: Migrate>(
     connection: &mut C,
     migrator: &Migrator,
 ) -> Result<HashMap<i64, AppliedMigration>, DbError> {
+    check_reserved_versions(migrator)?;
     if migrator.locking {
         connection.lock().await?;
     }
@@ -108,15 +191,32 @@ async fn prepare<C: Migrate>(
     let applied = connection
         .list_applied_migrations(&migrator.table_name)
         .await?;
+    // A framework version the migrator no longer contains belongs to a
+    // feature that was turned off; any other unknown version fails closed.
     if !migrator.ignore_missing
-        && let Some(missing) = applied
-            .iter()
-            .map(|m| m.version)
-            .find(|version| !migrator.version_exists(*version))
+        && let Some(missing) = applied.iter().map(|m| m.version).find(|version| {
+            !migrator.version_exists(*version) && framework_migration(*version).is_none()
+        })
     {
         return Err(MigrateError::VersionMissing(missing).into());
     }
     Ok(applied.into_iter().map(|m| (m.version, m)).collect())
+}
+
+/// Refuses an application migration that reuses a reserved framework version,
+/// so ownership is never decided for the wrong migration.
+fn check_reserved_versions(migrator: &Migrator) -> Result<(), DbError> {
+    for migration in migrator.iter() {
+        if let Some(framework) = framework_migration(migration.version)
+            && migration.description != framework.description
+        {
+            return Err(DbError::configuration(format!(
+                "migration version {} is reserved for the {} migration of {}; give the application migration another version",
+                migration.version, framework.description, framework.owner
+            )));
+        }
+    }
+    Ok(())
 }
 
 async fn release<C: Migrate>(connection: &mut C, migrator: &Migrator) -> Result<(), DbError> {
@@ -151,6 +251,10 @@ async fn finish<B: Backend, T>(
 /// timestamp versions of the form `YYYYMMDDHHMMSS`), otherwise the merge fails
 /// instead of silently picking one.
 ///
+/// Merging does not change ownership: the framework versions, listed in
+/// [`FRAMEWORK_MIGRATIONS`], are never reverted by the application's
+/// [`Database::rollback`](crate::Database::rollback) (ADR 0030).
+///
 /// ```
 /// use forge_db::{Migrator, combine_migrations};
 ///
@@ -161,6 +265,7 @@ async fn finish<B: Backend, T>(
 pub fn combine_migrations(sets: &[&Migrator]) -> Result<Migrator, DbError> {
     let mut merged: Vec<sqlx::migrate::Migration> = Vec::new();
     for set in sets {
+        check_reserved_versions(set)?;
         for migration in set.iter() {
             let clash = merged.iter().any(|existing| {
                 existing.version == migration.version
@@ -193,17 +298,18 @@ mod tests {
             versions
                 .iter()
                 .flat_map(|version| {
+                    let description = framework_migration(*version).map_or("m", |f| f.description);
                     [
                         Migration::new(
                             *version,
-                            "m".into(),
+                            description.into(),
                             MigrationType::ReversibleUp,
                             "SELECT 1".into_sql_str(),
                             false,
                         ),
                         Migration::new(
                             *version,
-                            "m".into(),
+                            description.into(),
                             MigrationType::ReversibleDown,
                             "SELECT 2".into_sql_str(),
                             false,
@@ -237,5 +343,40 @@ mod tests {
     fn duplicate_versions_are_refused() {
         let error = combine_migrations(&[&set(&[1, 2]), &set(&[2])]).expect_err("clash");
         assert!(error.to_string().contains("version 2"), "{error}");
+    }
+
+    #[test]
+    fn framework_versions_are_unique_and_described() {
+        for (index, migration) in FRAMEWORK_MIGRATIONS.iter().enumerate() {
+            assert!(!migration.description.is_empty() && migration.owner.starts_with("forge-"));
+            assert!(
+                FRAMEWORK_MIGRATIONS[index + 1..]
+                    .iter()
+                    .all(|other| other.version != migration.version),
+                "{migration:?} is listed twice"
+            );
+        }
+    }
+
+    #[test]
+    fn an_application_migration_on_a_reserved_version_is_refused() {
+        let app = Migrator::with_migrations(vec![Migration::new(
+            20_261_019_000_100,
+            "create widgets".into(),
+            MigrationType::ReversibleUp,
+            "SELECT 1".into_sql_str(),
+            false,
+        )]);
+        let error = check_reserved_versions(&app).expect_err("reserved");
+        assert!(
+            error
+                .to_string()
+                .contains("reserved for the cache migration of forge-cache"),
+            "{error}"
+        );
+        let error = combine_migrations(&[&app]).expect_err("reserved");
+        assert!(matches!(error, DbError::Configuration { .. }), "{error:?}");
+        // The framework's own migration under its own description is accepted.
+        assert!(check_reserved_versions(&set(&[1, 20_261_019_000_100])).is_ok());
     }
 }

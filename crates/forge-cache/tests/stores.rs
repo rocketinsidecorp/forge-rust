@@ -11,7 +11,7 @@ use forge_cache::{
     Cache, CacheError, MAX_PRUNE_ROUNDS, Options, Pruner, StoreOptions,
     testing::{Subject, run},
 };
-use forge_db::{Database, testing::TestDatabase};
+use forge_db::{Database, DbError, FRAMEWORK_MIGRATIONS, testing::TestDatabase};
 
 const HOUR: Option<Duration> = Some(Duration::from_secs(3600));
 
@@ -141,8 +141,18 @@ macro_rules! store_tests {
                 first.set("shared", b"v", HOUR).await.expect("set");
                 let second = <$cache>::new(test.database().clone(), StoreOptions::default()).expect("cache");
                 assert_eq!(second.get("shared").await.expect("get").as_deref(), Some(&b"v"[..]));
+                // The application rollback never reverts a framework migration (ADR 0030).
+                let error = test.database().rollback(&$migrations).await.expect_err("refused");
+                assert!(
+                    matches!(
+                        error,
+                        DbError::FrameworkMigrationOnly { version: 20_261_019_000_100, owner: "forge-cache" }
+                    ),
+                    "{error:?}"
+                );
+                assert_eq!(second.get("shared").await.expect("get").as_deref(), Some(&b"v"[..]));
                 assert_eq!(
-                    test.database().rollback(&$migrations).await.expect("rollback"),
+                    test.database().rollback_framework(&$migrations).await.expect("rollback"),
                     Some(20_261_019_000_100)
                 );
                 assert!(second.get("shared").await.is_err(), "the table is gone after rollback");
@@ -195,3 +205,25 @@ store_tests!(
     "SELECT COUNT(*) FROM forge_cache_entries WHERE LOCATE('alice', key_hash) > 0";
     #[ignore = "needs FORGE_TEST_MARIADB_URL"]
 );
+
+/// Every shipped migration is a registered framework migration (ADR 0030), so
+/// an application rollback never reverts it and turning the store off never
+/// breaks `migrate`.
+#[test]
+fn shipped_migrations_are_registered_framework_migrations() {
+    for set in [
+        &forge_cache::postgres::MIGRATIONS,
+        &forge_cache::mysql::MIGRATIONS,
+        &forge_cache::sqlite::MIGRATIONS,
+    ] {
+        assert!(set.iter().count() > 0);
+        for migration in set.iter() {
+            let registered = FRAMEWORK_MIGRATIONS
+                .iter()
+                .find(|framework| framework.version == migration.version)
+                .expect("registered in forge_db::FRAMEWORK_MIGRATIONS");
+            assert_eq!(registered.description, migration.description);
+            assert_eq!(registered.owner, "forge-cache");
+        }
+    }
+}
