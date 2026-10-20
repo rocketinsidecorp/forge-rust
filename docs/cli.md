@@ -42,6 +42,7 @@ forge db create | drop | reset | setup | prepare | migrate | status | seed
 forge db rollback [--steps N]
 forge openapi [--output FILE | --check FILE]
 forge i18n check [--json]
+forge credentials init|edit|show|rotate-key [-e|--environment ENV] [show: --reveal] [rotate-key: --keep-old --print-key --write-key-file]
 ```
 
 The quality and build commands run `cargo` directly (no shell) in the current
@@ -648,6 +649,31 @@ keys nothing references (informational; `date.`, `time.` and `number.` are
 data). It reads files only. Same report and exit status as Forge-Go
 ([i18n](i18n.md#forge-i18n-check)).
 
+## `forge credentials`
+
+Encrypted per-environment credentials, like `rails credentials:edit`, with
+Forge-Go's commands, files and format ([credentials](credentials.md),
+[ADR 0041](adr/0041-encrypted-credentials-and-attribute-encryption.md)). The
+commands work on `config/credentials/` under the current directory and never
+build or run the application.
+
+```sh
+forge credentials init -e production          # production.key (0600) + production.json.enc; ignore entries
+forge credentials edit                        # $VISUAL/$EDITOR, no shell, no FORGE_* variables
+forge credentials show                        # every value redacted
+forge credentials show --reveal               # values; refused unless stdout is a terminal
+forge credentials rotate-key --keep-old --print-key
+```
+
+- `--environment`/`-e` defaults to `$FORGE_ENV`, then `development`.
+- The key is `FORGE_MASTER_KEY` when set, else `config/credentials/<env>.key`,
+  which must be a regular 0600 file (not a symbolic link).
+- `edit` uses a 0600 file in a fresh 0700 directory (`/dev/shm` on Linux),
+  wiped on every exit including `SIGTERM` and `SIGHUP`; it refuses invalid or
+  duplicate-key JSON and a file that changed while the editor was open.
+- `rotate-key` needs `--print-key` or `--write-key-file` when the key came from
+  `FORGE_MASTER_KEY`; `--keep-old` keeps the previous keys readable.
+
 ## `forge check`, `forge test`, `forge format`, `forge lint`
 
 | Command | Runs |
@@ -842,7 +868,7 @@ Same command names, flags, messages and exit codes, except:
   accurate listing needs the application's composition, which needs its
   configuration), `forge inspect`, `db schema:dump`, `db schema:load` and
   `db console` (they run `pg_dump`, `psql` and friends with the database
-  credential), `destroy`, `deploy`, `logs`, `app`, `credentials`. They are
+  credential), `destroy`, `deploy`, `logs`, `app`. They are
   tracked in [Rails parity](rails-parity.md).
 - `forge doctor` also checks the toolchain and that the database server answers.
 - Progress lines of `forge dev` carry no time stamp.

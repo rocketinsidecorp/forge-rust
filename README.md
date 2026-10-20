@@ -190,6 +190,10 @@ forge doctor                                   # toolchain, FORGE_* settings, is
 forge doctor --json                            # versioned, secret-free report for scripts and CI
 forge i18n check                               # keys and plural forms each locale lacks; exit 1 when incomplete
 forge i18n check --json                        # the same report as JSON (schema_version 1)
+forge credentials edit                         # encrypted config/credentials/development.json.enc in $EDITOR
+forge credentials show -e production           # structure only, every value redacted (--reveal: terminal only)
+forge credentials init --environment production   # 0600 production.key + production.json.enc, *.key git-ignored
+forge credentials rotate-key -e production --keep-old --print-key   # re-encrypt under a new key
 forge check && forge lint && forge test        # cargo check / clippy -D warnings / test
 forge test --lib orders -- --nocapture         # arguments replace the defaults and go to cargo test
 forge format                                   # cargo fmt --all
@@ -222,7 +226,7 @@ cargo run -- seed                              #   setup, seed, openapi: what th
 ```
 
 The commands above that are not `new`, `generate`, `id`, `version`, `doctor`,
-`i18n`, `check`, `lint`, `test`, `format` or `build` run the generated application's own
+`i18n`, `credentials`, `check`, `lint`, `test`, `format` or `build` run the generated application's own
 subcommands: the CLI builds it with `cargo build --locked`, runs the binary it
 produced with your terminal and environment, and reads no database URL itself
 (`forge doctor` only describes it, redacted, and opens a TCP connection to its
@@ -599,6 +603,37 @@ A code and a backup code work once, the code step allows five attempts per
 account and 60 per address in five minutes, and a challenge only works in the
 browser that entered the password.
 
+## Credentials and encrypted columns
+
+Secrets live encrypted in `config/credentials/<environment>.json.enc`, which is
+committed, under a key that is not: `config/credentials/<environment>.key`
+(mode 0600, git- and docker-ignored; `forge new` creates the development one)
+or `FORGE_MASTER_KEY`. The format is Forge-Go's, so either framework reads the
+other's files ([ADR 0041](docs/adr/0041-encrypted-credentials-and-attribute-encryption.md),
+[docs/credentials.md](docs/credentials.md)):
+
+```sh
+forge credentials edit                                   # decrypt to a private temp file, $EDITOR, validate, re-encrypt
+forge credentials show                                   # structure only; values redacted
+forge credentials init --environment production          # new key + encrypted file; never overwrites
+docker run -e FORGE_ENV=production -e FORGE_MASTER_KEY="$(cat config/credentials/production.key)" shop
+forge credentials rotate-key -e production --keep-old --print-key   # new key; old list stays readable
+```
+
+Read them in `src/bootstrap` and encrypt columns with the key ring they hold
+([docs/encryption.md](docs/encryption.md)): values are AES-256-GCM, bound to
+their table, column and row, randomized, rotatable, with an opt-in blind index
+for lookups:
+
+```rust
+let credentials = forge::credentials::open("production",
+    forge::credentials::Options::default().with_required(["stripe.api_key", "encryption"]))?;
+let stripe_key = credentials.secret(&["stripe", "api_key"])?;   // prints [REDACTED]
+let cipher = forge::encryption::Cipher::new(&credentials.key_ring(&["encryption"])?)?;
+let stored = cipher.attribute("people", "ssn").seal(&id.to_string(), &ssn)?;  // TEXT column
+let ssn: String = cipher.attribute("people", "ssn").open(&id.to_string(), &stored)?;
+```
+
 ## Translations
 
 Full-stack applications are translated like Rails I18n: JSON files in
@@ -824,7 +859,9 @@ crates/
 ├── forge-cache    # application cache: memory and shared stores, single-flight fetch
 ├── forge-core     # lifecycle, errors, UUIDv7 identifiers
 ├── forge-config   # typed FORGE_* configuration and secret redaction
+├── forge-credentials # encrypted config/credentials/<env>.json.enc, keys, redacted store
 ├── forge-db       # repository/transaction contracts, including tenant-scoped ports
+├── forge-encryption # attribute encryption: AES-256-GCM values, key rings, blind index, rotation
 ├── forge-events   # integration events, transactional outbox, dispatcher, consumer inbox
 ├── forge-http     # HTTP server, routing, middleware, form/query decoding, limits
 ├── forge-i18n     # translations: JSON catalogs, CLDR plurals, locale matching, number/date formats
@@ -903,6 +940,7 @@ Contribution rules:
 - [Mail: SMTP, templates, previews and reset emails](docs/mail.md)
 - [Internationalization: translations, plurals, locales](docs/i18n.md)
 - [Two-factor authentication (TOTP)](docs/mfa.md)
+- [Credentials](docs/credentials.md) and [attribute encryption](docs/encryption.md)
 - [OpenAPI from typed routes](docs/openapi.md)
 - [Deployment](docs/deployment.md)
 - [Observability: traces, metrics and logs](docs/observability.md)

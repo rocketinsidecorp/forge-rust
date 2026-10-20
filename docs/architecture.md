@@ -122,6 +122,8 @@ forge/
 │   ├── forge-cache         # cache port and adapters (implemented, ADR 0028)
 │   ├── forge-ratelimit     # fixed-window limiter, stores, HTTP middleware (ADR 0027)
 │   ├── forge-storage       # storage port, disk adapter, signed links, uploads (ADR 0029)
+│   ├── forge-encryption    # attribute encryption: ring AES-GCM/HKDF/HMAC, key rings, blind index, rotation (ADR 0041)
+│   ├── forge-credentials   # encrypted per-environment credentials files and keys (ADR 0041)
 │   ├── forge-mail          # mail port, MIME encoder, SMTP/file/test senders, previews (ADR 0035)
 │   ├── forge-i18n          # translations: JSON catalogs, CLDR plurals, locale matching, formats (ADR 0037)
 │   ├── forge-broadcast     # live updates: Turbo Streams over SSE, LISTEN/NOTIFY fanout (ADR 0031)

@@ -40,6 +40,7 @@ does not mean implementation exists.
 | [0038](0038-generators-and-destroy.md) | Model, controller, mailer and queue job generators, and `forge destroy` that removes only files still identical to what the generator writes (port of Forge-Go ADR 0041) | Accepted |
 | [0039](0039-openapi-from-typed-routes.md) | OpenAPI 3.1 from typed routes: `#[derive(OpenApiSchema)]`, `describe`/`typed`, deterministic document, contract tests, `GET /openapi.json` behind `FORGE_OPENAPI_ENABLED`, `openapi` and `forge openapi` (port of Forge-Go ADR 0043) | Accepted |
 | [0040](0040-totp-multi-factor-authentication.md) | TOTP multi-factor authentication: RFC 6238 over `hmac`/`sha1`, AES-256-GCM seeds (`ring`) under `FORGE_AUTH_MFA_KEY`, backup codes, browser-bound throttled challenges, step-up enrollment, rotation and disable pages (port of Forge-Go ADR 0014 and 0015) | Accepted |
+| [0041](0041-encrypted-credentials-and-attribute-encryption.md) | Encrypted credentials and attribute encryption: `config/credentials/<env>.json.enc` under `FORGE_MASTER_KEY` or a 0600 key file, `forge credentials init\|edit\|show\|rotate-key`, AES-256-GCM/HKDF/HMAC from `ring`, row-bound `fg1.` values, blind indexes and resumable rotation (port of Forge-Go ADR 0036) | Accepted |
 
 New ADRs use the next four-digit number. A changed decision receives a new ADR
 that marks the prior record `Superseded`; accepted records are not rewritten to
