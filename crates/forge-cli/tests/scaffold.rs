@@ -179,28 +179,7 @@ fn apply_wiring(root: &Path, printed: &str) {
     assert!(section >= 2, "{printed}");
 
     for (file, declaration) in declarations {
-        let path = root.join(&file);
-        let source = fs::read_to_string(&path).unwrap_or_else(|error| panic!("{file}: {error}"));
-        let mut lines: Vec<String> = source.lines().map(str::to_owned).collect();
-        let is_module = |line: &String| line.starts_with("pub mod ") && line.ends_with(';');
-        match lines.iter().position(is_module) {
-            Some(start) => {
-                let end = start
-                    + lines[start..]
-                        .iter()
-                        .take_while(|line| is_module(line))
-                        .count();
-                let mut block: Vec<String> = lines[start..end].to_vec();
-                block.push(declaration);
-                block.sort();
-                lines.splice(start..end, block);
-            }
-            None => {
-                lines.push(String::new());
-                lines.push(declaration);
-            }
-        }
-        fs::write(&path, lines.join("\n") + "\n").unwrap_or_else(|error| panic!("{error}"));
+        declare(root, &file, declaration);
     }
 
     // The role example printed for PostgreSQL tenant resources, applied
@@ -234,6 +213,45 @@ fn apply_wiring(root: &Path, printed: &str) {
         .unwrap_or_else(|| panic!("compose ends with Ok(()):\n{source}"));
     let wired = format!("{}{statements}\n{}", &source[..end], &source[end..]);
     fs::write(&bootstrap, wired).unwrap_or_else(|error| panic!("{error}"));
+}
+
+/// Adds `declaration` (`pub mod name;`) to the sorted block of `file`.
+fn declare(root: &Path, file: &str, declaration: String) {
+    let path = root.join(file);
+    let source = fs::read_to_string(&path).unwrap_or_else(|error| panic!("{file}: {error}"));
+    let mut lines: Vec<String> = source.lines().map(str::to_owned).collect();
+    let is_module = |line: &String| line.starts_with("pub mod ") && line.ends_with(';');
+    match lines.iter().position(is_module) {
+        Some(start) => {
+            let end = start
+                + lines[start..]
+                    .iter()
+                    .take_while(|line| is_module(line))
+                    .count();
+            let mut block: Vec<String> = lines[start..end].to_vec();
+            block.push(declaration);
+            block.sort();
+            lines.splice(start..end, block);
+        }
+        None => {
+            lines.push(String::new());
+            lines.push(declaration);
+        }
+    }
+    fs::write(&path, lines.join("\n") + "\n").unwrap_or_else(|error| panic!("{error}"));
+}
+
+/// Applies only the module declarations of printed wiring (a model's: its
+/// use cases are built where the application needs them).
+fn declare_modules(root: &Path, printed: &str) {
+    let mut declared = 0;
+    for line in printed.lines() {
+        if let Some((file, module)) = line.trim().split_once(" pub mod ") {
+            declare(root, file.trim(), format!("pub mod {module}"));
+            declared += 1;
+        }
+    }
+    assert!(declared > 0, "{printed}");
 }
 
 /// Generates `database`'s application with both scaffolds and runs its
@@ -1232,4 +1250,261 @@ fn postgresql_application_runs_its_lifecycle_through_the_forge_cli() {
 fn uuid_simple() -> String {
     let id = run(Path::new("."), env!("CARGO_BIN_EXE_forge"), &["id"], &[]);
     String::from_utf8_lossy(&id.stdout).trim().replace('-', "")
+}
+
+/// Every file below `root` except build output and the lockfile, relative
+/// path to content.
+fn source_tree(root: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+    fn visit(
+        root: &Path,
+        directory: &Path,
+        files: &mut std::collections::BTreeMap<String, Vec<u8>>,
+    ) {
+        let entries = fs::read_dir(directory).unwrap_or_else(|error| panic!("{error}"));
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            let relative = path
+                .strip_prefix(root)
+                .unwrap_or_else(|error| panic!("{error}"))
+                .to_string_lossy()
+                .replace('\\', "/");
+            if relative == "target" || relative == "Cargo.lock" || relative == ".git" {
+                continue;
+            }
+            if path.is_dir() {
+                visit(root, &path, files);
+            } else {
+                let content = fs::read(&path).unwrap_or_else(|error| panic!("{error}"));
+                files.insert(relative, content);
+            }
+        }
+    }
+    let mut files = std::collections::BTreeMap::new();
+    visit(root, root, &mut files);
+    files
+}
+
+fn stdout(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+/// `forge generate model|controller|mailer|job` and `forge destroy` end to
+/// end (ADR 0038): a PostgreSQL application gets a model, a tenant-scoped
+/// scaffold, a controller that reuses the model's permission, a public and
+/// a JSON controller, a mailer and a queue job; the printed wiring is
+/// applied and the application passes `cargo fmt --check`, Clippy with
+/// warnings denied and `cargo test` (with FORGE_TEST_DATABASE_URL, the
+/// repository tests too). Then everything is destroyed, the wiring taken
+/// out, and the application is the one `forge new` wrote again (plus the
+/// shared access and jobs modules, which destroy never removes) and still
+/// builds.
+#[test]
+#[ignore = "slow: builds generated applications; run with --ignored"]
+fn postgresql_application_generates_and_destroys_every_generator() {
+    let forge = env!("CARGO_BIN_EXE_forge");
+    let parent = tempfile::tempdir().unwrap_or_else(|error| panic!("{error}"));
+    let forge_path = workspace().join("crates/forge");
+    let forge_path = forge_path.to_string_lossy();
+    run(
+        parent.path(),
+        forge,
+        &[
+            "new",
+            "generators-postgresql",
+            "--skip-docker",
+            "--skip-ci",
+            "--skip-lockfile",
+            "--forge-path",
+            &forge_path,
+        ],
+        &[],
+    );
+    let root = parent.path().join("generators-postgresql");
+    let original = source_tree(&root);
+
+    const MODEL: &[&str] = &["book", "title:string", "pages:integer?", "--global"];
+    const SCAFFOLD: &[&str] = &["article", "title:string", "--tenant-scoped"];
+    const BOOKS: &[&str] = &["books", "shelf"];
+    const PAGES: &[&str] = &["pages", "index", "about_us", "--public"];
+    const REPORTS: &[&str] = &["reports", "monthly", "--api"];
+    const MAILER: &[&str] = &["user", "welcome:name,url", "password_reset"];
+    const JOB: &[&str] = &["send_welcome", "user_id:uuid", "note:string?", "--queue"];
+    let generations: [(&str, &[&str]); 7] = [
+        ("model", MODEL),
+        ("scaffold", SCAFFOLD),
+        ("controller", BOOKS),
+        ("controller", PAGES),
+        ("controller", REPORTS),
+        ("mailer", MAILER),
+        ("job", JOB),
+    ];
+    for (generator, arguments) in generations {
+        let mut command = vec!["generate", generator];
+        command.extend_from_slice(arguments);
+        let mut dry = command.clone();
+        dry.push("--dry-run");
+        let before = source_tree(&root);
+        let planned = stdout(&run(&root, forge, &dry, &[]));
+        assert_eq!(before, source_tree(&root), "--dry-run writes nothing");
+        let printed = stdout(&run(&root, forge, &command, &[]));
+        assert_eq!(
+            planned.replace("would create", "create      "),
+            printed.replace(&version_of(&printed), &version_of(&planned)),
+            "--dry-run lists exactly what {generator} creates"
+        );
+        // Generating again refuses and writes nothing.
+        let again = run_unchecked(&root, forge, &command, &[], None);
+        assert!(!again.status.success(), "{generator} {arguments:?} twice");
+        if generator == "model" {
+            declare_modules(&root, &printed);
+        } else {
+            apply_wiring(&root, &printed);
+        }
+        if generator == "controller" && arguments == BOOKS {
+            assert!(printed.contains("already declares"), "{printed}");
+        }
+    }
+    // The job's feature, as its wiring says.
+    let manifest =
+        fs::read_to_string(root.join("Cargo.toml")).unwrap_or_else(|error| panic!("{error}"));
+    fs::write(
+        root.join("Cargo.toml"),
+        manifest.replace("features = [\"views\"", "features = [\"jobs\", \"views\""),
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
+    assert!(
+        fs::read_to_string(root.join("Cargo.toml"))
+            .unwrap_or_default()
+            .matches("\"jobs\"")
+            .count()
+            == 2
+    );
+
+    // A model whose permission a controller declares is refused (one owner).
+    let refused = run_unchecked(
+        &root,
+        forge,
+        &["generate", "model", "report", "title:string", "--global"],
+        &[],
+        None,
+    );
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("reports:read"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+
+    run(&root, "cargo", &["generate-lockfile", "--quiet"], &[]);
+    run(&root, "cargo", &["fmt", "--all", "--", "--check"], &[]);
+    let clippy = [
+        "clippy",
+        "--all-targets",
+        "--locked",
+        "--quiet",
+        "--",
+        "-D",
+        "warnings",
+    ];
+    run(&root, "cargo", &clippy, &[]);
+    let server = std::env::var_os("FORGE_TEST_DATABASE_URL").is_some();
+    let tests = test_output(&root, server);
+    for test in [
+        "every_action_answers ... ok",
+        "only_get_is_routed ... ok",
+        "every_route_asks_for_the_read_permission_once ... ok",
+        "the_generated_deny_all_default_refuses_every_action ... ok",
+        "welcome_is_delivered_with_its_subject_and_both_parts ... ok",
+        "welcome_escapes_its_data_in_the_html_part ... ok",
+        "password_reset_is_delivered_with_its_subject_and_both_parts ... ok",
+        "previews_render_and_exist_only_in_development ... ok",
+        "a_failing_sender_records_nothing_and_an_unconfigured_mailer_fails ... ok",
+        "the_handler_registers_once ... ok",
+        "the_placeholder_fails_permanently ... ok",
+        "create_show_edit_update_and_delete ... ok",
+    ] {
+        assert!(tests.contains(test), "{test}\n{tests}");
+    }
+    if server {
+        assert!(
+            tests.contains("postgres_round_trip_locking_and_pages ... ok"),
+            "{tests}"
+        );
+    }
+
+    // The model's files belong to its permission's controller until it goes.
+    let model = |extra: &[&'static str]| {
+        let mut command = vec!["destroy", "model"];
+        command.extend_from_slice(MODEL);
+        command.extend_from_slice(extra);
+        command
+    };
+    let blocked = run_unchecked(&root, forge, &model(&[]), &[], None);
+    assert!(!blocked.status.success());
+    assert!(String::from_utf8_lossy(&blocked.stderr).contains("books_controller.rs"));
+
+    // An edited file is never removed without --force.
+    let page = root.join("templates/pages/about_us.html");
+    let edited = fs::read_to_string(&page).unwrap_or_default();
+    fs::write(&page, format!("{edited}<p>edited</p>\n")).unwrap_or_else(|error| panic!("{error}"));
+    let mut pages = vec!["destroy", "controller"];
+    pages.extend_from_slice(PAGES);
+    let refused = run_unchecked(&root, forge, &pages, &[], None);
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("templates/pages/about_us.html"));
+    assert!(root.join("src/adapters/http/pages_controller.rs").exists());
+    fs::write(&page, edited).unwrap_or_else(|error| panic!("{error}"));
+
+    let destroy = |generator: &'static str, arguments: &[&'static str], extra: &[&'static str]| {
+        let mut command = vec!["destroy", generator];
+        command.extend_from_slice(arguments);
+        command.extend_from_slice(extra);
+        stdout(&run(&root, forge, &command, &[]))
+    };
+    let dry = destroy("controller", BOOKS, &["--dry-run"]);
+    assert!(
+        dry.contains("would remove src/adapters/http/books_controller.rs"),
+        "{dry}"
+    );
+    assert!(root.join("src/adapters/http/books_controller.rs").exists());
+    destroy("controller", BOOKS, &[]);
+    let kept = stdout(&run(&root, forge, &model(&[]), &[]));
+    assert!(kept.contains("keep         migrations/"), "{kept}");
+    let leftover = run_unchecked(&root, forge, &model(&[]), &[], None);
+    assert!(String::from_utf8_lossy(&leftover.stderr).contains("--migrations"));
+    run(&root, forge, &model(&["--migrations"]), &[]);
+    destroy("scaffold", SCAFFOLD, &["--migrations"]);
+    destroy("controller", PAGES, &[]);
+    destroy("controller", REPORTS, &[]);
+    destroy("mailer", MAILER, &[]);
+    destroy("job", JOB, &[]);
+
+    // Take the wiring out again: the files Forge never edits.
+    for (path, content) in &original {
+        let current = fs::read(root.join(path)).unwrap_or_default();
+        if &current != content {
+            fs::write(root.join(path), content).unwrap_or_else(|error| panic!("{error}"));
+        }
+    }
+    let mut restored = source_tree(&root);
+    for shared in ["src/adapters/http/access.rs", "src/adapters/jobs/mod.rs"] {
+        assert!(
+            restored.remove(shared).is_some(),
+            "{shared} is shared and kept"
+        );
+    }
+    let drift: Vec<&String> = original
+        .keys()
+        .chain(restored.keys())
+        .filter(|path| original.get(*path) != restored.get(*path))
+        .collect();
+    assert!(drift.is_empty(), "destroy left or removed {drift:?}");
+    assert!(!root.join("templates/mailers").exists());
+    assert!(
+        !root
+            .join("src/adapters/http/views/pages_controller.rs")
+            .exists()
+    );
+
+    run(&root, "cargo", &clippy, &[]);
+    run(&root, "cargo", &["build", "--locked", "--quiet"], &[]);
 }
