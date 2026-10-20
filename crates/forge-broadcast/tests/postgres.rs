@@ -100,15 +100,16 @@ async fn messages_reach_every_replica_exactly_once() {
         .publish(&channel, Message::new("hello"))
         .await
         .expect("publishes");
-    // A message several notifications long is reassembled.
+    assert_eq!(next(&mut on_one).await.as_str(), "hello");
+    assert_eq!(next(&mut on_two).await.as_str(), "hello");
+    // A message several notifications long is reassembled. (Ordering is
+    // per publisher: a replica's own subscribers get its messages at once,
+    // others through the notification.)
     let large: String = "<p>0123456789</p>".repeat(1_500);
     two.broker
         .publish(&channel, Message::new(large.clone()))
         .await
         .expect("publishes");
-
-    assert_eq!(next(&mut on_one).await.as_str(), "hello");
-    assert_eq!(next(&mut on_two).await.as_str(), "hello");
     assert_eq!(next(&mut on_one).await.as_str(), large);
     assert_eq!(next(&mut on_two).await.as_str(), large);
     silent(&mut on_one).await;
