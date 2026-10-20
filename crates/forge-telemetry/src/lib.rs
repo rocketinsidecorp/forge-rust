@@ -31,6 +31,8 @@ pub mod otlp;
 pub mod pool;
 pub mod process;
 pub mod prometheus;
+#[cfg(feature = "testing")]
+pub mod testing;
 pub mod trace;
 
 use std::{

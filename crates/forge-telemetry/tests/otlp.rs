@@ -1,157 +1,18 @@
 //! End-to-end export to an OTLP/HTTP receiver: a hyper server standing in
 //! for an OpenTelemetry Collector records every request it gets.
 
-use std::{
-    convert::Infallible,
-    io::Read as _,
-    net::SocketAddr,
-    sync::{Arc, Mutex},
-    time::Duration,
-};
+use std::time::Duration;
 
-use bytes::Bytes;
 use forge_config::{SecretString, TelemetryLogLevel};
 use forge_telemetry::{
-    Attribute, Options, OtlpClient, SpanKind, SpanSink, Telemetry, logs::TRACE_ID_FIELD,
+    Attribute, Options, SpanKind, SpanSink, Telemetry,
+    logs::TRACE_ID_FIELD,
+    testing::{Behavior, Receiver},
 };
-use http::{HeaderMap, HeaderValue, Request, Response, StatusCode};
-use http_body_util::{BodyExt, Full};
-use hyper::{body::Incoming, service::service_fn};
-use hyper_util::rt::TokioIo;
+use http::{HeaderMap, HeaderValue};
 use serde_json::Value;
-use tokio::{net::TcpListener, task::JoinHandle, time::Instant};
+use tokio::time::Instant;
 use tracing_subscriber::layer::SubscriberExt as _;
-
-#[derive(Clone, Debug)]
-struct Received {
-    path: String,
-    headers: HeaderMap,
-    body: Value,
-}
-
-/// What the receiver answers.
-#[derive(Clone, Copy)]
-enum Behavior {
-    Accept,
-    /// 503 with `Retry-After: 0`-like immediate retry for the first `n`.
-    FailFirst(usize, u16),
-    /// Always this status.
-    Always(u16),
-    /// Never answers.
-    Hang,
-}
-
-struct Receiver {
-    address: SocketAddr,
-    received: Arc<Mutex<Vec<Received>>>,
-    attempts: Arc<Mutex<usize>>,
-    task: JoinHandle<()>,
-}
-
-impl Receiver {
-    async fn start(behavior: Behavior) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-        let address = listener.local_addr().expect("address");
-        let received = Arc::new(Mutex::new(Vec::new()));
-        let attempts = Arc::new(Mutex::new(0_usize));
-        let (store, count) = (Arc::clone(&received), Arc::clone(&attempts));
-        let task = tokio::spawn(async move {
-            let mut connections = tokio::task::JoinSet::new();
-            loop {
-                let Ok((stream, _)) = listener.accept().await else {
-                    return;
-                };
-                let (store, count) = (Arc::clone(&store), Arc::clone(&count));
-                connections.spawn(async move {
-                    let service = service_fn(move |request: Request<Incoming>| {
-                        let (store, count) = (Arc::clone(&store), Arc::clone(&count));
-                        async move {
-                            let attempt = {
-                                let mut count = count.lock().expect("lock");
-                                *count += 1;
-                                *count
-                            };
-                            let (parts, body) = request.into_parts();
-                            let bytes = body.collect().await.expect("body").to_bytes();
-                            let status = match behavior {
-                                Behavior::Accept => 200,
-                                Behavior::FailFirst(n, status) if attempt <= n => status,
-                                Behavior::FailFirst(..) => 200,
-                                Behavior::Always(status) => status,
-                                Behavior::Hang => {
-                                    std::future::pending::<()>().await;
-                                    200
-                                }
-                            };
-                            if status == 200 {
-                                let json = if parts.headers.get("content-encoding")
-                                    == Some(&HeaderValue::from_static("gzip"))
-                                {
-                                    let mut text = String::new();
-                                    flate2::read::GzDecoder::new(&bytes[..])
-                                        .read_to_string(&mut text)
-                                        .expect("gzip");
-                                    text
-                                } else {
-                                    String::from_utf8(bytes.to_vec()).expect("utf-8")
-                                };
-                                store.lock().expect("lock").push(Received {
-                                    path: parts.uri.path().to_owned(),
-                                    headers: parts.headers,
-                                    body: serde_json::from_str(&json).expect("JSON body"),
-                                });
-                            }
-                            let mut response = Response::new(Full::new(Bytes::from_static(b"{}")));
-                            *response.status_mut() = StatusCode::from_u16(status).expect("status");
-                            Ok::<_, Infallible>(response)
-                        }
-                    });
-                    let _ = hyper::server::conn::http1::Builder::new()
-                        .serve_connection(TokioIo::new(stream), service)
-                        .await;
-                });
-            }
-        });
-        Self {
-            address,
-            received,
-            attempts,
-            task,
-        }
-    }
-
-    fn endpoint(&self) -> String {
-        format!("http://{}", self.address)
-    }
-
-    fn client(&self, headers: HeaderMap, gzip: bool, timeout: Duration) -> Arc<OtlpClient> {
-        Arc::new(
-            OtlpClient::new(&self.endpoint(), headers, gzip, timeout)
-                .expect("valid endpoint")
-                .with_initial_backoff(Duration::from_millis(10)),
-        )
-    }
-
-    fn received(&self, path: &str) -> Vec<Received> {
-        self.received
-            .lock()
-            .expect("lock")
-            .iter()
-            .filter(|received| received.path == path)
-            .cloned()
-            .collect()
-    }
-
-    fn attempts(&self) -> usize {
-        *self.attempts.lock().expect("lock")
-    }
-}
-
-impl Drop for Receiver {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
-}
 
 fn attribute<'a>(attributes: &'a Value, key: &str) -> Option<&'a Value> {
     attributes
@@ -456,62 +317,4 @@ fn logs_are_exported_with_trace_context_and_redacted_values() {
     assert!(!logs[0].body.to_string().contains("hunter2-secret"));
     drop(receiver);
     runtime.shutdown_timeout(Duration::from_secs(1));
-}
-
-/// Counts the telemetry's own export diagnostics.
-struct Diagnostics(Arc<Mutex<usize>>);
-
-impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Diagnostics {
-    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
-        if event.metadata().target() == "forge_telemetry::export" {
-            *self.0.lock().expect("lock") += 1;
-        }
-    }
-}
-
-#[test]
-fn a_failing_log_export_does_not_feed_itself() {
-    // One thread: the exporter task runs where the subscriber is the default,
-    // so its failure diagnostic reaches the log layer, which must skip it.
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("runtime");
-    let receiver = runtime.block_on(Receiver::start(Behavior::Always(400)));
-    let mut options = Options::new("svc");
-    options.logs = Some(receiver.client(HeaderMap::new(), false, FLUSH));
-    let telemetry = Telemetry::new(options).expect("valid");
-    let diagnostics = Arc::new(Mutex::new(0));
-    let subscriber = tracing_subscriber::registry()
-        .with(telemetry.log_layer().expect("layer"))
-        .with(Diagnostics(Arc::clone(&diagnostics)));
-    let _default = tracing::subscriber::set_default(subscriber);
-    runtime.block_on(async {
-        telemetry.start();
-        tracing::info!("one line");
-        telemetry.force_flush(FLUSH).await;
-        telemetry.force_flush(FLUSH).await;
-    });
-    assert_eq!(
-        *diagnostics.lock().expect("lock"),
-        1,
-        "the failure was reported"
-    );
-    assert_eq!(
-        receiver.attempts(),
-        1,
-        "only the application's line was exported"
-    );
-    let stats = telemetry.log_stats();
-    assert_eq!(stats.failed, 1);
-    assert_eq!(stats.exported, 0);
-    let text = forge_telemetry::prometheus::render(telemetry.metrics());
-    assert!(
-        text.contains("forge_telemetry_export_errors_total{signal=\"logs\"} 1"),
-        "{text}"
-    );
-    assert!(
-        text.contains("forge_telemetry_logs_dropped_total 1"),
-        "{text}"
-    );
 }

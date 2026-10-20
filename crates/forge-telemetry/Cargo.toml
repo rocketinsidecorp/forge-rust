@@ -28,5 +28,12 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 webpki-roots = { workspace = true }
 
+[features]
+# `testing::Receiver`, an OTLP/HTTP receiver for tests.
+testing = ["hyper/server"]
+
+[dev-dependencies]
+forge-telemetry = { path = ".", features = ["testing"] }
+
 [lints]
 workspace = true

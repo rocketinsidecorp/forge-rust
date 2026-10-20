@@ -11,6 +11,7 @@ repository.workspace = true
 [dependencies]
 bytes.workspace = true
 forge-config = { path = "../forge-config" }
+forge-telemetry = { path = "../forge-telemetry" }
 http.workspace = true
 http-body-util.workspace = true
 hyper.workspace = true
@@ -22,6 +23,11 @@ tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+forge-telemetry = { path = "../forge-telemetry", features = ["testing"] }
+tokio = { workspace = true, features = ["io-util"] }
+tracing-subscriber.workspace = true
 
 [lints]
 workspace = true

@@ -691,6 +691,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "forge-config",
+ "forge-telemetry",
  "http",
  "http-body-util",
  "hyper",
@@ -701,6 +702,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 
@@ -783,6 +785,7 @@ dependencies = [
  "bytes",
  "flate2",
  "forge-config",
+ "forge-telemetry",
  "getrandom 0.4.3",
  "http",
  "http-body-util",
