@@ -35,11 +35,9 @@ tracing.workspace = true
 postgres = ["dep:forge-db", "dep:sqlx", "forge-db/postgres"]
 
 [dev-dependencies]
-askama.workspace = true
 forge-auth = { path = "../forge-auth" }
 forge-broadcast = { path = ".", features = ["postgres"] }
 forge-db = { path = "../forge-db", features = ["postgres", "testing"] }
-uuid.workspace = true
 
 [lints]
 workspace = true

@@ -487,8 +487,10 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "bytes",
+ "forge",
  "forge-audit",
  "forge-auth",
+ "forge-broadcast",
  "forge-cache",
  "forge-config",
  "forge-core",
@@ -542,7 +544,6 @@ dependencies = [
 name = "forge-broadcast"
 version = "0.1.0"
 dependencies = [
- "askama",
  "async-trait",
  "base64",
  "bytes",
@@ -565,7 +566,6 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
- "uuid",
 ]
 
 [[package]]

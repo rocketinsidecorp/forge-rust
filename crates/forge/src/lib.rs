@@ -38,6 +38,11 @@ mod worker;
 
 pub use forge_audit as audit;
 pub use forge_auth as auth;
+/// Live page updates: Turbo Streams over Server-Sent Events, signed stream
+/// names and PostgreSQL `LISTEN/NOTIFY` fanout (feature `broadcast`, ADR
+/// 0031). HTTP adapters and the composition root only.
+#[cfg(feature = "broadcast")]
+pub use forge_broadcast as broadcast;
 /// Application cache with per-process stampede protection (feature `cache`,
 /// ADR 0028).
 #[cfg(feature = "cache")]
@@ -75,5 +80,7 @@ pub use background::EventsSetup;
 #[cfg(feature = "jobs")]
 pub use background::WorkerMode;
 pub use command::{CommandContext, CommandError, CommandOptions};
+#[cfg(feature = "broadcast")]
+pub use compose::Fanout;
 pub use compose::{ComposeError, Composition};
 pub use worker::{RunningWorkers, Shutdown, SubmitError, WorkQueue};

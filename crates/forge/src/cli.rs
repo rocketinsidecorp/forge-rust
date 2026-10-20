@@ -268,6 +268,7 @@ Environment:
   FORGE_STORAGE_SIGNING_KEY   unpadded base64url of 32+ bytes; required in production with a root
   FORGE_STORAGE_MAX_UPLOAD_BYTES largest uploaded file (default: 524288)
   FORGE_STORAGE_LINK_TTL_SECS default signed link lifetime (default: 900)
+  FORGE_STREAMS_KEY           base64 of 32+ bytes signing live-update stream names; required in production when streams are served
 
 Unknown FORGE_* variables are rejected at startup.
 "
