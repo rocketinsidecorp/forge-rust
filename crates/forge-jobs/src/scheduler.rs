@@ -10,7 +10,7 @@ use crate::{
     Cron, EnqueueOptions, Job, JobsError,
     backoff::jitter,
     name,
-    postgres::{JobSpec, NewJob, PgJobStore, TickOutcome, serialize},
+    postgres::{JobSpec, NewJob, PgJobStore, SCHEDULE_KEY_PREFIX, TickOutcome, serialize},
 };
 
 /// Longest wait between scheduler passes, so a clock jump is noticed.
@@ -93,8 +93,8 @@ impl Schedule {
 
     pub(crate) fn job_for(&self, tick: Timestamp) -> Result<NewJob, JobsError> {
         let seconds = tick.unix_micros().div_euclid(1_000_000);
-        let options =
-            EnqueueOptions::new().unique_key(format!("forge.schedule:{}:{seconds}", self.name));
+        let options = EnqueueOptions::new()
+            .unique_key(format!("{SCHEDULE_KEY_PREFIX}{}:{seconds}", self.name));
         NewJob::from_parts(self.spec, self.payload.clone(), &options, None)
     }
 }

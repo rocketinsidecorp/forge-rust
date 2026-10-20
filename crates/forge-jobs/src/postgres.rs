@@ -63,6 +63,9 @@ pub fn migrator() -> Migrator {
     migrator
 }
 
+/// Idempotency-key prefix reserved for schedule ticks.
+pub(crate) const SCHEDULE_KEY_PREFIX: &str = "forge.schedule:";
+
 const ZERO_TENANT: &str = "00000000-0000-0000-0000-000000000000";
 
 /// Enqueues a global (tenant-less) job in `transaction`.
@@ -197,6 +200,15 @@ impl NewJob {
         options: &EnqueueOptions,
         tenant: Option<JobTenant>,
     ) -> Result<Self, JobsError> {
+        if options
+            .unique_key
+            .as_deref()
+            .is_some_and(|key| key.starts_with(SCHEDULE_KEY_PREFIX))
+        {
+            return Err(JobsError::InvalidSetting(
+                "unique keys starting with `forge.schedule:` are reserved for schedules",
+            ));
+        }
         Self::from_parts(JobSpec::of::<J>(), serialize(job)?, options, tenant)
     }
 
@@ -285,7 +297,8 @@ pub(crate) async fn insert(
     .bind(job.delay_ms)
     .bind(job.unique_key.as_deref())
     .fetch_optional(&mut *connection)
-    .await?;
+    .await
+    .map_err(payload_error)?;
     if inserted.is_some() {
         return Ok(Enqueued::New(job.id));
     }
@@ -734,6 +747,21 @@ fn dead_job(row: &PgRow) -> Result<DeadJob, JobsError> {
             .map(timestamp)
             .transpose()?,
     })
+}
+
+/// Maps the database payload cap (measured on the stored JSON text) to
+/// [`JobsError::PayloadTooLarge`].
+fn payload_error(error: sqlx::Error) -> JobsError {
+    match forge_db::DbError::from(error) {
+        forge_db::DbError::CheckViolation { constraint }
+            if constraint.as_deref() == Some("forge_jobs_payload_size") =>
+        {
+            JobsError::PayloadTooLarge {
+                limit: MAX_PAYLOAD_BYTES,
+            }
+        }
+        other => JobsError::Database(other),
+    }
 }
 
 fn job_id(value: Uuid) -> Result<JobId, JobsError> {

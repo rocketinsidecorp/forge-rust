@@ -1133,3 +1133,68 @@ async fn ticks_from_a_fast_replica_clock_are_refused_and_do_not_block_others() {
     assert_eq!(count_state(&db, "queued").await, 1);
     db.cleanup().await.expect("cleanup");
 }
+
+#[derive(Serialize, Deserialize)]
+struct Wide(Vec<u8>);
+
+impl Job for Wide {
+    const NAME: &'static str = "test.wide";
+}
+
+#[tokio::test]
+#[ignore = "needs FORGE_TEST_DATABASE_URL"]
+async fn the_database_enforces_enqueue_columns_payload_size_and_reserved_keys() {
+    let db = fresh().await;
+    let runtime = db.runtime();
+    let refused = |sql: &'static str| async move {
+        sqlx::query(sql)
+            .bind(JobId::new().into_uuid())
+            .execute(runtime.pool())
+            .await
+            .map_err(DbError::from)
+    };
+    // State, attempts and finish times are not insertable by the runtime role.
+    let forged = refused(
+        "INSERT INTO forge_jobs (id, queue, job_name, payload, max_attempts, run_at, state, finished_at)
+         VALUES ($1, 'default', 'test.count', '{}', 1, now(), 'completed', now())",
+    )
+    .await;
+    assert!(matches!(forged, Err(DbError::Query(_))), "{forged:?}");
+    // Schedule idempotency keys are reserved, in SQL and in the API.
+    let squatted = refused(
+        "INSERT INTO forge_jobs (id, queue, job_name, payload, max_attempts, run_at, unique_key)
+         VALUES ($1, 'default', 'test.count', '{}', 1, now(), 'forge.schedule:nightly:60')",
+    )
+    .await;
+    assert!(squatted.is_err(), "{squatted:?}");
+    let store = PgJobStore::new(runtime.clone());
+    assert!(matches!(
+        store
+            .enqueue(
+                &Count { n: 1 },
+                EnqueueOptions::new().unique_key("forge.schedule:x:1")
+            )
+            .await,
+        Err(JobsError::InvalidSetting(_))
+    ));
+    // Schedule bookkeeping is reachable only through forge_jobs_fire_tick.
+    let schedules =
+        refused("INSERT INTO forge_job_schedules (name, last_tick_at) VALUES ($1::text, now())")
+            .await;
+    assert!(schedules.is_err());
+    // 240 KB of compact JSON passes the client check but its stored form
+    // ("1, 1, ...") exceeds the database cap.
+    let wide = store
+        .enqueue(&Wide(vec![1; 120_000]), EnqueueOptions::new())
+        .await;
+    assert!(
+        matches!(wide, Err(JobsError::PayloadTooLarge { .. })),
+        "{wide:?}"
+    );
+    let total: i64 = sqlx::query_scalar("SELECT count(*) FROM forge_jobs")
+        .fetch_one(db.admin().pool())
+        .await
+        .expect("count");
+    assert_eq!(total, 0);
+    db.cleanup().await.expect("cleanup");
+}

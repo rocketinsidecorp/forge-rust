@@ -94,7 +94,17 @@ async fn insert<E: IntegrationEvent>(
     .bind(payload)
     .bind(Timestamp::now().unix_micros())
     .execute(transaction.connection())
-    .await?;
+    .await
+    .map_err(|error| match forge_db::DbError::from(error) {
+        forge_db::DbError::CheckViolation { constraint }
+            if constraint.as_deref() == Some("forge_outbox_events_payload_size") =>
+        {
+            EventsError::PayloadTooLarge {
+                limit: MAX_PAYLOAD_BYTES,
+            }
+        }
+        other => EventsError::Database(other),
+    })?;
     Ok(id)
 }
 

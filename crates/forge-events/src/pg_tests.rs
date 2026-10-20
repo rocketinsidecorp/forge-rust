@@ -456,3 +456,35 @@ async fn tenant_events_are_isolated_by_row_level_security() {
     );
     db.cleanup().await.expect("cleanup");
 }
+
+#[derive(Serialize, Deserialize)]
+struct Wide(Vec<u8>);
+
+impl IntegrationEvent for Wide {
+    const TYPE: &'static str = "test.wide";
+}
+
+#[tokio::test]
+#[ignore = "needs FORGE_TEST_DATABASE_URL"]
+async fn the_database_enforces_append_columns_and_payload_size() {
+    let db = fresh().await;
+    let forged = sqlx::query(
+        "INSERT INTO forge_outbox_events (id, event_type, version, payload, occurred_at, state, published_at)
+         VALUES ($1, 'test.wide', 1, '{}', now(), 'published', now())",
+    )
+    .bind(EventId::new().into_uuid())
+    .execute(db.runtime().pool())
+    .await;
+    assert!(
+        forged.is_err(),
+        "delivery state is not insertable: {forged:?}"
+    );
+    let mut transaction = db.runtime().begin().await.expect("begin");
+    let wide = append(&mut transaction, &Wide(vec![1; 120_000])).await;
+    assert!(
+        matches!(wide, Err(EventsError::PayloadTooLarge { .. })),
+        "{wide:?}"
+    );
+    drop(transaction);
+    db.cleanup().await.expect("cleanup");
+}

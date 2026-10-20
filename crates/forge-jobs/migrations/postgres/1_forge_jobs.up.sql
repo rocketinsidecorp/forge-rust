@@ -35,6 +35,9 @@ CREATE TABLE forge_jobs (
         CHECK (state IN ('queued', 'running', 'completed', 'dead')),
     CONSTRAINT forge_jobs_attempt_budget
         CHECK (max_attempts BETWEEN 1 AND 1000 AND attempts BETWEEN 0 AND max_attempts),
+    -- Measured on the stored (canonical) JSON text; mirrors MAX_PAYLOAD_BYTES.
+    CONSTRAINT forge_jobs_payload_size
+        CHECK (octet_length(payload::text) <= 262144),
     CONSTRAINT forge_jobs_unique_key_length
         CHECK (unique_key IS NULL OR octet_length(unique_key) BETWEEN 1 AND 255),
     CONSTRAINT forge_jobs_last_error_length
@@ -92,6 +95,8 @@ CREATE TABLE forge_job_schedules (
 -- Row-level security (ADR 0004/0011): a transaction sees and writes exactly
 -- the jobs of its tenant scope. Without `forge.tenant_id` that scope is the
 -- global (tenant-less) jobs; a malformed setting fails the statement.
+-- Idempotency keys starting with `forge.schedule:` are reserved for
+-- forge_jobs_fire_tick, so the runtime role cannot pre-empt a schedule tick.
 ALTER TABLE forge_jobs ENABLE ROW LEVEL SECURITY;
 
 CREATE POLICY forge_jobs_tenant_scope ON forge_jobs
@@ -107,6 +112,7 @@ CREATE POLICY forge_jobs_tenant_scope ON forge_jobs
             OR principal_id IS NOT DISTINCT FROM
                 nullif(current_setting('forge.principal_id', true), '')::uuid
         )
+        AND (unique_key IS NULL OR unique_key NOT LIKE 'forge.schedule:%')
     );
 
 -- Claims up to p_limit due jobs of one queue whose names the worker can run.
@@ -473,7 +479,14 @@ BEGIN
     END IF;
 
     EXECUTE format('REVOKE ALL ON TABLE forge_jobs, forge_job_schedules FROM %I', runtime_role);
-    EXECUTE format('GRANT SELECT, INSERT ON TABLE forge_jobs TO %I', runtime_role);
+    -- Enqueue columns only: state, attempts, leases and timestamps always
+    -- start from their defaults.
+    EXECUTE format('GRANT SELECT ON TABLE forge_jobs TO %I', runtime_role);
+    EXECUTE format(
+        'GRANT INSERT (id, tenant_id, principal_id, queue, job_name, payload, priority, '
+        'max_attempts, run_at, unique_key) ON TABLE forge_jobs TO %I',
+        runtime_role
+    );
     FOR fn IN
         SELECT p.oid::regprocedure
         FROM pg_proc AS p

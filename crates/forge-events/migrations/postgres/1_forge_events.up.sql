@@ -25,6 +25,9 @@ CREATE TABLE forge_outbox_events (
     CONSTRAINT forge_outbox_events_type_format
         CHECK (event_type ~ '^[a-z0-9]([a-z0-9_.:-]{0,126}[a-z0-9])?$'),
     CONSTRAINT forge_outbox_events_version_range CHECK (version BETWEEN 1 AND 65535),
+    -- Measured on the stored (canonical) JSON text; mirrors MAX_PAYLOAD_BYTES.
+    CONSTRAINT forge_outbox_events_payload_size
+        CHECK (octet_length(payload::text) <= 262144),
     CONSTRAINT forge_outbox_events_state_known
         CHECK (state IN ('pending', 'publishing', 'published', 'dead')),
     CONSTRAINT forge_outbox_events_attempts_positive CHECK (attempts >= 0),
@@ -310,8 +313,14 @@ BEGIN
     END IF;
 
     EXECUTE format('REVOKE ALL ON TABLE forge_outbox_events, forge_inbox FROM %I', runtime_role);
-    EXECUTE format('GRANT SELECT, INSERT ON TABLE forge_outbox_events TO %I', runtime_role);
-    EXECUTE format('GRANT SELECT, INSERT ON TABLE forge_inbox TO %I', runtime_role);
+    -- Append columns only: delivery state always starts from its defaults.
+    EXECUTE format('GRANT SELECT ON TABLE forge_outbox_events, forge_inbox TO %I', runtime_role);
+    EXECUTE format(
+        'GRANT INSERT (id, tenant_id, event_type, version, payload, occurred_at) '
+        'ON TABLE forge_outbox_events TO %I',
+        runtime_role
+    );
+    EXECUTE format('GRANT INSERT (consumer, event_id) ON TABLE forge_inbox TO %I', runtime_role);
     FOR fn IN
         SELECT p.oid::regprocedure
         FROM pg_proc AS p
