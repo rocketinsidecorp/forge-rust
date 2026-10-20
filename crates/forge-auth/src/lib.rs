@@ -537,6 +537,17 @@ pub trait PasswordCredentialStore: Send + Sync {
         login: &str,
     ) -> Result<Option<PasswordCredential>, PasswordCredentialStoreError>;
 
+    /// Resolves the credential of a signed-in principal, for step-up
+    /// authentication (re-entering the password before changing a second
+    /// factor). The default fails closed: a store that does not implement
+    /// it makes every step-up unavailable.
+    async fn find_by_principal(
+        &self,
+        _principal_id: PrincipalId,
+    ) -> Result<Option<PasswordCredential>, PasswordCredentialStoreError> {
+        Err(PasswordCredentialStoreError::Unavailable)
+    }
+
     /// Replaces the password hash only when the observed credential version is
     /// still current. Implementations increment the persisted version on
     /// success and return Conflict on a stale version or concurrently disabled
