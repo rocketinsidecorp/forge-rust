@@ -635,6 +635,7 @@ name = "forge-config"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "forge-i18n",
  "serde",
  "serde_json",
  "thiserror",

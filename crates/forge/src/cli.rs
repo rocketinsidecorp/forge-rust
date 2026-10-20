@@ -363,6 +363,8 @@ Environment:
   FORGE_STORAGE_MAX_UPLOAD_BYTES largest uploaded file (default: 524288)
   FORGE_STORAGE_LINK_TTL_SECS default signed link lifetime (default: 900)
   FORGE_STREAMS_KEY           base64 of 32+ bytes signing live-update stream names; required in production when streams are served
+  FORGE_I18N_DEFAULT_LOCALE   default locale, spelled canonically (en, pt-BR); needs config/locales/LOCALE.json
+                              (default: the application's, set by forge new --locale)
   FORGE_MAIL_URL              smtp://user:pass@host:587 (STARTTLS), smtps://user:pass@host:465 (implicit TLS)
                               or file:tmp/mail (development .eml files; refused in production) (default: mail off)
   FORGE_MAIL_FROM             default sender, App <app@example.com>; required with FORGE_MAIL_URL
