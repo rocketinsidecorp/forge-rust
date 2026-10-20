@@ -1,0 +1,41 @@
+[package]
+name = "forge-encryption"
+publish = false
+description = "Authenticated attribute encryption with key rings, rotation and blind indexes for Forge applications"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+base64.workspace = true
+forge-core = { path = "../forge-core" }
+forge-db = { path = "../forge-db", optional = true }
+getrandom.workspace = true
+# AES-256-GCM, HKDF-SHA256 and HMAC-SHA256 (ADR 0041): the ring already in the
+# graph through rustls and forge-auth.
+ring.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx = { workspace = true, optional = true }
+thiserror.workspace = true
+uuid.workspace = true
+# Wipes key material and decrypted values on drop; already locked through rustls.
+zeroize.workspace = true
+
+[features]
+# `EncryptedColumn` re-encryption adapters, one per backend (Cipher::reencrypt).
+postgres = ["dep:forge-db", "dep:sqlx", "forge-db/postgres"]
+mysql = ["dep:forge-db", "dep:sqlx", "forge-db/mysql"]
+sqlite = ["dep:forge-db", "dep:sqlx", "forge-db/sqlite"]
+
+[dev-dependencies]
+forge-db = { path = "../forge-db", features = ["postgres", "mysql", "sqlite", "testing"] }
+forge-encryption = { path = ".", features = ["postgres", "mysql", "sqlite"] }
+sqlx = { workspace = true, features = ["macros"] }
+tokio.workspace = true
+
+[lints]
+workspace = true

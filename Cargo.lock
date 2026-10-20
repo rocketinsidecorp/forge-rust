@@ -519,7 +519,9 @@ dependencies = [
  "forge-cache",
  "forge-config",
  "forge-core",
+ "forge-credentials",
  "forge-db",
+ "forge-encryption",
  "forge-events",
  "forge-http",
  "forge-i18n",
@@ -666,6 +668,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "forge-credentials"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "forge-config",
+ "forge-encryption",
+ "getrandom 0.4.3",
+ "rustix",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "zeroize",
+]
+
+[[package]]
 name = "forge-db"
 version = "0.1.0"
 dependencies = [
@@ -680,6 +698,26 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "forge-encryption"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64",
+ "forge-core",
+ "forge-db",
+ "forge-encryption",
+ "getrandom 0.4.3",
+ "ring",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "thiserror",
+ "tokio",
+ "uuid",
+ "zeroize",
 ]
 
 [[package]]

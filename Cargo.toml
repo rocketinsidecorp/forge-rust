@@ -8,7 +8,9 @@ members = [
     "crates/forge-cli",
     "crates/forge-config",
     "crates/forge-core",
+    "crates/forge-credentials",
     "crates/forge-db",
+    "crates/forge-encryption",
     "crates/forge-events",
     "crates/forge-http",
     "crates/forge-i18n",
@@ -74,6 +76,9 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt", "jso
 webpki-roots = "1.0.9"
 url = "2.5.8"
 uuid = { version = "1.26.1", features = ["serde", "v7"] }
+# Wipes key material and decrypted credentials on drop (forge-encryption,
+# forge-credentials); already locked through rustls. No derive macro.
+zeroize = { version = "1.9.1", default-features = false, features = ["alloc"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

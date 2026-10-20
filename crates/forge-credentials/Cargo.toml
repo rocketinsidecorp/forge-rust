@@ -1,0 +1,30 @@
+[package]
+name = "forge-credentials"
+publish = false
+description = "Encrypted per-environment credentials for Forge applications"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+base64.workspace = true
+# SecretString, the redacted value type `Store::secret` returns.
+forge-config = { path = "../forge-config" }
+forge-encryption = { path = "../forge-encryption" }
+getrandom.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+zeroize.workspace = true
+
+# O_NOFOLLOW when opening key files, without unsafe code.
+[target.'cfg(unix)'.dependencies]
+rustix.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true
