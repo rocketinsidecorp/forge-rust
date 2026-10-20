@@ -34,6 +34,7 @@ pub mod openapi;
 #[cfg(feature = "jobs")]
 mod operator;
 mod probe;
+mod routes;
 mod signal;
 pub mod web;
 mod worker;

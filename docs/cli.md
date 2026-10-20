@@ -41,6 +41,7 @@ forge seed
 forge db create | drop | reset | setup | prepare | migrate | status | seed
 forge db rollback [--steps N]
 forge openapi [--output FILE | --check FILE]
+forge routes
 forge i18n check [--json]
 forge credentials init|edit|show|rotate-key [-e|--environment ENV] [show: --reveal] [rotate-key: --keep-old --print-key --write-key-file]
 forge deploy [--version TAG] [--skip-build] [--dry-run] [--json] [-c PATH] [--secrets PATH]
@@ -58,7 +59,7 @@ The quality and build commands run `cargo` directly (no shell) in the current
 directory. They are thin wrappers, and the underlying Cargo commands are always
 valid to run yourself. A failed Cargo invocation makes `forge` exit with a
 non-zero status. The lifecycle commands (`dev`, `migrate`, `rollback`, `setup`,
-`seed`, `db`, `openapi`) are described under
+`seed`, `db`, `routes`, `openapi`) are described under
 [Application lifecycle commands](#application-lifecycle-commands).
 
 ## `forge id`
@@ -703,7 +704,7 @@ that is up to date with `Cargo.toml`. `forge build NAME` builds one binary
 ## Application lifecycle commands
 
 `forge version`, `forge doctor`, `forge dev`, `forge migrate`, `forge rollback`,
-`forge setup`, `forge seed`, `forge db ...` and `forge openapi` are the same commands, with the
+`forge setup`, `forge seed`, `forge db ...`, `forge routes` and `forge openapi` are the same commands, with the
 same names, flags and messages, that the Forge-Go CLI has
 ([ADR 0036](adr/0036-application-lifecycle-commands.md)). `dev`, `migrate`,
 `rollback`, `setup`, `seed` and `db` run inside a generated application (a Cargo
@@ -727,10 +728,41 @@ forge db reset                     # drop + setup: a clean development database
 forge db status
 forge db drop
 FORGE_ALLOW_DESTRUCTIVE=true forge db drop --force-production --yes
+forge routes                       # every route: METHOD, PATH, ACTION, SOURCE
+forge routes | grep /v1            # only the JSON routes
 forge openapi                      # print the OpenAPI 3.1 document (ADR 0039)
 forge openapi --output openapi.json   # write it, to commit and diff
 forge openapi --check openapi.json    # exit 1 when the committed file is out of date (CI)
 ```
+
+`forge routes` runs the application's `routes` command, which composes the
+application without listening (like `forge openapi`, so it needs the
+configuration `serve` needs; for a PostgreSQL, MySQL or MariaDB application that
+includes `FORGE_DATABASE_URL`; pools connect lazily, so no database has to run) and
+prints the routes registered on it as a table with Forge-Go's columns, sorted by
+path, then method:
+
+```text
+METHOD  PATH                       ACTION  SOURCE
+GET     /                          -       src/adapters/http/mod.rs:35
+GET     /health                    -       forge (built in)
+GET     /health/live               -       forge (built in)
+GET     /health/ready              -       forge (built in)
+GET     /openapi.json              -       forge (built in; development and test, or FORGE_OPENAPI_ENABLED=true)
+GET     /pages                     -       src/adapters/http/pages_controller.rs:51
+GET     /v1/reports/monthly        -       src/adapters/http/reports_controller.rs:70
+GET     /v1/status                 -       src/adapters/http/status.rs:24
+
+Scope: every route registered while composing the application, HTML and JSON alike, and Forge's built-in routes; routes added only while serving are not included.
+```
+
+`SOURCE` is the `Router::route` call that registered the route (`file:line`;
+routes registered by a helper, such as the sign-in pages, show the helper's
+line). Forge's own routes (health probes, assets) and `GET /openapi.json`, which
+`serve` mounts only in development and test or with `FORGE_OPENAPI_ENABLED=true`,
+are marked as built in. `ACTION` is `-` for every route: Forge-Rust has no
+`Resources` router. It takes no arguments and exits 1 when the application
+cannot be composed.
 
 `forge openapi` runs the application's `openapi` command, which composes the
 application without listening: it needs the configuration `serve` needs
@@ -872,10 +904,14 @@ Same command names, flags, messages and exit codes, except:
   from the privileged URL.
 - `forge dev` has no browser-reload proxy, and does not read `.env.development`
   or `.env.local` (generated Rust applications have no env files).
-- Not ported: `forge routes` (Rust routes are registered by code and
-  composition hooks at run time, so a source scan would be wrong and an
-  accurate listing needs the application's composition, which needs its
-  configuration), `forge inspect`, `db schema:dump`, `db schema:load` and
+- `forge routes` runs the application instead of scanning the source (Rust
+  routes are registered by code and composition hooks at run time, so a scan
+  would be wrong), so it needs the configuration `serve` needs and builds the
+  application first. Same command, same columns, same sorting. It also lists the
+  `/v1/<plural>` JSON routes of resources, which Forge-Go's scan misses; `ACTION` is always `-`
+  because there is no `Resources` router. Tracked in
+  [Rails parity](rails-parity.md#parity-follow-ups).
+- Not ported: `forge inspect`, `db schema:dump`, `db schema:load` and
   `db console` (they run `pg_dump`, `psql` and friends with the database
   credential), `destroy`, `deploy`, `logs`, `app`. They are
   tracked in [Rails parity](rails-parity.md).
@@ -950,6 +986,7 @@ Every application built with `forge::App` accepts these subcommands:
 | `jobs retry JOB_ID` / `jobs discard JOB_ID` | Requeues a dead job with a fresh attempt budget, or deletes it. |
 | `jobs dead-events [LIMIT]` / `jobs retry-event EVENT_ID` | With `App::events`: lists or requeues dead outbox events. |
 | `openapi [--output FILE \| --check FILE]` | Composes the application without listening and prints its OpenAPI 3.1 document to standard output (logs and the list of undescribed routes go to standard error), writes it to `FILE`, or exits `1` when `FILE` differs ([OpenAPI](openapi.md)). |
+| `routes` | Composes the application without listening and prints every route as a table (`METHOD`, `PATH`, `ACTION`, `SOURCE`); logs go to standard error. |
 | `version` | Prints the application version. |
 | `help` | Prints usage, including the application's commands. |
 

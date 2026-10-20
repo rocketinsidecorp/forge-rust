@@ -362,6 +362,7 @@ impl App {
             Ok(Command::OpenApi(output)) => {
                 self.checked(|app| app.run_openapi_command(&output, load_config))
             }
+            Ok(Command::Routes) => self.checked(|app| app.run_routes_command(load_config)),
             Ok(Command::Version) => write_stdout(&format!("{} {}\n", self.name, self.version)),
             Ok(Command::Help) => write_stdout(&cli::usage(self.name, &self.summaries())),
             #[cfg(feature = "jobs")]
@@ -695,6 +696,46 @@ impl App {
         load_config: impl FnOnce() -> Result<AppConfig, ConfigError>,
     ) -> ExitCode {
         let info = self.openapi_info();
+        let inspected = match self.compose_for_inspection("openapi", load_config) {
+            Ok(inspected) => inspected,
+            Err(code) => return code,
+        };
+        let document = inspected.built.router.openapi(&info);
+        inspected.finish();
+        let document = match document {
+            Ok(document) => document,
+            Err(error) => {
+                write_stderr(&format!("{error}\n"));
+                return ExitCode::FAILURE;
+            }
+        };
+        write_openapi(&document, output)
+    }
+
+    /// `routes`: composes the application without listening and prints its
+    /// routes as a table (logs go to standard error). Same requirements as
+    /// `openapi`.
+    fn run_routes_command(
+        self,
+        load_config: impl FnOnce() -> Result<AppConfig, ConfigError>,
+    ) -> ExitCode {
+        let inspected = match self.compose_for_inspection("routes", load_config) {
+            Ok(inspected) => inspected,
+            Err(code) => return code,
+        };
+        let table = crate::routes::render(&inspected.built.router);
+        inspected.finish();
+        write_stdout(&table)
+    }
+
+    /// Composes the application the way `serve` does, without telemetry,
+    /// jobs running or a listener, for the commands that only inspect it.
+    /// Logs go to standard error: standard output is the command's data.
+    fn compose_for_inspection(
+        self,
+        command: &str,
+        load_config: impl FnOnce() -> Result<AppConfig, ConfigError>,
+    ) -> Result<Inspected, ExitCode> {
         let Self {
             name,
             registrations,
@@ -711,10 +752,10 @@ impl App {
         let declaration = declarations.pop();
         let config = match load_config() {
             Ok(config) => config,
-            Err(error) => return config_error(&error),
+            Err(error) => return Err(config_error(&error)),
         };
         if let Err(error) = logging::init_stderr(&config.log) {
-            return config_error(&error);
+            return Err(config_error(&error));
         }
         let url = match declaration
             .as_ref()
@@ -722,7 +763,7 @@ impl App {
             .transpose()
         {
             Ok(url) => url,
-            Err(error) => return config_error(&error),
+            Err(error) => return Err(config_error(&error)),
         };
         let runtime = match tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -731,10 +772,10 @@ impl App {
             Ok(runtime) => runtime,
             Err(error) => {
                 write_stderr(&format!(
-                    "openapi: failed to start async runtime: {}\n",
+                    "{command}: failed to start async runtime: {}\n",
                     ErrorChain(&error)
                 ));
-                return ExitCode::FAILURE;
+                return Err(ExitCode::FAILURE);
             }
         };
         let shutdown = Cancellation::new();
@@ -751,24 +792,11 @@ impl App {
                 None,
             )
         };
-        let built = match composed {
-            Ok(built) => built,
-            Err(code) => return code,
-        };
-        let document = built.router.openapi(&info);
-        shutdown.cancel();
-        if let Some(database) = built.database {
-            runtime.block_on(database.close());
-        }
-        runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
-        let document = match document {
-            Ok(document) => document,
-            Err(error) => {
-                write_stderr(&format!("{error}\n"));
-                return ExitCode::FAILURE;
-            }
-        };
-        write_openapi(&document, output)
+        Ok(Inspected {
+            built: composed?,
+            runtime,
+            shutdown,
+        })
     }
 
     /// Runs the application command at `index` with `arguments`.
@@ -1304,6 +1332,26 @@ fn build_router(
     Ok(router)
 }
 
+/// An application composed without listening (see
+/// `App::compose_for_inspection`).
+struct Inspected {
+    built: Built,
+    runtime: tokio::runtime::Runtime,
+    shutdown: Cancellation,
+}
+
+impl Inspected {
+    /// Stops what composition started: the shutdown signal, the database
+    /// pool and the runtime.
+    fn finish(self) {
+        self.shutdown.cancel();
+        if let Some(database) = self.built.database {
+            self.runtime.block_on(database.close());
+        }
+        self.runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
+    }
+}
+
 /// Failure while running the `serve` command.
 #[derive(Debug, Error)]
 enum ServeError {
@@ -1574,6 +1622,30 @@ mod tests {
         assert_eq!(
             described_app().run_with(args(&["openapi", "--yaml"]), no_config),
             ExitCode::from(EXIT_USAGE)
+        );
+    }
+
+    #[test]
+    fn the_routes_command_composes_without_serving() {
+        assert_eq!(
+            described_app().run_with(args(&["routes"]), no_config),
+            ExitCode::SUCCESS
+        );
+        assert_eq!(
+            described_app().run_with(args(&["routes", "--json"]), no_config),
+            ExitCode::from(EXIT_USAGE)
+        );
+        // An application cannot replace the built-in command.
+        let replaced = described_app().command("routes", "mine", |_| async { Ok(()) });
+        assert_eq!(
+            replaced.run_with(args(&["help"]), no_config),
+            ExitCode::SUCCESS
+        );
+        assert_eq!(
+            described_app()
+                .command("routes", "mine", |_| async { Ok(()) })
+                .run_with(args(&["serve"]), no_config),
+            ExitCode::FAILURE
         );
     }
 

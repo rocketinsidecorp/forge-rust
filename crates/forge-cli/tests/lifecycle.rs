@@ -391,6 +391,22 @@ fn openapi_runs_the_applications_command_with_absolute_files() {
 }
 
 #[test]
+fn routes_runs_the_applications_command() {
+    let fixture = Fixture::new(FAKE_APP);
+    let output = fixture.run(&["routes"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(fixture.app_calls(), ["routes".to_owned()]);
+    let failed = fixture
+        .command(&["routes"])
+        .env("APP_EXIT", "1")
+        .output()
+        .expect("forge runs");
+    assert_eq!(failed.status.code(), Some(1), "{}", stderr(&failed));
+    let extra = fixture.run(&["routes", "--json"]);
+    assert_eq!(extra.status.code(), Some(2), "{}", stderr(&extra));
+}
+
+#[test]
 fn argument_errors_are_usage_errors() {
     let fixture = Fixture::new(FAKE_APP);
     for arguments in [

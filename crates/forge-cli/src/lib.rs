@@ -263,6 +263,7 @@ fn execute(
         Command::Deploy(args) => run_deploy(current_dir, args),
         Command::Logs(args) => run_logs(current_dir, args),
         Command::App { command } => run_app(current_dir, command),
+        Command::Routes => lifecycle(current_dir, |app| app.routes()),
         Command::Db { command } => {
             let command = match command {
                 DbCommand::Create => Db::Create,

@@ -79,7 +79,7 @@ succeeds, a failed build is printed and leaves it running, and Ctrl-C stops it
 gracefully. `forge dev --no-reload` builds and runs once; `forge test ARGS`
 passes `ARGS` to `cargo test`; `forge build` is the locked release build.
 
-Binary commands: `serve` (default), `healthcheck`, `openapi`, `version`, `help`.
+Binary commands: `serve` (default), `healthcheck`, `openapi`, `routes`, `version`, `help`.
 
 Configuration uses `FORGE_*` environment variables; unknown `FORGE_*` keys are
 rejected at startup. Run `cargo run -- help` for the full list.

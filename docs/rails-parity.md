@@ -32,6 +32,7 @@ the work is finished and waiting for its review; **Planned** means not started.
 | Encrypted credentials, attribute encryption | `credentials:edit`, AR Encryption | Done (`forge credentials`, `encryption`) | Done (`forge credentials init\|edit\|show\|rotate-key`, `forge::credentials`, `forge::encryption`, [ADR 0041](adr/0041-encrypted-credentials-and-attribute-encryption.md), [credentials](credentials.md), [encryption](encryption.md)) |
 | i18n | I18n | Done (`config/locales/*.json`, `t`, CLDR plurals, `forge new --locale`, `forge i18n check`, Forge-Go ADR 0042) | Done (`config/locales/*.json`, `layout.i18n.t`, CLDR plurals, `forge new --locale`, `forge i18n check`, [ADR 0037](adr/0037-internationalization.md), [i18n](i18n.md)) |
 | OpenAPI from typed routes | — | Done (Forge-Go ADR 0043) | Done (`#[derive(OpenApiSchema)]`, `forge::openapi::typed`/`describe`, `GET /openapi.json`, `FORGE_OPENAPI_ENABLED`, `forge openapi`, [ADR 0039](adr/0039-openapi-from-typed-routes.md), [OpenAPI](openapi.md)) |
+| List the application's routes | `rails routes` | Done (`forge routes`, a source scan: literal `Handle`/`Resources` paths only, so the `/v1/<plural>` JSON routes of resources are missing) | Done (`forge routes`, runs the composed application: every HTML and JSON route with its source line, [CLI](cli.md#application-lifecycle-commands)) |
 | Controller, model, mailer and job generators | `rails g` | Done (Forge-Go ADR 0041) | Done (`forge generate model\|controller\|mailer\|job --queue`, [ADR 0038](adr/0038-generators-and-destroy.md), [generators](generators.md)) |
 | Undo a generator | `rails d` | Done (`forge destroy`, Forge-Go ADR 0041) | Done (`forge destroy`, [ADR 0038](adr/0038-generators-and-destroy.md)) |
 | Continuous fuzzing, SBOM, signed images | — | Planned | Planned |
@@ -79,10 +80,7 @@ the work is finished and waiting for its review; **Planned** means not started.
   `setup`, `seed` and `db create|drop|reset|setup|prepare|migrate|rollback|status|seed`
   with Forge-Go's names, flags and refusals. Still open, in this order, each
   an application subcommand so the CLI keeps holding no credentials:
-  `forge routes` (a `Router::routes()` accessor in `forge-http` and a built-in
-  `routes` command that composes the application without serving it; Forge-Go
-  scans the source, which cannot see Rust's code-built routes), `db
-  schema:dump|schema:load|console`, browser reload in `forge dev` (the Go
+  `db schema:dump|schema:load|console`, browser reload in `forge dev` (the Go
   proxy needs a reviewed Rust port with the same CSP rules), and
   `.env.development`/`.env.local` files in `forge dev` and the lifecycle
   commands together with generating them. Planned right after the generators
@@ -133,6 +131,27 @@ the work is finished and waiting for its review; **Planned** means not started.
   accepted by `forge` (forge-proxy accepts both, like Go). (5) As in
   Forge-Go, `forge new` does not write `config/deploy.yml`; `forge deploy
   init` does.
+
+- `forge routes`: same command, columns (`METHOD`, `PATH`, `ACTION`, `SOURCE`),
+  sorting and footer in both frameworks, but Forge-Go scans the source for
+  literal `Handle`, `HandleFunc` and `Resources` paths and Forge-Rust lists the
+  routes of the composed application (`Router::routes()` and a built-in `routes`
+  command, like `openapi`), because Rust routes are registered by code.
+  **Forge-Go follow-up:** its table does not list the `/v1/<plural>` JSON
+  routes of generated resources and scaffolds (`generate resource|scaffold`),
+  because their patterns are built from a package constant and are not a string
+  literal at the call (`"GET " + postsPath`, with `postsPath = "/v1/posts"` in
+  `app/adapters/httpapi`); the literal `GET /v1/status` and `--api` controller
+  routes are listed. Forge-Go should either resolve package-level string
+  constants and concatenations of them in `discoverRoutes`, or run the
+  application's own route registration as Forge-Rust does, so that `forge
+  routes` lists every route. Forge-Rust lists every HTML and JSON route. Its
+  `ACTION` column is always `-` because it has no `Resources` router (Forge-Go
+  fills it for `Resources` routes); porting `Resources` to Rust is a separate
+  item.
+  Forge-Rust's command needs the configuration `serve` needs (a database URL
+  for database applications) and builds the application first; Forge-Go's
+  never executes application code.
 
 ## Review gate
 
