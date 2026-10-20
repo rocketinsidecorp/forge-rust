@@ -13,7 +13,6 @@ successful login. Full-stack PostgreSQL applications are generated with
 sign-in, sign-out and password-reset pages, bounded in-process sign-in
 throttling, a `setup` command for the first tenant and owner, and seeds ([ADR
 0026](adr/0026-authentication-pages-and-setup.md)). Still open in Phase 3:
-password-reset delivery (no mailer yet; the generated notifier fails closed),
 MFA, a shared persistent throttle for horizontally scaled deployments, user
 invitation and management, identity persistence on MySQL, MariaDB and SQLite,
 and stronger audit integrity/retention controls. Phase 4 is implemented as a
@@ -122,6 +121,7 @@ forge/
 │   ├── forge-cache         # cache port and adapters (implemented, ADR 0028)
 │   ├── forge-ratelimit     # fixed-window limiter, stores, HTTP middleware (ADR 0027)
 │   ├── forge-storage       # storage port, disk adapter, signed links, uploads (ADR 0029)
+│   ├── forge-mail          # mail port, MIME encoder, SMTP/file/test senders, previews (ADR 0035)
 │   ├── forge-broadcast     # live updates: Turbo Streams over SSE, LISTEN/NOTIFY fanout (ADR 0031)
 │   ├── forge-telemetry     # traces, metrics, log export over OTLP/Prometheus (ADR 0033)
 │   ├── forge-openapi       # contract/schema projection
@@ -340,6 +340,17 @@ composition:
   only for raster images), and accepts uploads through a strict bounded
   multipart parser with a mandatory allow-list on the sniffed type. See
   [ADR 0029](adr/0029-file-storage.md) and [storage](storage.md).
+- `forge-mail` holds the `Sender` port and the plain `Message` data that
+  application code depends on, and its infrastructure adapters: a Forge-owned
+  SMTP client that requires verified TLS (STARTTLS or implicit) and sends
+  credentials only over it, a development `.eml` sender refused in
+  production, an in-memory test recorder, and `PasswordResetMailer`, which
+  implements `forge-auth`'s `PasswordResetNotifier` without `forge-auth`
+  depending on mail. Every sender encodes (validates) before any side effect.
+  Its preview handler is an HTTP-adapter `Middleware`, available only in
+  development and test with `FORGE_MAIL_PREVIEW=true`; bootstrap alone reads
+  `FORGE_MAIL_*` (`from_config`, `password_reset_notifier`). See
+  [ADR 0035](adr/0035-mail.md) and [mail](mail.md).
 - `forge-broadcast` pushes Turbo Streams to open pages over Server-Sent Events.
   It lives in the HTTP adapter ring (it depends on `forge-http` and
   `forge-views`); domain and application code never see it. Stream names are

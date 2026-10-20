@@ -242,10 +242,10 @@ which new attempts are refused until counters expire; a full reset queue
 drops requests (logged), so a flood can delay legitimate resets; the reset
 worker's database load still depends on whether accounts exist, observable
 only through server load; sign-in still does slightly more work (session
-issuance) when it succeeds; until a mailer adapter replaces
-`UndeliverablePasswordResets`, reset links are not delivered and the failure is
-only logged; MFA is not implemented; a session lasts 24 hours without
-idle expiry.
+issuance) when it succeeds; without `FORGE_MAIL_URL` the notifier is
+`UndeliverablePasswordResets`, reset links are not delivered and the failure
+is only logged (see the mail review below); MFA is not implemented; a session
+lasts 24 hours without idle expiry.
 
 ## Phase 4 review: jobs, schedules and the outbox
 
@@ -404,6 +404,37 @@ The metrics listener has no authentication: confirming it public relies on
 the network keeping it private. Trusting `traceparent` is safe only behind a
 gateway that sets or sanitizes it. Dropped spans and log records under load
 are counted, not retried.
+
+## Mail review
+
+Review date: 2026-10-20 ([ADR 0035](adr/0035-mail.md), port of Forge-Go ADR
+0024). Scope: `forge-mail` (message validation and encoding, the SMTP,
+file and test senders, previews, templates, the password reset adapter) and
+`FORGE_MAIL_*` / `FORGE_AUTH_PASSWORD_RESET_URL`.
+
+| Threat | STRIDE | Control | Verification |
+| --- | --- | --- | --- |
+| Header, recipient or MIME injection through user data (CRLF in a name, subject, address, header or file name) | T, S | Every sender encodes first; control characters, U+2028/2029, U+FFFD and direction overrides are refused in every header-bound string; addresses are ASCII dot-atom with an LDH domain; extra headers from a seven-name allow-list, printable ASCII; `Bcc` envelope-only; random 128-bit boundaries; errors name the field, never the value | `header_injection_is_refused_everywhere`, `only_allow_listed_headers_once`, `errors_name_the_field_never_the_value`, `bcc_is_envelope_only_and_ids_use_the_sender_domain`, golden parity tests against Forge-Go |
+| Encoded-word spoofing (`=?utf-8?b?...?=` typed as text) and direction-override file names (`invoice\u{202E}fdp.exe`) | S | ASCII text containing `=?` is base64-encoded whole; such file names are refused, directories stripped | `encoded_word_lookalikes_are_encoded_whole`, `lookalike_names_and_quoted_printable_edges`, `attachments_are_checked` |
+| SMTP downgrade (stripped STARTTLS) or certificate spoofing | I, S | `smtp://` requires STARTTLS, `smtps://` implicit TLS; certificates and names always verified (Mozilla roots plus `FORGE_MAIL_TLS_CA_FILE`), no skip switch; a TLS failure never falls back; STARTTLS is used when offered even with the plaintext flag | `a_server_without_starttls_is_refused_before_auth_or_mail`, `certificates_are_verified_and_failures_never_fall_back`, `offered_starttls_is_used_even_with_the_plaintext_flag` |
+| STARTTLS command injection (bytes sent before the handshake read as protected) | T | Any byte buffered after the `220` to STARTTLS fails the send | `bytes_injected_before_the_handshake_are_refused` |
+| SMTP password disclosure | I | Credentials are `SecretString`; AUTH PLAIN/LOGIN only over TLS, or in clear to a loopback host with `FORGE_MAIL_ALLOW_PLAINTEXT`; production refuses the flag with credentials for a remote host; credentials with control characters refused; `Debug`, errors and config errors never contain them; server reply text is discarded | `plaintext_never_carries_credentials_to_a_remote_host`, `plaintext_to_loopback_is_allowed_only_with_the_flag`, `production_refuses_plaintext_with_remote_credentials_and_previews`, `malformed_ambiguous_or_parameterised_urls_are_refused_without_echoing_them`, `configuration_is_validated_and_redacted`, `a_refused_recipient_aborts_before_data_and_reply_text_is_dropped` |
+| A slow or hostile mail server stalls workers or exhausts memory | D | One deadline per delivery (`FORGE_MAIL_TIMEOUT`, at most 10 min) and a 10 s connect; reply lines bounded to 2048 bytes and 128 lines; message size limits; no spawned task, dropping the future closes the socket; reset delivery runs on the bounded reset worker queue | `a_silent_server_hits_the_deadline`, `structure_and_limits`, `a_closed_port_is_transient` |
+| Duplicate or partial delivery | T | A refused recipient aborts before `DATA`; after `DATA` is accepted a failing or hanging `QUIT` is success | `a_refused_recipient_aborts_before_data_and_reply_text_is_dropped`, `a_lost_quit_after_acceptance_is_still_success`, `a_hanging_quit_after_acceptance_is_still_success` |
+| Reset token or recipient leaks into logs, metrics or errors | I | The token appears only in the email body link; failures log the error code, step and SMTP stage only; metrics carry the outcome code only | `failures_are_logged_without_recipient_link_or_token`, `instrumented_sends_record_the_outcome_code` |
+| Reset link points at an attacker or travels in clear | S, I | `FORGE_AUTH_PASSWORD_RESET_URL` and the adapter require https (http only on localhost), no credentials, query or fragment; links go to the stored login only (ADR 0026) | `reset_urls_are_absolute_https_or_local_http`, `reset_urls_must_be_https_or_local`, generated `reset_emails_carry_a_working_link_through_the_mailer` |
+| Half-configured mail silently drops resets | D | `FORGE_MAIL_URL` without `FORGE_MAIL_FROM` or the reset URL stops start-up; the reset email is probed at start-up | `a_url_needs_a_valid_sender`, `mail_without_a_reset_url_stops_start_up`, `settings_are_validated_with_a_probe` |
+| Development senders or previews in production | I, E | The file sender and `FORGE_MAIL_PREVIEW` are refused in production by configuration loading, `from_config` and `PreviewHandler::new` (both switches required); `.eml` files are `0600` in a `0700` directory, created with `O_EXCL` | `file_urls_name_a_directory_outside_production`, `hand_built_production_configs_cannot_use_the_file_sender`, `previews_need_development_or_test_and_the_explicit_flag`, `messages_become_private_eml_files_with_the_envelope`, `existing_paths_are_never_followed` |
+| Script in a previewed email runs in the developer's browser | E | Preview pages are askama-escaped under `default-src 'none'`; the HTML part is served under a `sandbox` CSP inside a sandboxed iframe; `nosniff`, `no-store`, `GET`/`HEAD` only, whole-segment prefix | `a_preview_page_escapes_everything_and_frames_html_in_a_sandbox`, `routing_is_by_whole_segments_and_read_only` |
+| Template data injects markup into the HTML part | T | HTML parts are askama `.html` templates (auto-escaped); a rendered subject is validated as a header; rendering is buffered | `html_is_escaped_and_text_is_not`, `subject_injection_through_template_data_is_refused_at_encoding`, `a_failing_part_renders_nothing` |
+
+Residual risks: an application can still render an HTML part from a template
+that disables escaping or from raw strings; the development file sender
+depends on `FORGE_ENV` (an unset value means development), mitigated by the
+start-up warning; mail is not DKIM-signed by Forge (the relay's job); no
+SMTPUTF8 or IDNA, so non-ASCII addresses are undeliverable rather than
+converted; the test CA and key under `crates/forge-mail/tests/fixtures/tls`
+are public test material and trusted only by the tests.
 
 ## Review cadence
 

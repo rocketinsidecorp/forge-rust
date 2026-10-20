@@ -18,7 +18,7 @@ the work is finished and waiting for its review; **Planned** means not started.
 | Multi-tenancy with database enforcement | (gems) | Done (PostgreSQL RLS) | Done (PostgreSQL RLS) |
 | TOTP MFA | (gems) | Done | Planned |
 | Persistent jobs, cron, outbox | Solid Queue | Done | Done (framework crates; `forge new` wiring planned) |
-| Mailer with previews | Action Mailer | Done | Planned |
+| Mailer with previews | Action Mailer | Done | Done (`forge::mail`, password-reset emails, `/_mail` previews, [ADR 0035](adr/0035-mail.md); `forge generate mailer` with the generators in [forge-rust#15](https://github.com/rocketinsidecorp/forge-rust/issues/15)) |
 | Rate limiting | `rate_limit` | Done | Done |
 | Client address behind trusted proxies | `request.remote_ip`, `trusted_proxies` | Done (`FORGE_HTTP_TRUSTED_PROXIES`, ADR 0037) | Done (`FORGE_HTTP_TRUSTED_PROXIES`, ADR 0032; `forge deploy` sets it once ported) |
 | Cache | Solid Cache | Done | Done |
@@ -60,7 +60,7 @@ the work is finished and waiting for its review; **Planned** means not started.
   yet: `db.client.operation.duration` and per-query spans (SQLx has no
   query hook), `forge.db.pool.waits`/`forge.db.pool.wait.duration` (the SQLx
   pool exposes no wait counters), `http.client.request.duration` (no
-  instrumented client), `forge.mail.send.duration` (no mailer). See
+  instrumented client). See
   [observability](observability.md#differences-from-forge-go).
 
 - Stream signing key rotation (ADR 0031, rocketinsidecorp/forge-rust#14):

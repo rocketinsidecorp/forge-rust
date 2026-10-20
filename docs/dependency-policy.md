@@ -324,6 +324,31 @@ Admission review:
   only runs `$RUSTC --version` to emit `cfg` flags.
 - `cargo deny check` was run with these crates in the graph.
 
+## Mail dependency decision
+
+[ADR 0035](adr/0035-mail.md) adds the workspace crate `forge-mail` and **no
+new package to `Cargo.lock`**. It declares only crates already admitted:
+`rustls` and `tokio-rustls` (ring provider, TLS 1.2/1.3; STARTTLS and implicit
+TLS), `webpki-roots` (Mozilla roots, under the existing CDLA-Permissive-2.0
+exception), `rustls::pki_types` PEM parsing for `FORGE_MAIL_TLS_CA_FILE`,
+`askama` (templates and the preview page), `base64` (AUTH, encoded words,
+attachments), `getrandom` (MIME boundaries), `uuid` (UUIDv7 `Message-ID`s),
+`serde`, `async-trait`, `thiserror`, `tracing` and `tokio` (it names the
+`io-util` feature, which `sqlx-core` already enables). Dev-dependencies:
+`tempfile`, `serde_json`, `tracing-subscriber`.
+
+`lettre` was evaluated and not admitted: with the needed features it would
+add seven packages (`lettre`, `nom`, `mime`, `quoted_printable`,
+`email-encoding`, `email_address`, a second `base64` 0.23), a MIME builder
+whose output differs from Forge-Go's, and a message type that would leak into
+Forge's API, while Forge would still wrap it to enforce its TLS rules. The
+Forge-owned SMTP client speaks only the submission subset, has no unsafe
+code, bounds every reply, and is covered by fake-server tests. No rustls or
+askama type appears in a stable `forge-mail` signature except askama's
+`DynTemplate` in `Templates`, deliberately: templates are the views' engine.
+The test CA and key in `crates/forge-mail/tests/fixtures/tls` are test
+material, not secrets.
+
 ## Features and public API containment
 
 - Set `default-features = false` when defaults add unused protocols, native

@@ -280,9 +280,10 @@ methods go to the sign-in page alone). JSON clients keep the `401`. To show a
 sign-out button elsewhere, include `templates/sessions/_sign_out.html` in a
 template whose view model has a `csrf_field`.
 
-Reset links go through the `PasswordResetNotifier` in `compose`; the
-generated `forge::auth::UndeliverablePasswordResets` delivers nothing until a
-mailer adapter replaces it, and the page answers the same either way.
+Reset links go through the `PasswordResetNotifier` in `compose`:
+`forge::mail::password_reset_notifier` emails them once mail is configured
+and otherwise delivers nothing; the page answers the same either way
+([mail](mail.md#password-reset-emails)).
 
 ## Rendering
 
