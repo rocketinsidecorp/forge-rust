@@ -69,7 +69,7 @@ app receives only the runtime credential.
 
 The app and migration containers use `read_only: true`, drop all capabilities
 and set `no-new-privileges`; the app also uses a `tmpfs` at `/tmp` and
-`stop_grace_period: 20s`. Compose is a development convenience, not Forge's
+`stop_grace_period: 35s` (the HTTP grace plus the job drain). Compose is a development convenience, not Forge's
 production orchestration contract.
 
 ```sh
@@ -231,7 +231,7 @@ The supervisor's stop timeout must be **longer** than
 | Platform | Setting | Default | Recommendation (grace 15 s) |
 | --- | --- | --- | --- |
 | Docker | `docker stop -t <secs>` | 10 s | `docker stop -t 20 <container>` |
-| Compose | `stop_grace_period` | 10 s | `20s` (set by the generated `compose.yaml`) |
+| Compose | `stop_grace_period` | 10 s | `35s` (set by the generated `compose.yaml`; covers the 25 s job drain) |
 | Kubernetes | `terminationGracePeriodSeconds` | 30 s | `30` |
 | systemd | `TimeoutStopSec` | 90 s (distribution default) | `30` |
 

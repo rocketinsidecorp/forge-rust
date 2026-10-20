@@ -1,3 +1,14 @@
+%%if views%%
+<p align="center">
+  <img src="assets/forge-rust-logo.png" alt="Forge Rust — Rust Framework" width="220">
+</p>
+%%end%%
+%%if !views%%
+<p align="center">
+  <img src="https://github.com/rocketinsidecorp/forge-rust/raw/main/crates/forge-cli/templates/app/assets/forge-rust-logo.png" alt="Forge Rust — Rust Framework" width="220">
+</p>
+%%end%%
+
 # %%APP_NAME%%
 
 A [Forge](https://github.com/rocketinsidecorp/forge-rust) application organized
@@ -302,6 +313,10 @@ gracefully. `forge dev --no-reload` builds and runs once; `forge test ARGS`
 passes `ARGS` to `cargo test`; `forge build` is the locked release build.
 
 Binary commands: `serve` (default), `healthcheck`, `openapi`, `routes`, `version`, `help`.
+%%if postgresql%%
+`jobs work|status|dead|retry|discard` run and inspect the job queue (see
+Background jobs).
+%%end%%
 %%if database%%
 Database-enabled binaries also support `migrate [status]`, `rollback [--steps N]`
 and `db create|exists|drop` (what `forge migrate`, `forge rollback` and
@@ -335,6 +350,49 @@ reachable only through the proxy:
 export FORGE_HTTP_TRUSTED_PROXIES=172.30.0.0/24,fd00:1::/64   # proxy CIDRs or addresses
 cargo run
 ```
+%%if postgresql%%
+
+## Background jobs
+
+`src/bootstrap/mod.rs` declares the persistent job queue (`forge::jobs`,
+[jobs guide](https://github.com/rocketinsidecorp/forge-rust/blob/main/docs/jobs.md)),
+like Solid Queue in Rails 8: `migrate` creates its tables, and `serve` runs
+its workers, cron schedules and the pruning of finished jobs next to the HTTP
+server, with the same lifecycle. On `SIGTERM` or Ctrl-C they stop claiming,
+wait up to 20 seconds for running jobs, cancel the rest and hand them back to
+the queue. Each queue runs at most 4 jobs at once (`jobs_configure`). No job
+is registered yet; add one with:
+
+```bash
+forge generate job send_welcome user_id:uuid --queue --dry-run # preview the job, its handler and tests
+forge generate job send_welcome user_id:uuid --queue  # src/adapters/jobs/send_welcome.rs and tests/send_welcome_job.rs
+# add the printed `pub mod` lines and the `register` line at the end of `jobs_configure`,
+# write `perform`, then:
+forge test
+```
+
+Enqueue a job in the transaction that writes the business state it follows
+from, so both commit or neither does:
+`crate::adapters::jobs::send_welcome::enqueue(&mut transaction, &job, forge::jobs::EnqueueOptions::new())`.
+Delivery is at least once: make `perform` idempotent. Failed attempts are
+retried with backoff; a job out of attempts is `dead` until you act:
+
+```bash
+cargo run -- jobs status                # jobs per queue and state
+cargo run -- jobs dead 20               # dead jobs, newest first (payloads are never shown)
+cargo run -- jobs retry <JOB_ID>        # run a dead job again with a fresh attempt budget
+cargo run -- jobs discard <JOB_ID>      # delete a dead job
+forge destroy job send_welcome user_id:uuid --queue  # remove the generated files again
+```
+
+To scale web and worker processes separately, change
+`.jobs(forge::WorkerMode::InServe)` to `forge::WorkerMode::Dedicated` in
+`src/bootstrap/mod.rs`; `serve` then only enqueues and the workers run in:
+
+```bash
+cargo run -- jobs work                  # workers and cron schedules, without HTTP
+```
+%%end%%
 
 ## OpenAPI
 

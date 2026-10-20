@@ -13,14 +13,6 @@ body {
   padding: 2rem 1rem;
 }
 
-.brand-logo {
-  aspect-ratio: 1;
-  display: block;
-  height: auto;
-  margin: 0 auto 1.5rem;
-  max-width: 100%;
-}
-
 .skip-link {
   left: 1rem;
   position: absolute;
@@ -31,28 +23,9 @@ body {
   top: 1rem;
 }
 
-.masthead,
-.eyebrow,
 .muted {
   color: #6b6b6b;
   font-size: 0.875rem;
-}
-
-.lede {
-  font-size: 1.125rem;
-}
-
-.actions {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 1rem;
-}
-
-.endpoints {
-  display: flex;
-  gap: 1rem;
-  list-style: none;
-  padding: 0;
 }
 
 .flash {
@@ -81,4 +54,234 @@ body {
   z-index: 2147483647;
   transition: width 300ms ease-out, opacity 150ms 150ms ease-in;
   transform: translate3d(0, 0, 0);
+}
+
+/* Welcome page (templates/welcome/index.html, the page served at /). Every
+   rule is scoped to its body class, so no other page is affected: delete
+   this section together with the page. */
+
+.welcome-page {
+  background:
+    radial-gradient(ellipse at 18% 12%, rgba(183, 81, 26, 0.16), transparent 36rem),
+    radial-gradient(ellipse at 88% 92%, rgba(102, 45, 20, 0.18), transparent 34rem),
+    #100d0a;
+  color: #f2e9dd;
+  color-scheme: dark;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  line-height: normal;
+  margin: 0;
+  max-width: none;
+  min-height: 100vh;
+  padding: 0;
+}
+
+.welcome-page *,
+.welcome-page *::before,
+.welcome-page *::after {
+  box-sizing: border-box;
+}
+
+.welcome-page a {
+  color: inherit;
+}
+
+.welcome-page a:focus-visible {
+  outline: 3px solid #f2a45d;
+  outline-offset: 4px;
+}
+
+.welcome-page .flash {
+  margin: 1rem auto 0;
+  max-width: 1080px;
+  width: calc(100% - 2rem);
+}
+
+.welcome-page .frame {
+  display: flex;
+  flex-direction: column;
+  margin: 0 auto;
+  min-height: 100vh;
+  padding: 28px clamp(20px, 5vw, 64px);
+  width: min(1080px, 100%);
+}
+
+.welcome-page .masthead {
+  align-items: center;
+  border-bottom: 1px solid rgba(210, 129, 70, 0.22);
+  color: #c9a17f;
+  display: flex;
+  font-size: 11px;
+  gap: 16px;
+  justify-content: space-between;
+  letter-spacing: 0.18em;
+  padding-bottom: 16px;
+  text-transform: uppercase;
+}
+
+.welcome-page .masthead strong {
+  color: #f2e9dd;
+  font-weight: 600;
+}
+
+.welcome-page .stage {
+  display: grid;
+  flex: 1;
+  padding: 44px 0;
+  place-items: center;
+}
+
+.welcome-page .welcome {
+  align-items: center;
+  background: linear-gradient(135deg, rgba(255, 255, 255, 0.035), transparent 52%);
+  border: 1px solid rgba(210, 129, 70, 0.38);
+  border-radius: 3px;
+  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.32), inset 0 1px rgba(255, 221, 183, 0.06);
+  display: grid;
+  gap: clamp(28px, 6vw, 72px);
+  grid-template-columns: minmax(220px, 0.85fr) minmax(0, 1.15fr);
+  padding: clamp(22px, 5vw, 58px);
+  width: 100%;
+}
+
+.welcome-page .brand-logo {
+  aspect-ratio: 1;
+  display: block;
+  height: auto;
+  margin: 0 auto;
+  object-fit: contain;
+  width: min(100%, 390px);
+}
+
+.welcome-page .eyebrow {
+  color: #e79758;
+  font-size: 11px;
+  font-weight: 650;
+  letter-spacing: 0.2em;
+  margin: 0 0 15px;
+  text-transform: uppercase;
+}
+
+.welcome-page h1 {
+  color: #fff8ef;
+  font-family: Georgia, "Times New Roman", serif;
+  font-size: clamp(36px, 5vw, 62px);
+  font-weight: 400;
+  letter-spacing: -0.035em;
+  line-height: 1.04;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.welcome-page .lede {
+  color: #c5b8a9;
+  font-size: 16px;
+  line-height: 1.7;
+  margin: 21px 0 0;
+  max-width: 42ch;
+}
+
+.welcome-page .actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-top: 28px;
+}
+
+.welcome-page .button {
+  align-items: center;
+  border: 1px solid rgba(230, 165, 111, 0.55);
+  border-radius: 2px;
+  display: inline-flex;
+  font-size: 14px;
+  font-weight: 600;
+  gap: 10px;
+  justify-content: center;
+  min-height: 46px;
+  padding: 0 17px;
+  text-decoration: none;
+  transition: background-color 0.18s ease, border-color 0.18s ease;
+}
+
+.welcome-page .button-primary {
+  background: #e79a5c;
+  border-color: #e79a5c;
+  color: #1a1009;
+}
+
+.welcome-page .button-primary:hover {
+  background: #ffc38d;
+  border-color: #ffc38d;
+}
+
+.welcome-page .button-secondary {
+  color: #f0d3b7;
+}
+
+.welcome-page .button-secondary:hover {
+  background: rgba(231, 154, 92, 0.09);
+  border-color: #e79a5c;
+}
+
+.welcome-page .endpoints {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 9px;
+  list-style: none;
+  margin: 26px 0 0;
+  padding: 0;
+}
+
+.welcome-page .endpoints a {
+  border: 1px solid rgba(210, 129, 70, 0.2);
+  color: #bca994;
+  display: inline-block;
+  font: 12px ui-monospace, SFMono-Regular, Menlo, monospace;
+  padding: 7px 10px;
+  text-decoration: none;
+}
+
+.welcome-page .endpoints a:hover {
+  border-color: rgba(231, 154, 92, 0.6);
+  color: #ffe0c2;
+}
+
+.welcome-page footer {
+  border-top: 1px solid rgba(210, 129, 70, 0.22);
+  color: #8e7966;
+  display: flex;
+  font-size: 11px;
+  gap: 16px;
+  justify-content: space-between;
+  letter-spacing: 0.12em;
+  padding-top: 15px;
+  text-transform: uppercase;
+}
+
+@media (max-width: 700px) {
+  .welcome-page .frame {
+    padding-top: 20px;
+  }
+
+  .welcome-page .welcome {
+    gap: 8px;
+    grid-template-columns: 1fr;
+  }
+
+  .welcome-page .brand-logo {
+    width: min(76vw, 300px);
+  }
+
+  .welcome-page .stage {
+    padding: 28px 0;
+  }
+
+  .welcome-page footer {
+    flex-direction: column;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .welcome-page .button {
+    transition-duration: 0.01ms;
+  }
 }

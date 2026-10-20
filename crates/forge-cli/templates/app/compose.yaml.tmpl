@@ -122,8 +122,9 @@ services:
       - ALL
     security_opt:
       - no-new-privileges:true
-    # Must exceed FORGE_SHUTDOWN_GRACE_SECS (15s by default).
-    stop_grace_period: 20s
+    # Must exceed FORGE_SHUTDOWN_GRACE_SECS (15s by default) and the job
+    # drain (20s, then 5s to cancel and hand jobs back), like forge deploy.
+    stop_grace_period: 35s
 %%if database%%
     depends_on:
       migrate:

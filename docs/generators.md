@@ -193,9 +193,13 @@ the `default` queue with five attempts and a one-minute timeout.
 transaction, &job, options)` stores the job atomically with your data.
 `perform` returns a permanent error until you write it, so a placeholder can
 never report success: the job goes straight to `dead`, visible in
-`cargo run -- jobs dead`. The printed wiring also enables the queue
-(`.jobs(forge::WorkerMode::InServe)` and the `jobs` feature of `forge`) when
-the application does not run it yet. The tests need no database.
+`cargo run -- jobs dead`. Like Forge-Go's generator, it does not edit the
+bootstrap: the printed wiring puts the `register` line at the end of
+`jobs_configure` in `src/bootstrap/mod.rs`, which `forge new` generates for
+PostgreSQL applications together with the queue declaration
+(`.jobs(forge::WorkerMode::InServe)`) and the `jobs` feature of `forge`.
+For an application generated before that, the wiring names `fn compose` and
+also prints the declaration and the feature. The tests need no database.
 
 ## Permission ownership
 

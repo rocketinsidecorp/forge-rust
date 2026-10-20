@@ -28,7 +28,7 @@ results.
 | 1 | Runtime, CLI, configuration, HTTP, graceful shutdown, health, Docker | Implemented, unreleased; `forge deploy` with forge-proxy ([ADR 0042](docs/adr/0042-forge-deploy.md)) in review |
 | 2 | PostgreSQL, migrations, transaction contracts, repositories | Behavior implemented; CI runner gate still blocked |
 | 3 | Authentication, authorization, tenancy, RLS, audit | Implemented for PostgreSQL (sign-in pages, setup, RBAC, RLS, audit, reset emails through the mailer of [ADR 0035](docs/adr/0035-mail.md), TOTP two-factor authentication of [ADR 0040](docs/adr/0040-totp-multi-factor-authentication.md)); other backends pending |
-| 4 | PostgreSQL jobs, cron scheduler, outbox, idempotent consumers | Library implemented and tested (`forge` features `jobs`, `events`); `forge new` wiring pending |
+| 4 | PostgreSQL jobs, cron scheduler, outbox, idempotent consumers | Library implemented and tested (`forge` features `jobs`, `events`); `forge new` wires the job queue into PostgreSQL applications; outbox wiring pending |
 | 5 | Traces, metrics, correlated logs (OTLP, Prometheus) | Implemented ([ADR 0033](docs/adr/0033-telemetry.md)); generated local Grafana, Prometheus, Tempo and Loki stack ([ADR 0034](docs/adr/0034-local-observability-stack.md)) |
 | 6 | OpenAPI from typed routes | Implemented ([ADR 0039](docs/adr/0039-openapi-from-typed-routes.md)); code generation and AI pending |
 | 7+ | AI, hardening | Design only |
@@ -409,19 +409,27 @@ for how logs reach Loki and what the dashboard shows.
 
 ### Background jobs, cron and the outbox
 
-Enable the `jobs` (and optionally `events`) feature of `forge`, declare them on
-the `App`, and register handlers in a composition hook. Generated applications
-do not include this wiring yet; `forge generate job` writes a typed job and
-prints exactly these steps ([generators](docs/generators.md#job)). Full guide:
-[docs/jobs.md](docs/jobs.md).
+`forge new` wires the persistent job queue into every PostgreSQL application,
+like Forge-Go's `bootstrap.JobsConfigure`: the `jobs` feature of `forge`,
+`.jobs(forge::WorkerMode::InServe)` on the `App` and a `jobs_configure`
+composition hook in `src/bootstrap/mod.rs` (at most 4 attempts per queue, no
+job registered). `serve` runs the workers, cron schedules and pruning under
+its own lifecycle and drains them on `SIGTERM`. `forge generate job` writes a
+typed job and prints the line that registers it in `jobs_configure`
+([generators](docs/generators.md#job)). Full guide: [docs/jobs.md](docs/jobs.md).
 
 ```sh
+forge new shop && cd shop
+forge migrate                           # app migrations + the framework job schema
 forge generate job send_welcome user_id:uuid 'note:string?' --queue
-# add the printed module lines, `register(composition.jobs()?)`, `.jobs(...)` and the
-# `jobs` feature, write `perform`, then:
-forge migrate && forge test
+# add the printed `pub mod` lines and the `register` line at the end of
+# `jobs_configure`, write `perform`, then:
+forge test
+forge dev                               # HTTP + job workers + cron schedules
 cargo run -- jobs status
 ```
+
+Other applications (or the outbox, `events`) opt in by hand:
 
 ```toml
 # Cargo.toml of the application (jobs and the outbox need PostgreSQL)
@@ -507,7 +515,9 @@ Kubernetes and systemd deployment is covered in
   response, CSRF protection for every unsafe request (hidden field or
   `x-csrf-token`, host-only cookie, `403` otherwise) with the `_method`
   override, one-shot flash messages, strict form decoding with field errors,
-  and a `tests/http.rs` that proves the stack.
+  and a `tests/http.rs` that proves the stack. The welcome page at `/` is
+  styled like Forge-Go's, and the generated `README.md` starts with the
+  Forge Rust logo.
 - Translations: the layout, welcome, sign-in and scaffold pages read their
   text from `config/locales/*.json` (English, plus Spanish or Brazilian
   Portuguese with `--locale`), with a locale per request and
@@ -520,8 +530,9 @@ Kubernetes and systemd deployment is covered in
   `tests/openapi.rs` contract test ([ADR 0039](docs/adr/0039-openapi-from-typed-routes.md)).
 - Binary subcommands: `serve` (default), `healthcheck`, `openapi`, `routes`, `migrate`,
   `rollback`, `seed` (database applications), `setup` (full-stack
-  PostgreSQL), `jobs` (applications that declare `App::jobs`), `version`,
-  `help`.
+  PostgreSQL), `jobs work|status|dead|retry|discard` (PostgreSQL
+  applications, which `forge new` wires to the persistent job queue),
+  `version`, `help`.
 - Sign-in, sign-out and password-reset pages on full-stack PostgreSQL
   applications, like `rails generate authentication`: tenant slug + email +
   password, uniform failures, per-account and per-source throttling, session

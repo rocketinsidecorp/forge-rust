@@ -2,8 +2,10 @@
 
 Status: Phase 4 library implemented in `forge-jobs`, `forge-events` and the
 `forge` facade (features `jobs` and `events`), with PostgreSQL integration
-tests. `forge new` does not generate the wiring yet; applications opt in by
-hand as shown below. Design and trade-offs: [ADR 0025](adr/0025-durable-jobs-scheduler-and-outbox.md).
+tests. `forge new` wires the job queue into every PostgreSQL application (see
+[Generated applications](#generated-applications)); the outbox and other
+applications opt in by hand as shown below. Design and trade-offs:
+[ADR 0025](adr/0025-durable-jobs-scheduler-and-outbox.md).
 
 | Capability | Where |
 | --- | --- |
@@ -43,6 +45,43 @@ fn main() -> std::process::ExitCode {
 schema with `App::events`) before the application's migrations, runs the
 workers inside `serve` (`InServe`) and in `jobs work`, and enables the
 operator commands.
+
+## Generated applications
+
+`forge new` (PostgreSQL, full stack or `--api`) enables the `jobs` feature
+and generates the lifecycle wiring, as Forge-Go's `forge new` generates
+`bootstrap.JobsConfigure`:
+
+```rust
+// src/bootstrap/mod.rs
+forge::App::new(env!("CARGO_PKG_NAME"))
+    .postgres(sqlx::migrate!())
+    .jobs(forge::WorkerMode::InServe)
+    // ...
+    .compose(jobs_configure)
+    .run()
+
+fn jobs_configure(composition: &mut forge::Composition<'_>) -> Result<(), forge::ComposeError> {
+    // At most 4 attempts of each queue run at once.
+    composition
+        .jobs()?
+        .settings(forge::jobs::WorkerSettings::default().default_concurrency(4));
+    // Register application jobs here (`forge generate job NAME --queue`).
+    Ok(())
+}
+```
+
+No job is generated; until one is registered the runtime only prunes
+finished jobs. `forge generate job NAME --queue` prints the `register` line
+for the end of `jobs_configure`:
+
+```sh
+forge migrate                                         # app migrations + the job schema
+forge generate job send_welcome user_id:uuid --queue  # then add the printed lines
+forge test
+forge dev                                             # serve: HTTP + workers + schedules
+cargo run -- jobs status
+```
 
 ## Define a job and its handler
 
@@ -321,4 +360,6 @@ outbox atomicity and consumer idempotency.
 - Polling only; `LISTEN/NOTIFY` wake-ups are not implemented.
 - No per-key concurrency limits or rate limits yet; use queues and their
   concurrency.
-- `forge new` does not generate the wiring yet.
+- `forge new` wires the job queue but not the outbox (`App::events`), and
+  MySQL, MariaDB and SQLite applications get no job queue (Forge-Go runs its
+  in-process scheduler on MySQL and MariaDB too).

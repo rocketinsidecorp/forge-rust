@@ -10,7 +10,7 @@
     {{ layout.import_map|safe }}
     <script type="module" src="{{ layout.javascript }}"></script>
   </head>
-  <body>
+  <body{% block body_class %}{% endblock %}>
     <a class="skip-link" href="#main">{{ layout.i18n.t("layout.skip_to_content") }}</a>
     {% include "layouts/_flash.html" %}
     <main id="main">

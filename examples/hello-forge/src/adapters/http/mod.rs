@@ -44,7 +44,6 @@ fn index(site: &Site, request: &Request) -> Response {
         layout: site.layout(request),
         logo: site.logo(),
         application: env!("CARGO_PKG_NAME"),
-        version: env!("CARGO_PKG_VERSION"),
         sign_in: SIGN_IN,
     })
 }

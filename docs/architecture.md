@@ -20,8 +20,9 @@ and stronger audit integrity/retention controls. Phase 4 is implemented as a
 library: `forge-jobs` (durable PostgreSQL jobs, fenced leases, workers, cron
 schedules) and `forge-events` (transactional outbox, dispatcher, consumer
 inbox), exposed through the `forge` features `jobs` and `events` ([ADR
-0025](adr/0025-durable-jobs-scheduler-and-outbox.md)); generator wiring for
-`forge new` is pending.
+0025](adr/0025-durable-jobs-scheduler-and-outbox.md)). `forge new` wires the
+job queue into PostgreSQL applications (`.jobs(WorkerMode::InServe)` and a
+`jobs_configure` hook); outbox wiring is pending.
 
 Forge is an opinionated Rust application framework for long-lived services. Its
 value is the integration of explicit application architecture, secure defaults,

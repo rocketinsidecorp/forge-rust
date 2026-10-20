@@ -17,7 +17,7 @@ the work is finished and waiting for its review; **Planned** means not started.
 | First tenant and owner, seeds | `db:seed` | Done (`forge setup`, `forge seed`) | In review (`forge setup`, `forge seed`; the application commands `setup` and `seed` are Done) |
 | Multi-tenancy with database enforcement | (gems) | Done (PostgreSQL RLS) | Done (PostgreSQL RLS) |
 | TOTP MFA | (gems) | Done | Done (`FORGE_AUTH_MFA_KEY`, `/session/mfa`, `/mfa`, [ADR 0040](adr/0040-totp-multi-factor-authentication.md), [MFA](mfa.md)) |
-| Persistent jobs, cron, outbox | Solid Queue | Done | Done (framework crates; `forge new` wiring planned) |
+| Persistent jobs, cron, outbox | Solid Queue | Done | Done (framework crates); In review (`forge new` wires the job queue into PostgreSQL applications: `jobs` feature, `.jobs(WorkerMode::InServe)`, `jobs_configure`) |
 | Mailer with previews | Action Mailer | Done | Done (`forge::mail`, password-reset emails, `/_mail` previews, [ADR 0035](adr/0035-mail.md); `forge generate mailer`, [ADR 0038](adr/0038-generators-and-destroy.md)) |
 | Rate limiting | `rate_limit` | Done | Done |
 | Client address behind trusted proxies | `request.remote_ip`, `trusted_proxies` | Done (`FORGE_HTTP_TRUSTED_PROXIES`, ADR 0037) | Done (`FORGE_HTTP_TRUSTED_PROXIES`, ADR 0032; `forge deploy` sets it for the proxied role, [ADR 0042](adr/0042-forge-deploy.md)) |
@@ -174,6 +174,31 @@ the work is finished and waiting for its review; **Planned** means not started.
   `proxy_*` and `mail_message`; (5) fuzzing found that database URLs accepted
   port 0 where Forge-Go refuses it; fixed in the same change
   ([supply chain](supply-chain.md#findings)).
+
+- Jobs in generated applications: both `forge new`s wire background work
+  into the application lifecycle with a `JobsConfigure`/`jobs_configure`
+  hook that registers no job, runs at most 4 jobs at once and stops with the
+  process, and `forge generate job` prints the line to add there. Forge-Go's
+  hook starts its in-process recurring scheduler (`jobs.Scheduler`, on
+  PostgreSQL, MySQL and MariaDB) and its persistent queue (`forge generate
+  job --queue`) is wired by hand; Forge-Rust's starts the persistent
+  PostgreSQL queue (`forge::jobs`, whose cron `Schedule`s replace the
+  scheduler), so MySQL, MariaDB and SQLite applications get no job wiring,
+  and its limit of 4 is per queue. `forge generate job` without `--queue` (an
+  in-process scheduled job) stays Forge-Go only. Forge-Rust's generated
+  README documents the `jobs work|status|dead|retry|discard` commands, which
+  Forge-Go's lacks.
+
+- Welcome page and README logo: the generated welcome page has Forge-Go's
+  layout, sections, colors and text (masthead, logo, call-to-action buttons,
+  health endpoints, footer) with the Forge Rust logo. Forge-Go serves it as a
+  standalone document with an inline stylesheet (`style-src
+  'unsafe-inline'`); Forge-Rust renders it in the application layout, so it
+  keeps the strict Content-Security-Policy, the flash messages and Turbo, and
+  its styles are the `welcome-page` section of `assets/application.css`. The
+  generated README starts with the logo from `assets/` like Forge-Go's; a
+  `--api` application has no `assets/`, so its README links the logo in the
+  Forge-Rust repository instead.
 
 ## Review gate
 
