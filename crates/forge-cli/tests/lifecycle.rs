@@ -1,0 +1,585 @@
+//! The lifecycle commands (`forge migrate`, `forge db ...`, `forge dev`) end
+//! to end with the real `forge` binary, a fake `cargo` and a fake application:
+//! no real build, no database. The fake `cargo build` prints the machine
+//! readable message naming the fake application, which records its arguments
+//! and the environment it received.
+//!
+//! Real builds against PostgreSQL are in `tests/scaffold.rs`.
+#![cfg(unix)]
+
+use std::fs;
+use std::os::unix::fs::PermissionsExt as _;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Output, Stdio};
+use std::time::{Duration, Instant};
+
+const FORGE: &str = env!("CARGO_BIN_EXE_forge");
+
+const FAKE_CARGO: &str = r#"#!/bin/sh
+echo "cargo $*" >> "$RECORD"
+printf '{"reason":"compiler-artifact","target":{"kind":["bin"],"name":"shop"},"executable":"%s"}\n' "$FAKE_APP"
+exit "${CARGO_EXIT:-0}"
+"#;
+
+const FAKE_APP: &str = r#"#!/bin/sh
+echo "app $*" >> "$RECORD"
+echo "allow=${FORGE_ALLOW_DESTRUCTIVE-unset} url=${FORGE_DATABASE_URL-unset}" >> "$RECORD"
+if [ "$1 $2" = "db exists" ]; then exit "${EXISTS_CODE:-0}"; fi
+exit "${APP_EXIT:-0}"
+"#;
+
+const SERVER_APP: &str = r#"#!/bin/sh
+trap 'echo stopped >> "$RECORD"; exit 0' TERM
+echo started >> "$RECORD"
+while :; do sleep 0.05; done
+"#;
+
+struct Fixture {
+    directory: tempfile::TempDir,
+}
+
+impl Fixture {
+    fn new(app_script: &str) -> Self {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let root = directory.path();
+        fs::create_dir_all(root.join("shop/src")).expect("mkdir");
+        fs::write(
+            root.join("shop/Cargo.toml"),
+            "[package]\nname = \"shop\"\nversion = \"0.1.0\"\n\n[dependencies]\nforge = { path = \"../../forge\" }\n",
+        )
+        .expect("manifest");
+        fs::write(root.join("shop/src/main.rs"), "fn main() {}\n").expect("main");
+        fs::create_dir_all(root.join("bin")).expect("mkdir");
+        executable(&root.join("bin/cargo"), FAKE_CARGO);
+        executable(&root.join("app"), app_script);
+        Self { directory }
+    }
+
+    fn project(&self) -> PathBuf {
+        self.directory.path().join("shop")
+    }
+
+    fn record(&self) -> PathBuf {
+        self.directory.path().join("record")
+    }
+
+    fn lines(&self) -> Vec<String> {
+        fs::read_to_string(self.record())
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// Only the `app ...` lines the fake application recorded.
+    fn app_calls(&self) -> Vec<String> {
+        self.lines()
+            .into_iter()
+            .filter_map(|line| line.strip_prefix("app ").map(str::to_owned))
+            .collect()
+    }
+
+    fn command(&self, arguments: &[&str]) -> Command {
+        let path = format!(
+            "{}:{}",
+            self.directory.path().join("bin").display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let mut command = forge_command();
+        command
+            .args(arguments)
+            .current_dir(self.project())
+            .env("PATH", path)
+            .env("RECORD", self.record())
+            .env("FAKE_APP", self.directory.path().join("app"))
+            .env_remove("FORGE_ENV")
+            .env_remove("FORGE_ALLOW_DESTRUCTIVE")
+            .env_remove("FORGE_DATABASE_URL")
+            .stdin(Stdio::null());
+        command
+    }
+
+    fn run(&self, arguments: &[&str]) -> Output {
+        self.command(arguments).output().expect("forge runs")
+    }
+}
+
+/// A `forge` command without the test harness's own `FORGE_TEST_*` variables:
+/// the application's configuration loader (and `forge doctor`) refuse unknown
+/// `FORGE_*` keys.
+fn forge_command() -> Command {
+    let mut command = Command::new(FORGE);
+    for name in [
+        "FORGE_TEST_DATABASE_URL",
+        "FORGE_TEST_MYSQL_URL",
+        "FORGE_TEST_MARIADB_URL",
+    ] {
+        command.env_remove(name);
+    }
+    command
+}
+
+fn executable(path: &Path, content: &str) {
+    fs::write(path, content).expect("write script");
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("chmod");
+}
+
+fn stderr(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+#[test]
+fn migrate_rollback_seed_and_setup_run_the_applications_own_commands() {
+    let fixture = Fixture::new(FAKE_APP);
+    for arguments in [
+        &["migrate"][..],
+        &["migrate", "status"],
+        &["rollback"],
+        &["rollback", "--steps", "2"],
+        &["seed"],
+        &[
+            "setup",
+            "--tenant",
+            "acme",
+            "--email",
+            "owner@example.com",
+            "--organization",
+            "Acme Inc",
+        ],
+    ] {
+        let output = fixture.run(arguments);
+        assert!(
+            output.status.success(),
+            "{arguments:?}: {}",
+            stderr(&output)
+        );
+    }
+    assert_eq!(
+        fixture.app_calls(),
+        [
+            "migrate",
+            "migrate status",
+            "rollback",
+            "rollback --steps 2",
+            "seed",
+            "setup --tenant acme --email owner@example.com --organization Acme Inc",
+        ]
+    );
+    let builds: Vec<String> = fixture
+        .lines()
+        .into_iter()
+        .filter(|line| line.starts_with("cargo "))
+        .collect();
+    assert_eq!(builds.len(), 6, "one build per forge invocation");
+    assert!(
+        builds.iter().all(|line| line
+            == "cargo build --locked --message-format=json-render-diagnostics --bin shop"),
+        "{builds:?}"
+    );
+}
+
+#[test]
+fn the_database_url_is_passed_through_and_the_clis_switch_is_not() {
+    let fixture = Fixture::new(FAKE_APP);
+    let output = fixture
+        .command(&["db", "drop", "--force-production", "--yes"])
+        .env("FORGE_ENV", "production")
+        .env("FORGE_ALLOW_DESTRUCTIVE", "true")
+        .env("FORGE_DATABASE_URL", "postgres://u:p@127.0.0.1/shop")
+        .output()
+        .expect("forge runs");
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(fixture.app_calls(), ["db drop --force-production"]);
+    assert!(
+        fixture
+            .lines()
+            .contains(&"allow=unset url=postgres://u:p@127.0.0.1/shop".to_owned()),
+        "{:?}",
+        fixture.lines()
+    );
+    // And the CLI printed nothing of the URL.
+    let everything = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        stderr(&output)
+    );
+    assert!(!everything.contains("postgres://"), "{everything}");
+}
+
+#[test]
+fn db_setup_reset_and_prepare_compose_the_applications_commands() {
+    let fixture = Fixture::new(FAKE_APP);
+    assert!(fixture.run(&["db", "setup"]).status.success());
+    assert!(fixture.run(&["db", "reset"]).status.success());
+    assert!(fixture.run(&["db", "prepare"]).status.success());
+    assert_eq!(
+        fixture.app_calls(),
+        [
+            "db create",
+            "migrate",
+            "seed",
+            "db drop",
+            "db create",
+            "migrate",
+            "seed",
+            "db exists",
+            "migrate",
+        ]
+    );
+
+    let missing = Fixture::new(FAKE_APP);
+    let output = missing
+        .command(&["db", "prepare"])
+        .env("EXISTS_CODE", "3")
+        .output()
+        .expect("forge runs");
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(
+        missing.app_calls(),
+        ["db exists", "db create", "migrate", "seed"]
+    );
+}
+
+#[test]
+fn production_refuses_destructive_commands_before_building_anything() {
+    for arguments in [
+        &["db", "drop"][..],
+        &["db", "reset"],
+        &["db", "rollback"],
+        &["db", "rollback", "--steps", "2"],
+    ] {
+        let fixture = Fixture::new(FAKE_APP);
+        let output = fixture
+            .command(arguments)
+            .env("FORGE_ENV", "production")
+            .output()
+            .expect("forge runs");
+        assert_eq!(output.status.code(), Some(1), "{arguments:?}");
+        let message = stderr(&output);
+        assert!(
+            message.contains("refusing to ")
+                && message.contains("FORGE_ENV is production")
+                && message.contains("pass --force-production, and confirm"),
+            "{arguments:?}: {message}"
+        );
+        assert!(
+            !fixture.record().exists(),
+            "{arguments:?}: neither cargo nor the application ran"
+        );
+    }
+}
+
+#[test]
+fn force_production_needs_confirmation_and_yes_needs_the_environment() {
+    let fixture = Fixture::new(FAKE_APP);
+    // Not a terminal, no --yes: refused.
+    let output = fixture
+        .command(&["db", "drop", "--force-production"])
+        .env("FORGE_ENV", "production")
+        .output()
+        .expect("forge runs");
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        stderr(&output).contains("needs an interactive terminal"),
+        "{}",
+        stderr(&output)
+    );
+
+    // --yes without FORGE_ALLOW_DESTRUCTIVE=true: refused.
+    let output = fixture
+        .command(&["db", "drop", "--force-production", "--yes"])
+        .env("FORGE_ENV", "production")
+        .output()
+        .expect("forge runs");
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        stderr(&output).contains("FORGE_ALLOW_DESTRUCTIVE=true"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(!fixture.record().exists());
+
+    // --yes alone is a usage error: it only means something with --force-production.
+    let output = fixture.run(&["db", "drop", "--yes"]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        stderr(&output).contains("--force-production"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn a_failing_application_command_fails_the_cli() {
+    let fixture = Fixture::new(FAKE_APP);
+    let output = fixture
+        .command(&["migrate"])
+        .env("APP_EXIT", "78")
+        .output()
+        .expect("forge runs");
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        stderr(&output).contains("application command \"migrate\" failed with status 78"),
+        "{}",
+        stderr(&output)
+    );
+
+    let output = fixture
+        .command(&["migrate"])
+        .env("CARGO_EXIT", "101")
+        .output()
+        .expect("forge runs");
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        stderr(&output).contains("`cargo build` failed with exit code 101"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn lifecycle_commands_refuse_directories_that_are_not_forge_applications() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let output = Command::new(FORGE)
+        .args(["db", "setup"])
+        .current_dir(directory.path())
+        .output()
+        .expect("forge runs");
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        stderr(&output).contains("no Cargo.toml here: run this inside a Forge application"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn argument_errors_are_usage_errors() {
+    let fixture = Fixture::new(FAKE_APP);
+    for arguments in [
+        &["rollback", "--steps", "0"][..],
+        &["rollback", "--steps", "many"],
+        &["setup", "--tenant", "acme"],
+        &["migrate", "now"],
+        &["db"],
+        &["db", "explode"],
+        &["dev", "--poll-interval", "10ms"],
+        &["dev", "--poll-interval", "fast"],
+        &["dev", "--debounce", "2m"],
+    ] {
+        let output = fixture.run(arguments);
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{arguments:?}: {}",
+            stderr(&output)
+        );
+    }
+    assert!(!fixture.record().exists(), "nothing was built");
+}
+
+#[test]
+fn version_prints_the_cli_version() {
+    let output = Command::new(FORGE)
+        .arg("version")
+        .output()
+        .expect("forge runs");
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        format!("forge {}\n", env!("CARGO_PKG_VERSION"))
+    );
+}
+
+#[test]
+fn doctor_reports_an_unreachable_database_without_leaking_the_url() {
+    let free = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        listener.local_addr().expect("address").port()
+    };
+    let url = format!("postgres://app_runtime:hunter2@127.0.0.1:{free}/shop");
+    let output = forge_command()
+        .arg("doctor")
+        .env("FORGE_DATABASE_URL", &url)
+        .env_remove("FORGE_ENV")
+        .output()
+        .expect("forge runs");
+    assert_eq!(output.status.code(), Some(1));
+    let text = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert!(text.contains("configuration: ok"), "{text}");
+    assert!(
+        text.contains(&format!(
+            "database: postgres database \"shop\" on 127.0.0.1:{free}"
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains("database reachability: unreachable"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("hunter2") && !text.contains("app_runtime"),
+        "{text}"
+    );
+
+    let json = forge_command()
+        .args(["doctor", "--json"])
+        .env("FORGE_DATABASE_URL", &url)
+        .env_remove("FORGE_ENV")
+        .output()
+        .expect("forge runs");
+    assert_eq!(json.status.code(), Some(1));
+    let text = String::from_utf8_lossy(&json.stdout).into_owned();
+    assert!(text.contains("\"schema_version\":1") && text.contains("\"database.unreachable\""));
+    assert!(!text.contains("hunter2"), "{text}");
+}
+
+#[test]
+fn doctor_is_healthy_with_a_listening_database_and_no_database() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("address").port();
+    let output = forge_command()
+        .arg("doctor")
+        .env(
+            "FORGE_DATABASE_URL",
+            format!("postgres://u:p@127.0.0.1:{port}/shop"),
+        )
+        .env_remove("FORGE_ENV")
+        .output()
+        .expect("forge runs");
+    assert!(
+        output.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        stderr(&output)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("the server accepts connections"));
+    drop(listener);
+
+    let output = forge_command()
+        .args(["doctor", "--json"])
+        .env_remove("FORGE_DATABASE_URL")
+        .env_remove("FORGE_ENV")
+        .output()
+        .expect("forge runs");
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        r#"{"database":"none","diagnostics":[],"environment":"development","ok":true,"schema_version":1}"#
+    );
+}
+
+fn wait_for(fixture: &Fixture, line: &str, count: usize) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while fixture.lines().iter().filter(|l| *l == line).count() < count {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {count} x {line:?}: {:?}",
+            fixture.lines()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn signal(child: &Child, name: &str) {
+    let status = Command::new("kill")
+        .args([&format!("-{name}"), &child.id().to_string()])
+        .status()
+        .expect("kill runs");
+    assert!(status.success());
+}
+
+#[test]
+fn dev_rebuilds_and_restarts_on_change_and_stops_its_child_on_sigterm() {
+    let fixture = Fixture::new(SERVER_APP);
+    let mut forge = fixture
+        .command(&["dev", "--poll-interval", "50ms", "--debounce", "0"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("forge dev starts");
+
+    wait_for(&fixture, "started", 1);
+    // An edit builds again; the new process replaces the old one.
+    fs::write(
+        fixture.project().join("src/main.rs"),
+        "fn main() { println!(\"changed\"); }\n",
+    )
+    .expect("edit");
+    wait_for(&fixture, "started", 2);
+    wait_for(&fixture, "stopped", 1);
+    let builds = fixture
+        .lines()
+        .iter()
+        .filter(|line| line.starts_with("cargo "))
+        .count();
+    assert_eq!(builds, 2, "{:?}", fixture.lines());
+
+    // A change outside the watched files does nothing.
+    fs::write(fixture.project().join("README.md"), "notes\n").expect("write");
+    std::thread::sleep(Duration::from_millis(400));
+    assert_eq!(
+        fixture.lines().iter().filter(|l| *l == "started").count(),
+        2
+    );
+
+    signal(&forge, "TERM");
+    let status = forge.wait().expect("forge dev ends");
+    assert!(status.success(), "{status:?}");
+    // The application got SIGTERM and finished: nothing is left running.
+    wait_for(&fixture, "stopped", 2);
+    let log = {
+        let mut text = String::new();
+        std::io::Read::read_to_string(&mut forge.stderr.take().expect("stderr"), &mut text)
+            .expect("read stderr");
+        text
+    };
+    assert!(log.contains("forge dev: building"), "{log}");
+    assert!(log.contains("forge dev: changed: src/main.rs"), "{log}");
+    assert!(log.contains("forge dev: restarting"), "{log}");
+}
+
+#[test]
+fn dev_keeps_the_running_application_when_a_build_fails() {
+    let fixture = Fixture::new(SERVER_APP);
+    let mut forge = fixture
+        .command(&["dev", "--poll-interval", "50ms", "--debounce", "0"])
+        .env("RECORD", fixture.record())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("forge dev starts");
+    wait_for(&fixture, "started", 1);
+
+    // The next build fails: the first process must keep running.
+    executable(
+        &fixture.directory.path().join("bin/cargo"),
+        &FAKE_CARGO.replace("exit \"${CARGO_EXIT:-0}\"", "exit 101"),
+    );
+    fs::write(
+        fixture.project().join("src/main.rs"),
+        "fn main() { broken }\n",
+    )
+    .expect("edit");
+    wait_for(
+        &fixture,
+        "cargo build --locked --message-format=json-render-diagnostics --bin shop",
+        2,
+    );
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        fixture.lines().iter().filter(|l| *l == "started").count(),
+        1,
+        "no replacement"
+    );
+    assert_eq!(
+        fixture.lines().iter().filter(|l| *l == "stopped").count(),
+        0,
+        "the old one was not stopped"
+    );
+
+    signal(&forge, "INT");
+    let status = forge.wait().expect("forge dev ends");
+    assert!(status.success(), "{status:?}");
+    wait_for(&fixture, "stopped", 1);
+}

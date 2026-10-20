@@ -45,6 +45,38 @@ pub enum CliError {
         code: Option<i32>,
     },
     Output(io::Error),
+    /// The current directory is not a Forge application.
+    NotAnApplication(String),
+    /// A process could not be started or waited for.
+    SpawnProcess {
+        program: String,
+        source: io::Error,
+    },
+    /// `cargo build` produced no binary of that name.
+    NoBinary {
+        name: Option<String>,
+    },
+    /// The application's own command exited unsuccessfully (`None`: killed by
+    /// a signal).
+    AppCommandFailed {
+        command: String,
+        code: Option<i32>,
+    },
+    /// A destructive command was refused or not confirmed; nothing changed.
+    Refused(String),
+    /// An argument is invalid in a way the argument parser cannot see.
+    Usage(String),
+    /// A signal ended the command.
+    Interrupted,
+    /// The signal handlers could not be installed.
+    Signals(io::Error),
+    /// The watched tree is too large to poll.
+    TooManyFiles {
+        root: PathBuf,
+        limit: usize,
+    },
+    /// The command already printed what is wrong (`forge doctor`).
+    Reported,
 }
 
 impl fmt::Display for CliError {
@@ -94,6 +126,37 @@ impl fmt::Display for CliError {
                 None => write!(formatter, "`cargo {command}` was terminated by a signal"),
             },
             Self::Output(error) => write!(formatter, "could not write command output: {error}"),
+            Self::NotAnApplication(reason) => {
+                write!(formatter, "{reason}: run this inside a Forge application")
+            }
+            Self::SpawnProcess { program, source } => {
+                write!(formatter, "could not run `{program}`: {source}")
+            }
+            Self::NoBinary { name } => match name {
+                Some(name) => write!(formatter, "`cargo build` produced no binary named `{name}`"),
+                None => write!(formatter, "`cargo build` produced no binary"),
+            },
+            Self::AppCommandFailed { command, code } => match code {
+                Some(code) => write!(
+                    formatter,
+                    "application command \"{command}\" failed with status {code}"
+                ),
+                None => write!(
+                    formatter,
+                    "application command \"{command}\" was terminated by a signal"
+                ),
+            },
+            Self::Refused(reason) | Self::Usage(reason) => formatter.write_str(reason),
+            Self::Interrupted => formatter.write_str("interrupted"),
+            Self::Signals(error) => {
+                write!(formatter, "could not install the signal handlers: {error}")
+            }
+            Self::TooManyFiles { root, limit } => write!(
+                formatter,
+                "more than {limit} watched files under `{}`: is a build output directory missing from the ignore rules?",
+                root.display()
+            ),
+            Self::Reported => formatter.write_str("checks failed"),
         }
     }
 }
@@ -103,6 +166,8 @@ impl std::error::Error for CliError {
         match self {
             Self::CurrentDirectory(error)
             | Self::Output(error)
+            | Self::Signals(error)
+            | Self::SpawnProcess { source: error, .. }
             | Self::CreateDirectory { source: error, .. }
             | Self::WriteFile { source: error, .. }
             | Self::ReadDirectory { source: error, .. }
@@ -114,6 +179,14 @@ impl std::error::Error for CliError {
             | Self::Scaffold(_)
             | Self::Authentication(_)
             | Self::DestinationExists(_)
+            | Self::NotAnApplication(_)
+            | Self::NoBinary { .. }
+            | Self::AppCommandFailed { .. }
+            | Self::Refused(_)
+            | Self::Usage(_)
+            | Self::Interrupted
+            | Self::TooManyFiles { .. }
+            | Self::Reported
             | Self::CargoFailed { .. } => None,
         }
     }

@@ -623,6 +623,7 @@ dependencies = [
  "clap",
  "forge-config",
  "forge-db",
+ "rustix",
  "serde_json",
  "tempfile",
  "tokio",

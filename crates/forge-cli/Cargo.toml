@@ -17,14 +17,19 @@ path = "src/main.rs"
 
 [dependencies]
 clap.workspace = true
+# `forge doctor` validates the same FORGE_* settings the application loads and
+# redacts database URLs with the same helpers (no new package in Cargo.lock).
+forge-config = { path = "../forge-config" }
+# Stops the application and its process group on `forge dev` shutdown, without
+# unsafe code or a shell; `process` is the only feature added to the workspace entry.
+rustix = { workspace = true, features = ["process"] }
+# Reads Cargo's `--message-format=json` to find the binary it built.
+serde_json.workspace = true
+# One signal thread (SIGINT/SIGTERM) owned by the commands that run children.
+tokio.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
-# tests/observability.rs loads the generated stack's app settings with the
-# framework's own configuration loader and parses the dashboard JSON.
-forge-config = { path = "../forge-config" }
-serde_json.workspace = true
 # tests/scaffold.rs provisions a PostgreSQL database for migrate/rollback.
 forge-db = { path = "../forge-db", features = ["postgres", "testing"] }
 tempfile.workspace = true
-tokio.workspace = true
