@@ -9,13 +9,19 @@
 //!
 //! Every return path that comes from a request goes through
 //! [`return_path`], which accepts only a path on this site, so `return_to`
-//! cannot redirect anywhere else.
+//! cannot redirect anywhere else. Behind
+//! [`LocaleNegotiation::with_path_prefix`](crate::LocaleNegotiation::with_path_prefix)
+//! the locale prefix the layer removed is put back in front of the path
+//! (`/pt-BR/posts`), so the visitor returns to the page in their language;
+//! the prefixed path must pass the same check, or the unprefixed one is
+//! used.
 
 use forge_http::{
     BoxResponseFuture, HeaderValue, Method, Middleware, Next, Request, Response, StatusCode, header,
 };
 use tracing::error;
 
+use crate::i18n::path_prefix;
 use crate::turbo::{RedirectError, see_other};
 
 /// The query/form parameter that carries the page to return to after
@@ -178,16 +184,31 @@ impl SignInRedirect {
     }
 }
 
+/// The page a visitor asked for, as a [`return_path`] or `None`: the
+/// request's path and query (stripped of the locale prefix when
+/// [`LocaleNegotiation`](crate::LocaleNegotiation) removed one) with
+/// `prefix` put back in front. A prefixed path that is not a safe local
+/// path is not used: the unprefixed one is.
+fn requested_path(requested: &str, prefix: Option<&str>) -> Option<String> {
+    return_path(requested)?;
+    if let Some(prefix) = prefix {
+        let prefixed = format!("{prefix}{requested}");
+        if return_path(&prefixed).is_some() {
+            return Some(prefixed);
+        }
+    }
+    Some(requested.to_owned())
+}
+
 impl Middleware for SignInRedirect {
     fn handle<'a>(&'a self, request: Request, next: Next<'a>) -> BoxResponseFuture<'a> {
         Box::pin(async move {
             let html = prefers_html(&request);
             let return_to = matches!(*request.method(), Method::GET | Method::HEAD)
                 .then(|| {
-                    request
-                        .uri()
-                        .path_and_query()
-                        .map(|path| path.as_str().to_owned())
+                    request.uri().path_and_query().and_then(|requested| {
+                        requested_path(requested.as_str(), path_prefix(&request))
+                    })
                 })
                 .flatten();
             let response = next.run(request).await;
@@ -265,6 +286,43 @@ mod tests {
     }
 
     #[test]
+    fn the_locale_prefix_is_put_back_only_in_a_local_path() {
+        for (requested, prefix, want) in [
+            ("/posts?page=2", Some("/pt-BR"), Some("/pt-BR/posts?page=2")),
+            ("/", Some("/pt-BR"), Some("/pt-BR/")),
+            ("/posts", None, Some("/posts")),
+            // Hostile paths are refused, with and without a prefix.
+            ("//evil.example/x", None, None),
+            ("//evil.example/x", Some("/pt-BR"), None),
+            ("/\\evil.example", Some("/pt-BR"), None),
+            ("\\evil.example", Some("/pt-BR"), None),
+            ("https://evil.example/", Some("/pt-BR"), None),
+            ("", Some("/pt-BR"), None),
+            // A prefix that would make the result unsafe is dropped.
+            ("/posts", Some("/pt-BR\\x"), Some("/posts")),
+            ("/posts", Some("//evil.example"), Some("/posts")),
+            ("/posts", Some(""), Some("/posts")),
+            // Percent-encoded slashes and backslashes stay encoded text.
+            (
+                "/%2F%2Fevil.example",
+                Some("/pt-BR"),
+                Some("/pt-BR/%2F%2Fevil.example"),
+            ),
+            (
+                "/%5Cevil.example",
+                Some("/pt-BR"),
+                Some("/pt-BR/%5Cevil.example"),
+            ),
+        ] {
+            let got = requested_path(requested, prefix);
+            assert_eq!(got.as_deref(), want, "{requested:?} with {prefix:?}");
+            if let Some(path) = got {
+                assert_eq!(return_path(&path), Some(path.as_str()), "{path}");
+            }
+        }
+    }
+
+    #[test]
     fn html_preference_follows_the_accept_header() {
         for (accept, expected) in [
             (Some(BROWSER), true),
@@ -338,6 +396,170 @@ mod tests {
         assert_eq!(
             response.headers()[header::SET_COOKIE],
             "__Host-forge_session=; Max-Age=0"
+        );
+    }
+
+    /// Refuses every request with `401`, wherever the route table would send it.
+    struct Refuse;
+
+    impl Middleware for Refuse {
+        fn handle<'a>(&'a self, _: Request, _: Next<'a>) -> BoxResponseFuture<'a> {
+            Box::pin(async { Response::new(StatusCode::UNAUTHORIZED, "authentication required") })
+        }
+    }
+
+    fn translator() -> std::sync::Arc<forge_i18n::Translator> {
+        let files = [
+            ("en.json", r#"{"en": {"hello": "Hello"}}"#),
+            ("pt-BR.json", r#"{"pt-BR": {"hello": "Olá"}}"#),
+        ];
+        std::sync::Arc::new(
+            forge_i18n::Translator::from_files(&files, forge_i18n::Options::new())
+                .expect("valid catalog"),
+        )
+    }
+
+    /// Behind the locale layer the return path is the page the visitor asked
+    /// for, with its locale prefix, and still only a local path.
+    #[tokio::test]
+    async fn the_locale_prefix_survives_the_sign_in_redirect() {
+        use crate::LocaleNegotiation;
+
+        let location_for = |prefix_on: bool, negotiation_first: bool, target: &str| {
+            let negotiation = if prefix_on {
+                LocaleNegotiation::new(translator()).with_path_prefix()
+            } else {
+                LocaleNegotiation::new(translator())
+            };
+            let mut router = Router::new();
+            if negotiation_first {
+                router.layer(negotiation);
+                router.layer(SignInRedirect::new("/session/new").expect("valid path"));
+            } else {
+                router.layer(SignInRedirect::new("/session/new").expect("valid path"));
+                router.layer(negotiation);
+            }
+            router.layer(Refuse);
+            let target = target.to_owned();
+            async move {
+                let response = router
+                    .dispatch(request(Method::GET, &target, Some(BROWSER)))
+                    .await;
+                assert_eq!(response.status(), StatusCode::SEE_OTHER, "{target}");
+                response.headers()[header::LOCATION]
+                    .to_str()
+                    .expect("ASCII location")
+                    .to_owned()
+            }
+        };
+        let to = |path: &str| sign_in_location("/session/new", Some(path));
+        let plain = "/session/new";
+        for (name, prefix_on, target, want) in [
+            (
+                "prefix on",
+                true,
+                "/pt-BR/products?page=2",
+                to("/pt-BR/products?page=2"),
+            ),
+            ("prefix on, root slash", true, "/pt-BR/", to("/pt-BR/")),
+            (
+                "prefix on, no prefix in the request",
+                true,
+                "/products?page=2",
+                to("/products?page=2"),
+            ),
+            // Not a locale: a plain segment, routed and returned as is.
+            (
+                "prefix on, unknown locale",
+                true,
+                "/fr/products",
+                to("/fr/products"),
+            ),
+            (
+                "prefix off, routed as is",
+                false,
+                "/pt-BR/products?page=2",
+                to("/pt-BR/products?page=2"),
+            ),
+            // Hostile paths stay rejected, with and without a prefix.
+            ("double slash", true, "//evil.example/x", plain.to_owned()),
+            (
+                "double slash after the prefix",
+                true,
+                "/pt-BR//evil.example/x",
+                plain.to_owned(),
+            ),
+            (
+                "double slash, prefix off",
+                false,
+                "//evil.example/x",
+                plain.to_owned(),
+            ),
+            // The URI keeps a raw backslash; it is never returned.
+            (
+                "backslash after the prefix",
+                true,
+                "/pt-BR/\\evil.example",
+                plain.to_owned(),
+            ),
+            (
+                "backslash instead of the prefix",
+                true,
+                "/pt-BR\\evil.example",
+                plain.to_owned(),
+            ),
+            // Encoded slashes are text, not separators: the segment is not
+            // a locale, and what returns is a path on this site.
+            (
+                "encoded slash in the prefix",
+                true,
+                "/pt-BR%2F%2Fevil.example",
+                to("/pt-BR%2F%2Fevil.example"),
+            ),
+            (
+                "encoded slash after the prefix",
+                true,
+                "/pt-BR/%2F%2Fevil.example",
+                to("/pt-BR/%2F%2Fevil.example"),
+            ),
+            (
+                "encoded prefix is not a locale",
+                true,
+                "/%2Fevil.example/x",
+                to("/%2Fevil.example/x"),
+            ),
+            (
+                "encoded backslash after the prefix",
+                true,
+                "/pt-BR/%5Cevil.example",
+                to("/pt-BR/%5Cevil.example"),
+            ),
+        ] {
+            assert_eq!(location_for(prefix_on, true, target).await, want, "{name}");
+            // A redirect layer registered before the locale layer sees the
+            // prefixed path as sent: it returns it, if it is local.
+            assert_eq!(
+                location_for(prefix_on, false, target).await,
+                to(target),
+                "{name}, redirect layer first"
+            );
+        }
+        // The stored prefix is the locale's canonical name, not the request's
+        // spelling of it. (A redirect layer registered before the locale
+        // layer never sees the stripped path and keeps the spelling.)
+        assert_eq!(
+            location_for(true, true, "/PT-br/products").await,
+            to("/pt-BR/products")
+        );
+        assert_eq!(
+            location_for(true, false, "/PT-br/products").await,
+            to("/PT-br/products")
+        );
+        // The bare prefix is routed as "/": the visitor returns to "/pt-BR/".
+        assert_eq!(location_for(true, true, "/pt-BR").await, to("/pt-BR/"));
+        assert_eq!(
+            location_for(true, true, "/pt-BR/products?page=2").await,
+            "/session/new?return_to=%2Fpt-BR%2Fproducts%3Fpage%3D2"
         );
     }
 

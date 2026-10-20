@@ -513,7 +513,8 @@ impl Translator {
             };
             match directive {
                 'Y' => out.push_str(&civil.year.to_string()),
-                'y' => number(&mut out, civil.year % 100, 2),
+                // Two digits of the year, never negative (year -5 is "95", as in C).
+                'y' => number(&mut out, civil.year.rem_euclid(100), 2),
                 'm' => number(&mut out, i64::from(civil.month), 2),
                 'd' => number(&mut out, i64::from(civil.day), 2),
                 'e' => {

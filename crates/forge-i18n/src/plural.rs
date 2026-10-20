@@ -88,12 +88,18 @@ impl Operands {
     }
 
     /// The operands of a float count: `v` counts the digits of its shortest
-    /// round-trip decimal form (`1.5` has one). NaN and infinities never
-    /// select a singular form.
+    /// round-trip decimal form (`1.5` has one). NaN and infinities have no
+    /// plural form of their own: [`plural_rule_for`] answers
+    /// [`Category::Other`] for them in every locale.
     #[must_use]
     pub fn from_float(value: f64) -> Self {
         if !value.is_finite() {
-            return Self { n: 0.0, i: 0, v: 1 };
+            // No rule on n counts NaN as 0, 1 or 2.
+            return Self {
+                n: f64::NAN,
+                i: 0,
+                v: 1,
+            };
         }
         let value = value.abs();
         let text = value.to_string();
@@ -160,7 +166,8 @@ fn one_if_integer_one(o: Operands) -> Category {
     }
 }
 
-/// `n = 1`: Turkish, Greek and Hungarian.
+/// `n = 1`: Norwegian, Turkish, Greek and Hungarian ("1.0" is singular
+/// too).
 fn one_if_exactly_one(o: Operands) -> Category {
     #[allow(clippy::float_cmp)] // CLDR compares the exact value
     if o.n == 1.0 {
@@ -228,10 +235,17 @@ fn czech(o: Operands) -> Category {
     }
 }
 
+/// CLDR 46 writes the Arabic rule on n, the whole value, so "0.0", "1.0"
+/// and "103.0" count as the integers they equal: zero n = 0, one n = 1, two
+/// n = 2, few n % 100 = 3..10, many n % 100 = 11..99. A range matches whole
+/// numbers only, so 3.5 is `other`.
 fn arabic(o: Operands) -> Category {
-    if o.v != 0 {
+    #[allow(clippy::float_cmp)] // a whole number is its own truncation; NaN is not
+    if o.n != o.n.trunc() {
         return Category::Other;
     }
+    // `i` holds the integer digits, so n % 100 stays exact past 2^53,
+    // where the float n is not.
     let mod100 = o.i % 100;
     match o.i {
         0 => Category::Zero,
@@ -254,50 +268,84 @@ fn hebrew(o: Operands) -> Category {
 }
 
 /// The CLDR 46 cardinal rules Forge ships, by canonical locale.
+const BUILTIN: &[(&str, PluralRule)] = &[
+    ("en", one_if_integer_one),
+    ("de", one_if_integer_one),
+    ("nl", one_if_integer_one),
+    ("sv", one_if_integer_one),
+    ("fi", one_if_integer_one),
+    ("et", one_if_integer_one),
+    // n = 1: "1.0" is singular.
+    ("nb", one_if_exactly_one),
+    ("tr", one_if_exactly_one),
+    ("el", one_if_exactly_one),
+    ("hu", one_if_exactly_one),
+    ("ja", only_other),
+    ("zh", only_other),
+    ("ko", only_other),
+    ("vi", only_other),
+    ("th", only_other),
+    ("id", only_other),
+    ("ms", only_other),
+    ("es", spanish),
+    ("it", italian),
+    // "pt" is Brazilian Portuguese in CLDR.
+    ("fr", zero_or_one_singular),
+    ("pt", zero_or_one_singular),
+    // European Portuguese: only 1 is singular.
+    ("pt-PT", italian),
+    ("ru", slavic),
+    ("uk", slavic),
+    ("pl", polish),
+    ("cs", czech),
+    ("sk", czech),
+    ("ar", arabic),
+    ("he", hebrew),
+];
+
 fn builtin(locale: &str) -> Option<PluralRule> {
-    Some(match locale {
-        "en" | "de" | "nl" | "sv" | "nb" | "fi" | "et" => one_if_integer_one,
-        "tr" | "el" | "hu" => one_if_exactly_one,
-        "ja" | "zh" | "ko" | "vi" | "th" | "id" | "ms" => only_other,
-        "es" => spanish,
-        "it" => italian,
-        // "pt" is Brazilian Portuguese in CLDR.
-        "fr" | "pt" => zero_or_one_singular,
-        // European Portuguese: only 1 is singular.
-        "pt-PT" => italian,
-        "ru" | "uk" => slavic,
-        "pl" => polish,
-        "cs" | "sk" => czech,
-        "ar" => arabic,
-        "he" => hebrew,
-        _ => return None,
-    })
+    BUILTIN
+        .iter()
+        .find_map(|(name, rule)| (*name == locale).then_some(*rule))
 }
 
 /// The built-in rule of a canonical locale, trying its parents (`pt-BR`
 /// uses `pt`, `pt-PT` has its own). Locales without one use
-/// [`Category::Other`] for every count.
-#[must_use]
-pub fn plural_rule_for(locale: &str) -> PluralRule {
+/// [`Category::Other`] for every count. NaN and infinite counts are
+/// [`Category::Other`] in every locale.
+pub fn plural_rule_for(locale: &str) -> impl Fn(Operands) -> Category + Copy + use<> {
     rule_in(&[], locale)
 }
 
-pub(crate) fn rule_in(custom: &[(String, PluralRule)], locale: &str) -> PluralRule {
-    for candidate in parents(locale) {
-        if let Some((_, rule)) = custom.iter().find(|(name, _)| name == candidate) {
-            return *rule;
-        }
-        if let Some(rule) = builtin(candidate) {
-            return rule;
+/// The rule of `locale`, a custom one first, behind the guard that makes
+/// NaN and infinity `other` whatever the rule says: rules keyed on the
+/// integer digits (French, Portuguese, Hebrew) would otherwise call NaN
+/// singular, and a custom rule gets no say either.
+pub(crate) fn rule_in(
+    custom: &[(String, PluralRule)],
+    locale: &str,
+) -> impl Fn(Operands) -> Category + Copy + use<> {
+    let rule = parents(locale)
+        .find_map(|candidate| {
+            custom
+                .iter()
+                .find_map(|(name, rule)| (name == candidate).then_some(*rule))
+                .or_else(|| builtin(candidate))
+        })
+        .unwrap_or(only_other);
+    move |operands: Operands| {
+        if operands.n.is_finite() {
+            rule(operands)
+        } else {
+            Category::Other
         }
     }
-    only_other
 }
 
 /// The categories a rule gives the integers 0 to 1000: the forms a
 /// translator must provide. The `many` of whole millions (French, Spanish,
 /// Italian, Portuguese) is left out: it falls back to `other`.
-pub(crate) fn used_categories(rule: PluralRule) -> Vec<Category> {
+pub(crate) fn used_categories(rule: impl Fn(Operands) -> Category) -> Vec<Category> {
     let mut seen = [false; 6];
     for n in 0..=1000 {
         let category = rule(Operands::from_integer(n));
@@ -462,7 +510,13 @@ mod tests {
                     (i(101), F),
                     (i(102), F),
                     (f(1.5), F),
+                    // Past 2^53, where a float n % 100 is not exact.
+                    (i(100_000_000_000_000_003), Fw),
                 ],
+            ),
+            (
+                "nb",
+                vec![(i(1), O), (f(1.0), O), (i(0), F), (i(2), F), (f(1.5), F)],
             ),
             (
                 "he",
@@ -481,6 +535,216 @@ mod tests {
             for (count, want) in samples {
                 assert_eq!(rule(count.operands()), want, "{locale}: {count:?}");
             }
+        }
+    }
+
+    /// The CLDR 46 samples with visible fraction digits ("1.0", "0.00"),
+    /// which a float cannot carry, so the operands are written out (Forge-Go's
+    /// `TestPluralRulesDecimalSamples`).
+    #[test]
+    fn rules_match_cldr_decimal_samples() {
+        use Category::{Few as Fw, Many as M, One as O, Other as F, Two as Tw, Zero as Z};
+        #[allow(clippy::cast_possible_truncation)] // the samples are small, non-negative
+        let dec = |n: f64, v: u32| Operands { n, i: n as i64, v };
+        type Sample = (&'static str, Operands, Category);
+        let tables: Vec<(&str, Vec<Sample>)> = vec![
+            // ar: zero n = 0; one n = 1; two n = 2; few n % 100 = 3..10;
+            // many n % 100 = 11..99.
+            (
+                "ar",
+                vec![
+                    ("0", dec(0.0, 0), Z),
+                    ("0.0", dec(0.0, 1), Z),
+                    ("0.00", dec(0.0, 2), Z),
+                    ("1", dec(1.0, 0), O),
+                    ("1.0", dec(1.0, 1), O),
+                    ("1.00", dec(1.0, 2), O),
+                    ("2", dec(2.0, 0), Tw),
+                    ("2.0", dec(2.0, 1), Tw),
+                    ("2.00", dec(2.0, 2), Tw),
+                    ("3", dec(3.0, 0), Fw),
+                    ("3.0", dec(3.0, 1), Fw),
+                    ("10.0", dec(10.0, 1), Fw),
+                    ("103.0", dec(103.0, 1), Fw),
+                    ("110.00", dec(110.0, 2), Fw),
+                    ("1003.0", dec(1003.0, 1), Fw),
+                    ("11", dec(11.0, 0), M),
+                    ("11.0", dec(11.0, 1), M),
+                    ("26.00", dec(26.0, 2), M),
+                    ("99.0", dec(99.0, 1), M),
+                    ("111.0", dec(111.0, 1), M),
+                    ("1011.0", dec(1011.0, 1), M),
+                    ("100", dec(100.0, 0), F),
+                    ("100.0", dec(100.0, 1), F),
+                    ("101.0", dec(101.0, 1), F),
+                    ("102.00", dec(102.0, 2), F),
+                    ("200.0", dec(200.0, 1), F),
+                    ("1000.0", dec(1000.0, 1), F),
+                    ("0.1", dec(0.1, 1), F),
+                    ("0.9", dec(0.9, 1), F),
+                    ("1.1", dec(1.1, 1), F),
+                    ("1.7", dec(1.7, 1), F),
+                    ("2.5", dec(2.5, 1), F),
+                    ("3.5", dec(3.5, 1), F),
+                    ("10.1", dec(10.1, 1), F),
+                    ("11.5", dec(11.5, 1), F),
+                    ("100.1", dec(100.1, 1), F),
+                    ("103.5", dec(103.5, 1), F),
+                    ("1000.1", dec(1000.1, 1), F),
+                ],
+            ),
+            // n = 1 languages: "1.0" is singular, unlike "i = 1 and v = 0".
+            (
+                "nb",
+                vec![
+                    ("1.0", dec(1.0, 1), O),
+                    ("1.00", dec(1.0, 2), O),
+                    ("0.0", dec(0.0, 1), F),
+                    ("1.5", dec(1.5, 1), F),
+                ],
+            ),
+            ("tr", vec![("1.0", dec(1.0, 1), O), ("1.5", dec(1.5, 1), F)]),
+            ("el", vec![("1.0", dec(1.0, 1), O), ("2.0", dec(2.0, 1), F)]),
+            ("hu", vec![("1.0", dec(1.0, 1), O), ("0.5", dec(0.5, 1), F)]),
+            (
+                "es",
+                vec![
+                    ("1.0", dec(1.0, 1), O),
+                    ("1.5", dec(1.5, 1), F),
+                    ("1000000.0", dec(1e6, 1), F),
+                ],
+            ),
+            // i = 1 and v = 0 languages: "1.0" is plural.
+            (
+                "en",
+                vec![
+                    ("1.0", dec(1.0, 1), F),
+                    ("1.00", dec(1.0, 2), F),
+                    ("0.0", dec(0.0, 1), F),
+                ],
+            ),
+            ("de", vec![("1.0", dec(1.0, 1), F)]),
+            ("nl", vec![("1.0", dec(1.0, 1), F)]),
+            ("sv", vec![("1.0", dec(1.0, 1), F)]),
+            ("fi", vec![("1.0", dec(1.0, 1), F)]),
+            ("et", vec![("1.0", dec(1.0, 1), F)]),
+            (
+                "it",
+                vec![("1.0", dec(1.0, 1), F), ("1000000.0", dec(1e6, 1), F)],
+            ),
+            ("pt-PT", vec![("1.0", dec(1.0, 1), F)]),
+            // i = 0..1 languages.
+            (
+                "fr",
+                vec![
+                    ("0.0", dec(0.0, 1), O),
+                    ("1.0", dec(1.0, 1), O),
+                    ("1.5", dec(1.5, 1), O),
+                    ("2.0", dec(2.0, 1), F),
+                ],
+            ),
+            (
+                "pt",
+                vec![
+                    ("0.0", dec(0.0, 1), O),
+                    ("1.0", dec(1.0, 1), O),
+                    ("2.0", dec(2.0, 1), F),
+                ],
+            ),
+            // v = 0 only: decimals are "other".
+            (
+                "ru",
+                vec![
+                    ("1.0", dec(1.0, 1), F),
+                    ("2.0", dec(2.0, 1), F),
+                    ("5.0", dec(5.0, 1), F),
+                ],
+            ),
+            ("uk", vec![("1.0", dec(1.0, 1), F)]),
+            ("pl", vec![("1.0", dec(1.0, 1), F), ("2.0", dec(2.0, 1), F)]),
+            (
+                "cs",
+                vec![
+                    ("1.0", dec(1.0, 1), M),
+                    ("2.0", dec(2.0, 1), M),
+                    ("0.5", dec(0.5, 1), M),
+                ],
+            ),
+            ("sk", vec![("1.0", dec(1.0, 1), M)]),
+            // he: i = 1 and v = 0 or i = 0 and v != 0; i = 2 and v = 0.
+            (
+                "he",
+                vec![
+                    ("1.0", dec(1.0, 1), F),
+                    ("2.0", dec(2.0, 1), F),
+                    ("0.0", dec(0.0, 1), O),
+                    ("0.5", dec(0.5, 1), O),
+                ],
+            ),
+            ("ja", vec![("1.0", dec(1.0, 1), F)]),
+        ];
+        for (locale, samples) in tables {
+            let rule = plural_rule_for(locale);
+            for (text, operands, want) in samples {
+                assert_eq!(rule(operands), want, "{locale}: {text}");
+            }
+        }
+    }
+
+    /// NaN and infinity are never zero, one or two in any locale: for the
+    /// built-in rules (even those keyed on the integer digits), for
+    /// locales without one and for custom rules.
+    #[test]
+    fn non_finite_counts_are_other_in_every_locale() {
+        let always_one: PluralRule = |_| Category::One;
+        let custom = [("cy".to_owned(), always_one)];
+        let non_finite = [f64::NAN, f64::INFINITY, f64::NEG_INFINITY];
+        let locales = BUILTIN
+            .iter()
+            .map(|(locale, _)| *locale)
+            .chain(["xx", "pt-BR", "cy"]);
+        let check = |locale: &str, rule: &dyn Fn(Operands) -> Category| {
+            for count in non_finite {
+                assert_eq!(
+                    rule(Operands::from_float(count)),
+                    Category::Other,
+                    "{locale}: {count}"
+                );
+                assert_eq!(
+                    rule(Count::from(count).operands()),
+                    Category::Other,
+                    "{locale}: Count {count}"
+                );
+            }
+            // Operands built by hand are covered too.
+            let infinite = Operands {
+                n: f64::INFINITY,
+                i: 0,
+                v: 0,
+            };
+            assert_eq!(rule(infinite), Category::Other, "{locale}: hand-built");
+        };
+        for locale in locales {
+            check(locale, &plural_rule_for(locale));
+            check(locale, &rule_in(&custom, locale));
+        }
+        // The custom rule still decides finite counts.
+        assert_eq!(
+            rule_in(&custom, "cy")(Operands::from_integer(1)),
+            Category::One
+        );
+    }
+
+    #[test]
+    fn every_built_in_locale_has_a_canonical_unique_name() {
+        let mut seen = std::collections::BTreeSet::new();
+        for (locale, _) in BUILTIN {
+            assert_eq!(
+                crate::locale::canonical_locale(locale).as_deref(),
+                Ok(*locale)
+            );
+            assert!(seen.insert(*locale), "{locale} is listed twice");
+            assert!(builtin(locale).is_some(), "{locale}");
         }
     }
 
@@ -507,6 +771,7 @@ mod tests {
         assert_eq!(huge.i, i64::MAX);
         let nan = Operands::from_float(f64::NAN);
         assert_eq!((nan.i, nan.v), (0, 1));
+        assert!(nan.n.is_nan());
         let float = Operands::from_float(-12.25);
         assert_eq!((float.i, float.v), (12, 2));
         assert_eq!(Operands::from_float(1e300).i, i64::MAX);

@@ -373,6 +373,26 @@ fn format_time() -> Result<(), LoadError> {
         custom.format_time("en", &DateTime::from_unix(0), "%Z"),
         "Thu, 01 Jan 1970 00:00:00 +0000"
     );
+    // %y is the year modulo 100, never negative.
+    let years = Translator::from_files(
+        &[(
+            "en.json",
+            r#"{"en":{"time":{"formats":{"y":"%Y|%y|%-y"}}}}"#,
+        )],
+        Options::new(),
+    )?;
+    for (year, want) in [
+        (2026, "2026|26|26"),
+        (2005, "2005|05|5"),
+        (100, "100|00|0"),
+        (0, "0|00|0"),
+        (-1, "-1|99|99"),
+        (-5, "-5|95|95"),
+        (-105, "-105|95|95"),
+    ] {
+        let date = DateTime::from_utc(year, 6, 15, 0, 0, 0).expect("a valid date");
+        assert_eq!(years.format_time("en", &date, "y"), want, "year {year}");
+    }
     Ok(())
 }
 

@@ -239,7 +239,14 @@ impl askama::filters::HtmlSafe for Translation<'_> {}
 /// ever names a file. After the handler, a response that used the
 /// binding gets `Content-Language` and `Vary: Accept-Language, Cookie`.
 /// Register it before the other HTML layers so the prefix is removed for
-/// all of them.
+/// all of them; with the path prefix, a layer that decides by path (an
+/// `/admin` guard, an allow-list) must be registered after it, because
+/// layers before it see `/pt-BR/admin`.
+///
+/// [`LocaleNegotiation::negotiate`] only answers the question and cannot
+/// mark a response. A response that depends on its result (a redirect to
+/// the visitor's language, say) must add `Vary: Accept-Language, Cookie`
+/// itself with [`set_content_language`].
 #[derive(Clone)]
 pub struct LocaleNegotiation {
     translator: Arc<Translator>,
@@ -307,7 +314,10 @@ impl LocaleNegotiation {
         &self.translator
     }
 
-    /// The locale of `request` (see the order above).
+    /// The locale of `request` (see the order above). It does not mark any
+    /// response: when what you send depends on the answer, call
+    /// [`set_content_language`] (or add `Vary: Accept-Language, Cookie`)
+    /// yourself.
     #[must_use]
     pub fn negotiate(&self, request: &Request) -> String {
         self.choose(request).0.to_owned()
@@ -354,6 +364,11 @@ impl Middleware for LocaleNegotiation {
         let i18n = I18n::new(Arc::clone(&self.translator), locale);
         if let Some(prefix) = prefix {
             strip_prefix(&mut request, prefix);
+            // The locale's canonical name, not the request's spelling of it
+            // ("/PT-br" is stored as "/pt-BR").
+            request
+                .extensions_mut()
+                .insert(PathPrefix(format!("/{}", i18n.locale)));
         }
         request.extensions_mut().insert(i18n.clone());
         Box::pin(async move {
@@ -364,6 +379,27 @@ impl Middleware for LocaleNegotiation {
             response
         })
     }
+}
+
+/// The locale path segment [`LocaleNegotiation`] removed from the request.
+#[derive(Clone, Debug)]
+struct PathPrefix(String);
+
+/// The locale path segment [`LocaleNegotiation::with_path_prefix`] removed
+/// from `request` (`"/pt-BR"`), or `None` when the request had none (or did
+/// not pass through the layer with the prefix on). Code that builds a URL
+/// from the stripped request path, such as the sign-in return path, puts it
+/// back in front so the visitor returns to the page in the language they
+/// used. The value is an available locale's canonical name (letters, digits
+/// and hyphens) behind a slash, never request text, even for `/PT-br`; still
+/// validate the finished URL (see [`return_path`](crate::return_path))
+/// before redirecting to it.
+#[must_use]
+pub fn path_prefix(request: &Request) -> Option<&str> {
+    request
+        .extensions()
+        .get::<PathPrefix>()
+        .map(|prefix| prefix.0.as_str())
 }
 
 /// Removes the first `length` bytes (`/` and a locale segment) of the
@@ -654,6 +690,74 @@ mod tests {
             assert_eq!(response.status(), status, "{target}");
             assert_eq!(text(&response), want, "{target}");
         }
+    }
+
+    /// Answers every request with the prefix the negotiation layer kept.
+    struct ReportPrefix;
+
+    impl Middleware for ReportPrefix {
+        fn handle<'a>(&'a self, request: Request, _: Next<'a>) -> BoxResponseFuture<'a> {
+            let prefix = path_prefix(&request).unwrap_or("none").to_owned();
+            Box::pin(async move { Response::new(StatusCode::OK, prefix) })
+        }
+    }
+
+    #[tokio::test]
+    async fn the_layer_keeps_the_canonical_prefix_it_removed() {
+        let serve = |negotiation: LocaleNegotiation, target: &'static str| async move {
+            let mut router = Router::new();
+            router.layer(negotiation);
+            router.layer(ReportPrefix);
+            text(&router.dispatch(request(target, "", "")).await)
+        };
+        let on = || LocaleNegotiation::new(translator()).with_path_prefix();
+        for (target, want) in [
+            ("/pt-BR/posts", "/pt-BR"),
+            ("/pt/posts", "/pt"),
+            // The locale's name, not the request's spelling of it.
+            ("/PT-br/posts", "/pt-BR"),
+            ("/posts", "none"),
+            ("/fr/posts", "none"),
+            ("/pt-BRx/posts", "none"),
+            ("//evil/posts", "none"),
+        ] {
+            assert_eq!(serve(on(), target).await, want, "prefix on, {target}");
+        }
+        assert_eq!(
+            serve(LocaleNegotiation::new(translator()), "/pt-BR/posts").await,
+            "none",
+            "prefix off"
+        );
+        assert_eq!(path_prefix(&request("/pt-BR/posts", "", "")), None);
+    }
+
+    #[tokio::test]
+    async fn negotiate_alone_marks_no_response() {
+        // `negotiate` answers a question; it has no response to mark, so a
+        // handler whose output depends on it sets the headers itself.
+        let negotiation = LocaleNegotiation::new(translator());
+        let mut router = Router::new();
+        router
+            .route(Method::GET, "/where", {
+                let negotiation = negotiation.clone();
+                move |request: Request| {
+                    let negotiation = negotiation.clone();
+                    async move {
+                        let locale = negotiation.negotiate(&request);
+                        let mut response = forge_http::Response::empty(StatusCode::SEE_OTHER);
+                        if let Ok(value) = HeaderValue::from_str(&format!("/{locale}/")) {
+                            response.headers_mut().insert(header::LOCATION, value);
+                        }
+                        response
+                    }
+                }
+            })
+            .expect("route registers");
+        router.layer(negotiation);
+        let unmarked = router.dispatch(request("/where", "", "pt-BR")).await;
+        assert_eq!(header_of(&unmarked, "location"), Some("/pt-BR/"));
+        assert!(unmarked.headers().get(header::VARY).is_none());
+        assert_eq!(header_of(&unmarked, "content-language"), None);
     }
 
     #[tokio::test]
