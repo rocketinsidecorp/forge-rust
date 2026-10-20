@@ -443,7 +443,10 @@ set, and otherwise returns `UndeliverablePasswordResets`, which delivers
 nothing and reports `NotConfigured` (logged, never shown); the page answers
 the same either way ([mail](mail.md#password-reset-emails)). With
 `FORGE_MAIL_PREVIEW=true` in development the email is previewed at
-`/_mail/password_reset`. MFA (TOTP) is not provided yet.
+`/_mail/password_reset`. The same files include TOTP two-factor
+authentication (`/session/mfa`, `/mfa`, migration
+`00000000000000000004_forge_mfa`), on once `FORGE_AUTH_MFA_KEY` is set
+([MFA](mfa.md)).
 
 ## `forge generate scaffold`
 

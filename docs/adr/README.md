@@ -39,6 +39,7 @@ does not mean implementation exists.
 | [0037](0037-internationalization.md) | Internationalization: Rails-style JSON catalogs in `config/locales`, CLDR plural rules, locale negotiation, `t`/`l`/`number`/`locale` helpers, `forge new --locale`, `forge i18n check` (port of Forge-Go ADR 0042) | Accepted |
 | [0038](0038-generators-and-destroy.md) | Model, controller, mailer and queue job generators, and `forge destroy` that removes only files still identical to what the generator writes (port of Forge-Go ADR 0041) | Accepted |
 | [0039](0039-openapi-from-typed-routes.md) | OpenAPI 3.1 from typed routes: `#[derive(OpenApiSchema)]`, `describe`/`typed`, deterministic document, contract tests, `GET /openapi.json` behind `FORGE_OPENAPI_ENABLED`, `openapi` and `forge openapi` (port of Forge-Go ADR 0043) | Accepted |
+| [0040](0040-totp-multi-factor-authentication.md) | TOTP multi-factor authentication: RFC 6238 over `hmac`/`sha1`, AES-256-GCM seeds (`ring`) under `FORGE_AUTH_MFA_KEY`, backup codes, browser-bound throttled challenges, step-up enrollment, rotation and disable pages (port of Forge-Go ADR 0014 and 0015) | Accepted |
 
 New ADRs use the next four-digit number. A changed decision receives a new ADR
 that marks the prior record `Superseded`; accepted records are not rewritten to

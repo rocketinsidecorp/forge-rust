@@ -380,6 +380,45 @@ request layer and template helpers, feature `runtime`) and `forge-cli`
 (`forge i18n check`, which also adds `serde` for its JSON report) depend on
 `forge-i18n`; the `forge` facade exposes it behind the feature `i18n`.
 
+## Two-factor authentication dependency decision
+
+[ADR 0040](adr/0040-totp-multi-factor-authentication.md) adds TOTP MFA and
+**no new package to `Cargo.lock`**. `forge-auth` newly declares, all from the
+existing lock and the RustCrypto/ring stacks already reviewed:
+
+| Crate | Version | Used by | Purpose | Feature policy |
+| --- | --- | --- | --- | --- |
+| `hmac` | `0.13.0` | `forge-auth` | HMAC of RFC 6238 codes | defaults disabled (admitted for `forge-storage`) |
+| `sha1` | `0.11.0` | `forge-auth` | the SHA-1 of HMAC-SHA-1, the hash authenticator apps implement | defaults disabled; already locked through `sqlx-mysql` |
+| `ring` | `0.17.14` | `forge-auth` | AES-256-GCM of TOTP seeds at rest (`LessSafeKey`, random 96-bit nonces) | defaults disabled; already in every application's graph through rustls |
+| `subtle`, `base64`, `getrandom`, `sha2` | as admitted | `forge-auth` | constant-time digest comparison, the key and challenge encodings, CSPRNG, digests | unchanged workspace entries |
+
+Admission review:
+
+- No TOTP crate (`totp-rs`, `totp-lite`, `google-authenticator`) was
+  admitted: RFC 6238 is a dynamic truncation over an HMAC, which Forge-Go
+  also writes over its standard library; the HMAC and hash stay in RustCrypto.
+  The codes are checked against the RFC 6238 SHA-1 vectors.
+- `aes-gcm` (RustCrypto) would have added `aes`, `cipher`, `ctr`, `ghash`,
+  `polyval`, `aead` and `universal-hash`; `ring`'s AES-GCM is already linked
+  into every application for TLS, audited and constant-time on the supported
+  targets, so it adds no code. Its C/assembly build step and `unsafe` were
+  already accepted for rustls (see the telemetry decision). The stored form,
+  `nonce || ciphertext || tag`, is byte-compatible with Forge-Go's
+  `NewAESGCMSecretCipher`, checked against a vector produced by Go's
+  `crypto/cipher`.
+- Base32 (RFC 4648) of the seed and backup codes is a 30-line encoder for
+  whole 5-byte groups in `forge-auth` (no padding case exists), tested
+  against RFC 4648 and Go's `encoding/base32`; it is an encoding, not
+  cryptography.
+- No new type appears in a public signature: `forge_auth::mfa` exposes
+  Forge-owned types (`TotpSecret`, `SecretCipher`, `Aes256GcmSecretCipher`,
+  digests, `MfaBackupCode`, `MfaChallengeToken`).
+- `forge-tenancy` gains only a `testing` feature (the in-memory MFA store)
+  and `tokio` as a dev-dependency; `forge-cli` gains `forge-auth` as a
+  dev-dependency for the generated-application end-to-end test.
+- `cargo deny check` was run with these declarations.
+
 ## CLI lifecycle dependencies
 
 [ADR 0036](adr/0036-application-lifecycle-commands.md) adds **no package to
