@@ -35,8 +35,8 @@ the work is finished and waiting for its review; **Planned** means not started.
 | List the application's routes | `rails routes` | Done (`forge routes`, a source scan: literal `Handle`/`Resources` paths only, so the `/v1/<plural>` JSON routes of resources are missing) | Done (`forge routes`, runs the composed application: every HTML and JSON route with its source line, [CLI](cli.md#application-lifecycle-commands)) |
 | Controller, model, mailer and job generators | `rails g` | Done (Forge-Go ADR 0041) | Done (`forge generate model\|controller\|mailer\|job --queue`, [ADR 0038](adr/0038-generators-and-destroy.md), [generators](generators.md)) |
 | Undo a generator | `rails d` | Done (`forge destroy`, Forge-Go ADR 0041) | Done (`forge destroy`, [ADR 0038](adr/0038-generators-and-destroy.md)) |
-| Continuous fuzzing, SBOM, signed images | — | Done (`scripts/fuzz.sh`, `scripts/sbom.sh`, `release.yml`, Forge-Go ADR 0044) | In review (`scripts/fuzz.sh`, `scripts/sbom.sh`, signed forge-proxy image, SHA/digest pins enforced by `crates/forge/tests/supply_chain.rs`, [ADR 0043](adr/0043-continuous-fuzzing-sbom-signed-images.md), [supply chain](supply-chain.md)) |
-| Published benchmarks | — | Planned | Planned |
+| Continuous fuzzing, SBOM, signed images | — | Done (`scripts/fuzz.sh`, `scripts/sbom.sh`, `release.yml`, Forge-Go ADR 0044) | Done (`scripts/fuzz.sh`, `scripts/sbom.sh`, signed forge-proxy image, SHA/digest pins enforced by `crates/forge/tests/supply_chain.rs`, [ADR 0043](adr/0043-continuous-fuzzing-sbom-signed-images.md), [supply chain](supply-chain.md)) |
+| Published benchmarks | — | Done (`go test -bench`, `scripts/bench.sh`, [BENCHMARKS.md](https://github.com/rocketinsidecorp/forge-go/blob/main/docs/BENCHMARKS.md)) | Done (`cargo bench -p forge-bench`, `scripts/bench.sh`, [benchmarks](benchmarks.md)) |
 | Getting Started guide | Rails Guides | Done (Forge-Go docs/GETTING_STARTED.md) | Done ([getting started](getting-started.md)) |
 
 ## Parity follow-ups
@@ -50,6 +50,25 @@ the work is finished and waiting for its review; **Planned** means not started.
   same pages and `auth.mfa.backup_codes_regenerated` in a follow-up pull
   request. Forge-Rust has no JSON login API, so it has no
   `/auth/mfa/complete` bearer route, and does not port `PruneMFA` yet.
+
+- Benchmarks ([benchmarks](benchmarks.md), rocketinsidecorp/forge-rust#41): the
+  scenario names, variants and output formats are Forge-Go's, and results are
+  read side by side. Forge-Rust has no equivalent of two scenarios, so they are
+  not run and not reported: `router_match/wildcard/*` (its router has no
+  catch-all `{name...}` segment) and the end-to-end `show_json` (a generated
+  application has no JSON scaffold and no bearer-token login: `forge generate
+  scaffold` is HTML-only, [CLI](cli.md#refusals)). Adding a JSON
+  scaffold with bearer-token login to Forge-Rust, or a catch-all to its router,
+  makes the scenario available; the load generator already names `show_json`
+  and refuses it with that reason. Differences that are not gaps: `health` is
+  `GET /health/ready` in Forge-Rust (the probe that pings the database; its
+  `/health` never does), `password_verify` times Argon2id where Forge-Go's is
+  PBKDF2, `middleware_chain` and `http_telemetry` drive `Router::dispatch`
+  with the server's telemetry steps because the server's request handler is
+  private, and the rig creates a migration role and a runtime role where
+  Forge-Go creates one. The load generator is a Rust port
+  (`crates/forge-loadgen`), because Forge-Go's `internal/loadgen` speaks to a
+  Forge-Go application only (other form field, session and login routes).
 
 - Framework migration ownership ([ADR 0030](adr/0030-framework-migration-ownership.md),
   rocketinsidecorp/forge-rust#10): Forge-Rust's `rollback` never reverts the

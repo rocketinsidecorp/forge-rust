@@ -1,0 +1,51 @@
+[package]
+name = "forge-bench"
+publish = false
+description = "Micro-benchmarks of Forge's hot paths (docs/benchmarks.md); nothing depends on it"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# Argon2id with the parameters of the generated application's password hasher
+# (templates/app/src/infrastructure/security): `password_verify` times it.
+# Admitted for generated applications in docs/dependency-policy.md; here it is
+# used by the benchmarks only, never by a framework crate.
+argon2 = { version = "0.6.0", default-features = false, features = ["alloc", "getrandom", "password-hash", "zeroize"] }
+askama.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+cookie.workspace = true
+forge = { path = "../forge", default-features = false, features = ["postgres", "views", "ratelimit"] }
+http.workspace = true
+serde.workspace = true
+sha2.workspace = true
+subtle.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+
+[[bench]]
+name = "micro"
+path = "benches/micro/main.rs"
+# A small harness instead of criterion (not in the dependency graph): a fixed
+# number of iterations per scenario, the median of three runs and a counting
+# allocator for B/op and allocs/op.
+harness = false
+
+# This crate holds the repository's only `unsafe`: the counting allocator in
+# src/alloc.rs, isolated, documented and tested (CLAUDE.md, "Coding
+# standards"). Everything else stays under the workspace's rules, restated
+# here because `workspace = true` cannot be combined with an override.
+[lints.rust]
+unsafe_code = "deny"
+unused_must_use = "deny"
+
+[lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+unwrap_used = "deny"
+expect_used = "deny"
+undocumented_unsafe_blocks = "deny"

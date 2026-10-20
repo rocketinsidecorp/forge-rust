@@ -1,0 +1,1 @@
+{% extends "layout.html" %}{% block title %}Posts{% endblock %}{% block content %}<h1>Posts</h1><table>{% for row in rows %}{% include "posts/_row.html" %}{% endfor %}</table>{% include "posts/_form.html" %}{% endblock %}

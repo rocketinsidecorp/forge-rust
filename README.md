@@ -952,6 +952,36 @@ cosign verify ghcr.io/rocketinsidecorp/forge-proxy:v0.1.0 \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```
 
+## Benchmarks
+
+Micro-benchmarks of the hot paths (router, middleware chain, JSON and HTML
+rendering, CSRF, session cookie, password hashing, UUIDv7, i18n, attribute
+encryption, rate limiting, telemetry) and an end-to-end HTTP benchmark of a
+generated application on PostgreSQL, with a load generator written with the
+standard library only. The scenario names, variants and output format are
+Forge-Go's, so the two suites can be read side by side. Methodology,
+scenarios, caveats and a dated results table:
+[docs/benchmarks.md](docs/benchmarks.md).
+
+```sh
+# micro-benchmarks: every scenario, the median of 3 runs, with heap figures
+cargo bench -p forge-bench
+cargo bench -p forge-bench -- router_match      # a subset: scenario names that contain the text
+cargo bench -p forge-bench -- --quick           # each scenario once (what CI does)
+
+# end to end: builds a generated app against this checkout (release), runs it on
+# PostgreSQL, prints requests/s and p50/p95/p99 of the readiness probe, the
+# welcome page, the scaffold index and the scaffold create
+export FORGE_TEST_DATABASE_URL='postgres://postgres:postgres@127.0.0.1:5432/postgres'
+scripts/bench.sh                                  # 16 workers, 10s per scenario, 3 runs
+BENCH_DURATION=3s BENCH_RUNS=1 scripts/bench.sh   # a quick check
+scripts/bench.sh -format json                     # the same figures as JSON
+```
+
+CI runs every benchmark once in a non-gating job (`benchmarks`). Two scenarios
+of Forge-Go's catalog have no Forge-Rust equivalent yet (`router_match/wildcard/*`
+and `show_json`); the document says why.
+
 ## Workspace layout
 
 ```text
@@ -959,6 +989,7 @@ crates/
 ├── forge          # facade: forge::App and framework-owned re-exports
 ├── forge-audit    # immutable security audit events and append-only sink contract
 ├── forge-auth     # sessions, sign-in throttling, password policy, reset tokens
+├── forge-bench    # micro-benchmarks and the counting allocator (the repository's only unsafe, bench-only)
 ├── forge-broadcast # live updates: Turbo Streams over SSE, signed streams, LISTEN/NOTIFY fanout
 ├── forge-cache    # application cache: memory and shared stores, single-flight fetch
 ├── forge-core     # lifecycle, errors, UUIDv7 identifiers
@@ -970,6 +1001,7 @@ crates/
 ├── forge-http     # HTTP server, routing, middleware, form/query decoding, limits
 ├── forge-i18n     # translations: JSON catalogs, CLDR plurals, locale matching, number/date formats
 ├── forge-jobs     # durable PostgreSQL jobs, workers, cron schedules
+├── forge-loadgen  # HTTP load generator of scripts/bench.sh (standard library only)
 ├── forge-macros   # #[derive(OpenApiSchema)] from serde attributes
 ├── forge-mail     # email: validated MIME, TLS-enforcing SMTP, file/test senders, previews
 ├── forge-openapi  # OpenAPI 3.1 documents from typed routes, contract validation
@@ -986,6 +1018,7 @@ examples/
                    # workspace member) with its own Cargo.lock; golden-tested
 fuzz/              # cargo-fuzz targets and seed corpora; standalone package with its own Cargo.lock
 scripts/
+├── bench.sh               # end-to-end HTTP benchmark of a generated application
 ├── e2e-generated-app.sh   # generated-app host + container end-to-end test
 ├── fuzz.sh                # runs every fuzz target (nightly + cargo-fuzz)
 └── sbom.sh                # CycloneDX and SPDX SBOMs of forge, forge-proxy and Cargo.lock
@@ -1058,6 +1091,7 @@ Contribution rules:
 - [Dependency policy](docs/dependency-policy.md)
 - [Test strategy](docs/test-strategy.md)
 - [Performance targets](docs/performance-targets.md)
+- [Benchmarks: scenarios, methodology and results](docs/benchmarks.md)
 
 ## License
 
