@@ -76,7 +76,7 @@ const ENTITY: &str = scaffold_template!("entity.rs.tmpl");
 const PORT: &str = scaffold_template!("port.rs.tmpl");
 const SERVICE: &str = scaffold_template!("service.rs.tmpl");
 const REPOSITORY: &str = scaffold_template!("repository.rs.tmpl");
-const ACCESS: &str = scaffold_template!("access.rs.tmpl");
+pub(crate) const ACCESS: &str = scaffold_template!("access.rs.tmpl");
 const STREAMS: &str = scaffold_template!("streams.rs.tmpl");
 const ROW_PARTIAL: &str = scaffold_template!("templates/_row.html.tmpl");
 const HTTP: &str = scaffold_template!("http.rs.tmpl");
@@ -182,6 +182,11 @@ pub(crate) fn files(
     files.push(renderer.file(format!("tests/{plural}_http.rs"), TESTS_HTTP));
     files.push(renderer.file(format!("tests/{plural}_repository.rs"), TESTS_REPOSITORY));
     files
+}
+
+/// The up and down migration of `resource`: the same for every version.
+pub(crate) fn migration(resource: &Resource, backend: Backend) -> (String, String) {
+    Renderer::new(resource, backend, false).migration()
 }
 
 struct Renderer<'a> {

@@ -4,12 +4,19 @@ mod application;
 mod authentication;
 mod cargo;
 mod cli;
+mod controller;
+mod destroy;
 mod dev;
 mod doctor;
 mod error;
 mod generate;
+#[cfg(test)]
+mod generator_tests;
+mod generators;
 mod i18n;
+mod job;
 mod lifecycle;
+mod mailer;
 mod process;
 mod project;
 mod scaffold;
@@ -24,13 +31,18 @@ pub use error::CliError;
 use crate::application::{Application as _, CargoApplication};
 use crate::cargo::CargoCommand;
 use crate::cli::{
-    Cli, Command, DbCommand, DestructiveArgs, GenerateCommand, I18nCommand, MigrateView,
+    Cli, Command, ControllerArgs, DbCommand, DestroyArgs, DestroyCommand, DestructiveArgs,
+    GenerateCommand, I18nCommand, JobArgs, MailerArgs, MigrateView, ResourceArgs,
 };
+use crate::controller::ControllerOptions;
+use crate::destroy::{DestroyFlags, DestroyPlan};
 use crate::generate::{ForgeSource, NewApplication};
+use crate::job::JobOptions;
 use crate::lifecycle::{Db, Destructive, Lifecycle};
+use crate::mailer::MailerOptions;
 use crate::process::Signals;
 use crate::project::Project;
-use crate::scaffold::{ScaffoldOptions, Scope};
+use crate::scaffold::{Layers, ScaffoldOptions, Scope};
 
 /// Parses process arguments and executes the selected Forge command.
 pub fn run() -> Result<(), CliError> {
@@ -129,6 +141,7 @@ fn execute(
                     plural,
                     broadcast,
                     dry_run,
+                    layers: Layers::Scaffold,
                 };
                 let version = generate::migration_version(current_dir)?;
                 let outcome = scaffold::generate(current_dir, &options, &version)?;
@@ -146,7 +159,44 @@ fn execute(
                 }
                 write!(output, "{}", outcome.wiring).map_err(CliError::Output)
             }
+            GenerateCommand::Model { resource } => {
+                let options = resource_options(resource, Layers::Model, false);
+                let version = generate::migration_version(current_dir)?;
+                let outcome = scaffold::generate(current_dir, &options, &version)?;
+                let verb = if options.dry_run {
+                    "would create"
+                } else {
+                    "create"
+                };
+                for path in &outcome.created {
+                    writeln!(output, "  {verb:<12} {path}").map_err(CliError::Output)?;
+                }
+                write!(output, "{}", outcome.wiring).map_err(CliError::Output)
+            }
+            GenerateCommand::Controller { controller } => {
+                let options = controller_options(controller);
+                let outcome = controller::generate(current_dir, &options)?;
+                generators::report(output, options.dry_run, &outcome.files)?;
+                if outcome.reused_access {
+                    writeln!(output, "  {:<12} {}", "reuse", scaffold::ACCESS_PATH)
+                        .map_err(CliError::Output)?;
+                }
+                write!(output, "{}", outcome.wiring).map_err(CliError::Output)
+            }
+            GenerateCommand::Mailer { mailer } => {
+                let options = mailer_options(mailer);
+                let outcome = mailer::generate(current_dir, &options)?;
+                generators::report(output, options.dry_run, &outcome.files)?;
+                write!(output, "{}", outcome.wiring).map_err(CliError::Output)
+            }
+            GenerateCommand::Job { job } => {
+                let options = job_options(job);
+                let outcome = job::generate(current_dir, &options)?;
+                generators::report(output, options.dry_run, &outcome.files)?;
+                write!(output, "{}", outcome.wiring).map_err(CliError::Output)
+            }
         },
+        Command::Destroy { generator } => run_destroy(current_dir, generator, output),
         Command::Check => CargoCommand::Check.run(current_dir),
         Command::Test { args } => CargoCommand::Test(args).run(current_dir),
         Command::Format => CargoCommand::Format.run(current_dir),
@@ -209,6 +259,138 @@ fn execute(
             lifecycle(current_dir, |app| app.db(&command))
         }
     }
+}
+
+fn resource_options(resource: ResourceArgs, layers: Layers, broadcast: bool) -> ScaffoldOptions {
+    ScaffoldOptions {
+        name: resource.name,
+        fields: resource.fields,
+        scope: if resource.tenant_scoped {
+            Scope::Tenant
+        } else {
+            Scope::Global
+        },
+        plural: resource.plural,
+        broadcast,
+        dry_run: resource.dry_run,
+        layers,
+    }
+}
+
+fn controller_options(arguments: ControllerArgs) -> ControllerOptions {
+    ControllerOptions {
+        name: arguments.name,
+        actions: arguments.actions,
+        api: arguments.api,
+        public: arguments.public,
+        dry_run: arguments.dry_run,
+    }
+}
+
+fn mailer_options(arguments: MailerArgs) -> MailerOptions {
+    MailerOptions {
+        name: arguments.name,
+        methods: arguments.methods,
+        dry_run: arguments.dry_run,
+    }
+}
+
+fn job_options(arguments: JobArgs) -> JobOptions {
+    JobOptions {
+        name: arguments.name,
+        fields: arguments.fields,
+        queue: arguments.queue,
+        dry_run: arguments.dry_run,
+    }
+}
+
+/// `forge destroy GENERATOR ARGUMENTS...`: plans what the generator would
+/// write from the same arguments, then removes what is unchanged.
+fn run_destroy(
+    root: &std::path::Path,
+    generator: DestroyCommand,
+    output: &mut dyn io::Write,
+) -> Result<(), CliError> {
+    let destroy_flags = |dry_run: bool, flags: DestroyArgs| DestroyFlags {
+        dry_run,
+        force: flags.force,
+        migrations: flags.migrations,
+    };
+    let (plan, flags) = match generator {
+        DestroyCommand::Model { resource, flags } => {
+            let options = resource_options(resource, Layers::Model, false);
+            let (files, unwire, owned_elsewhere) = scaffold::plan_destroy(root, &options)?;
+            (
+                DestroyPlan {
+                    files,
+                    unwire,
+                    owned_elsewhere,
+                },
+                destroy_flags(options.dry_run, flags),
+            )
+        }
+        DestroyCommand::Scaffold {
+            resource,
+            broadcast,
+            flags,
+        } => {
+            let options = resource_options(resource, Layers::Scaffold, broadcast);
+            let (files, unwire, owned_elsewhere) = scaffold::plan_destroy(root, &options)?;
+            (
+                DestroyPlan {
+                    files,
+                    unwire,
+                    owned_elsewhere,
+                },
+                destroy_flags(options.dry_run, flags),
+            )
+        }
+        DestroyCommand::Controller { controller, flags } => {
+            let options = controller_options(controller);
+            let (files, unwire) = controller::plan_destroy(root, &options)?;
+            (
+                DestroyPlan {
+                    files,
+                    unwire,
+                    owned_elsewhere: None,
+                },
+                destroy_flags(options.dry_run, flags),
+            )
+        }
+        DestroyCommand::Mailer { mailer, flags } => {
+            let options = mailer_options(mailer);
+            let (files, unwire) = mailer::plan_destroy(root, &options)?;
+            (
+                DestroyPlan {
+                    files,
+                    unwire,
+                    owned_elsewhere: None,
+                },
+                destroy_flags(options.dry_run, flags),
+            )
+        }
+        DestroyCommand::Job { job, flags } => {
+            let options = job_options(job);
+            let (files, unwire) = job::plan_destroy(root, &options)?;
+            (
+                DestroyPlan {
+                    files,
+                    unwire,
+                    owned_elsewhere: None,
+                },
+                destroy_flags(options.dry_run, flags),
+            )
+        }
+        DestroyCommand::Migration { .. } => {
+            return Err(CliError::Destroy(
+                "forge destroy does not remove migrations: one that ran is part of the \
+                 database's history. Revert it with `forge rollback` and delete \
+                 migrations/<version>_NAME.{up,down}.sql yourself"
+                    .to_owned(),
+            ));
+        }
+    };
+    destroy::apply(root, &plan, flags, output)
 }
 
 fn guard(flags: DestructiveArgs) -> Destructive {
