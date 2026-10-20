@@ -15,5 +15,12 @@ forge-core = { path = "../forge-core" }
 forge-security = { path = "../forge-security" }
 thiserror.workspace = true
 
+[dev-dependencies]
+tokio.workspace = true
+
+[features]
+# `forge_tenancy::testing::MemoryMfaStore`, an in-memory MFA store for tests.
+testing = []
+
 [lints]
 workspace = true

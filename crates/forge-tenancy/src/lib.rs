@@ -6,9 +6,12 @@
 //!
 //! Browser sign-in and password resets use the tenant-aware contracts
 //! [`TenantDirectory`] and [`PasswordResetStore`]; people name a tenant by
-//! its [`TenantSlug`].
+//! its [`TenantSlug`]. Accounts with a TOTP second factor sign in through
+//! [`MfaService`] over an [`MfaStore`] (the `testing` feature adds the
+//! in-memory [`testing::MemoryMfaStore`]).
 
 mod accounts;
+mod mfa;
 
 use async_trait::async_trait;
 use forge_auth::AuthenticatedPrincipal;
@@ -21,6 +24,15 @@ use thiserror::Error;
 pub use accounts::{
     AccountStoreError, PasswordResetGrant, PasswordResetGrantError, PasswordResetStore,
     RedeemedPasswordReset, TenantDirectory, TenantSlug, TenantSlugError,
+};
+
+/// Test support: the in-memory [`MfaStore`].
+#[cfg(any(test, feature = "testing"))]
+pub use mfa::testing;
+pub use mfa::{
+    ActiveTotp, IssuedMfaChallenge, MFA_CHALLENGE_LIFETIME_SECS, MFA_ENROLLMENT_LIFETIME_SECS,
+    MfaChallengeGrant, MfaChallengeRecord, MfaChange, MfaError, MfaRejection, MfaService,
+    MfaSignIn, MfaStatus, MfaStore, PendingTotp, SecondFactor, TotpEnrollment, mfa_throttle_config,
 };
 
 /// Marker type for a tenant identity.

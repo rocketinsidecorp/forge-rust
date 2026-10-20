@@ -51,7 +51,12 @@ postgres = [
 mysql = ["forge-db/mysql", "forge-ratelimit?/mysql", "forge-cache?/mysql"]
 sqlite = ["forge-db/sqlite", "forge-ratelimit?/sqlite", "forge-cache?/sqlite"]
 # `Composition::for_testing` and `forge::db::testing::TestDatabase`.
-testing = ["forge-db/testing", "forge-jobs?/testing", "forge-mail?/testing"]
+testing = [
+    "forge-db/testing",
+    "forge-jobs?/testing",
+    "forge-mail?/testing",
+    "forge-tenancy/testing",
+]
 # Server-rendered views (ADR 0022): `forge::views` and `forge::web::html`.
 # Full-stack applications get the mailer and translations too, like Rails'
 # Action Mailer and I18n.
