@@ -320,6 +320,34 @@ const TEMPLATES: &[Template] = &[
     template!(Group::Docker, "Dockerfile" => "Dockerfile.tmpl"),
     template!(Group::Docker, ".dockerignore" => "dockerignore.tmpl"),
     template!(Group::Docker, "compose.yaml" => "compose.yaml.tmpl"),
+    // The local observability stack (ADR 0034): an overlay for compose.yaml
+    // and the configuration it mounts read-only into its containers.
+    template!(
+        Group::Docker,
+        "compose.observability.yaml" => "compose.observability.yaml.tmpl"
+    ),
+    template!(
+        Group::Docker,
+        "observability/otel-collector.yaml" => "observability/otel-collector.yaml.tmpl"
+    ),
+    template!(
+        Group::Docker,
+        "observability/prometheus.yml" => "observability/prometheus.yml.tmpl"
+    ),
+    template!(Group::Docker, "observability/tempo.yaml" => "observability/tempo.yaml.tmpl"),
+    template!(Group::Docker, "observability/loki.yaml" => "observability/loki.yaml.tmpl"),
+    template!(
+        Group::Docker,
+        "observability/grafana/provisioning/datasources/datasources.yaml" => "observability/grafana/provisioning/datasources/datasources.yaml.tmpl"
+    ),
+    template!(
+        Group::Docker,
+        "observability/grafana/provisioning/dashboards/dashboards.yaml" => "observability/grafana/provisioning/dashboards/dashboards.yaml.tmpl"
+    ),
+    template!(
+        Group::Docker,
+        "observability/grafana/dashboards/forge-application.json" => "observability/grafana/dashboards/forge-application.json.tmpl"
+    ),
     template!(Group::Docker, "tests/container.rs" => "tests/container.rs.tmpl"),
     template!(Group::Ci, ".github/workflows/ci.yml" => "github/workflows/ci.yml.tmpl"),
     template!(Group::Ci, ".github/dependabot.yml" => "github/dependabot.yml.tmpl"),
@@ -782,6 +810,9 @@ fn write_application(
                 },
             );
             write_file(&root.join(template.path), &content)?;
+            if template.path.starts_with(OBSERVABILITY_DIRECTORY) {
+                make_world_readable(root, template.path)?;
+            }
         }
     }
     for file in BINARY_FILES {
@@ -805,6 +836,44 @@ fn write_application(
         )?;
     }
 
+    Ok(())
+}
+
+/// The directory of the observability stack's configuration, bind-mounted
+/// into containers that run as other users.
+const OBSERVABILITY_DIRECTORY: &str = "observability/";
+
+/// Makes `relative` (a file below [`OBSERVABILITY_DIRECTORY`]) readable, and
+/// its directories traversable, by every user whatever the umask: the
+/// stack's containers (Grafana, Prometheus, ...) read these bind mounts as
+/// their own users. The files hold no secrets.
+#[cfg(unix)]
+fn make_world_readable(root: &Path, relative: &str) -> Result<(), CliError> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let set = |path: &Path, mode: u32| {
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).map_err(|source| {
+            CliError::WriteFile {
+                path: path.to_path_buf(),
+                source,
+            }
+        })
+    };
+    let file = root.join(relative);
+    set(&file, 0o644)?;
+    let mut directory = file.parent();
+    while let Some(path) = directory {
+        if path == root {
+            break;
+        }
+        set(path, 0o755)?;
+        directory = path.parent();
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn make_world_readable(_root: &Path, _relative: &str) -> Result<(), CliError> {
     Ok(())
 }
 
@@ -1295,6 +1364,8 @@ mod tests {
             "Dockerfile",
             ".dockerignore",
             "compose.yaml",
+            "compose.observability.yaml",
+            "observability",
             "tests/container.rs",
             ".github",
         ] {

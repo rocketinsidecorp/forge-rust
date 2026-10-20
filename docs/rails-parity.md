@@ -26,7 +26,7 @@ the work is finished and waiting for its review; **Planned** means not started.
 | Import maps, Turbo, Stimulus | Hotwire | In review | Done |
 | Turbo Streams over SSE | Action Cable | In review | Done (`scaffold --broadcast`, ADR 0031) |
 | Traces, metrics, log correlation | (gems) | Done (OpenTelemetry, Prometheus) | Done (OpenTelemetry, Prometheus; ADR 0033) |
-| Preconfigured Prometheus, Grafana, Tempo, Loki | — | Planned | Planned |
+| Preconfigured Prometheus, Grafana, Tempo, Loki | — | Done (`compose.observability.yaml`, Forge-Go ADR 0038) | Done (`compose.observability.yaml`, [ADR 0034](adr/0034-local-observability-stack.md)) |
 | Zero-downtime deploys, rollback, remote logs | Kamal | In review (`forge deploy`) | Planned |
 | Live reload and database lifecycle | `bin/dev`, `db:*` | In review (`forge dev`, `forge db`) | Planned |
 | Encrypted credentials, attribute encryption | `credentials:edit`, AR Encryption | In review | Planned |
@@ -48,13 +48,16 @@ the work is finished and waiting for its review; **Planned** means not started.
   contain; it adopts the same rule in rocketinsidecorp/forge-go#13 (in
   progress, next Forge-Go pull request after the observability stack).
 
-- Telemetry (ADR 0033, rocketinsidecorp/forge-rust#13): part 1 ports
-  Forge-Go's telemetry (same `FORGE_TELEMETRY_*` variables, metric names and
-  OTLP/Prometheus formats). Still open in the same issue: part 2, the
-  generated local observability stack (`compose.observability.yaml` with the
-  Collector, Prometheus, Tempo, Loki and Grafana, the "Preconfigured
-  Prometheus, Grafana, Tempo, Loki" row); and metrics Forge-Rust cannot
-  record yet: `db.client.operation.duration` and per-query spans (SQLx has no
+- Telemetry (ADR 0033 and 0034, rocketinsidecorp/forge-rust#13): part 1
+  ports Forge-Go's telemetry (same `FORGE_TELEMETRY_*` variables, metric
+  names and OTLP/Prometheus formats); part 2 ports the generated local
+  observability stack with the same files, services, image digests and
+  commands. Grafana's default host port is 3001 instead of Forge-Go's 3000
+  because Forge-Rust's generated app already publishes 3000, and the overlay
+  also sets `FORGE_TELEMETRY_OTLP_ALLOW_PLAINTEXT=true` because the image runs
+  in production; the dashboard keeps only panels for metrics Forge-Rust
+  exports. Still open in the same issue: metrics Forge-Rust cannot record
+  yet: `db.client.operation.duration` and per-query spans (SQLx has no
   query hook), `forge.db.pool.waits`/`forge.db.pool.wait.duration` (the SQLx
   pool exposes no wait counters), `http.client.request.duration` (no
   instrumented client), `forge.mail.send.duration` (no mailer). See

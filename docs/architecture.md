@@ -434,6 +434,9 @@ and export over OTLP/HTTP JSON and a separate Prometheus listener. It lives in
 the adapter and infrastructure rings; `forge` builds it from `FORGE_TELEMETRY_*`
 and shuts it down last. Domain and application code never depend on it.
 Per-query database spans are not implemented yet (SQLx has no query hook).
+Generated applications include an opt-in local Collector, Prometheus, Tempo,
+Loki and Grafana stack (`compose.observability.yaml`,
+[ADR 0034](adr/0034-local-observability-stack.md)).
 
 - `/health/live` reports whether the process event loop is alive.
 - `/health/ready` reports whether the instance can accept its configured work and

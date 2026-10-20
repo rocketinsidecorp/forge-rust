@@ -1,0 +1,69 @@
+# Grafana data sources for the local observability stack, read at startup.
+# `$$` is Grafana's escape for a literal `$` in provisioning files.
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    uid: prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false
+    jsonData:
+      httpMethod: POST
+      timeInterval: 15s
+
+  # Trace -> logs: "Logs for this span" opens Loki filtered by the trace ID
+  # (structured metadata of each log record) and service. Trace -> metrics:
+  # request rate of the span's service.
+  - name: Tempo
+    uid: tempo
+    type: tempo
+    access: proxy
+    url: http://tempo:3200
+    editable: false
+    jsonData:
+      nodeGraph:
+        enabled: true
+      tracesToLogsV2:
+        datasourceUid: loki
+        spanStartTimeShift: -5m
+        spanEndTimeShift: 5m
+        # trace_id is structured metadata, not part of the log line, so the
+        # default line filter would find nothing.
+        customQuery: true
+        query: '{$${__tags}} | trace_id="$${__span.traceId}"'
+        tags:
+          - key: service.name
+            value: service_name
+      tracesToMetrics:
+        datasourceUid: prometheus
+        spanStartTimeShift: -5m
+        spanEndTimeShift: 5m
+        tags:
+          - key: service.name
+            value: job
+        queries:
+          - name: Request rate
+            query: sum(rate(http_server_request_duration_seconds_count{$$__tags}[5m]))
+          - name: p95 latency
+            query: histogram_quantile(0.95, sum by (le) (rate(http_server_request_duration_seconds_bucket{$$__tags}[5m])))
+
+  # Logs -> trace: the trace_id of a log record (structured metadata) becomes
+  # a link that opens the trace in Tempo.
+  - name: Loki
+    uid: loki
+    type: loki
+    access: proxy
+    url: http://loki:3100
+    editable: false
+    jsonData:
+      maxLines: 1000
+      derivedFields:
+        - name: trace_id
+          datasourceUid: tempo
+          matcherType: label
+          matcherRegex: trace_id
+          url: '$${__value.raw}'
+          urlDisplayLabel: Open trace

@@ -1,0 +1,17 @@
+# Prometheus for the local observability stack.
+#
+# The application does not need a scrape target: it pushes its metrics over
+# OTLP to the collector, which forwards them to Prometheus's OTLP receiver
+# (started with --web.enable-otlp-receiver). OTLP names are translated to the
+# Prometheus names in the metric catalogue of the Forge observability guide
+# (docs/observability.md), for example
+# http.server.request.duration -> http_server_request_duration_seconds, and
+# the resource attribute service.name becomes the job label.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]

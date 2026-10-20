@@ -1,0 +1,12 @@
+# Loads every dashboard JSON file under /etc/grafana/dashboards.
+apiVersion: 1
+
+providers:
+  - name: Forge
+    type: file
+    disableDeletion: true
+    allowUiUpdates: false
+    updateIntervalSeconds: 30
+    options:
+      path: /etc/grafana/dashboards
+      foldersFromFilesStructure: false

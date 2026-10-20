@@ -620,7 +620,9 @@ name = "forge-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "forge-config",
  "forge-db",
+ "serde_json",
  "tempfile",
  "tokio",
  "uuid",

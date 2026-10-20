@@ -369,3 +369,16 @@ The trusted-proxy resolver (ADR 0032) mirrors the Forge-Go ADR 0037 tests:
 - **End to end:** the generated-app script scrapes the separate metrics
   listener, checks route-template labels, that the application port never
   serves `/metrics`, and that an OTLP endpoint error does not echo it.
+- **Local stack** (`crates/forge-cli/tests/observability.rs`, ADR 0034): the
+  overlay and `observability/` files are generated for every backend and
+  shape (world-readable), parse as YAML/JSON, publish only loopback ports,
+  pin images by version and digest, require the Grafana password with no
+  default and hold no secret; the default `compose.yaml` stays free of the
+  stack; the app's overlay environment loads through `AppConfig::from_vars`
+  as the production image sees it; collector, Tempo, Loki, Prometheus and
+  Grafana agree on hosts and ports; every metric the dashboard and data
+  sources query is in the documented catalogue; YAML-keyword application
+  names stay strings. The Docker path of the end-to-end script runs
+  `docker compose config` on the overlay and smoke-tests the running stack
+  (Grafana login and data sources, dashboard, metrics in Prometheus, traces
+  in Tempo, logs in Loki).

@@ -54,7 +54,7 @@ lowercase ASCII letter and use only lowercase letters, digits, `-` and `_`.
 | Flag | Effect |
 | --- | --- |
 | `--api` | Generate an API-only application, like `rails new --api`: JSON handlers, no `templates/`, `assets/`, view models, Askama dependency or HTML request layers. |
-| `--skip-docker` | Do not generate `Dockerfile`, `.dockerignore` or `compose.yaml`. |
+| `--skip-docker` | Do not generate `Dockerfile`, `.dockerignore`, `compose.yaml` or the observability stack (`compose.observability.yaml`, `observability/`). |
 | `--skip-ci` | Do not generate `.github/workflows/ci.yml` or `.github/dependabot.yml`. |
 | `-d`, `--database <DATABASE>` | `postgresql` (default, alias `postgres`), `mysql`, `mariadb`, `sqlite3` (alias `sqlite`) or `none`. `none` omits SQLx, migrations, database Compose services and bootstrap hooks. See [Database backends](#database-backends). |
 | `--skip-lockfile` | Do not run `cargo generate-lockfile` after generation. |
@@ -192,6 +192,7 @@ shop/
 ├── Dockerfile               # omitted with --skip-docker
 ├── README.md
 ├── compose.yaml             # omitted with --skip-docker; 127.0.0.1:3000, stop_grace_period 20s
+├── compose.observability.yaml  # omitted with --skip-docker; opt-in overlay: collector, Prometheus, Tempo, Loki, Grafana
 ├── docker/                   # omitted with --skip-docker
 │   └── postgres/
 │       └── init.sql          # PostgreSQL only; local least-privilege roles
@@ -202,6 +203,12 @@ shop/
 │   ├── 00000000000000000002_forge_identity.down.sql
 │   ├── 00000000000000000003_forge_authentication.up.sql    # PostgreSQL full-stack: tenants, reset tokens
 │   └── 00000000000000000003_forge_authentication.down.sql
+├── observability/           # omitted with --skip-docker; read-only config of the stack (ADR 0034)
+│   ├── otel-collector.yaml
+│   ├── prometheus.yml
+│   ├── tempo.yaml
+│   ├── loki.yaml
+│   └── grafana/             #   data sources and the "Forge application" dashboard
 ├── rust-toolchain.toml      # pinned to the framework toolchain
 ├── src/
 │   ├── main.rs              # binary `shop`: calls app::bootstrap::run()

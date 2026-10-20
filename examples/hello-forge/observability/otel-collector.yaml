@@ -1,0 +1,51 @@
+# OpenTelemetry Collector for the local observability stack.
+#
+#   app --OTLP/HTTP--> collector --> Tempo       (traces)
+#                                --> Prometheus  (metrics, OTLP receiver)
+#                                --> Loki        (logs, native OTLP endpoint)
+#
+# Log records arrive already structured: the severity, the trace_id and
+# span_id of the request, and the fields of the tracing event and its spans,
+# so no parsing happens here. Loki indexes service.name as the service_name label and keeps
+# trace_id, span_id and the attributes as structured metadata.
+#
+# Receivers listen on all interfaces of the container network only; Compose
+# publishes them to 127.0.0.1 on the host (see compose.observability.yaml).
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 256
+    spike_limit_mib: 64
+  batch: {}
+
+exporters:
+  otlp_http/tempo:
+    endpoint: http://tempo:4318
+  otlp_http/prometheus:
+    endpoint: http://prometheus:9090/api/v1/otlp
+  otlp_http/loki:
+    endpoint: http://loki:3100/otlp
+
+service:
+  telemetry:
+    metrics:
+      level: none
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlp_http/tempo]
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlp_http/prometheus]
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlp_http/loki]

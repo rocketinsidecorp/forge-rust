@@ -1,0 +1,112 @@
+# Observability stack for hello-forge: an overlay for compose.yaml that adds the
+# OpenTelemetry Collector, Prometheus (metrics), Tempo (traces), Loki (logs) and
+# Grafana, configured by ./observability. `docker compose up` alone does not
+# start it. Nothing leaves your machine, and every published port is bound to
+# 127.0.0.1.
+#
+#   export GRAFANA_ADMIN_PASSWORD="$(openssl rand -base64 18)"   # required; or put it in .env
+#   docker compose -f compose.yaml -f compose.observability.yaml up --build
+#   open http://127.0.0.1:3001          # Grafana: user admin, the password above
+#   docker compose -f compose.yaml -f compose.observability.yaml down     # keeps the data; add -v to delete it
+#
+# How the data flows:
+#   traces + metrics   app --OTLP/HTTP--> otel-collector --> Tempo, Prometheus
+#   logs               app --OTLP/HTTP--> otel-collector --> Loki
+# Images are pinned to exact versions and digests; update them deliberately.
+
+services:
+  app:
+    environment:
+      FORGE_TELEMETRY_SERVICE_NAME: "hello-forge"
+      FORGE_TELEMETRY_EXPORTER: otlp
+      FORGE_TELEMETRY_OTLP_ENDPOINT: http://otel-collector:4318
+      # The image runs with FORGE_ENV=production, which requires an https
+      # collector unless plaintext is allowed: the collector is reached only
+      # over the compose project's private network.
+      FORGE_TELEMETRY_OTLP_ALLOW_PLAINTEXT: "true"
+      FORGE_TELEMETRY_METRICS_INTERVAL: 15s
+      # Every log line also goes to the collector, with trace_id and
+      # span_id; standard output (docker compose logs) keeps the same lines.
+      FORGE_TELEMETRY_LOGS_EXPORTER: otlp
+    depends_on:
+      otel-collector:
+        condition: service_started
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.163.1@sha256:1175b03003053962012f5a231f5567f66a3e8fdb960c7835c0e48f7aa1555806
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./observability/otel-collector.yaml:/etc/otelcol/config.yaml:ro
+    ports:
+      # OTLP/HTTP, so an app started with `cargo run` can export here too.
+      - "127.0.0.1:4318:4318"
+    depends_on:
+      - tempo
+      - loki
+      - prometheus
+
+  prometheus:
+    image: prom/prometheus:v3.15.0@sha256:efd719c99d83b060d9daefdcf00360461adf279f45ef5391f8d111892118753e
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=7d
+      - --web.enable-otlp-receiver
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "127.0.0.1:${PROMETHEUS_PORT:-9090}:9090"
+
+  tempo:
+    image: grafana/tempo:2.10.8@sha256:f0561deb1c68ec44d6e6e7e4487f30106c4e5e768642077695b37958b105812a
+    command: ["-config.file=/etc/tempo/tempo.yaml"]
+    volumes:
+      - ./observability/tempo.yaml:/etc/tempo/tempo.yaml:ro
+      - tempo-data:/var/tempo
+
+  loki:
+    image: grafana/loki:3.6.18@sha256:700eaaa9fbd4275914d6b11f77c080b5ba0b983f6690055e48264ea77cb0bf6f
+    command: ["-config.file=/etc/loki/loki.yaml"]
+    volumes:
+      - ./observability/loki.yaml:/etc/loki/loki.yaml:ro
+      - loki-data:/loki
+
+  grafana:
+    image: grafana/grafana:13.2.4@sha256:dbbc38ea21103cefb50396340cd88afec779c7e070b0a7bf5a75b4ce46651d3f
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      # No default: compose refuses to start the stack without a password.
+      # Grafana applies it when it first creates its database; to change it
+      # later, use Grafana's user settings or delete the grafana-data volume.
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set GRAFANA_ADMIN_PASSWORD, see the Observability section of README.md}
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_SECURITY_DISABLE_GRAVATAR: "true"
+      GF_SNAPSHOTS_EXTERNAL_ENABLED: "false"
+      # Nothing phones home: no usage statistics, update checks, news feed or
+      # plugin downloads at startup.
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES: "false"
+      GF_NEWS_NEWS_FEED_ENABLED: "false"
+      GF_PLUGINS_PREINSTALL_DISABLED: "true"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /etc/grafana/dashboards/forge-application.json
+    volumes:
+      - ./observability/grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+      - ./observability/grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./observability/grafana/dashboards:/etc/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      # 3001 on the host, because the app already publishes 3000.
+      - "127.0.0.1:${GRAFANA_PORT:-3001}:3000"
+    depends_on:
+      - prometheus
+      - tempo
+      - loki
+
+volumes:
+  prometheus-data:
+  tempo-data:
+  loki-data:
+  grafana-data:
