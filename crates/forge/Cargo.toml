@@ -17,6 +17,7 @@ forge-core = { path = "../forge-core" }
 forge-db = { path = "../forge-db" }
 forge-events = { path = "../forge-events", optional = true }
 forge-http = { path = "../forge-http" }
+forge-i18n = { path = "../forge-i18n", optional = true }
 forge-jobs = { path = "../forge-jobs", optional = true }
 forge-mail = { path = "../forge-mail", optional = true }
 forge-cache = { path = "../forge-cache", optional = true }
@@ -51,8 +52,13 @@ sqlite = ["forge-db/sqlite", "forge-ratelimit?/sqlite", "forge-cache?/sqlite"]
 # `Composition::for_testing` and `forge::db::testing::TestDatabase`.
 testing = ["forge-db/testing", "forge-jobs?/testing", "forge-mail?/testing"]
 # Server-rendered views (ADR 0022): `forge::views` and `forge::web::html`.
-# Full-stack applications get the mailer too, like Rails' Action Mailer.
-views = ["dep:forge-views", "mail"]
+# Full-stack applications get the mailer and translations too, like Rails'
+# Action Mailer and I18n.
+views = ["dep:forge-views", "mail", "i18n"]
+# Translations (ADR 0037): `forge::i18n`, the JSON catalogs of
+# config/locales, CLDR plural rules and localized numbers and dates. The
+# request side (locale negotiation, template helpers) is in `forge::views`.
+i18n = ["dep:forge-i18n"]
 # Email (ADR 0035): `forge::mail`, the SMTP, file and test senders, askama
 # templates, previews and the password reset mailer.
 mail = ["dep:forge-mail"]

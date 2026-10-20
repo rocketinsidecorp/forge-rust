@@ -56,6 +56,12 @@ pub use forge_db as db;
 #[cfg(feature = "events")]
 pub use forge_events as events;
 pub use forge_http as http;
+/// Translations (feature `i18n`, enabled by `views`, ADR 0037): the
+/// `config/locales` catalogs, `%{name}` interpolation, CLDR plural rules and
+/// localized numbers and dates. Jobs and mailers translate with a
+/// `Translator` directly; pages use `forge::views::I18n`.
+#[cfg(feature = "i18n")]
+pub use forge_i18n as i18n;
 /// Durable jobs, workers and cron schedules (feature `jobs`, ADR 0025).
 #[cfg(feature = "jobs")]
 pub use forge_jobs as jobs;
