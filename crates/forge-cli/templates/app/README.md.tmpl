@@ -271,7 +271,7 @@ succeeds, a failed build is printed and leaves it running, and Ctrl-C stops it
 gracefully. `forge dev --no-reload` builds and runs once; `forge test ARGS`
 passes `ARGS` to `cargo test`; `forge build` is the locked release build.
 
-Binary commands: `serve` (default), `healthcheck`, `version`, `help`.
+Binary commands: `serve` (default), `healthcheck`, `openapi`, `version`, `help`.
 %%if database%%
 Database-enabled binaries also support `migrate [status]`, `rollback [--steps N]`
 and `db create|exists|drop` (what `forge migrate`, `forge rollback` and
@@ -305,6 +305,28 @@ reachable only through the proxy:
 export FORGE_HTTP_TRUSTED_PROXIES=172.30.0.0/24,fd00:1::/64   # proxy CIDRs or addresses
 cargo run
 ```
+
+## OpenAPI
+
+JSON routes describe themselves in an OpenAPI 3.1 document built from their
+Rust types: `GET /v1/status` (`src/adapters/http/status.rs`) uses
+`forge::openapi::typed`, and the health routes are described by Forge.
+`tests/openapi.rs` checks every JSON response against the document.
+
+```bash
+curl http://127.0.0.1:3000/v1/status
+curl http://127.0.0.1:3000/openapi.json        # development and test only, by default
+forge openapi                                   # print the document (or: cargo run -- openapi)
+forge openapi --output openapi.json             # write it, to commit and diff
+forge openapi --check openapi.json              # exit 1 when it is out of date (CI)
+FORGE_ENV=production FORGE_OPENAPI_ENABLED=true cargo run   # serve it in production too
+```
+
+The document lists every described route with its permission, so production
+does not serve it unless `FORGE_OPENAPI_ENABLED=true`; `false` never serves
+it. Describe your own JSON routes with `#[derive(OpenApiSchema)]` next to
+`Serialize` and `forge::openapi::typed`, or attach an `Operation` to an
+ordinary handler with `forge::openapi::describe`.
 
 ## Observability
 

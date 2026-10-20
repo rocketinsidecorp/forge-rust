@@ -40,6 +40,7 @@ forge setup --tenant SLUG --email EMAIL [--organization NAME] [--password-stdin]
 forge seed
 forge db create | drop | reset | setup | prepare | migrate | status | seed
 forge db rollback [--steps N]
+forge openapi [--output FILE | --check FILE]
 forge i18n check [--json]
 ```
 
@@ -47,7 +48,7 @@ The quality and build commands run `cargo` directly (no shell) in the current
 directory. They are thin wrappers, and the underlying Cargo commands are always
 valid to run yourself. A failed Cargo invocation makes `forge` exit with a
 non-zero status. The lifecycle commands (`dev`, `migrate`, `rollback`, `setup`,
-`seed`, `db`) are described under
+`seed`, `db`, `openapi`) are described under
 [Application lifecycle commands](#application-lifecycle-commands).
 
 ## `forge id`
@@ -664,7 +665,7 @@ that is up to date with `Cargo.toml`. `forge build NAME` builds one binary
 ## Application lifecycle commands
 
 `forge version`, `forge doctor`, `forge dev`, `forge migrate`, `forge rollback`,
-`forge setup`, `forge seed` and `forge db ...` are the same commands, with the
+`forge setup`, `forge seed`, `forge db ...` and `forge openapi` are the same commands, with the
 same names, flags and messages, that the Forge-Go CLI has
 ([ADR 0036](adr/0036-application-lifecycle-commands.md)). `dev`, `migrate`,
 `rollback`, `setup`, `seed` and `db` run inside a generated application (a Cargo
@@ -688,7 +689,15 @@ forge db reset                     # drop + setup: a clean development database
 forge db status
 forge db drop
 FORGE_ALLOW_DESTRUCTIVE=true forge db drop --force-production --yes
+forge openapi                      # print the OpenAPI 3.1 document (ADR 0039)
+forge openapi --output openapi.json   # write it, to commit and diff
+forge openapi --check openapi.json    # exit 1 when the committed file is out of date (CI)
 ```
+
+`forge openapi` runs the application's `openapi` command, which composes the
+application without listening: it needs the configuration `serve` needs
+(database pools connect lazily, so the database need not be running). A
+relative `FILE` is resolved where `forge` runs. See [OpenAPI](openapi.md).
 
 ### How they run
 
@@ -854,6 +863,7 @@ Every application built with `forge::App` accepts these subcommands:
 | `jobs dead [LIMIT]` | Lists dead jobs, newest first (default 50, at most 500); payloads are never printed. |
 | `jobs retry JOB_ID` / `jobs discard JOB_ID` | Requeues a dead job with a fresh attempt budget, or deletes it. |
 | `jobs dead-events [LIMIT]` / `jobs retry-event EVENT_ID` | With `App::events`: lists or requeues dead outbox events. |
+| `openapi [--output FILE \| --check FILE]` | Composes the application without listening and prints its OpenAPI 3.1 document to standard output (logs and the list of undescribed routes go to standard error), writes it to `FILE`, or exits `1` when `FILE` differs ([OpenAPI](openapi.md)). |
 | `version` | Prints the application version. |
 | `help` | Prints usage, including the application's commands. |
 
