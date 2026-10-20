@@ -2,6 +2,7 @@
 //! map the result to a response, usually an HTML page rendered from a view
 //! model in `views` (or a `303` redirect after a form submission).
 
+pub mod status;
 pub mod views;
 
 use std::sync::Arc;
@@ -34,6 +35,7 @@ pub fn routes(router: &mut Router, site: &Arc<Site>) -> Result<(), ComposeError>
         let site = Arc::clone(&index_site);
         async move { index(&site, &request) }
     })?;
+    status::routes(router)?;
     Ok(())
 }
 

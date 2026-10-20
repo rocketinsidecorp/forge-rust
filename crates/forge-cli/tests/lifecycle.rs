@@ -362,7 +362,11 @@ fn openapi_runs_the_applications_command_with_absolute_files() {
         &["openapi", "--check", "openapi.json"],
     ] {
         let output = fixture.run(arguments);
-        assert!(output.status.success(), "{arguments:?}: {}", stderr(&output));
+        assert!(
+            output.status.success(),
+            "{arguments:?}: {}",
+            stderr(&output)
+        );
     }
     let file = fixture
         .project()

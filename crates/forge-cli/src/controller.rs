@@ -335,7 +335,7 @@ fn plan(root: &Path, options: &ControllerOptions, destroy: bool) -> Result<Plan,
             let message = format!("Find me in {controller_path}");
             if guarded {
                 routes.push_str(&format!(
-                    "    route(router, &state, \"{route}\", {action})?;\n"
+                    "    route(router, &state, \"{route}\", \"{action}\", {action})?;\n"
                 ));
                 handlers.push_str(&format!(
                     "\n/// `GET {route}`.\n\
@@ -350,7 +350,8 @@ fn plan(root: &Path, options: &ControllerOptions, destroy: bool) -> Result<Plan,
                 ));
             } else {
                 routes.push_str(&format!(
-                    "    router.route(Method::GET, \"{route}\", {action})?;\n"
+                    "    router.route(\n        Method::GET,\n        \"{route}\",\n        \
+                     describe({action}, operation(\"{action}\")),\n    )?;\n"
                 ));
                 handlers.push_str(&format!(
                     "\n/// `GET {route}`.\n\

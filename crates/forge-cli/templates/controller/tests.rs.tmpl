@@ -69,6 +69,13 @@ fn router() -> Result<Router, Box<dyn Error>> {
     let site = app::adapters::http::site(&mut router, translator)?;
 %%end%%
     app::adapters::http::%%NAME%%_controller::routes(&mut router%%ROUTES_ARGUMENTS%%)?;
+%%if api%%
+    // Every response below is also checked against the OpenAPI document.
+    let document = router.openapi(&forge::openapi::Info::new("app", "0.0.0"))?;
+    router.layer(forge::openapi::CheckResponses::new(document, |failure| {
+        panic!("{failure}")
+    }));
+%%end%%
     Ok(router)
 }
 
