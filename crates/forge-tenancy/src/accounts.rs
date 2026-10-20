@@ -165,6 +165,15 @@ pub trait PasswordResetStore: Send + Sync {
     /// Stores an issued reset (only its digest).
     async fn issue(&self, grant: &PasswordResetGrant) -> Result<(), AccountStoreError>;
 
+    /// Whether a token is known, unused and unexpired at `now`, checked
+    /// before the expensive password hash of a reset is computed. Only a
+    /// pre-check: [`PasswordResetStore::redeem`] decides.
+    async fn is_redeemable(
+        &self,
+        digest: &PasswordResetTokenDigest,
+        now: UnixTimestamp,
+    ) -> Result<bool, AccountStoreError>;
+
     /// Redeems a token in one atomic step, or returns `None` and changes
     /// nothing when the token is unknown, already used, expired at `now`, or
     /// its principal is disabled or no longer an active member of the tenant
