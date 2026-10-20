@@ -17,12 +17,13 @@
 //!   limiter itself fails (unless [`RateLimit::fail_open`] is chosen).
 //!
 //! What identifies a client is the application's decision (a key function).
-//! [`by_remote_addr`] keys by the TCP peer address and never reads forwarded
-//! headers; see its documentation for the consequences behind a reverse proxy.
+//! [`by_client_ip`], the client address resolved under the trusted-proxy
+//! policy (`FORGE_HTTP_TRUSTED_PROXIES`, ADR 0032), is the usual choice;
+//! [`by_remote_addr`] is always the TCP peer.
 //!
 //! ```
 //! use std::{sync::Arc, time::Duration};
-//! use forge_ratelimit::{Limit, MemoryLimiter, MemoryOptions, RateLimit, by_remote_addr};
+//! use forge_ratelimit::{Limit, MemoryLimiter, MemoryOptions, RateLimit, by_client_ip};
 //!
 //! # fn main() -> Result<(), forge_ratelimit::LimitError> {
 //! let limiter = Arc::new(MemoryLimiter::new(MemoryOptions::default())?);
@@ -31,7 +32,7 @@
 //!     limiter,
 //!     "comments.create",
 //!     Limit::new(10, Duration::from_secs(180))?,
-//!     by_remote_addr,
+//!     by_client_ip,
 //! )?;
 //! # let _ = create;
 //! # Ok(())
@@ -62,7 +63,7 @@ pub mod testing;
 #[cfg(any(feature = "mysql", feature = "postgres", feature = "sqlite"))]
 pub use forge_db::{MAX_PRUNE_ROUNDS, PruneGate};
 pub use memory::{MemoryLimiter, MemoryOptions, WhenFull};
-pub use middleware::{KeyFn, RateLimit, RateLimited, by_remote_addr, join};
+pub use middleware::{KeyFn, RateLimit, RateLimited, by_client_ip, by_remote_addr, join};
 #[cfg(any(feature = "mysql", feature = "postgres", feature = "sqlite"))]
 pub use store::StoreOptions;
 

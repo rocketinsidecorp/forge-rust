@@ -955,6 +955,7 @@ async fn serve(
         version,
         environment = environment_name(config.environment),
         %address,
+        trusted_proxies = config.server.trusted_proxies.len(),
         "listening"
     );
 

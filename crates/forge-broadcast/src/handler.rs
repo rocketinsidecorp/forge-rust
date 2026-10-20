@@ -121,17 +121,28 @@ pub trait StreamAccess: Send + Sync {
 /// The client address a request is counted by when it has no principal.
 pub type ClientAddress = Arc<dyn Fn(&Request) -> String + Send + Sync>;
 
-/// The peer address of the TCP connection, IPv4 (and IPv4-mapped IPv6)
-/// whole, IPv6 by its `/64` prefix (one subscriber's allocation), like the
-/// rate limiter and the login throttle.
-///
-/// It never reads forwarded headers. Behind a reverse proxy every
-/// anonymous viewer shares the proxy's slots; authenticated viewers are
-/// counted by principal. Pass a resolver of trusted proxies to
-/// [`EventStreams::client_address`] once the application has one.
+/// The client address the HTTP server resolved ([`Request::client_ip`],
+/// ADR 0032: the TCP peer unless it is a trusted proxy listed in
+/// `FORGE_HTTP_TRUSTED_PROXIES`), IPv4 (and IPv4-mapped IPv6) whole, IPv6 by
+/// its `/64` prefix (one subscriber's allocation), like the rate limiter and
+/// the login throttle. It is how [`EventStreams`] counts anonymous viewers by
+/// default; authenticated viewers are counted by principal.
+#[must_use]
+pub fn client_ip_address(request: &Request) -> String {
+    address_bucket(request.client_ip())
+}
+
+/// The peer address of the TCP connection, whatever the trusted proxies,
+/// grouped like [`client_ip_address`]. It never reads a forwarding header;
+/// behind a reverse proxy every anonymous viewer counted by it shares the
+/// proxy's slots.
 #[must_use]
 pub fn peer_address(request: &Request) -> String {
-    match request.remote_addr().ip().to_canonical() {
+    address_bucket(request.remote_addr().ip())
+}
+
+fn address_bucket(address: IpAddr) -> String {
+    match address.to_canonical() {
         IpAddr::V4(address) => address.to_string(),
         IpAddr::V6(address) => {
             let prefix = u128::from(address) & (u128::MAX << 64);
@@ -200,7 +211,7 @@ impl EventStreams {
             max_connection_age: Some(DEFAULT_MAX_CONNECTION_AGE),
             max_per_principal: Some(DEFAULT_MAX_PER_PRINCIPAL),
             max_per_tenant: Some(DEFAULT_MAX_PER_TENANT),
-            client_address: Arc::new(peer_address),
+            client_address: Arc::new(client_ip_address),
             open: Arc::new(OpenStreams::default()),
         }
     }
@@ -238,9 +249,9 @@ impl EventStreams {
         self
     }
 
-    /// Replaces how anonymous viewers are counted ([`peer_address`] by
-    /// default), for example with a trusted-proxy resolver. The value must
-    /// not be chosen by the client.
+    /// Replaces how anonymous viewers are counted ([`client_ip_address`] by
+    /// default; [`peer_address`] counts the TCP peer whatever the trusted
+    /// proxies). The value must not be chosen by the client.
     #[must_use]
     pub fn client_address(mut self, resolve: ClientAddress) -> Self {
         self.client_address = resolve;
@@ -844,6 +855,53 @@ mod tests {
         // An IPv4-mapped IPv6 peer is its IPv4 address.
         let mapped = fixture.get(&url, &anonymous, "[::ffff:192.0.2.1]:1").await;
         assert_eq!(mapped.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn anonymous_viewers_behind_a_trusted_proxy_are_counted_per_client() {
+        let mut fixture = fixture(|streams| streams.max_per_principal(Some(1)));
+        fixture
+            .router
+            .layer(forge_http::TrustedProxies::new(["172.18.0.0/16"
+                .parse()
+                .expect("valid network")]));
+        let url = fixture.url(&Channel::global("posts").expect("valid"));
+        let via_proxy = |forwarded_for: &str| {
+            [
+                ("x-test-anonymous", "1".to_owned()),
+                ("x-forwarded-for", forwarded_for.to_owned()),
+            ]
+        };
+        let proxy = "172.18.0.2:5000";
+
+        let first = fixture.get(&url, &via_proxy("203.0.113.9"), proxy).await;
+        assert_eq!(first.status(), StatusCode::OK);
+        // Another client behind the same proxy has its own slot.
+        let second = fixture.get(&url, &via_proxy("198.51.100.7"), proxy).await;
+        assert_eq!(second.status(), StatusCode::OK);
+        // A forged entry left of the proxy's entry does not escape the cap.
+        let forged = fixture
+            .get(&url, &via_proxy("192.0.2.1, 203.0.113.9"), proxy)
+            .await;
+        assert_eq!(forged.status(), StatusCode::TOO_MANY_REQUESTS);
+        // Rotating inside one /64 behind the proxy is one client.
+        let v6 = fixture
+            .get(&url, &via_proxy("2001:db8:1:2::1"), proxy)
+            .await;
+        assert_eq!(v6.status(), StatusCode::OK);
+        let rotated = fixture
+            .get(&url, &via_proxy("2001:db8:1:2:ffff::9"), proxy)
+            .await;
+        assert_eq!(rotated.status(), StatusCode::TOO_MANY_REQUESTS);
+        // A direct client cannot pick a fresh slot with the header.
+        let direct = fixture
+            .get(&url, &via_proxy("192.0.2.50"), "198.51.100.20:1")
+            .await;
+        assert_eq!(direct.status(), StatusCode::OK);
+        let direct_again = fixture
+            .get(&url, &via_proxy("192.0.2.51"), "198.51.100.20:2")
+            .await;
+        assert_eq!(direct_again.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 
     #[test]

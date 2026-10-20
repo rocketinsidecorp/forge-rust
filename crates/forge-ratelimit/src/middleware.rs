@@ -24,23 +24,37 @@ use crate::{Decision, Limit, LimitError, Limiter, key, retry_after_seconds};
 /// (it is limited, never exempt).
 pub type KeyFn = Arc<dyn Fn(&Request) -> String + Send + Sync>;
 
-/// Keys by the peer address of the TCP connection, the only address a client
-/// cannot forge. IPv4 addresses (and IPv4-mapped IPv6 addresses) are used
-/// whole; IPv6 addresses are reduced to their `/64` prefix, because one
-/// subscriber routinely controls a whole `/64` and could otherwise rotate
-/// through addresses.
+/// Keys by the client address the HTTP server resolved
+/// ([`Request::client_ip`], ADR 0032): the TCP peer, unless the peer is a
+/// trusted proxy listed in `FORGE_HTTP_TRUSTED_PROXIES`, in which case it is
+/// the first untrusted `X-Forwarded-For` entry read from the right. A client
+/// that reaches the application directly cannot choose it; with no trusted
+/// proxies configured it equals [`by_remote_addr`]. IPv4 addresses (and
+/// IPv4-mapped IPv6 addresses) are used whole; IPv6 addresses are reduced to
+/// their `/64` prefix, because one subscriber routinely controls a whole
+/// `/64` and could otherwise rotate through addresses.
 ///
-/// It **never reads `X-Forwarded-For`, `X-Real-IP` or `Forwarded`**: those
-/// headers are client-controlled unless a proxy overwrites them, and Forge has
-/// no trusted-proxy policy yet. Behind a reverse proxy the peer is the proxy,
-/// so every client shares one bucket (loud and safe, but useless as a
-/// per-client limit): key by something the application authenticated (a
-/// session or user ID, see [`join`]), or write a key function that reads the
-/// one header your proxy overwrites, only when the proxy is the sole network
-/// path to the application.
+/// It is the key to use for per-client limits, including behind a reverse
+/// proxy once `FORGE_HTTP_TRUSTED_PROXIES` lists it. `X-Real-IP` and
+/// `Forwarded` are never read.
+#[must_use]
+pub fn by_client_ip(request: &Request) -> String {
+    address_key(request.client_ip())
+}
+
+/// Keys by the peer address of the TCP connection, whatever the trusted
+/// proxies (IPv6 reduced to its `/64` like [`by_client_ip`]). It never reads
+/// a forwarding header. Behind a reverse proxy the peer is the proxy, so
+/// every client shares one bucket; use [`by_client_ip`] for per-client
+/// limits.
 #[must_use]
 pub fn by_remote_addr(request: &Request) -> String {
-    match request.remote_addr().ip().to_canonical() {
+    address_key(request.remote_addr().ip())
+}
+
+/// An IPv4 address whole, an IPv6 address as its `/64`.
+fn address_key(address: IpAddr) -> String {
+    match address.to_canonical() {
         IpAddr::V4(address) => address.to_string(),
         IpAddr::V6(address) => {
             let prefix = u128::from(address) & (u128::MAX << 64);
@@ -308,7 +322,7 @@ mod tests {
     };
 
     use async_trait::async_trait;
-    use forge_http::{HeaderMap, Router, Uri};
+    use forge_http::{HeaderMap, Router, TrustedProxies, Uri};
     use uuid::Uuid;
 
     use super::*;
@@ -463,6 +477,111 @@ mod tests {
             ]
         );
         assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    fn behind_proxy(peer: &str, forwarded_for: &str) -> Request {
+        let mut request = request(
+            Method::POST,
+            "/comments",
+            peer,
+            &[("x-forwarded-for", forwarded_for)],
+        );
+        trusted().apply(&mut request);
+        request
+    }
+
+    fn trusted() -> TrustedProxies {
+        TrustedProxies::new(["172.18.0.0/16".parse().expect("valid network")])
+    }
+
+    #[tokio::test]
+    async fn clients_behind_a_trusted_proxy_get_their_own_buckets() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let rate =
+            RateLimit::new(memory(), "s", two_per_minute(), by_client_ip).expect("rate limit");
+        let router = router(rate, Arc::clone(&hits));
+        let status = |request| {
+            let router = &router;
+            async move { router.dispatch(request).await.status() }
+        };
+        for _ in 0..2 {
+            assert_eq!(
+                status(behind_proxy("172.18.0.2:5000", "203.0.113.9")).await,
+                StatusCode::CREATED
+            );
+        }
+        assert_eq!(
+            status(behind_proxy("172.18.0.2:5000", "203.0.113.9")).await,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        // Forged entries left of the proxy's own entry change nothing.
+        for forged in ["1.2.3.4, 203.0.113.9", "172.18.0.9, 203.0.113.9"] {
+            assert_eq!(
+                status(behind_proxy("172.18.0.2:5000", forged)).await,
+                StatusCode::TOO_MANY_REQUESTS,
+                "{forged}"
+            );
+        }
+        // Another client behind the same proxy has its own bucket.
+        assert_eq!(
+            status(behind_proxy("172.18.0.2:5000", "198.51.100.7")).await,
+            StatusCode::CREATED
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn direct_clients_cannot_choose_their_client_ip_bucket() {
+        let rate =
+            RateLimit::new(memory(), "s", two_per_minute(), by_client_ip).expect("rate limit");
+        let router = router(rate, Arc::new(AtomicUsize::new(0)));
+        let mut statuses = Vec::new();
+        for i in 0..4 {
+            // The peer is not a trusted proxy: its header is ignored.
+            let response = router
+                .dispatch(behind_proxy("203.0.113.7:5000", &format!("198.51.100.{i}")))
+                .await;
+            statuses.push(response.status());
+        }
+        assert_eq!(
+            statuses,
+            [
+                StatusCode::CREATED,
+                StatusCode::CREATED,
+                StatusCode::TOO_MANY_REQUESTS,
+                StatusCode::TOO_MANY_REQUESTS,
+            ]
+        );
+    }
+
+    #[test]
+    fn client_ip_keys_group_ipv6_by_64_and_keep_the_peer_key_the_peer() {
+        // Rotating inside one /64 behind the proxy is one client.
+        assert_eq!(
+            by_client_ip(&behind_proxy("172.18.0.2:5000", "2001:db8:1:2::1")),
+            by_client_ip(&behind_proxy("172.18.0.2:5000", "2001:db8:1:2:ffff::9")),
+        );
+        assert_eq!(
+            by_client_ip(&behind_proxy("172.18.0.2:5000", "2001:db8:1:2::1")),
+            "2001:db8:1:2::/64"
+        );
+        assert_ne!(
+            by_client_ip(&behind_proxy("172.18.0.2:5000", "2001:db8:1:2::1")),
+            by_client_ip(&behind_proxy("172.18.0.2:5000", "2001:db8:1:3::1")),
+        );
+        // The peer key still means the peer, whatever the trusted proxies.
+        assert_eq!(
+            by_remote_addr(&behind_proxy("172.18.0.2:5000", "203.0.113.9")),
+            "172.18.0.2"
+        );
+        // Without a resolver the client is the peer.
+        let direct = request(
+            Method::GET,
+            "/",
+            "[::ffff:203.0.113.7]:80",
+            &[("x-forwarded-for", "198.51.100.1")],
+        );
+        assert_eq!(by_client_ip(&direct), "203.0.113.7");
     }
 
     #[test]

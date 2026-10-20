@@ -51,7 +51,7 @@ pub use channel::{Channel, MAX_CHANNEL_NAME_BYTES};
 pub use handler::{
     ClientAddress, DEFAULT_HEARTBEAT, DEFAULT_MAX_CONNECTION_AGE, DEFAULT_MAX_PER_PRINCIPAL,
     DEFAULT_MAX_PER_TENANT, DEFAULT_RETRY, EventStreams, StreamAccess, StreamDenied, StreamViewer,
-    peer_address,
+    client_ip_address, peer_address,
 };
 pub use memory::{
     DEFAULT_BUFFER, DEFAULT_MAX_MESSAGE_BYTES, DEFAULT_MAX_SUBSCRIBERS,

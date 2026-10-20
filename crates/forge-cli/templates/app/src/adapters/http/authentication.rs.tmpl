@@ -20,7 +20,9 @@
 //! - A wrong organization, email or password, a disabled account and an
 //!   inactive membership all show one message (`422`); unknown logins still
 //!   cost one Argon2id hash. Attempts are throttled per account and per
-//!   network source (`429` with `Retry-After`).
+//!   network source (`429` with `Retry-After`); the source is
+//!   `Request::client_ip`, the TCP peer unless it is a reverse proxy listed in
+//!   `FORGE_HTTP_TRUSTED_PROXIES`.
 //! - Signing in issues a new server-side session and a new CSRF token, both
 //!   in fresh cookies, and revokes any session the browser already held, so
 //!   an identifier or token planted before sign-in is useless after it.
@@ -281,7 +283,7 @@ async fn create_session(pages: Arc<Pages>, request: Request) -> Response {
     let key = ThrottleKey::new(
         "sign_in",
         &account_key(login.as_ref(), &values.email),
-        Some(request.remote_addr().ip()),
+        Some(request.client_ip()),
     );
     match ports.sign_in_throttle.attempt(&key).await {
         Ok(ThrottleDecision::Allowed) => {}
@@ -483,7 +485,7 @@ async fn request_password_reset(pages: Arc<Pages>, request: Request) -> Response
     let key = ThrottleKey::new(
         "password_reset",
         &account_key(login.as_ref(), &email),
-        Some(request.remote_addr().ip()),
+        Some(request.client_ip()),
     );
     match pages.ports.reset_throttle.attempt(&key).await {
         Ok(ThrottleDecision::Allowed) => {}
@@ -641,7 +643,7 @@ async fn update_password(pages: Arc<Pages>, request: Request) -> Response {
     let key = ThrottleKey::new(
         "password_update",
         token.expose(),
-        Some(request.remote_addr().ip()),
+        Some(request.client_ip()),
     );
     match ports.reset_throttle.attempt(&key).await {
         Ok(ThrottleDecision::Allowed) => {}
