@@ -115,7 +115,7 @@ fn execute(
                     broadcast,
                     dry_run,
                 };
-                let version = generate::migration_version()?;
+                let version = generate::migration_version(current_dir)?;
                 let outcome = scaffold::generate(current_dir, &options, &version)?;
                 let verb = if dry_run { "would create" } else { "create" };
                 for path in &outcome.created {

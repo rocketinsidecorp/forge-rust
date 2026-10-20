@@ -113,8 +113,12 @@ forge generate migration create_customers
 ```
 
 Forge creates a versioned `.up.sql` / `.down.sql` pair using a positive,
-time-sortable numeric migration version. It creates files with create-new
-semantics and never overwrites an existing migration.
+time-sortable numeric migration version (nanoseconds since the Unix epoch).
+A version that is already taken, by a file in `migrations/` or by a
+framework migration (`forge_db::FRAMEWORK_MIGRATIONS`, whose versions are
+reserved, [ADR 0030](adr/0030-framework-migration-ownership.md)), moves to the
+next free second; `forge generate scaffold` follows the same rule. It creates
+files with create-new semantics and never overwrites an existing migration.
 
 Generated database applications separate runtime and migration credentials.
 Both values are treated as secrets by Forge configuration and are redacted from
