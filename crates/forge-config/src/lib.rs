@@ -20,8 +20,14 @@ use base64::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+mod mail;
 mod telemetry;
 
+pub use mail::{
+    AuthConfig, MAIL_KEYS, MailConfig, MailEndpoint, MailTransport, MailboxError,
+    PASSWORD_RESET_URL_KEY, has_text_problem, is_bidi_control, is_local_web_host, is_loopback_host,
+    parse_mailbox, valid_mail_domain, validate_mailbox,
+};
 pub use telemetry::{
     EndpointScheme, OtlpCompression, OtlpHeader, SampleRatio, TELEMETRY_ENABLED_KEY,
     TELEMETRY_KEYS, TelemetryConfig, TelemetryExporter, TelemetryLogLevel, TelemetryLogsExporter,
@@ -93,6 +99,14 @@ pub const KNOWN_KEYS: &[&str] = &[
     "FORGE_STORAGE_MAX_UPLOAD_BYTES",
     "FORGE_STORAGE_LINK_TTL_SECS",
     "FORGE_STREAMS_KEY",
+    // MAIL_KEYS and PASSWORD_RESET_URL_KEY, ADR 0035.
+    "FORGE_MAIL_URL",
+    "FORGE_MAIL_FROM",
+    "FORGE_MAIL_ALLOW_PLAINTEXT",
+    "FORGE_MAIL_TIMEOUT",
+    "FORGE_MAIL_PREVIEW",
+    "FORGE_MAIL_TLS_CA_FILE",
+    PASSWORD_RESET_URL_KEY,
     // TELEMETRY_KEYS, ADR 0033.
     "FORGE_TELEMETRY_ENABLED",
     "FORGE_TELEMETRY_SERVICE_NAME",
@@ -772,6 +786,12 @@ pub struct AppConfig {
     /// Traces, metrics and log export (`FORGE_TELEMETRY_*`, ADR 0033).
     #[serde(default)]
     pub telemetry: TelemetryConfig,
+    /// Outgoing mail (`FORGE_MAIL_*`, ADR 0035).
+    #[serde(default)]
+    pub mail: MailConfig,
+    /// Identity settings (`FORGE_AUTH_PASSWORD_RESET_URL`).
+    #[serde(default)]
+    pub auth: AuthConfig,
 }
 
 impl AppConfig {
@@ -866,6 +886,7 @@ impl AppConfig {
         }
         apply_services(&lookup, &mut config)?;
         telemetry::apply(&lookup, &mut config.telemetry)?;
+        mail::apply(&lookup, &mut config.mail, &mut config.auth)?;
         // The format default depends on the environment, so derive it only
         // after FORGE_ENV has been applied.
         config.log.format = match lookup("FORGE_LOG_FORMAT") {
@@ -875,6 +896,7 @@ impl AppConfig {
 
         validate_services(&config)?;
         telemetry::validate(&config.telemetry, config.environment, config.server.bind)?;
+        mail::validate(&config.mail, &config.auth, config.environment)?;
         Ok(config)
     }
 }
@@ -1128,6 +1150,18 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
+
+    #[test]
+    fn mail_keys_are_known_keys() {
+        for key in MAIL_KEYS.iter().chain([&PASSWORD_RESET_URL_KEY]) {
+            assert!(KNOWN_KEYS.contains(key), "{key}");
+        }
+        let mail_known = KNOWN_KEYS
+            .iter()
+            .filter(|key| key.starts_with("FORGE_MAIL_"))
+            .count();
+        assert_eq!(mail_known, MAIL_KEYS.len());
+    }
 
     #[test]
     fn telemetry_keys_are_known_keys() {
@@ -1462,6 +1496,13 @@ mod tests {
             "10",
             "60",
             "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=",
+            "smtps://mailer:secret@smtp.example.com:465",
+            "Billing <billing@example.com>",
+            "false",
+            "45s",
+            "false",
+            "/etc/ssl/private-relay.pem",
+            "https://billing.example.com/passwords/edit",
             "true",
             "billing",
             "1.0.0",

@@ -597,7 +597,7 @@ fn percent_decode(value: &str) -> Option<String> {
 }
 
 /// Go's `strconv.ParseBool`.
-fn parse_bool(key: &'static str, value: &str) -> Result<bool, ConfigError> {
+pub(crate) fn parse_bool(key: &'static str, value: &str) -> Result<bool, ConfigError> {
     match value.trim() {
         "1" | "t" | "T" | "TRUE" | "true" | "True" => Ok(true),
         "0" | "f" | "F" | "FALSE" | "false" | "False" => Ok(false),
