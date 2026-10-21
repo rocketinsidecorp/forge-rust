@@ -421,8 +421,8 @@ cargo run
   connection from; a proxy that passes the client's header on unchanged lets
   clients choose their address.
 
-Forge-Rust has no `forge deploy` yet (Forge-Go's sets this variable from the
-`forge` Docker network automatically); set it yourself.
+`forge deploy` sets this variable to the `forge` Docker network automatically
+(see [forge-proxy](#forge-proxy)); set it yourself on any other platform.
 
 **nginx on the same host** (the systemd unit above binds to loopback):
 

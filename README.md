@@ -15,6 +15,11 @@ a Dependabot configuration by default, so a fresh application can be built,
 checked and run as a container from its first commit. `forge new --api`
 generates a JSON-only service.
 
+**New here? Start with [Getting started](docs/getting-started.md)**: a tested,
+copy-and-paste walkthrough from `forge new blog` to sign-in with two-factor
+authentication, a scaffold, translations, email, a background job, OpenAPI,
+credentials and a deploy configuration.
+
 ## Status
 
 Forge is early and has not been released. It is not production-certified, and
