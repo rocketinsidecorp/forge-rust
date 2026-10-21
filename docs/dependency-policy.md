@@ -120,6 +120,34 @@ Only its parser/builder and `Secure`, `HttpOnly`, `SameSite`, `Path`
 attributes are required.
 
 
+## Benchmark dependency decision
+
+[Benchmarks](benchmarks.md) add two workspace crates, `forge-bench` and
+`forge-loadgen`, that no other crate depends on and no release build contains.
+`criterion` is not in the graph and is not added: `forge-bench` carries a small
+harness on stable Rust instead. `forge-loadgen` uses only the standard library.
+
+`forge-bench` adds one third-party package to the workspace lockfile family:
+`argon2 0.6.0`, with the features and defaults the generated application
+declares (see the authentication decision above), and its RustCrypto
+dependencies `password-hash`, `phc`, `blake2` and `base64ct`. It is needed
+only because the `password_verify` scenario must time the same Argon2id
+parameters the generated application's `Argon2idPasswordHasher` uses (version
+19, m=19456 KiB, t=2, p=1), and that hasher lives in generated application
+code, not in a framework crate. `cargo deny check` passes (advisories, bans,
+licenses, sources). No framework crate depends on `argon2`.
+
+`forge-bench` also contains the repository's only `unsafe`: the counting
+global allocator of `src/alloc.rs`, which forwards every call to `System` and
+adds two atomic counters so the benchmarks can report `B/op` and `allocs/op`.
+It is an exception to "no framework-authored unsafe" under the conditions the
+project requires: isolated in one module of a bench-only crate (the crate sets
+`unsafe_code = "deny"` and the one `unsafe impl` carries a local `allow`, with
+`undocumented_unsafe_blocks` denied), written invariants and a soundness
+argument in the module documentation, dedicated tests (`tests/alloc.rs`), and
+review through the pull request. Every other crate keeps
+`unsafe_code = "forbid"`.
+
 ## OpenAPI dependency decision
 
 [ADR 0039](adr/0039-openapi-from-typed-routes.md) adds two workspace crates,

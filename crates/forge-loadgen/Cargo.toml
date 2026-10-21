@@ -1,0 +1,27 @@
+[package]
+name = "forge-loadgen"
+publish = false
+description = "HTTP load generator of scripts/bench.sh (docs/benchmarks.md): the Rust port of Forge-Go's internal/loadgen"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Standard library only, like Forge-Go's: nothing to audit but this crate.
+[dependencies]
+
+[[bin]]
+name = "loadgen"
+path = "src/main.rs"
+
+[lints.rust]
+unsafe_code = "forbid"
+unused_must_use = "deny"
+
+[lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+unwrap_used = "deny"
+expect_used = "deny"

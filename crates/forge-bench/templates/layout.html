@@ -1,0 +1,1 @@
+<!doctype html><html lang="en"><head><title>{% block title %}App{% endblock %}</title>{{ csrf_meta|safe }}</head><body>{% if let Some(notice) = notice %}<p class="flash flash-notice">{{ notice }}</p>{% endif %}{% if let Some(alert) = alert %}<p class="flash flash-alert">{{ alert }}</p>{% endif %}<main>{% block content %}{% endblock %}</main></body></html>
