@@ -172,6 +172,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
+name = "base64"
+version = "0.23.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
+
+[[package]]
 name = "base64ct"
 version = "1.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -591,7 +597,7 @@ name = "forge-auth"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "base64",
+ "base64 0.23.1",
  "forge-core",
  "forge-security",
  "getrandom 0.4.3",
@@ -627,7 +633,7 @@ name = "forge-broadcast"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "base64",
+ "base64 0.23.1",
  "bytes",
  "forge-auth",
  "forge-broadcast",
@@ -698,7 +704,7 @@ dependencies = [
 name = "forge-config"
 version = "0.1.0"
 dependencies = [
- "base64",
+ "base64 0.23.1",
  "forge-i18n",
  "serde",
  "serde_json",
@@ -723,7 +729,7 @@ dependencies = [
 name = "forge-credentials"
 version = "0.1.0"
 dependencies = [
- "base64",
+ "base64 0.23.1",
  "forge-config",
  "forge-encryption",
  "getrandom 0.4.3",
@@ -757,7 +763,7 @@ name = "forge-encryption"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "base64",
+ "base64 0.23.1",
  "forge-core",
  "forge-db",
  "forge-encryption",
@@ -873,7 +879,7 @@ version = "0.1.0"
 dependencies = [
  "askama",
  "async-trait",
- "base64",
+ "base64 0.23.1",
  "forge-auth",
  "forge-config",
  "forge-http",
@@ -907,7 +913,7 @@ dependencies = [
 name = "forge-proxy"
 version = "0.1.0"
 dependencies = [
- "base64",
+ "base64 0.23.1",
  "bytes",
  "getrandom 0.4.3",
  "http",
@@ -958,7 +964,7 @@ name = "forge-storage"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "base64",
+ "base64 0.23.1",
  "bytes",
  "forge-config",
  "forge-http",
@@ -1963,7 +1969,7 @@ version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "05b44e85bf579a8eeb4ceaa77a3a523baf2bf0e9bac7e40f405d537b5d2d5ccb"
 dependencies = [
- "base64",
+ "base64 0.22.1",
  "bytes",
  "cfg-if",
  "crc",
@@ -2067,7 +2073,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "87a2bdd6e83f6b3ea525ca9fee568030508b58355a43d0b2c1674d5f79dcd65e"
 dependencies = [
  "atoi",
- "base64",
+ "base64 0.22.1",
  "bitflags",
  "byteorder",
  "crc",
