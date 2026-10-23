@@ -13,7 +13,7 @@
 # the image built from this file. The Rust tag matches rust-toolchain.toml, and
 # crates/forge/tests/supply_chain.rs fails when it or a digest is missing.
 
-FROM rust:1.98.1-slim-trixie@sha256:4cd829461bd5c4d511c32e269da9cb8929223b666519d8004e35fc8d1d771ab7 AS build
+FROM rust:1.99.0-slim-trixie@sha256:2752b332db73fdbb7dc576f06c82ed1f312005784ef913d7e04a28f5f55dc581 AS build
 WORKDIR /src
 COPY . .
 # Cargo.lock is required: the image is built from the reviewed dependency graph.
