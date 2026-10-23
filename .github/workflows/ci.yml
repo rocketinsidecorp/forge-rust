@@ -54,7 +54,7 @@ jobs:
           persist-credentials: false
       - name: Install toolchain from rust-toolchain.toml
         run: cargo --version
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Clippy (warnings denied)
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
@@ -68,7 +68,7 @@ jobs:
           persist-credentials: false
       - name: Install toolchain from rust-toolchain.toml
         run: cargo --version
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: |
             .
@@ -97,7 +97,7 @@ jobs:
           persist-credentials: false
       - name: Install toolchain from rust-toolchain.toml
         run: cargo --version
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Show Docker version
         run: docker version
       - name: Generated application end-to-end
@@ -128,7 +128,7 @@ jobs:
           persist-credentials: false
       - name: Install toolchain from rust-toolchain.toml
         run: cargo --version
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Scaffold PostgreSQL, SQLite and MySQL applications and run their gates
         run: cargo test -p forge-cli --test scaffold --locked -- --ignored
 
@@ -146,7 +146,7 @@ jobs:
           persist-credentials: false
       - name: Install the pinned nightly toolchain
         run: rustup toolchain install "$(scripts/fuzz.sh -T)" --profile minimal
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: fuzz
           shared-key: fuzz-${{ hashFiles('scripts/fuzz.sh', 'fuzz/Cargo.lock') }}
@@ -179,7 +179,7 @@ jobs:
           persist-credentials: false
       - name: Install toolchain from rust-toolchain.toml
         run: cargo --version
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Install cargo-auditable
         run: command -v cargo-auditable >/dev/null || cargo install cargo-auditable --version 0.7.7 --locked
       - name: Build the binaries and their SBOMs
@@ -229,7 +229,7 @@ jobs:
           persist-credentials: false
       - name: Install toolchain from rust-toolchain.toml
         run: cargo --version
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Micro-benchmarks, each scenario once
         run: cargo bench -p forge-bench --bench micro --locked -- --quick
       - name: End-to-end benchmark, one short run
