@@ -310,3 +310,37 @@ fn any_of_branches_sharing_a_recursive_member_do_not_blow_up() {
         started.elapsed()
     );
 }
+
+/// An inline (not component) object with an alias and a write-only member.
+struct Inline;
+
+impl OpenApiSchema for Inline {
+    fn schema(generator: &mut forge_openapi::SchemaGenerator) -> forge_openapi::Schema {
+        let mut object = forge_openapi::ObjectSchema::new();
+        object
+            .field::<String>(generator, "name", forge_openapi::Field::new().alias("nm"))
+            .accept(["password"]);
+        object.into_schema()
+    }
+}
+
+#[test]
+fn internal_keys_are_stripped_from_nullable_inline_objects_too() {
+    for (schema, components) in [
+        forge_openapi::schema_of::<Inline>().expect("schema"),
+        forge_openapi::schema_of::<Option<Inline>>().expect("schema"),
+    ] {
+        let published = serde_json::to_string(&(schema, components)).expect("json");
+        for hidden in ["x-forge-accepts", "x-forge-aliases", "password", "\"nm\""] {
+            assert!(
+                !published.contains(hidden),
+                "{hidden} published: {published}"
+            );
+        }
+    }
+    assert_eq!(check::<Option<Inline>>(&json!({"nm": "a"})), None);
+    assert_eq!(
+        check::<Option<Inline>>(&json!({"name": "a", "x": 1})).as_deref(),
+        Some("x")
+    );
+}

@@ -752,11 +752,15 @@ fn resolve_references(value: &mut Value, names: &[String]) {
     match value {
         Value::Object(object) => {
             // Internal: the names typed decoding accepts, never published.
-            // Only at an object schema node (`"type": "object"` as the
-            // derive writes it), never in a map of member names.
-            if object.get("type") == Some(&Value::from("object"))
-                && object.contains_key("properties")
-            {
+            // Only at an object schema node (`"type": "object"`, or
+            // `["object", "null"]` once `nullable` has run), never in a map
+            // of member names.
+            let object_node = match object.get("type") {
+                Some(Value::String(kind)) => kind == "object",
+                Some(Value::Array(kinds)) => kinds.iter().any(|kind| kind == "object"),
+                _ => false,
+            };
+            if object_node && object.contains_key("properties") {
                 object.remove(ACCEPTS_KEY);
                 object.remove(ALIASES_KEY);
             }
