@@ -283,7 +283,10 @@ Known limitations: a directory that becomes empty is removed even if it
 existed, empty, before the generator ran; and a file can still change in the
 instant between its last check and its removal (std has no descriptor-relative
 unlink), so do not run destroy while an editor or another command writes the
-same files.
+same files. In that instant, a parent directory swapped for a symbolic link
+would make the removal go through the link and delete a same-named file
+outside the application; this takes someone with write access to the
+application racing the command.
 
 ## Reading the code
 

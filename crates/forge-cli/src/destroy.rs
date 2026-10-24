@@ -208,7 +208,10 @@ pub(crate) fn apply(
 /// another process) must not be removed on the strength of it. A file that
 /// is already gone counts as removed. A final race between this check and
 /// the unlink cannot be closed without a descriptor-relative unlink, which
-/// std does not offer; the window is the width of one read.
+/// std does not offer; the window is the width of one read. In that window a
+/// parent directory swapped for a symlink would make the unlink go through
+/// the link and remove a same-named file outside the application, which
+/// takes someone with write access racing the command.
 fn remove_checked(root: &Path, path: &str, checked: &[u8]) -> Result<(), String> {
     refuse_symlinks(root, [path])
         .map_err(|reason| format!("refusing to remove {path}: {reason}"))?;

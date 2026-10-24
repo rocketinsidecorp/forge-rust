@@ -303,7 +303,8 @@ fn rust_files(root: &Path, directory: &Path, files: &mut Vec<String>) -> Result<
                 .is_ok_and(|target| target.is_dir() || path.extension().is_some_and(|e| e == "rs"));
             if holds_code {
                 return Err(format!(
-                    "{shown} is a symbolic link under src/: the code behind it could already                      declare a permission, and the generator does not follow links. Replace \
+                    "{shown} is a symbolic link under src/: the code behind it could already \
+                     declare a permission, and the generator does not follow links. Replace \
                      the link with the real files (or move it aside) and run the command again"
                 ));
             }

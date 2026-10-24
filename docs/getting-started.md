@@ -350,7 +350,7 @@ supplies a tenant, so scaffold with `--global` instead of `--tenant-scoped`;
 tenant isolation on SQLite rests on the application layer, not on row-level
 security. A scaffold's pages refuse everyone (`DenyAll`) until you replace it
 in the printed wiring with your own `GlobalAccess`. Sections 5 (without
-sign-in), 7, 8, 10 and 14 apply; the rest of this guide was run on PostgreSQL. The
+sign-in), 7, 8, 10, 11 and 14 apply; the rest of this guide was run on PostgreSQL. The
 same goes for `-d mysql` and `-d mariadb`; see
 [ADR 0021](adr/0021-selectable-database-backends.md) for what each backend has.
 
