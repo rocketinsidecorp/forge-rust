@@ -43,6 +43,7 @@ mod client_ip;
 mod encoding;
 mod form;
 mod io;
+mod json;
 mod openapi;
 mod query;
 mod routing;
@@ -53,6 +54,7 @@ pub use form::{
     CSRF_FIELD_NAME, FORM_CONTENT_TYPE, FormError, FormErrorKind, MAX_FORM_FIELDS,
     METHOD_FIELD_NAME, RESERVED_FORM_FIELDS,
 };
+pub use json::{JSON_CONTENT_TYPE, JsonBodyError};
 pub use openapi::{
     CheckResponses, ContractFailure, Described, HealthReport, HealthStatus, OPENAPI_PATH, describe,
     health_operation,
@@ -68,7 +70,6 @@ const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(50);
 /// for a fast API does not cut off clients that read a large download or an
 /// event stream slowly; those are only disconnected when they stop reading.
 const MIN_WRITE_STALL_TIMEOUT: Duration = Duration::from_secs(30);
-const JSON_CONTENT_TYPE: &str = "application/json";
 
 type BoxHandlerFuture = Pin<Box<dyn Future<Output = Response> + Send + 'static>>;
 
@@ -226,7 +227,9 @@ impl Request {
         }
     }
 
-    /// Decodes a JSON request body.
+    /// Decodes a JSON request body. It ignores the `Content-Type` and
+    /// unknown members; [`Request::json_body`] and
+    /// [`Request::json_body_strict`] enforce them.
     pub fn json<T: DeserializeOwned>(&self) -> Result<T, JsonError> {
         serde_json::from_slice(&self.body).map_err(JsonError::Decode)
     }

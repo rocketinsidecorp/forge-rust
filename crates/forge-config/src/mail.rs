@@ -276,7 +276,7 @@ pub(crate) fn validate(
     environment: Environment,
 ) -> Result<(), ConfigError> {
     if let Some(url) = &auth.password_reset_url {
-        validate_reset_url(url)?;
+        validate_password_reset_url(url)?;
     }
     if mail.preview && environment == Environment::Production {
         return Err(invalid(
@@ -409,7 +409,13 @@ fn validate_smtp(
     Ok(())
 }
 
-fn validate_reset_url(url: &str) -> Result<(), ConfigError> {
+/// Checks a password-reset URL (`FORGE_AUTH_PASSWORD_RESET_URL`): an
+/// absolute `https` URL, or `http` on a local host, with a valid host and
+/// port and without credentials, query or fragment. Applications that take
+/// the URL from somewhere else than the environment (for example
+/// `forge_mail::PasswordResetEmails::new`) call this so both paths accept
+/// the same URLs.
+pub fn validate_password_reset_url(url: &str) -> Result<(), ConfigError> {
     let shape = || {
         invalid(
             PASSWORD_RESET_URL_KEY,

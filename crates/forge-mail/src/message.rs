@@ -24,6 +24,10 @@ const MAX_HEADER_VALUE_BYTES: usize = 900;
 const MAX_REPLY_TO: usize = 10;
 const MAX_CONTENT_ID_BYTES: usize = 128;
 const MAX_FILENAME_BYTES: usize = 255;
+/// The longest attachment media type, `type/subtype` (RFC 6838 limits each
+/// half to 127 bytes; the whole is capped at that so a part header stays
+/// well under the 998-octet line limit even with a long file name).
+const MAX_MEDIA_TYPE_BYTES: usize = 127;
 
 /// One outgoing email.
 ///
@@ -79,8 +83,8 @@ pub struct Attachment {
     /// Reduced to a base name; names with control or bidirectional-override
     /// characters are rejected.
     pub filename: String,
-    /// Defaults to `application/octet-stream`; `multipart/*`, `message/*`
-    /// and parameters are rejected.
+    /// Defaults to `application/octet-stream`; `multipart/*`, `message/*`,
+    /// parameters and types longer than 127 bytes are rejected.
     pub content_type: String,
     /// The bytes.
     pub data: Vec<u8>,
@@ -452,12 +456,16 @@ pub fn sanitize_filename(name: &str) -> Result<String, MailError> {
 }
 
 /// The canonical media type of an attachment, or `None` when it is
-/// malformed, has parameters or is `multipart/*` or `message/*`.
+/// malformed, longer than 127 bytes, has parameters or is `multipart/*` or
+/// `message/*`.
 pub(crate) fn attachment_content_type(value: &str) -> Option<String> {
     if value.is_empty() {
         return Some("application/octet-stream".to_owned());
     }
     let media_type = encoding::parse_media_type(value)?;
+    if media_type.len() > MAX_MEDIA_TYPE_BYTES {
+        return None;
+    }
     if media_type.starts_with("multipart/") || media_type.starts_with("message/") {
         return None;
     }
@@ -575,6 +583,32 @@ mod tests {
             ..Limits::default()
         };
         assert!(base().cc(base().from).validate_with(&limits).is_err());
+    }
+
+    #[test]
+    fn the_media_type_is_capped_so_part_headers_stay_short() {
+        let long = format!("application/{}", "x".repeat(MAX_MEDIA_TYPE_BYTES));
+        let message = base().attach(Attachment::new("a", long, "x"));
+        assert_eq!(invalid_field(&message), "Attachments[0].ContentType");
+        let exact = format!("application/{}", "x".repeat(MAX_MEDIA_TYPE_BYTES - 12));
+        assert_eq!(exact.len(), MAX_MEDIA_TYPE_BYTES);
+        assert!(
+            base()
+                .attach(Attachment::new("a", exact, "x"))
+                .validate()
+                .is_ok()
+        );
+        // The longest accepted type with the longest non-ASCII file name
+        // still fits one header line.
+        let name = "é".repeat(MAX_FILENAME_BYTES / 2);
+        let wire = crate::encode(&base().attach(Attachment::new(
+            name,
+            "application/".to_owned() + &"x".repeat(115),
+            "x",
+        )))
+        .expect("valid");
+        let text = String::from_utf8(wire.data).expect("ascii");
+        assert!(text.split("\r\n").all(|line| line.len() <= 998));
     }
 
     #[test]

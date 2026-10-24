@@ -85,7 +85,8 @@ enough to commit and diff.
    derivation (`getV1PostsById`).
 5. **Typed handlers.** `forge::openapi::typed(status, operation, |request,
    body| async { ... })` takes `Json<T>` (decoded with
-   `forge::web::decode_json`) or `NoBody`, writes the `Ok` value with
+   `forge::web::decode_json_strict`: `application/json` only, and no member
+   the schema of `T` does not list) or `NoBody`, writes the `Ok` value with
    `forge::web::json` and the `ForgeError` with `forge::web::error`, and
    derives the request body and the success response from its types. A
    status that is not a 2xx with a body makes the description invalid
@@ -167,7 +168,7 @@ enough to commit and diff.
 - `Vec`, sets and maps are not nullable: serde writes them as arrays and
   objects, never `null` (Go's nil slices and maps are `null`).
 - Errors are `ErrorReport`, not `ErrorBody`/`ErrorDetail`; the implied
-  statuses are what Forge-Rust answers (`413` text and `422` for a body
+  statuses are what Forge-Rust answers (`413` text, `415` and `422` for a body
   instead of `400`/`413`/`415`; `401`/`403` as text), and the security
   scheme is the session cookie instead of `bearerAuth`: Forge-Rust has no
   bearer-token API authentication.

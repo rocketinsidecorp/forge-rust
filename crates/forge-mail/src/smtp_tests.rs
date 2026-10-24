@@ -27,6 +27,8 @@ struct Script {
     implicit_tls: bool,
     starttls: bool,
     auth: &'static str,
+    /// Advertise the mechanisms as the legacy `AUTH=...` line only.
+    legacy_auth: bool,
     auth_reply: u16,
     ehlo_reply: u16,
     rcpt_refused: Option<(&'static str, u16)>,
@@ -50,6 +52,7 @@ impl Default for Script {
             implicit_tls: false,
             starttls: true,
             auth: "PLAIN LOGIN",
+            legacy_auth: false,
             auth_reply: 235,
             ehlo_reply: 250,
             rcpt_refused: None,
@@ -168,7 +171,10 @@ async fn serve(script: Script) -> (SocketAddr, JoinHandle<Transcript>) {
                     stream.send("250-STARTTLS").await;
                 }
                 if !script.auth.is_empty() {
-                    stream.send(&format!("250-AUTH {}", script.auth)).await;
+                    let separator = if script.legacy_auth { '=' } else { ' ' };
+                    stream
+                        .send(&format!("250-AUTH{separator}{}", script.auth))
+                        .await;
                 }
                 stream.send("250 8BITMIME").await;
             } else if upper.starts_with("HELO") {
@@ -325,6 +331,51 @@ async fn implicit_tls_with_login_when_plain_is_not_offered() {
     assert_eq!(transcript.tls_for("EHLO"), Some(true));
     let expected = format!("LOGIN-PASSWORD {}", STANDARD.encode(PASSWORD));
     assert_eq!(transcript.tls_for(&expected), Some(true));
+}
+
+#[tokio::test]
+async fn the_legacy_auth_equals_advertisement_is_recognised() {
+    for auth in ["PLAIN LOGIN", "LOGIN"] {
+        let (address, server) = serve(Script {
+            auth,
+            legacy_auth: true,
+            ..Script::default()
+        })
+        .await;
+        sender(config("localhost", address.port()), address)
+            .send(&message())
+            .await
+            .expect("delivered");
+        let transcript = server.await.expect("server");
+        let method = if auth == "LOGIN" {
+            "AUTH LOGIN"
+        } else {
+            "AUTH PLAIN"
+        };
+        assert_eq!(transcript.tls_for(method), Some(true), "{auth}");
+    }
+}
+
+#[tokio::test]
+async fn an_unsupported_legacy_advertisement_still_fails_closed() {
+    let (address, server) = serve(Script {
+        auth: "CRAM-MD5",
+        legacy_auth: true,
+        ..Script::default()
+    })
+    .await;
+    let error = sender(config("localhost", address.port()), address)
+        .send(&message())
+        .await
+        .expect_err("no mechanism");
+    assert_eq!(
+        error,
+        MailError::AuthFailed {
+            stage: "auth",
+            reply: None
+        }
+    );
+    assert!(!server.await.expect("server").saw("MAIL"));
 }
 
 #[tokio::test]

@@ -67,7 +67,8 @@ fn valid_preview_name(name: &str) -> bool {
 }
 
 const PAGE_CSP: &str = "default-src 'none'; style-src 'unsafe-inline'; frame-src 'self'; base-uri 'none'; form-action 'none'";
-const CONTENT_CSP: &str = "default-src 'none'; img-src 'self' data: https: http:; style-src 'unsafe-inline'; font-src https: http:; sandbox";
+const CONTENT_CSP: &str =
+    "default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'; sandbox";
 
 /// Serves registered [`Preview`]s below a prefix such as `/_mail`: an index
 /// and, per preview, the headers, the HTML part in a sandboxed frame, the
@@ -627,7 +628,12 @@ mod tests {
         assert!(!html.contains("<script>"), "{html}");
 
         let frame = get("/_mail/welcome/html").expect("served");
-        assert!(header_of(&frame, header::CONTENT_SECURITY_POLICY).ends_with("sandbox"));
+        let csp = header_of(&frame, header::CONTENT_SECURITY_POLICY);
+        assert!(csp.ends_with("sandbox"), "{csp}");
+        // Remote images and fonts would phone home from the browser.
+        assert!(csp.contains("img-src 'self' data:;"), "{csp}");
+        assert!(!csp.contains("http:") && !csp.contains("https:"), "{csp}");
+        assert!(!csp.contains("font-src"), "{csp}");
         assert!(body(&frame).contains("src=\"/_mail/welcome/cid/logo\""));
         let image = get("/_mail/welcome/cid/logo").expect("served");
         assert_eq!(header_of(&image, header::CONTENT_TYPE), "image/png");

@@ -68,10 +68,10 @@ fn expand(input: &DeriveInput) -> Result<Tokens> {
     let methods = if let Some(target) = &container.as_type {
         quote! {
             fn schema(generator: &mut #krate::SchemaGenerator) -> #krate::Schema {
-                <#target as #krate::OpenApiSchema>::schema(generator)
+                generator.subschema::<#target>()
             }
             fn flatten(generator: &mut #krate::SchemaGenerator) -> ::core::option::Option<#krate::ObjectSchema> {
-                <#target as #krate::OpenApiSchema>::flatten(generator)
+                generator.flatten_of::<#target>()
             }
         }
     } else {
@@ -117,26 +117,37 @@ fn structure(container: &Container, krate: &Path, data: &DataStruct) -> Result<T
             let mut statements = Vec::new();
             for field in &fields.named {
                 let member = Member::parse(field, &field.attrs)?;
-                if member.skipped {
-                    continue;
-                }
-                let schema_type = &member.schema_type;
                 let ident = field
                     .ident
                     .as_ref()
                     .map(|ident| ident.unraw().to_string())
                     .unwrap_or_default();
-                if member.flatten {
+                if member.write_only {
+                    // Never written, so not in the document, but a request
+                    // may carry it (a password): typed decoding must not
+                    // refuse it as unknown.
+                    let wire = member.wire_name(container, &ident);
+                    let names = std::iter::once(wire).chain(member.aliases.iter().cloned());
                     statements.push(quote! {
-                        object.flatten::<#schema_type>(generator, #ident);
+                        object.accept([#(#names),*]);
                     });
                     continue;
                 }
-                let wire = member.rename.clone().unwrap_or_else(|| {
-                    container
-                        .rename_all
-                        .map_or_else(|| ident.clone(), |rule| rule.apply_to_field(&ident))
-                });
+                if member.skipped {
+                    continue;
+                }
+                let schema_type = &member.schema_type;
+                if member.flatten {
+                    // serde writes none of a skipped flattened member's
+                    // members, so none of them is required.
+                    statements.push(if member.optional {
+                        quote! { object.flatten_optional::<#schema_type>(generator, #ident); }
+                    } else {
+                        quote! { object.flatten::<#schema_type>(generator, #ident); }
+                    });
+                    continue;
+                }
+                let wire = member.wire_name(container, &ident);
                 let options = member.options(krate);
                 statements.push(quote! {
                     object.field::<#schema_type>(generator, #wire, #options);
@@ -189,14 +200,16 @@ fn structure(container: &Container, krate: &Path, data: &DataStruct) -> Result<T
     }
 }
 
-/// A newtype is written as its only member.
+/// A newtype is written as its only member. The calls go through the
+/// generator, which refuses a type that contains itself this way
+/// (`struct A(Option<Box<A>>)`) instead of overflowing the stack.
 fn delegate(krate: &Path, inner: &Type) -> Tokens {
     quote! {
         fn schema(generator: &mut #krate::SchemaGenerator) -> #krate::Schema {
-            <#inner as #krate::OpenApiSchema>::schema(generator)
+            generator.subschema::<#inner>()
         }
         fn flatten(generator: &mut #krate::SchemaGenerator) -> ::core::option::Option<#krate::ObjectSchema> {
-            <#inner as #krate::OpenApiSchema>::flatten(generator)
+            generator.flatten_of::<#inner>()
         }
     }
 }
@@ -327,6 +340,14 @@ struct Member {
     schema_type: Type,
     rename: Option<String>,
     skipped: bool,
+    /// `skip_serializing` alone: never written, but still read from a
+    /// request, so it is accepted without being described.
+    write_only: bool,
+    /// `skip_deserializing`/`skip`: the other halves of the above.
+    skip_read: bool,
+    skip_write: bool,
+    /// Extra names a request may use (`alias`).
+    aliases: Vec<String>,
     flatten: bool,
     optional: bool,
     required: bool,
@@ -342,6 +363,10 @@ impl Member {
             schema_type: field.ty.clone(),
             rename: None,
             skipped: false,
+            write_only: false,
+            skip_read: false,
+            skip_write: false,
+            aliases: Vec::new(),
             flatten: false,
             optional: false,
             required: false,
@@ -379,8 +404,17 @@ impl Member {
             attr.parse_nested_meta(|meta| {
                 if meta.path.is_ident("rename") {
                     member.rename = Some(serialized_name(&meta)?);
-                } else if meta.path.is_ident("skip") || meta.path.is_ident("skip_serializing") {
+                } else if meta.path.is_ident("skip") {
                     member.skipped = true;
+                    member.skip_read = true;
+                    member.skip_write = true;
+                } else if meta.path.is_ident("skip_serializing") {
+                    member.skipped = true;
+                    member.skip_write = true;
+                } else if meta.path.is_ident("skip_deserializing") {
+                    member.skip_read = true;
+                } else if meta.path.is_ident("alias") {
+                    member.aliases.push(string(&meta)?);
                 } else if meta.path.is_ident("skip_serializing_if") {
                     skip_value(&meta)?;
                     member.optional = true;
@@ -397,16 +431,9 @@ impl Member {
                              #[openapi(as = Type)]: the type it is written as",
                         ));
                     }
-                } else if [
-                    "alias",
-                    "default",
-                    "skip_deserializing",
-                    "borrow",
-                    "bound",
-                    "getter",
-                ]
-                .iter()
-                .any(|name| meta.path.is_ident(name))
+                } else if ["default", "borrow", "bound", "getter"]
+                    .iter()
+                    .any(|name| meta.path.is_ident(name))
                 {
                     // Decoding-only details: the member is written as declared.
                     skip_value(&meta)?;
@@ -419,6 +446,7 @@ impl Member {
                 Ok(())
             })?;
         }
+        member.write_only = member.skip_write && !member.skip_read && !member.flatten;
         if member.flatten
             && (member.rename.is_some()
                 || member.doc.is_some()
@@ -436,9 +464,21 @@ impl Member {
         Ok(member)
     }
 
+    /// The name serde writes (and reads): `rename`, else `rename_all`.
+    fn wire_name(&self, container: &Container, ident: &str) -> String {
+        self.rename.clone().unwrap_or_else(|| {
+            container
+                .rename_all
+                .map_or_else(|| ident.to_owned(), |rule| rule.apply_to_field(ident))
+        })
+    }
+
     /// The `Field` options of this member.
     fn options(&self, krate: &Path) -> Tokens {
         let mut options = quote! { #krate::Field::new() };
+        for alias in &self.aliases {
+            options = quote! { #options.alias(#alias) };
+        }
         if self.optional {
             options = quote! { #options.optional() };
         }

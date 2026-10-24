@@ -50,9 +50,12 @@ pub use forge_openapi::*;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-/// A JSON request body of type `T`, decoded with [`crate::web::decode_json`]
-/// (a body that does not decode is `422 invalid_json`; one over
-/// `FORGE_MAX_BODY_BYTES` is refused with `413` before the handler runs).
+/// A JSON request body of type `T`, decoded with
+/// [`crate::web::decode_json_strict`]: the request must declare
+/// `Content-Type: application/json` (`415` otherwise), and a body that does
+/// not decode, or has a member the document does not list for `T`
+/// (`additionalProperties: false`), is `422 invalid_json`. One over
+/// `FORGE_MAX_BODY_BYTES` is refused with `413` before the handler runs.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Json<T>(pub T);
 
@@ -72,7 +75,7 @@ pub trait RequestBody: Sized + Send + 'static {
 
 impl<T: DeserializeOwned + OpenApiSchema + Send + 'static> RequestBody for Json<T> {
     fn decode(request: &Request) -> Result<Self, ForgeError> {
-        crate::web::decode_json(request).map(Json)
+        crate::web::decode_json_strict(request).map(Json)
     }
 
     fn describe(operation: Operation) -> Operation {

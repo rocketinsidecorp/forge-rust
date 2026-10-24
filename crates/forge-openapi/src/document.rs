@@ -9,7 +9,10 @@ use serde_json::{Map, Value, json};
 
 use crate::json::to_canonical;
 use crate::operation::{Body, Operation, Param, ParamLocation};
-use crate::schema::{Component, Field, OpenApiSchema, REF_PLACEHOLDER, SchemaGenerator, non_null};
+use crate::schema::{
+    ACCEPTS_KEY, ALIASES_KEY, Component, Field, OpenApiSchema, REF_PLACEHOLDER, SchemaGenerator,
+    non_null,
+};
 use crate::status;
 
 /// The OpenAPI version of the documents [`Document::build`] produces.
@@ -370,8 +373,11 @@ fn operation_object(
             "requestBody".to_owned(),
             json!({ "required": true, "content": { JSON_MEDIA_TYPE: { "schema": body } } }),
         );
-        // The server's body limit (text), then decode_json's invalid_json.
+        // The server's body limit (text), then what decode_json answers: 415
+        // for a Content-Type other than application/json, 422 for a body
+        // that is not valid JSON for the type or has a member it lacks.
         implied.push((413, Some(Body::Text)));
+        implied.push((415, None));
         implied.push((422, None));
     }
     if operation.permission.is_some() || operation.authenticated {
@@ -745,6 +751,19 @@ fn sanitize(name: &str) -> String {
 fn resolve_references(value: &mut Value, names: &[String]) {
     match value {
         Value::Object(object) => {
+            // Internal: the names typed decoding accepts, never published.
+            // Only at an object schema node (`"type": "object"`, or
+            // `["object", "null"]` once `nullable` has run), never in a map
+            // of member names.
+            let object_node = match object.get("type") {
+                Some(Value::String(kind)) => kind == "object",
+                Some(Value::Array(kinds)) => kinds.iter().any(|kind| kind == "object"),
+                _ => false,
+            };
+            if object_node && object.contains_key("properties") {
+                object.remove(ACCEPTS_KEY);
+                object.remove(ALIASES_KEY);
+            }
             for (key, member) in object.iter_mut() {
                 if key == "$ref"
                     && let Value::String(text) = member

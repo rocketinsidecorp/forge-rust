@@ -70,8 +70,18 @@ Objects list their members with `additionalProperties: false`. A member is
 are required and nullable (serde writes `null`). Serde attributes the derive
 follows: `rename`, `rename_all`, `skip`, `skip_serializing`,
 `skip_serializing_if`, `flatten` (of a struct, a map, or an `Option` of
-one), `transparent`. Decoding-only ones (`default`, `alias`,
-`deny_unknown_fields`, `skip_deserializing`, `bound`) are accepted.
+one), `transparent`. A flattened member with `skip_serializing_if` writes
+none of its members when it is skipped, so none of them is `required`.
+Decoding-only ones (`default`, `alias`, `deny_unknown_fields`,
+`skip_deserializing`, `bound`) are accepted.
+
+**One schema serves requests and responses.** The derive reads what serde
+*writes*, and the same component describes a request body of that type.
+A decoding-only attribute therefore does not change the schema:
+`#[serde(default)]` and `skip_deserializing` members appear as `required`
+(they are always written in a response), `alias` names are not listed, and a
+`serde_repr` enum (written as a number) is described as a string. When
+requests and responses differ, use two types.
 Attributes that change the shape in ways the derive cannot describe (`tag`,
 `untagged`, `content`, `from`/`into`, `with`, data-carrying enum variants,
 tuple structs, lifetime parameters) are a **compile error**, never a guess.
@@ -92,7 +102,16 @@ tuple structs, lifetime parameters) are a **compile error**, never a guess.
 Component names are the Rust names, with type arguments reduced to their
 names (`Page<Post>` is `Page_Post`). Types that share a name are qualified
 with their module (`v1.Item`, `v2.Item`), then their full path; names that
-still collide (two equal `name`s) are a build error naming both types.
+still collide (two equal `name`s) are a build error naming both types. The
+module path comes from `std::any::type_name`, which is not guaranteed to be
+stable between compiler versions, so a qualified name (`v1.Item`) can change
+when the toolchain does; give colliding types a `name` to pin theirs.
+
+A named struct ends recursion at its `$ref`. A newtype or flattened member
+that contains itself (`struct A(Option<Box<A>>)`, or flattening
+`Option<Box<Self>>`) has no object to point at: it is a **build error**
+("contains itself"), not a stack overflow. Put the recursion in a named
+struct member instead.
 
 What the derive writes is the code you would write by hand, which is also
 how to describe a type yourself:
@@ -138,10 +157,64 @@ router.route(
 )?;
 ```
 
-`Json<T>` is decoded with `forge::web::decode_json` (`422 invalid_json`
-when it does not decode); `NoBody` reads nothing. The `Ok` value is written
-as JSON with the status, the `ForgeError` with `forge::web::error`. Validate
-in the handler or its use case and return a `Validation` error (`422`).
+`Json<T>` is decoded with `forge::web::decode_json_strict`; `NoBody` reads
+nothing. The `Ok` value is written as JSON with the status, the `ForgeError`
+with `forge::web::error`. Validate in the handler or its use case and return
+a `Validation` error (`422`).
+
+### What a typed handler accepts
+
+A `Json<T>` body must match the document, which says `additionalProperties:
+false` for every object:
+
+| Request | Answer |
+| --- | --- |
+| `Content-Type` other than `application/json` (case-insensitive; empty parameters such as `application/json;` and a UTF-8 `charset` are fine, any other parameter is not), absent, or repeated | `415`, `unsupported_media_type` |
+| a body over `FORGE_MAX_BODY_BYTES` | `413` (text), before the handler runs |
+| not valid JSON for `T`, a wrong type, a missing member | `422`, `invalid_json` |
+| a member the schema of `T` does not list, at any depth | `422`, `invalid_json`, the member's path (`address.street`, `items[2].sku`) in `metadata.member` |
+
+Maps (`BTreeMap`, flattened maps) and `serde_json::Value` accept any member.
+Two kinds of names are accepted although the document does not list them,
+and are never published: a member with `#[serde(skip_serializing)]` (read but
+never written, such as a `password`), and `#[serde(alias = "...")]` names.
+The value of a `skip_serializing` member is not checked by the schema (serde
+still decodes it); the value under an alias is checked like the member it
+stands for. A
+member with `skip`, or one the derive does not know, is refused as unknown.
+A schema written by hand with `OpenApiSchema` accepts such names with
+`ObjectSchema::accept` / `Field::alias`. The check is bounded (at least 10,000
+steps, or four per value in the body): a body that exhausts it, as a
+pathological `anyOf` with branches sharing a recursive member could, is
+answered `422` rather than let through. For `anyOf`/`oneOf` a value is
+accepted when any branch of a matching `type` accepts it; `allOf` and other
+keywords are not interpreted. A type whose description cannot be built is
+answered with `500 json_description_invalid` (the same defect stops the
+document from building) rather than skipping the check.
+`#[serde(deny_unknown_fields)]` is no longer needed for typed handlers, but
+it still matters for `forge::web::decode_json` (below).
+
+`415` and the unknown-member `422` are in the document of every operation
+with a request body, so after upgrading `forge openapi --check` reports the
+committed file as stale once: regenerate it with `forge openapi --output`.
+Clients that sent JSON without `Content-Type: application/json` (`curl -d`
+sends `application/x-www-form-urlencoded`: add `-H 'Content-Type:
+application/json'`) now get `415`.
+
+Outside typed handlers, `forge::web::decode_json::<T>(&request)` applies the
+same `Content-Type` rule and `invalid_json`, but ignores members `T` lacks
+unless it says `deny_unknown_fields` (it has no schema to check against);
+`forge::web::decode_json_strict` is what `Json<T>` uses. `forge::web::error`
+answers the `unsupported_media_type` code with `415`.
+
+Forge-Go answers `400 invalid_json` where this answers `422`: Forge-Rust maps
+a `Validation` error to `422` everywhere, and the documents declare what each
+framework answers. The `Content-Type` rule is also stricter here: Go's
+`DecodeJSON` accepts any parameters and reads the first of several
+`Content-Type` headers, this refuses a repeated header or a parameter other
+than a UTF-8 `charset`. The strict path parses the body twice (once to look
+at its members, once into `T` from the original bytes), so number handling is
+exactly that of `Request::json`.
 
 An ordinary handler keeps working; `describe` attaches what it accepts and
 answers:
@@ -190,7 +263,7 @@ own:
 
 | Declared | Adds |
 | --- | --- |
-| a request body (`Json<T>`, `Operation::request`) | `413` (`text/plain`, `FORGE_MAX_BODY_BYTES`), `422` (`invalid_json`) |
+| a request body (`Json<T>`, `Operation::request`) | `413` (`text/plain`, `FORGE_MAX_BODY_BYTES`), `415` (`unsupported_media_type`), `422` (`invalid_json`) |
 | `authenticated()` | `401` (`text/plain`), `security: sessionCookie` |
 | `permission("posts:write")` | `401`, `403` (`text/plain`), `security: sessionCookie`, `x-forge-permission` |
 
@@ -220,8 +293,16 @@ server starts, so an inaccurate description stops startup. An application
 that registers its own `GET /openapi.json` keeps it; Forge then does not
 mount its document there.
 
+When Forge does serve it, `GET /openapi.json` is an exact route, and exact
+routes win over parameter routes: an application's catch-all such as
+`GET /{page}` never sees that one path while the document is enabled
+(development, test, or `FORGE_OPENAPI_ENABLED=true`). Set
+`FORGE_OPENAPI_ENABLED=false`, or register your own exact `GET /openapi.json`,
+to take the path back.
+
 `forge openapi` builds the application and runs its `openapi` command, like
-`forge migrate`. The command composes the application without listening, so
+`forge migrate`. `openapi` is a reserved built-in command of the application
+binary: an application cannot define one of that name (startup error). The command composes the application without listening, so
 it needs the configuration `serve` needs; database pools connect lazily, so
 the database does not have to be running. The binary accepts the same
 command:

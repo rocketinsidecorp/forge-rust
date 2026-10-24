@@ -12,7 +12,7 @@ use forge_auth::{
     PasswordResetDelivery, PasswordResetDeliveryError, PasswordResetNotifier,
     UndeliverablePasswordResets, UnixTimestamp,
 };
-use forge_config::{AppConfig, is_local_web_host};
+use forge_config::AppConfig;
 use forge_telemetry::Telemetry;
 
 use crate::{
@@ -322,39 +322,15 @@ fn unix_now() -> u64 {
         .as_secs()
 }
 
-/// An absolute `https` URL, or `http` on a local host, without credentials
-/// or fragment (Forge-Go's `recoverymail` rule).
+/// The configuration loader's rule (`forge_config::validate_password_reset_url`):
+/// an absolute `https` URL, or `http` on a local host, with a valid host and
+/// port and without credentials, query or fragment. The URL is never echoed.
 fn validate_reset_url(url: &str) -> Result<(), MailError> {
-    let refuse = || {
+    forge_config::validate_password_reset_url(url).map_err(|_| {
         configuration(
-            "password reset URL must be an absolute https URL (http only for localhost) without credentials or fragment",
+            "password reset URL must be an absolute https URL (http only for localhost) without credentials, query or fragment",
         )
-    };
-    if url
-        .chars()
-        .any(|character| character.is_control() || character == ' ')
-        || url.contains('#')
-    {
-        return Err(refuse());
-    }
-    let (scheme, rest) = url.split_once("://").ok_or_else(refuse)?;
-    let authority = rest.split(['/', '?']).next().unwrap_or_default();
-    if authority.is_empty() || authority.contains('@') {
-        return Err(refuse());
-    }
-    let host = if let Some(bracketed) = authority.strip_prefix('[') {
-        bracketed.split(']').next().unwrap_or_default()
-    } else {
-        authority.split(':').next().unwrap_or_default()
-    };
-    if host.is_empty() {
-        return Err(refuse());
-    }
-    match scheme.to_ascii_lowercase().as_str() {
-        "https" => Ok(()),
-        "http" if is_local_web_host(&host.to_ascii_lowercase()) => Ok(()),
-        _ => Err(refuse()),
-    }
+    })
 }
 
 #[cfg(test)]
@@ -379,6 +355,12 @@ mod tests {
             "/passwords/edit",
             "https:///x",
             "https://app.example.com/x\r\n",
+            "https://app.example.com/x?next=/y",
+            "https://app.example.com\\@evil.example/x",
+            "https://app.example.com\\.evil.example/x",
+            "https://app.example.com:0/x",
+            "https://app.example.com:99999/x",
+            "ftp://app.example.com/x",
         ] {
             assert!(validate_reset_url(url).is_err(), "{url}");
         }

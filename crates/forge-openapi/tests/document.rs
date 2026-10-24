@@ -116,6 +116,36 @@ struct Wrapper {
     maybe: Option<Audit>,
 }
 
+#[derive(Serialize, OpenApiSchema)]
+#[openapi(crate = "forge_openapi")]
+struct Loop(Option<Box<Loop>>);
+
+#[derive(Serialize, OpenApiSchema)]
+#[openapi(crate = "forge_openapi")]
+struct Chain {
+    id: u8,
+    #[serde(flatten)]
+    next: Option<Box<Chain>>,
+}
+
+#[derive(Serialize, OpenApiSchema)]
+#[openapi(crate = "forge_openapi", as = Echo)]
+struct Echo(u8);
+
+#[derive(Serialize, OpenApiSchema)]
+#[openapi(crate = "forge_openapi")]
+struct Optional {
+    id: u8,
+    #[serde(flatten, skip_serializing_if = "Audit::is_unset")]
+    audit: Audit,
+}
+
+impl Audit {
+    fn is_unset(&self) -> bool {
+        false
+    }
+}
+
 fn route(method: &str, path: &str, operation: Operation) -> Route {
     Route {
         method: method.to_owned(),
@@ -340,7 +370,7 @@ fn the_document_has_the_go_shape_and_identical_bytes_for_any_route_order()
     statuses.sort_unstable();
     assert_eq!(
         statuses,
-        ["201", "401", "403", "409", "413", "422", "default"]
+        ["201", "401", "403", "409", "413", "415", "422", "default"]
     );
     assert_eq!(
         responses["201"]["headers"],
@@ -598,5 +628,37 @@ fn responses_are_checked_against_the_document() -> Result<(), forge_openapi::Bui
         ),
         Ok(())
     );
+    Ok(())
+}
+
+#[test]
+fn a_type_that_contains_itself_is_refused_not_a_stack_overflow() {
+    for (error, name) in [
+        (schema_of::<Loop>().err(), "Loop"),
+        (schema_of::<Chain>().err(), "Chain"),
+        (schema_of::<Echo>().err(), "Echo"),
+    ] {
+        let message = error.map(|error| error.to_string()).unwrap_or_default();
+        assert!(message.contains("contains itself"), "{name}: {message}");
+        assert!(message.contains(name), "{name}: {message}");
+    }
+    // Inside a route the build fails the same way.
+    let message = build_error(&[route("GET", "/loop", Operation::new().json::<Loop>(200))]);
+    assert!(message.contains("contains itself"), "{message}");
+    // Ordinary recursion through a named struct is unaffected.
+    assert!(schema_of::<Node>().is_ok());
+}
+
+#[test]
+fn a_skipped_flattened_member_makes_its_members_optional() -> Result<(), forge_openapi::BuildError>
+{
+    let (_, components) = schema_of::<Optional>()?;
+    let object = &components["Optional"];
+    assert_eq!(object["required"], json!(["id"]), "{object}");
+    assert!(object["properties"]["created_at"].is_object());
+    // Without skip_serializing_if the flattened members stay required.
+    let (_, components) = schema_of::<KitchenSink>()?;
+    let required = components["KitchenSink"]["required"].to_string();
+    assert!(required.contains("created_at"), "{required}");
     Ok(())
 }

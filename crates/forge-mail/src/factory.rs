@@ -15,6 +15,10 @@ use crate::{Address, FileSender, MailError, Sender, SmtpConfig, SmtpSender};
 /// pretending to send. It repeats the production rules of configuration
 /// loading so a hand-built [`AppConfig`] cannot bypass them: the file sender
 /// is refused in production, and the SMTP sender requires verified TLS.
+///
+/// Production with `FORGE_MAIL_ALLOW_PLAINTEXT=true` and no credentials is
+/// accepted (an internal relay), but logs a warning: nothing then stops a
+/// network attacker from stripping `STARTTLS`, so the mail travels in clear.
 pub fn from_config(config: &AppConfig) -> Result<Arc<dyn Sender>, MailError> {
     let mail = &config.mail;
     if mail.url.is_none() {
@@ -43,6 +47,14 @@ pub fn from_config(config: &AppConfig) -> Result<Arc<dyn Sender>, MailError> {
                     })
                 })
                 .transpose()?;
+            if config.environment == Environment::Production
+                && mail.allow_plaintext
+                && endpoint.username.is_none()
+            {
+                tracing::warn!(
+                    "FORGE_MAIL_ALLOW_PLAINTEXT=true in production without credentials: mail may be sent unencrypted, and a network attacker can strip STARTTLS"
+                );
+            }
             Ok(Arc::new(SmtpSender::new(SmtpConfig {
                 host: endpoint.host,
                 port: endpoint.port,
@@ -112,6 +124,52 @@ mod tests {
         ]);
         assert!(from_config(&config).is_ok());
         assert!(root.path().join("mail").is_dir());
+    }
+
+    #[derive(Clone, Default)]
+    struct Logs(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Logs {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("logs").extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The log text `from_config` writes for `pairs`.
+    fn logged(pairs: &[(&str, &str)]) -> String {
+        let logs = Logs::default();
+        let writer = logs.clone();
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_writer(move || writer.clone())
+                .with_ansi(false)
+                .finish(),
+        );
+        assert!(from_config(&load(pairs)).is_ok());
+        String::from_utf8_lossy(&logs.0.lock().expect("logs")).into_owned()
+    }
+
+    #[test]
+    fn plaintext_in_production_without_credentials_is_warned_about() {
+        let from = ("FORGE_MAIL_FROM", "shop@example.com");
+        let plaintext = ("FORGE_MAIL_ALLOW_PLAINTEXT", "true");
+        let production = ("FORGE_ENV", "production");
+        let relay = ("FORGE_MAIL_URL", "smtp://relay.example.com");
+        let warning = logged(&[relay, from, plaintext, production]);
+        assert!(warning.contains("WARN"), "{warning}");
+        assert!(warning.contains("strip STARTTLS"), "{warning}");
+        // Not in production, without the flag, or with credentials.
+        assert!(!logged(&[relay, from, plaintext]).contains("STARTTLS"));
+        assert!(!logged(&[relay, from, production]).contains("STARTTLS"));
+        let credentials = ("FORGE_MAIL_URL", "smtp://user:pass@localhost");
+        let quiet = logged(&[credentials, from, plaintext, production]);
+        assert!(!quiet.contains("STARTTLS"), "{quiet}");
+        assert!(!quiet.contains("pass"), "{quiet}");
     }
 
     #[test]

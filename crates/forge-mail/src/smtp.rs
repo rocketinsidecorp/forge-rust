@@ -538,10 +538,30 @@ impl Session {
         self.command(stage, &format!("EHLO {name}")).await?;
         let reply = self.reply(stage).await?;
         if reply.code == 250 {
-            let mut extensions = HashMap::new();
+            let mut extensions: HashMap<String, String> = HashMap::new();
             for line in reply.lines.iter().skip(1) {
                 let (key, value) = line.split_once(' ').unwrap_or((line, ""));
-                extensions.insert(key.to_ascii_uppercase(), value.to_owned());
+                let key = key.to_ascii_uppercase();
+                match key.strip_prefix("AUTH=") {
+                    // The legacy `250-AUTH=PLAIN LOGIN` advertisement (old
+                    // Outlook Express era servers, still seen in relays)
+                    // lists the same mechanisms as `AUTH`; merge both.
+                    Some(first) => {
+                        let merged = extensions.entry("AUTH".to_owned()).or_default();
+                        for mechanism in std::iter::once(first).chain(value.split_whitespace()) {
+                            merged.push(' ');
+                            merged.push_str(mechanism);
+                        }
+                    }
+                    None if key == "AUTH" => {
+                        let merged = extensions.entry(key).or_default();
+                        merged.push(' ');
+                        merged.push_str(value);
+                    }
+                    None => {
+                        extensions.insert(key, value.to_owned());
+                    }
+                }
             }
             return Ok(extensions);
         }

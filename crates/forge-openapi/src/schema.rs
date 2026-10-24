@@ -17,6 +17,23 @@ pub type Schema = Value;
 pub const UUID_V7_PATTERN: &str =
     "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$";
 
+/// How many newtypes, `as` targets and flattened members may nest inside one
+/// another before the description is refused: a type that refers back to
+/// itself through them (`struct A(Option<Box<A>>)`, or a flattened
+/// `Option<Box<Self>>`) has no named object for a `$ref` to end at.
+const MAX_NESTING: usize = 64;
+
+/// Where an object schema keeps the member names a request may use without
+/// the document listing them (`skip_serializing` members, `alias`es). It is
+/// read by `unknown_member` and removed when the document is built, so it is
+/// never published.
+pub(crate) const ACCEPTS_KEY: &str = "x-forge-accepts";
+
+/// Where an object schema maps each alias to the member it stands for
+/// (`{"addr": "address"}`), so a value under an alias is checked with the
+/// member's schema. Internal like [`ACCEPTS_KEY`].
+pub(crate) const ALIASES_KEY: &str = "x-forge-aliases";
+
 /// The `$ref` text of a component before names are assigned; rewritten when
 /// the document is built, so names do not depend on the order types are met.
 pub(crate) const REF_PLACEHOLDER: &str = "\u{0}forge-component:";
@@ -64,6 +81,7 @@ pub struct SchemaGenerator {
     pub(crate) components: Vec<Component>,
     index: HashMap<TypeId, usize>,
     error: Option<String>,
+    depth: usize,
 }
 
 #[derive(Debug)]
@@ -78,9 +96,36 @@ impl SchemaGenerator {
         Self::default()
     }
 
-    /// The schema of `T`.
+    /// The schema of `T`. The derive calls it for newtypes and `as` targets,
+    /// the places a type can contain itself without a named object in
+    /// between; nesting beyond a fixed depth is a build error rather than a
+    /// stack overflow.
     pub fn subschema<T: OpenApiSchema + ?Sized>(&mut self) -> Schema {
-        T::schema(self)
+        self.nested::<T, Schema>(Schema::Null, T::schema)
+    }
+
+    /// The members `T` contributes when it is flattened, with the same
+    /// recursion guard as [`SchemaGenerator::subschema`].
+    pub fn flatten_of<T: OpenApiSchema + ?Sized>(&mut self) -> Option<ObjectSchema> {
+        self.nested::<T, Option<ObjectSchema>>(None, T::flatten)
+    }
+
+    /// Runs `build` one level deeper, or records a build error and returns
+    /// `fallback` when the nesting is too deep.
+    fn nested<T: ?Sized, R>(&mut self, fallback: R, build: impl FnOnce(&mut Self) -> R) -> R {
+        if self.depth >= MAX_NESTING {
+            self.fail(format!(
+                "{} contains itself through newtypes or flattened members, so there is no \
+                 object for a reference to point at; give the recursion a named struct member \
+                 (for example a field of type Option<Box<{0}>>)",
+                type_name::<T>()
+            ));
+            return fallback;
+        }
+        self.depth += 1;
+        let result = build(self);
+        self.depth -= 1;
+        result
     }
 
     /// Registers `T` as a component, built once by `build`, and returns a
@@ -135,6 +180,7 @@ pub struct Field {
     doc: Option<String>,
     example: Option<String>,
     format: Option<String>,
+    aliases: Vec<String>,
 }
 
 impl Field {
@@ -176,6 +222,14 @@ impl Field {
     #[must_use]
     pub fn example(mut self, text: impl Into<String>) -> Self {
         self.example = Some(text.into());
+        self
+    }
+
+    /// Another name a request may use for the member (`#[serde(alias)]`). It
+    /// is not part of the document: typed decoding accepts it, nothing more.
+    #[must_use]
+    pub fn alias(mut self, name: impl Into<String>) -> Self {
+        self.aliases.push(name.into());
         self
     }
 
@@ -221,6 +275,8 @@ pub struct ObjectSchema {
     required: BTreeSet<String>,
     additional: Option<Value>,
     description: Option<String>,
+    accepted: BTreeSet<String>,
+    aliases: BTreeMap<String, String>,
 }
 
 impl ObjectSchema {
@@ -247,6 +303,18 @@ impl ObjectSchema {
         if options.is_required() {
             self.required.insert(name.to_owned());
         }
+        for alias in options.aliases {
+            self.aliases.insert(alias, name.to_owned());
+        }
+        self
+    }
+
+    /// Names a request may carry although the object does not describe them:
+    /// members serde reads but never writes (`skip_serializing`, such as a
+    /// password), whose values are not checked; the document does not list
+    /// them. (A [`Field::alias`] is checked like its member.)
+    pub fn accept<'a>(&mut self, names: impl IntoIterator<Item = &'a str>) -> &mut Self {
+        self.accepted.extend(names.into_iter().map(str::to_owned));
         self
     }
 
@@ -257,12 +325,37 @@ impl ObjectSchema {
         generator: &mut SchemaGenerator,
         member: &str,
     ) -> &mut Self {
-        let Some(inner) = T::flatten(generator) else {
+        self.flatten_members::<T>(generator, member, false)
+    }
+
+    /// [`ObjectSchema::flatten`] for a flattened member that serde may skip
+    /// as a whole (`#[serde(flatten, skip_serializing_if = "...")]`): none of
+    /// its members is then written, so none of them is `required`.
+    pub fn flatten_optional<T: OpenApiSchema + ?Sized>(
+        &mut self,
+        generator: &mut SchemaGenerator,
+        member: &str,
+    ) -> &mut Self {
+        self.flatten_members::<T>(generator, member, true)
+    }
+
+    fn flatten_members<T: OpenApiSchema + ?Sized>(
+        &mut self,
+        generator: &mut SchemaGenerator,
+        member: &str,
+        optional: bool,
+    ) -> &mut Self {
+        let Some(inner) = generator.flatten_of::<T>() else {
             generator.fail(format!(
                 "the flattened member {member:?} ({}) is not written as an object",
                 type_name::<T>()
             ));
             return self;
+        };
+        let inner = if optional {
+            inner.all_optional()
+        } else {
+            inner
         };
         for (name, schema) in inner.properties {
             if self.properties.contains_key(&name) {
@@ -274,6 +367,8 @@ impl ObjectSchema {
             self.properties.insert(name, schema);
         }
         self.required.extend(inner.required);
+        self.accepted.extend(inner.accepted);
+        self.aliases.extend(inner.aliases);
         if let Some(additional) = inner.additional {
             if self.additional.is_some() {
                 generator.fail(format!(
@@ -313,6 +408,23 @@ impl ObjectSchema {
         }
         if let Some(description) = self.description {
             object.insert("description".to_owned(), Value::String(description));
+        }
+        if !self.accepted.is_empty() {
+            object.insert(
+                ACCEPTS_KEY.to_owned(),
+                Value::Array(self.accepted.into_iter().map(Value::String).collect()),
+            );
+        }
+        if !self.aliases.is_empty() {
+            object.insert(
+                ALIASES_KEY.to_owned(),
+                Value::Object(
+                    self.aliases
+                        .into_iter()
+                        .map(|(alias, name)| (alias, Value::String(name)))
+                        .collect(),
+                ),
+            );
         }
         Value::Object(object)
     }
