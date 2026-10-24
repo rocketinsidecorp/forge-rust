@@ -556,6 +556,53 @@ async fn create_session(pages: Arc<Pages>, request: Request) -> Response {
             return unavailable_because("mfa_unavailable", error);
         }
     }
+    // A password reset that committed after the password was verified
+    // revoked every session of the account before this one existed: the
+    // reset locks the account row (`FOR UPDATE`), so on PostgreSQL the insert
+    // above waited for it and the bumped version is visible here. The
+    // session's cookie has not been sent; it ends, and the old password is
+    // refused like a wrong one.
+    match password_is_current(ports.credentials.as_ref(), principal, version).await {
+        Ok(true) => {}
+        Ok(false) => {
+            if ports
+                .sessions
+                .revoke(issued.session.id(), now)
+                .await
+                .is_err()
+            {
+                return unavailable("session_store_unavailable");
+            }
+            record(
+                ports,
+                now,
+                AuditActor::Principal(principal),
+                Some(tenant),
+                "auth.sign_in",
+                AuditOutcome::Failed,
+            )
+            .await;
+            return render_sign_in(
+                &pages,
+                &request,
+                values,
+                Some(
+                    pages
+                        .site
+                        .i18n(&request)
+                        .t("sessions.invalid_credentials")
+                        .text(),
+                ),
+                false,
+                StatusCode::UNPROCESSABLE_ENTITY,
+            );
+        }
+        Err(_) => {
+            // Never sent, so unusable; revoked anyway when the store answers.
+            let _ = ports.sessions.revoke(issued.session.id(), now).await;
+            return unavailable("authentication_unavailable");
+        }
+    }
     record(
         ports,
         now,
@@ -1200,14 +1247,9 @@ pub async fn issue_second_factor_session(
         .await
         .map_err(|_| "session_store_unavailable")?;
     let factor = mfa.sign_in_is_current(signed_in).await;
-    let password = credentials.find_by_principal(principal).await;
+    let password = password_is_current(credentials, principal, signed_in.credential_version).await;
     let current = match (factor, password) {
-        (Ok(factor), Ok(password)) => {
-            factor
-                && password.is_some_and(|credential| {
-                    !credential.disabled() && credential.version() == signed_in.credential_version
-                })
-        }
+        (Ok(factor), Ok(password)) => factor && password,
         // Never sent, so unusable; revoked anyway when the store answers.
         _ => {
             let _ = sessions.revoke(issued.session.id(), now).await;
@@ -1222,6 +1264,22 @@ pub async fn issue_second_factor_session(
         .await
         .map_err(|_| "session_store_unavailable")?;
     Ok(None)
+}
+
+/// Whether the account's password is still enabled and still the version a
+/// sign-in verified; a reset or a rehash bumps the version.
+async fn password_is_current(
+    credentials: &dyn PasswordCredentialStore,
+    principal: PrincipalId,
+    verified_version: PasswordCredentialVersion,
+) -> Result<bool, ()> {
+    let credential = credentials
+        .find_by_principal(principal)
+        .await
+        .map_err(|_| ())?;
+    Ok(credential.is_some_and(|credential| {
+        !credential.disabled() && credential.version() == verified_version
+    }))
 }
 
 /// The two-factor settings page of the signed-in account.
