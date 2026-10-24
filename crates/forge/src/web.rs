@@ -16,7 +16,8 @@
 use std::{error::Error as StdError, str::FromStr};
 
 use forge_core::{ErrorCategory, ForgeError};
-use forge_http::{PathParamError, Request, Response, StatusCode};
+use forge_http::{JsonBodyError, PathParamError, Request, Response, StatusCode};
+use forge_openapi::OpenApiSchema;
 use serde::{Serialize, de::DeserializeOwned};
 use tracing::{error, warn};
 
@@ -41,8 +42,7 @@ pub fn json(status: StatusCode, value: &impl Serialize) -> Response {
 /// are logged with their full cause chain instead.
 #[must_use]
 pub fn error(failure: &ForgeError) -> Response {
-    let status =
-        StatusCode::from_u16(failure.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let status = status_of(failure);
     if status.is_server_error() {
         let chain = cause_chain(failure);
         match failure.category() {
@@ -79,17 +79,66 @@ pub async fn at_least<F: std::future::Future>(minimum: std::time::Duration, work
     output
 }
 
-/// Decodes a JSON request body, mapping malformed input to a `Validation`
-/// error with code `invalid_json` (the decoder's detail is not exposed).
+/// The `code` of the error [`decode_json`] returns for a request whose
+/// `Content-Type` is not `application/json`; [`error`] answers it with
+/// `415`.
+pub const UNSUPPORTED_MEDIA_TYPE: &str = "unsupported_media_type";
+
+/// The status [`error`] answers: the category's, except `415` for the one
+/// validation failure that is about the media type and not the content.
+fn status_of(failure: &ForgeError) -> StatusCode {
+    if failure.category() == ErrorCategory::Validation && failure.code() == UNSUPPORTED_MEDIA_TYPE {
+        return StatusCode::UNSUPPORTED_MEDIA_TYPE;
+    }
+    StatusCode::from_u16(failure.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
+}
+
+/// Decodes a JSON request body.
+///
+/// A request that does not declare `Content-Type: application/json`
+/// (case-insensitive, an optional `charset` must be UTF-8) is refused with a
+/// `Validation` error with code [`UNSUPPORTED_MEDIA_TYPE`], which [`error`]
+/// answers as `415`. Malformed input is a `Validation` error with code
+/// `invalid_json` (the decoder's detail is not exposed). Members `T` does not
+/// have are ignored unless it uses `#[serde(deny_unknown_fields)]`;
+/// [`decode_json_strict`] refuses them for a type with an OpenAPI
+/// description.
 pub fn decode_json<T: DeserializeOwned>(request: &Request) -> Result<T, ForgeError> {
-    request.json().map_err(|failure| {
-        ForgeError::new(
+    request.json_body().map_err(json_failure)
+}
+
+/// [`decode_json`] for a type with an OpenAPI description (what
+/// [`crate::openapi::Json`] uses): a member the description does not list is
+/// refused with `invalid_json` and the member's path (`address.street`,
+/// truncated to 64 characters) in the `member` metadata, so decoding accepts
+/// what the published document accepts (`additionalProperties: false`). A
+/// `#[serde(alias)]` is not a listed member.
+pub fn decode_json_strict<T: DeserializeOwned + OpenApiSchema + 'static>(
+    request: &Request,
+) -> Result<T, ForgeError> {
+    request.json_body_strict().map_err(json_failure)
+}
+
+fn json_failure(failure: JsonBodyError) -> ForgeError {
+    match failure {
+        JsonBodyError::UnsupportedMediaType => ForgeError::new(
+            ErrorCategory::Validation,
+            UNSUPPORTED_MEDIA_TYPE,
+            "request body must be application/json",
+        ),
+        JsonBodyError::UnknownMember { member } => ForgeError::new(
+            ErrorCategory::Validation,
+            "invalid_json",
+            "request body has a member this endpoint does not accept",
+        )
+        .with_metadata("member", member.chars().take(64).collect::<String>()),
+        other => ForgeError::new(
             ErrorCategory::Validation,
             "invalid_json",
             "request body is not valid JSON for this endpoint",
         )
-        .with_source(failure)
-    })
+        .with_source(other),
+    }
 }
 
 /// Decodes the query string into `T` (see [`Request::query`] for the strict
@@ -257,6 +306,70 @@ mod tests {
         serde_json::from_slice(response.body()).expect("JSON body")
     }
 
+    fn json_request(body: &str, content_type: Option<&str>) -> Request {
+        let mut headers = HeaderMap::new();
+        if let Some(value) = content_type {
+            headers.insert(
+                forge_http::header::CONTENT_TYPE,
+                forge_http::HeaderValue::from_str(value).expect("valid header"),
+            );
+        }
+        Request::new_for_test(
+            Method::POST,
+            Uri::from_static("/products"),
+            headers,
+            Bytes::copy_from_slice(body.as_bytes()),
+            "127.0.0.1:4000".parse().expect("valid test address"),
+            Uuid::now_v7(),
+        )
+    }
+
+    #[derive(serde::Deserialize, Debug, forge_openapi::OpenApiSchema)]
+    #[openapi(crate = "forge_openapi")]
+    struct Product {
+        sku: String,
+    }
+
+    #[test]
+    fn a_wrong_media_type_is_415_and_a_right_one_decodes() {
+        for content_type in [
+            None,
+            Some("text/plain"),
+            Some("application/x-www-form-urlencoded"),
+        ] {
+            let req = json_request(r#"{"sku":"a"}"#, content_type);
+            let failure = decode_json::<Product>(&req).expect_err("wrong media type");
+            assert_eq!(failure.code(), UNSUPPORTED_MEDIA_TYPE);
+            let response = error(&failure);
+            assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+            assert_eq!(body(&response)["code"], "unsupported_media_type");
+            assert!(decode_json_strict::<Product>(&req).is_err());
+        }
+        let req = json_request(r#"{"sku":"a"}"#, Some("application/json; charset=utf-8"));
+        assert_eq!(decode_json::<Product>(&req).expect("decodes").sku, "a");
+        // Only the one failure about the media type is 415.
+        let other = ForgeError::new(ErrorCategory::Conflict, UNSUPPORTED_MEDIA_TYPE, "x");
+        assert_eq!(error(&other).status(), StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn strict_decoding_refuses_unknown_members_and_names_them() {
+        let req = json_request(r#"{"sku":"a","price":1}"#, Some("application/json"));
+        assert!(decode_json::<Product>(&req).is_ok(), "lenient ignores it");
+        let failure = decode_json_strict::<Product>(&req).expect_err("unknown member");
+        assert_eq!(failure.code(), "invalid_json");
+        assert_eq!(error(&failure).status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body(&error(&failure))["metadata"]["member"], "price");
+        let long = format!(r#"{{"sku":"a","{}":1}}"#, "k".repeat(200));
+        let failure = decode_json_strict::<Product>(&json_request(&long, Some("application/json")))
+            .expect_err("unknown member");
+        let member = failure
+            .metadata()
+            .get("member")
+            .and_then(serde_json::Value::as_str);
+        assert_eq!(member.map(str::len), Some(64));
+    }
+
     #[test]
     fn errors_use_category_status_and_hide_sources() {
         let failure = ForgeError::new(
@@ -294,7 +407,7 @@ mod tests {
             #[serde(rename = "name")]
             _name: String,
         }
-        let req = request(forge_http::Method::POST, "/products");
+        let req = json_request(r#"{"title":"x"}"#, Some("application/json"));
 
         let failure = decode_json::<Input>(&req).expect_err("wrong shape");
 

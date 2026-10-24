@@ -68,10 +68,10 @@ fn expand(input: &DeriveInput) -> Result<Tokens> {
     let methods = if let Some(target) = &container.as_type {
         quote! {
             fn schema(generator: &mut #krate::SchemaGenerator) -> #krate::Schema {
-                <#target as #krate::OpenApiSchema>::schema(generator)
+                generator.subschema::<#target>()
             }
             fn flatten(generator: &mut #krate::SchemaGenerator) -> ::core::option::Option<#krate::ObjectSchema> {
-                <#target as #krate::OpenApiSchema>::flatten(generator)
+                generator.flatten_of::<#target>()
             }
         }
     } else {
@@ -127,8 +127,12 @@ fn structure(container: &Container, krate: &Path, data: &DataStruct) -> Result<T
                     .map(|ident| ident.unraw().to_string())
                     .unwrap_or_default();
                 if member.flatten {
-                    statements.push(quote! {
-                        object.flatten::<#schema_type>(generator, #ident);
+                    // serde writes none of a skipped flattened member's
+                    // members, so none of them is required.
+                    statements.push(if member.optional {
+                        quote! { object.flatten_optional::<#schema_type>(generator, #ident); }
+                    } else {
+                        quote! { object.flatten::<#schema_type>(generator, #ident); }
                     });
                     continue;
                 }
@@ -189,14 +193,16 @@ fn structure(container: &Container, krate: &Path, data: &DataStruct) -> Result<T
     }
 }
 
-/// A newtype is written as its only member.
+/// A newtype is written as its only member. The calls go through the
+/// generator, which refuses a type that contains itself this way
+/// (`struct A(Option<Box<A>>)`) instead of overflowing the stack.
 fn delegate(krate: &Path, inner: &Type) -> Tokens {
     quote! {
         fn schema(generator: &mut #krate::SchemaGenerator) -> #krate::Schema {
-            <#inner as #krate::OpenApiSchema>::schema(generator)
+            generator.subschema::<#inner>()
         }
         fn flatten(generator: &mut #krate::SchemaGenerator) -> ::core::option::Option<#krate::ObjectSchema> {
-            <#inner as #krate::OpenApiSchema>::flatten(generator)
+            generator.flatten_of::<#inner>()
         }
     }
 }

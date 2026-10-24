@@ -317,7 +317,9 @@ impl Operation {
     }
 
     /// The JSON request body, decoded with `forge::web::decode_json`. It adds
-    /// the `413` (too large) and `422` (`invalid_json`) errors.
+    /// the `413` (too large), `415` (`unsupported_media_type`: the
+    /// `Content-Type` is not `application/json`) and `422` (`invalid_json`)
+    /// errors.
     #[must_use]
     pub fn request<T: OpenApiSchema + ?Sized>(mut self) -> Self {
         self.request = Some(TypeRef::of::<T>());

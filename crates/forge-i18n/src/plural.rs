@@ -313,6 +313,7 @@ fn builtin(locale: &str) -> Option<PluralRule> {
 /// uses `pt`, `pt-PT` has its own). Locales without one use
 /// [`Category::Other`] for every count. NaN and infinite counts are
 /// [`Category::Other`] in every locale.
+#[must_use = "the rule is only useful when it is called with operands"]
 pub fn plural_rule_for(locale: &str) -> impl Fn(Operands) -> Category + Copy + use<> {
     rule_in(&[], locale)
 }

@@ -167,7 +167,7 @@ enough to commit and diff.
 - `Vec`, sets and maps are not nullable: serde writes them as arrays and
   objects, never `null` (Go's nil slices and maps are `null`).
 - Errors are `ErrorReport`, not `ErrorBody`/`ErrorDetail`; the implied
-  statuses are what Forge-Rust answers (`413` text and `422` for a body
+  statuses are what Forge-Rust answers (`413` text, `415` and `422` for a body
   instead of `400`/`413`/`415`; `401`/`403` as text), and the security
   scheme is the session cookie instead of `bearerAuth`: Forge-Rust has no
   bearer-token API authentication.

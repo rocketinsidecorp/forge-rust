@@ -363,12 +363,16 @@ impl Middleware for LocaleNegotiation {
         let (locale, prefix) = self.choose(&request);
         let i18n = I18n::new(Arc::clone(&self.translator), locale);
         if let Some(prefix) = prefix {
-            strip_prefix(&mut request, prefix);
-            // The locale's canonical name, not the request's spelling of it
-            // ("/PT-br" is stored as "/pt-BR").
-            request
-                .extensions_mut()
-                .insert(PathPrefix(format!("/{}", i18n.locale)));
+            // Only a prefix that was really removed is reported: were the
+            // rewrite refused, the request would still carry it and a return
+            // path built from `path_prefix` would read `/pt-BR/pt-BR/...`.
+            if strip_prefix(&mut request, prefix) {
+                // The locale's canonical name, not the request's spelling of
+                // it ("/PT-br" is stored as "/pt-BR").
+                request
+                    .extensions_mut()
+                    .insert(PathPrefix(format!("/{}", i18n.locale)));
+            }
         }
         request.extensions_mut().insert(i18n.clone());
         Box::pin(async move {
@@ -406,8 +410,9 @@ pub fn path_prefix(request: &Request) -> Option<&str> {
 /// path. The URI holds only the escaped path, which is what the segment
 /// was read from and what routing matches, so no decoded form can
 /// disagree with it: `/pt-BR%2F..%2Fadmin` has the segment
-/// `pt-BR%2F..%2Fadmin`, which is not a locale, and is left alone.
-fn strip_prefix(request: &mut Request, length: usize) {
+/// `pt-BR%2F..%2Fadmin`, which is not a locale, and is left alone. Returns
+/// whether the request was rewritten.
+fn strip_prefix(request: &mut Request, length: usize) -> bool {
     let uri = request.uri();
     let rest = uri.path().get(length..).unwrap_or_default();
     let path = if rest.is_empty() { "/" } else { rest };
@@ -420,9 +425,12 @@ fn strip_prefix(request: &mut Request, length: usize) {
         parts.path_and_query = Some(path_and_query);
         Uri::from_parts(parts).ok()
     });
-    match rebuilt {
-        Some(stripped) => request.set_uri(stripped),
-        None => warn!("locale prefix not removed: the remaining path is not a valid URI"),
+    if let Some(stripped) = rebuilt {
+        request.set_uri(stripped);
+        true
+    } else {
+        warn!("locale prefix not removed: the remaining path is not a valid URI");
+        false
     }
 }
 
@@ -729,6 +737,16 @@ mod tests {
             "prefix off"
         );
         assert_eq!(path_prefix(&request("/pt-BR/posts", "", "")), None);
+    }
+
+    #[test]
+    fn strip_prefix_reports_whether_it_rewrote_the_request() {
+        let mut posts = request("/pt-BR/posts?page=2", "", "");
+        assert!(strip_prefix(&mut posts, "/pt-BR".len()));
+        assert_eq!(posts.uri().to_string(), "/posts?page=2");
+        let mut root = request("/pt-BR", "", "");
+        assert!(strip_prefix(&mut root, "/pt-BR".len()));
+        assert_eq!(root.uri().path(), "/");
     }
 
     #[tokio::test]

@@ -15,7 +15,11 @@ use crate::{MailError, Message, Sender, encode, encoding};
 /// client) and logs only the file path, never headers, recipients or
 /// bodies. Files are created `0600` with `O_CREAT | O_EXCL` under a
 /// generated name in a `0700` directory, so an existing file or symlink is
-/// never followed or overwritten.
+/// never followed or overwritten. A directory that already exists with group
+/// or other permissions is tightened to `0700` (the owner bits are kept) so
+/// file names and timing stay private too; one that cannot be tightened is
+/// an error. A sticky directory such as `/tmp` is a shared system location
+/// and is left alone with a warning (the files in it are `0600` anyway).
 ///
 /// It exists to read mail without a mail server and is never used in
 /// production: configuration validation and [`from_config`] refuse it
@@ -29,8 +33,8 @@ pub struct FileSender {
 }
 
 impl FileSender {
-    /// Creates `dir` (`0700`) if needed and returns a sender writing into
-    /// it.
+    /// Creates `dir` (`0700`) if needed, tightens an existing one and returns
+    /// a sender writing into it.
     pub fn new(dir: impl Into<PathBuf>) -> Result<Self, MailError> {
         let dir = dir.into();
         if dir.as_os_str().is_empty() {
@@ -45,6 +49,7 @@ impl FileSender {
         builder
             .create(&dir)
             .map_err(|error| MailError::File { kind: error.kind() })?;
+        tighten_directory(&dir)?;
         // Mail written to files is never delivered: say so loudly, once, so
         // a development URL that survived into a deployment shows up in the
         // first lines of the log rather than as missing email.
@@ -88,6 +93,38 @@ impl Sender for FileSender {
         tracing::info!(path = %path.display(), "mail written to file");
         Ok(())
     }
+}
+
+/// Removes group and other access from an existing directory (Unix).
+#[cfg(unix)]
+fn tighten_directory(dir: &Path) -> Result<(), MailError> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let file_error = |error: std::io::Error| MailError::File { kind: error.kind() };
+    let metadata = std::fs::metadata(dir).map_err(file_error)?;
+    let mode = metadata.permissions().mode();
+    if mode & 0o077 == 0 {
+        return Ok(());
+    }
+    if mode & 0o1000 != 0 {
+        tracing::warn!(
+            dir = %dir.display(),
+            "development mail directory is shared (sticky) and was not tightened"
+        );
+        return Ok(());
+    }
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode & 0o7700))
+        .map_err(file_error)?;
+    tracing::warn!(
+        dir = %dir.display(),
+        "development mail directory was group- or world-accessible; tightened to 0700"
+    );
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn tighten_directory(_dir: &Path) -> Result<(), MailError> {
+    Ok(())
 }
 
 fn write_new(path: &Path, data: &[u8]) -> Result<(), MailError> {
@@ -153,6 +190,38 @@ mod tests {
             let dir_mode = std::fs::metadata(&dir).expect("meta").permissions().mode();
             assert_eq!(dir_mode & 0o777, 0o700);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_existing_open_directory_is_tightened() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().expect("temporary directory");
+        let dir = root.path().join("mail");
+        std::fs::create_dir(&dir).expect("create");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        FileSender::new(&dir).expect("tightened");
+        let mode = std::fs::metadata(&dir).expect("meta").permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+        // Already private: untouched, including owner bits.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).expect("chmod");
+        FileSender::new(&dir).expect("kept");
+        let mode = std::fs::metadata(&dir).expect("meta").permissions().mode();
+        assert_eq!(mode & 0o777, 0o500);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_sticky_shared_directory_is_left_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().expect("temporary directory");
+        let dir = root.path().join("shared");
+        std::fs::create_dir(&dir).expect("create");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o1777)).expect("chmod");
+        FileSender::new(&dir).expect("accepted");
+        let mode = std::fs::metadata(&dir).expect("meta").permissions().mode();
+        assert_eq!(mode & 0o7777, 0o1777);
     }
 
     #[tokio::test]

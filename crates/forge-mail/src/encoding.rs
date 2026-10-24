@@ -16,8 +16,6 @@ const UPPER_HEX: &[u8; 16] = b"0123456789ABCDEF";
 const MAX_ENCODED_WORD: usize = 75;
 /// Content of one encoded word: 75 minus `=?UTF-8?q?` and `?=`.
 const MAX_WORD_CONTENT: usize = MAX_ENCODED_WORD - 10 - 2;
-/// Input bytes of one base64 encoded word: `DecodedLen(63)`.
-const MAX_BASE64_WORD_INPUT: usize = MAX_WORD_CONTENT / 4 * 3;
 /// Quoted-printable line limit, soft break included.
 const QP_LINE: usize = 76;
 /// Input bytes that encode to exactly 76 base64 characters.
@@ -64,42 +62,26 @@ pub(crate) fn q_encode(text: &str) -> String {
     out
 }
 
-/// `mime.BEncoding.Encode("utf-8", text)`.
-pub(crate) fn b_encode(text: &str) -> String {
-    if !needs_encoding(text) {
-        return text.to_owned();
+/// Unstructured header text (a subject, a display name containing `=?`).
+///
+/// Text that, with its surrounding spaces trimmed, contains `=?` or a double
+/// space is encoded entirely as base64 encoded words of the trimmed text: a
+/// client would otherwise decode a hand-written `=?utf-8?b?...?=` into
+/// attacker-chosen text, bypassing every check applied to the literal value,
+/// and header folding would collapse the run of spaces. Surrounding spaces
+/// are dropped, as folding drops them from plain text. Any other text is
+/// Q-encoded when it is not plain ASCII.
+pub(crate) fn encode_text(text: &str) -> String {
+    let trimmed = text.trim_matches(' ');
+    if trimmed.contains("=?") || trimmed.contains("  ") {
+        return base64_words(trimmed);
     }
-    let mut out = String::from("=?utf-8?b?");
-    if STANDARD.encode(text).len() <= MAX_WORD_CONTENT {
-        out.push_str(&STANDARD.encode(text));
-        out.push_str("?=");
-        return out;
-    }
-    let (mut current, mut last) = (0, 0);
-    for (index, character) in text.char_indices() {
-        let length = character.len_utf8();
-        if current + length <= MAX_BASE64_WORD_INPUT {
-            current += length;
-        } else {
-            out.push_str(&STANDARD.encode(&text[last..index]));
-            out.push_str("?= =?utf-8?b?");
-            last = index;
-            current = length;
-        }
-    }
-    out.push_str(&STANDARD.encode(&text[last..]));
-    out.push_str("?=");
-    out
+    q_encode(text)
 }
 
-/// Unstructured header text (a subject, a display name containing `=?`):
-/// Q-encoded when not plain ASCII, and base64-encoded as a whole when it
-/// contains `=?`, because a client would otherwise decode a hand-written
-/// `=?utf-8?b?...?=` into attacker-chosen text.
-pub(crate) fn encode_text(text: &str) -> String {
-    if !text.contains("=?") {
-        return q_encode(text);
-    }
+/// `text` as base64 encoded words short enough for one header line each,
+/// never splitting a UTF-8 sequence.
+pub(crate) fn base64_words(text: &str) -> String {
     const MAX_RAW: usize = 45;
     let mut words = Vec::new();
     let mut rest = text;
@@ -115,8 +97,9 @@ pub(crate) fn encode_text(text: &str) -> String {
 }
 
 /// A display name as `net/mail.Address.String` writes it: a quoted string
-/// when printable ASCII, otherwise an encoded word (base64 when the name has
-/// characters an encoded word in a phrase must not contain).
+/// when printable ASCII, otherwise base64 encoded words. Q-encoding would
+/// leave characters such as `\` raw, which a phrase does not allow (RFC 2047
+/// section 5), so the address would not parse back.
 pub(crate) fn display_name(name: &str) -> String {
     let printable = name
         .bytes()
@@ -133,11 +116,7 @@ pub(crate) fn display_name(name: &str) -> String {
         out.push('"');
         return out;
     }
-    if name.contains(|character| "\"#$%&'(),.:;<>@[]^`{|}~".contains(character)) {
-        b_encode(name)
-    } else {
-        q_encode(name)
-    }
+    base64_words(name)
 }
 
 fn push_hex(out: &mut String, byte: u8) {
@@ -440,11 +419,12 @@ mod tests {
     }
 
     #[test]
-    fn b_encoding_matches_go() {
-        assert_eq!(b_encode("Zoë, Inc."), "=?utf-8?b?Wm/DqywgSW5jLg==?=");
+    fn base64_words_split_on_character_boundaries() {
+        assert_eq!(base64_words("Zoë, Inc."), "=?utf-8?b?Wm/DqywgSW5jLg==?=");
         let long = "ç".repeat(30);
-        let encoded = b_encode(&long);
+        let encoded = base64_words(&long);
         assert_eq!(encoded.matches("=?utf-8?b?").count(), 2, "{encoded}");
+        assert_eq!(base64_words(""), "");
     }
 
     #[test]
@@ -454,14 +434,35 @@ mod tests {
             "=?utf-8?b?PT91dGYtOD9xP2V2aWw/PQ==?="
         );
         assert_eq!(encode_text("Plain subject"), "Plain subject");
+        // Surrounding spaces are dropped, like plain text under folding.
+        assert_eq!(
+            encode_text("  =?x  "),
+            format!("=?utf-8?b?{}?=", STANDARD.encode("=?x"))
+        );
+    }
+
+    #[test]
+    fn interior_space_runs_are_kept_in_base64_words() {
+        let encoded = encode_text("a  b");
+        assert_eq!(encoded, format!("=?utf-8?b?{}?=", STANDARD.encode("a  b")));
+        // Folding cannot collapse a run that is inside an encoded word.
+        let folded = fold_header("Subject", &encoded);
+        assert_eq!(folded, format!("Subject: {encoded}"));
+        assert_eq!(encode_text("a b"), "a b");
+        assert_eq!(encode_text(" a b "), " a b ");
     }
 
     #[test]
     fn display_names_match_net_mail() {
         assert_eq!(display_name("Forge App"), "\"Forge App\"");
         assert_eq!(display_name("Doe, \"J\""), "\"Doe, \\\"J\\\"\"");
-        assert_eq!(display_name("João"), "=?utf-8?q?Jo=C3=A3o?=");
-        assert_eq!(display_name("João, Inc."), b_encode("João, Inc."));
+        // Non-ASCII names are base64 encoded words, never Q: Q-encoding
+        // leaves a backslash raw, which a phrase does not allow.
+        assert_eq!(display_name("João"), base64_words("João"));
+        assert_eq!(display_name("João, Inc."), base64_words("João, Inc."));
+        let backslash = display_name("Jo\\ão");
+        assert!(backslash.starts_with("=?utf-8?b?"), "{backslash}");
+        assert!(!backslash.contains('\\'), "{backslash}");
     }
 
     #[test]

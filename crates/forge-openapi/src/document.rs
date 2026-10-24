@@ -370,8 +370,11 @@ fn operation_object(
             "requestBody".to_owned(),
             json!({ "required": true, "content": { JSON_MEDIA_TYPE: { "schema": body } } }),
         );
-        // The server's body limit (text), then decode_json's invalid_json.
+        // The server's body limit (text), then what decode_json answers: 415
+        // for a Content-Type other than application/json, 422 for a body
+        // that is not valid JSON for the type or has a member it lacks.
         implied.push((413, Some(Body::Text)));
+        implied.push((415, None));
         implied.push((422, None));
     }
     if operation.permission.is_some() || operation.authenticated {

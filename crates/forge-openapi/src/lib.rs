@@ -42,6 +42,7 @@
 
 mod document;
 mod json;
+mod members;
 mod operation;
 mod schema;
 mod status;
@@ -54,6 +55,7 @@ pub use document::{
 /// `#[derive(OpenApiSchema)]`: the schema of a struct or unit-only enum from
 /// its fields and serde attributes.
 pub use forge_macros::OpenApiSchema;
+pub use members::unknown_member;
 pub use operation::{Operation, Param, ParamLocation, Response, TypeRef};
 pub use schema::{
     Field, MapKey, ObjectSchema, OpenApiSchema, Schema, SchemaGenerator, UUID_V7_PATTERN, non_null,

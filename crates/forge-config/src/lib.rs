@@ -28,6 +28,7 @@ pub use mail::{
     AuthConfig, MAIL_KEYS, MFA_KEY_BYTES, MFA_KEY_KEY, MailConfig, MailEndpoint, MailTransport,
     MailboxError, PASSWORD_RESET_URL_KEY, has_text_problem, is_bidi_control, is_local_web_host,
     is_loopback_host, parse_mailbox, valid_mail_domain, validate_mailbox,
+    validate_password_reset_url,
 };
 pub use telemetry::{
     EndpointScheme, OtlpCompression, OtlpHeader, SampleRatio, TELEMETRY_ENABLED_KEY,
