@@ -127,18 +127,23 @@ impl Drop for Front {
 pub fn limits() -> HttpLimits {
     HttpLimits {
         read_header_timeout: Duration::from_secs(10),
+        idle_timeout: Duration::from_secs(120),
         shutdown_timeout: Duration::from_secs(5),
     }
 }
 
 pub async fn front_with(server: Server) -> Front {
+    front_with_limits(server, limits()).await
+}
+
+pub async fn front_with_limits(server: Server, limits: HttpLimits) -> Front {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("addr");
     let stop = CancellationToken::new();
     tokio::spawn(forge_proxy::serve_plain(
         server.clone(),
         listener,
-        limits(),
+        limits,
         stop.clone(),
     ));
     Front { server, addr, stop }

@@ -3,7 +3,6 @@
 //! persisted state that lets a restarted proxy resume routing.
 
 use std::collections::{BTreeMap, HashMap};
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -352,8 +351,8 @@ impl Server {
         Ok(())
     }
 
-    /// Writes the routing table atomically (temporary file, fsync, rename)
-    /// with 0600 permissions.
+    /// Writes the routing table atomically (temporary file, fsync, rename,
+    /// directory fsync) with 0600 permissions.
     fn save_state(&self) -> Result<(), String> {
         let Some(path) = self.inner.state_path.as_deref() else {
             return Ok(());
@@ -381,7 +380,8 @@ impl Server {
         let mut content = serde_json::to_vec_pretty(&state).map_err(|e| e.to_string())?;
         content.push(b'\n');
         let _guard = lock(&self.inner.state_lock);
-        write_atomically(path, &content).map_err(|error| format!("write proxy state: {error}"))
+        crate::files::write_atomically(path, &content)
+            .map_err(|error| format!("write proxy state: {error}"))
     }
 
     pub(crate) fn route(&self, host: &str) -> Option<Arc<Service>> {
@@ -696,34 +696,6 @@ fn reindex(routes: &mut Routes) {
             routes.hosts.insert(host.clone(), Arc::clone(service));
         }
     }
-}
-
-/// Writes `content` to a new 0600 file next to `path`, syncs it and renames
-/// it over `path`.
-pub(crate) fn write_atomically(path: &Path, content: &[u8]) -> std::io::Result<()> {
-    let directory = path.parent().unwrap_or_else(|| Path::new("."));
-    let mut suffix = [0_u8; 6];
-    getrandom::fill(&mut suffix).map_err(|error| std::io::Error::other(error.to_string()))?;
-    let name: String = suffix.iter().map(|b| format!("{b:02x}")).collect();
-    let temporary = directory.join(format!(".state-{name}.json"));
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(0o600);
-    }
-    let result = (|| {
-        let mut file = options.open(&temporary)?;
-        file.write_all(content)?;
-        file.sync_all()?;
-        drop(file);
-        std::fs::rename(&temporary, path)
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&temporary);
-    }
-    result
 }
 
 /// One health check: `GET http://TARGET/PATH` with the service's first host

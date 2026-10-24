@@ -17,6 +17,7 @@ pub mod clock;
 pub mod control;
 pub mod der;
 pub mod duration;
+mod files;
 mod flags;
 pub mod forward;
 mod listen;

@@ -75,7 +75,11 @@ const RUN_FLAGS: &[Spec] = &[
         false,
         "time allowed to read request headers",
     ),
-    ("idle-timeout", false, "keep-alive idle timeout"),
+    (
+        "idle-timeout",
+        false,
+        "keep-alive idle timeout; also how long a write to a client may make no progress and an upgraded connection may carry no data",
+    ),
     ("shutdown-timeout", false, "graceful shutdown budget"),
 ];
 
@@ -198,17 +202,18 @@ async fn run(
     let read_header = parsed
         .duration("read-header-timeout", GoDuration::from_secs(10))
         .map_err(flag_error)?;
-    // Accepted for compatibility: idle keep-alive connections are closed by
-    // the read-header timeout, which hyper starts while waiting for the
-    // next request.
-    let _idle = parsed
+    let idle = parsed
         .duration("idle-timeout", GoDuration::from_secs(120))
         .map_err(flag_error)?;
+    if idle.as_nanos() <= 0 {
+        return Err("-idle-timeout must be positive".to_owned());
+    }
     let shutdown_timeout = parsed
         .duration("shutdown-timeout", GoDuration::from_secs(30))
         .map_err(flag_error)?;
     let limits = HttpLimits {
         read_header_timeout: read_header.to_std().max(Duration::from_millis(1)),
+        idle_timeout: idle.to_std(),
         shutdown_timeout: shutdown_timeout.to_std(),
     };
 
@@ -226,6 +231,7 @@ async fn run(
                 cache: acme_cache,
                 email: acme_email,
                 directory: acme_directory,
+                directory_roots: Vec::new(),
             },
         )?)
     };

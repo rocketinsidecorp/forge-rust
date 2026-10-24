@@ -78,7 +78,8 @@ impl ControlResponse {
     }
 }
 
-/// Creates the control socket at `path`. Its directory is created 0700 and
+/// Creates the control socket at `path`. Its directory is created 0700 (an
+/// existing one is restricted to 0700; a link or file there is refused) and
 /// the socket is 0600, so only the proxy's user (and root on the host,
 /// through `docker exec`) can connect. A stale socket left by a previous
 /// process is replaced; any other file at `path` is an error.
@@ -87,16 +88,13 @@ impl ControlResponse {
 ///
 /// The directory or socket cannot be created or restricted.
 pub fn listen_control(path: &Path) -> Result<UnixListener, String> {
-    use std::os::unix::fs::{DirBuilderExt as _, FileTypeExt as _, PermissionsExt as _};
+    use std::os::unix::fs::{FileTypeExt as _, PermissionsExt as _};
 
     if let Some(directory) = path.parent()
         && !directory.as_os_str().is_empty()
     {
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(directory)
-            .map_err(|error| format!("create control directory: {error}"))?;
+        crate::files::private_directory(directory)
+            .map_err(|error| format!("control directory: {error}"))?;
     }
     match std::fs::symlink_metadata(path) {
         Ok(metadata) => {

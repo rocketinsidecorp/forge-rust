@@ -3,6 +3,11 @@
 //! where it is missing); the ACME server is a small RFC 8555 implementation
 //! in this file that verifies every JWS signature and nonce and validates
 //! the HTTP-01 challenge through the proxy's plain listener.
+//!
+//! `acme_client_interoperates_with_pebble` runs the client against
+//! Let's Encrypt's test CA, Pebble, when `FORGE_TEST_PEBBLE_DIRECTORY` names
+//! its directory (it is skipped, with a notice, otherwise); see that test
+//! for the setup.
 
 mod support;
 
@@ -117,6 +122,47 @@ fn sign(dir: &Path, csr: &[u8]) -> Option<String> {
         return None;
     }
     std::fs::read_to_string(dir.join("leaf.pem")).ok()
+}
+
+/// A key and a certificate from the test CA (`dir` holds it) with common
+/// name `cn` and subject alternative names `san`, as one PEM.
+fn leaf_pem(dir: &Path, name: &str, cn: &str, san: &str) -> String {
+    let key = format!("{name}.key");
+    let der = format!("{name}.der");
+    assert!(openssl(
+        dir,
+        &[
+            "ecparam",
+            "-name",
+            "prime256v1",
+            "-genkey",
+            "-noout",
+            "-out",
+            &key
+        ]
+    ));
+    assert!(openssl(
+        dir,
+        &[
+            "req",
+            "-new",
+            "-key",
+            &key,
+            "-subj",
+            &format!("/CN={cn}"),
+            "-addext",
+            &format!("subjectAltName={san}"),
+            "-outform",
+            "DER",
+            "-out",
+            &der
+        ]
+    ));
+    let csr = std::fs::read(dir.join(&der)).expect("csr");
+    let leaf = sign(dir, &csr).expect("signed");
+    let mut pem = std::fs::read_to_string(dir.join(&key)).expect("key");
+    pem.push_str(&leaf);
+    pem
 }
 
 fn client_config(dir: &Path) -> Arc<rustls::ClientConfig> {
@@ -238,6 +284,7 @@ async fn certificates_are_served_only_for_tls_hosts() {
                 cache: dir.path().join("acme"),
                 email: String::new(),
                 directory: "http://127.0.0.1:1/directory".to_owned(),
+                ..AcmeSettings::default()
             },
         )
         .expect("tls"),
@@ -246,6 +293,13 @@ async fn certificates_are_served_only_for_tls_hosts() {
     let mut mismatched = std::fs::read_to_string(dir.path().join("ca.key")).expect("ca key");
     mismatched.push_str(&leaf);
     assert!(tls.install(TEST_HOST, mismatched.as_bytes()).is_err());
+    // So is a valid certificate whose subject alternative names do not
+    // cover the host, even when its common name does.
+    let foreign = leaf_pem(dir.path(), "foreign", TEST_HOST, "DNS:other.example.com");
+    let error = tls
+        .install(TEST_HOST, foreign.as_bytes())
+        .expect_err("certificate for another host");
+    assert!(error.contains("not valid for app.example.com"), "{error}");
     tls.install(TEST_HOST, pem.as_bytes()).expect("install");
     let addr = serve_tls(front.server.clone(), Arc::clone(&tls), front.stop.clone()).await;
     let config = client_config(dir.path());
@@ -579,6 +633,7 @@ async fn acme_obtains_caches_and_reuses_a_certificate() {
         cache: cache.clone(),
         email: "ops@example.com".to_owned(),
         directory: format!("{}/directory", acme.base),
+        ..AcmeSettings::default()
     };
     let tls = Arc::new(Tls::new(front.server.clone(), settings.clone()).expect("tls"));
     // Before a TLS service exists, challenge paths of unknown hosts are
@@ -679,4 +734,203 @@ async fn acme_obtains_caches_and_reuses_a_certificate() {
     );
     again.cancel();
     loop_again.await.expect("renewal loop");
+}
+
+#[tokio::test]
+async fn an_existing_cache_directory_is_restricted_and_a_link_refused() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let server =
+        forge_proxy::Server::new(forge_proxy::log::Logger::discard(), None).expect("server");
+    let settings = |cache: PathBuf| AcmeSettings {
+        cache,
+        directory: "http://127.0.0.1:1/directory".to_owned(),
+        ..AcmeSettings::default()
+    };
+    let mode = |path: &Path| {
+        std::fs::symlink_metadata(path)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o7777
+    };
+    // A cache left world-readable (an older image, a hand-made volume) is
+    // restricted before any key is written to it.
+    let cache = dir.path().join("acme");
+    std::fs::create_dir(&cache).expect("mkdir");
+    std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    Tls::new(server.clone(), settings(cache.clone())).expect("tls");
+    assert_eq!(mode(&cache), 0o700);
+
+    // A link is refused, and its target left as it was.
+    let link = dir.path().join("link");
+    std::os::unix::fs::symlink(&cache, &link).expect("symlink");
+    std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    let error = Tls::new(server, settings(link)).expect_err("link refused");
+    assert!(error.contains("is not a directory"), "{error}");
+    assert_eq!(mode(&cache), 0o755);
+}
+
+/// A log sink the test can read.
+#[derive(Clone, Default)]
+struct Captured(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for Captured {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().expect("lock").extend_from_slice(data);
+        Ok(data.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// The ACME client against Pebble (<https://github.com/letsencrypt/pebble>),
+/// a CA that behaves like Let's Encrypt: nonce rejection, `Retry-After`,
+/// HTTP-01 validation over the network and a real issuance chain. Skipped
+/// unless `FORGE_TEST_PEBBLE_DIRECTORY` is set; with it set, it must pass.
+///
+/// - `FORGE_TEST_PEBBLE_DIRECTORY`: the directory URL, e.g.
+///   `https://127.0.0.1:14000/dir`.
+/// - `FORGE_TEST_PEBBLE_CA`: PEM file of the CA of Pebble's own HTTPS
+///   certificate (`test/certs/pebble.minica.pem` in Pebble's repository).
+/// - `FORGE_TEST_PEBBLE_HTTP_ADDR`: where the proxy's plain listener binds,
+///   the address Pebble connects to for HTTP-01 (Pebble's `httpPort`,
+///   default `127.0.0.1:5002`).
+/// - `FORGE_TEST_PEBBLE_HOST`: the host name certified (default
+///   `forge-proxy.pebble.test`); Pebble must resolve it to that listener,
+///   e.g. with `pebble-challtestsrv -defaultIPv4 127.0.0.1` as its DNS
+///   server.
+///
+/// Locally, with both binaries built from Pebble's repository:
+///
+/// ```sh
+/// pebble-challtestsrv -defaultIPv4 127.0.0.1 -defaultIPv6 "" -dns01 127.0.0.1:8053 \
+///   -http01 "" -https01 "" -tlsalpn01 "" -doh "" -management 127.0.0.1:8055 &
+/// (cd pebble && pebble -config test/config/pebble-config.json -dnsserver 127.0.0.1:8053) &
+/// FORGE_TEST_PEBBLE_DIRECTORY=https://127.0.0.1:14000/dir \
+///   FORGE_TEST_PEBBLE_CA=pebble/test/certs/pebble.minica.pem \
+///   cargo test --locked -p forge-proxy --test tls acme_client_interoperates_with_pebble
+/// ```
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn acme_client_interoperates_with_pebble() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let Ok(directory) = std::env::var("FORGE_TEST_PEBBLE_DIRECTORY") else {
+        eprintln!("skipped: FORGE_TEST_PEBBLE_DIRECTORY is not set (no Pebble ACME server)");
+        return;
+    };
+    let ca = std::env::var("FORGE_TEST_PEBBLE_CA")
+        .expect("FORGE_TEST_PEBBLE_CA names Pebble's HTTPS CA certificate");
+    let http_addr = std::env::var("FORGE_TEST_PEBBLE_HTTP_ADDR")
+        .unwrap_or_else(|_| "127.0.0.1:5002".to_owned());
+    let host = std::env::var("FORGE_TEST_PEBBLE_HOST")
+        .unwrap_or_else(|_| "forge-proxy.pebble.test".to_owned());
+    let directory_roots = CertificateDer::pem_file_iter(&ca)
+        .expect("read FORGE_TEST_PEBBLE_CA")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("FORGE_TEST_PEBBLE_CA holds certificates");
+
+    let logs = Captured::default();
+    let server =
+        forge_proxy::Server::new(forge_proxy::log::Logger::new(Box::new(logs.clone())), None)
+            .expect("server");
+    let stop = CancellationToken::new();
+    let plain = TcpListener::bind(&http_addr)
+        .await
+        .unwrap_or_else(|error| panic!("bind {http_addr} for HTTP-01: {error}"));
+    let plain_loop = tokio::spawn(forge_proxy::serve_plain(
+        server.clone(),
+        plain,
+        limits(),
+        stop.clone(),
+    ));
+    let app = backend("app", None).await;
+    let mut request = fast_request(&app.addr);
+    request.hosts = vec![host.clone()];
+    request.tls = true;
+    server.deploy(request).await.expect("deploy");
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cache = dir.path().join("acme");
+    let tls = Arc::new(
+        Tls::new(
+            server.clone(),
+            AcmeSettings {
+                cache: cache.clone(),
+                email: "ops@example.com".to_owned(),
+                directory,
+                directory_roots,
+            },
+        )
+        .expect("tls"),
+    );
+    let renewal = tokio::spawn({
+        let (tls, stop) = (Arc::clone(&tls), stop.clone());
+        async move { tls.run(stop).await }
+    });
+    let certificate = cache.join(&host);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    while !certificate.exists() {
+        let failed = String::from_utf8_lossy(&logs.0.lock().expect("lock"))
+            .lines()
+            .find(|line| line.contains("certificate issuance failed"))
+            .map(str::to_owned);
+        assert!(failed.is_none(), "Pebble refused the client: {failed:?}");
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no certificate from Pebble within 120 s"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let mode = |path: &Path| {
+        std::fs::metadata(path)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777
+    };
+    assert_eq!(mode(&certificate), 0o600);
+    assert_eq!(mode(&cache.join("acme_account+key")), 0o600);
+    assert_eq!(mode(&cache), 0o700);
+
+    // The proxy serves the issued chain: a client trusting Pebble's issuer
+    // (the last certificate of the chain) completes the handshake.
+    let chain: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(&certificate)
+        .expect("cached chain")
+        .collect::<Result<_, _>>()
+        .expect("certificates");
+    assert!(chain.len() >= 2, "Pebble returns the leaf and its issuer");
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(chain.last().expect("issuer").clone())
+        .expect("issuer as trust anchor");
+    let config = Arc::new(
+        rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .expect("versions")
+        .with_root_certificates(roots)
+        .with_no_client_auth(),
+    );
+    let addr = serve_tls(server.clone(), Arc::clone(&tls), stop.clone()).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match https_get(Arc::clone(&config), addr, &host).await {
+            Ok(answer) => {
+                assert_eq!(answer, (200, "app".to_owned()));
+                break;
+            }
+            Err(error) => assert!(
+                tokio::time::Instant::now() < deadline,
+                "issued certificate not served: {error}"
+            ),
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    stop.cancel();
+    renewal.await.expect("renewal loop");
+    plain_loop.await.expect("plain listener");
 }

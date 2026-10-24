@@ -853,8 +853,12 @@ volume, so it resumes routing after a restart. It:
   the service is deployed and again 30 days before expiry, serves them with
   rustls (TLS 1.2 and 1.3) and redirects plain HTTP with `308`. A handshake
   for any other host, or before the certificate exists, fails rather than
-  presenting a wrong certificate. The cache uses autocert's file layout, so
-  Forge-Go's proxy image reuses it and vice versa;
+  presenting a wrong certificate; a cached or issued certificate is used only
+  if its key matches and its subject alternative names cover the host. The
+  cache directory is kept `0700` (an existing one is restricted at start, a
+  symbolic link is refused) with `0600` files written atomically and synced
+  to disk. The cache uses autocert's file layout, so Forge-Go's proxy image
+  reuses it and vice versa;
 - is the internet edge: it drops any `Forwarded`, `X-Forwarded-*` and
   `X-Real-IP` headers the client sent, sets `X-Forwarded-For` to the
   connecting address only (replacing, never appending), `X-Forwarded-Proto`
@@ -868,13 +872,22 @@ volume, so it resumes routing after a restart. It:
   application, and answers `408` if one does not arrive within 30 s; streams
   larger bodies, answering `408` when no data arrives for 30 s; gives the
   application `response_timeout` to send response headers;
+- disconnects clients that hold connections without using them, after
+  `-idle-timeout` (120 s by default): a keep-alive connection waiting for its
+  next request (or after the 10 s `-read-header-timeout`, whichever is
+  shorter), a response the client stops reading, and an upgraded
+  (WebSocket) connection with no data in either direction. The application
+  connection and the in-flight count are released with it, so a stalled
+  client cannot hold a drain open. WebSocket applications should ping more
+  often than that;
 - tunnels protocol upgrades (WebSocket) and counts them as in flight, so a
   switch drains them; refuses `CONNECT`;
 - writes JSON access logs (service, host, method, path without query,
   status, bytes, duration, client IP, target) to `docker logs forge-proxy`;
 - is controlled only through a Unix socket inside the container (directory
-  0700, socket 0600): `docker exec forge-proxy /usr/local/bin/forge-proxy
-  status`. A routing state file it cannot read stops it from starting.
+  0700, restricted at start if it already exists; socket 0600): `docker exec
+  forge-proxy /usr/local/bin/forge-proxy status`. A routing state file it
+  cannot read stops it from starting.
 
 ```sh
 docker exec forge-proxy /usr/local/bin/forge-proxy status

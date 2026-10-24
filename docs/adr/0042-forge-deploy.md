@@ -70,10 +70,13 @@ configuration, and no new crate unless strictly necessary.
    multi-line scalars with a line number rather than guessing.
 
 5. **Concurrency.** Hosts are handled by scoped threads, at most
-   `parallelism` at once (sequentially in a dry run); every child process is
-   waited for or killed; a signal (SIGINT/SIGTERM) cancels remote work, and
-   cleanup (lock release, revert) runs with its own deadline. `forge logs`
-   closes each stream's stdin on Ctrl-C so the remote watchdog stops `docker
+   `parallelism` at once (sequentially in a dry run), for every deploy
+   operation and for `forge logs` without `-f`. `forge logs -f` opens every
+   host at once instead: a followed stream never ends, so a host queued
+   behind the cap would never be shown. Every child process is waited for
+   or killed; a signal (SIGINT/SIGTERM) cancels remote work, and cleanup
+   (lock release, revert) runs with its own deadline. `forge logs` closes
+   each stream's stdin on Ctrl-C so the remote watchdog stops `docker
    logs`.
 
 6. **forge-proxy in Rust.** hyper (HTTP/1.1) server and per-request client
@@ -85,6 +88,14 @@ configuration, and no new crate unless strictly necessary.
    file (atomic, 0600, Forge-Go's format) and command line (Go `flag` syntax)
    are Forge-Go's. Connections, control requests and tunnels are bounded and
    owned (`JoinSet`, `TaskTracker`) and stop within the shutdown budget.
+   `-idle-timeout` closes a keep-alive connection waiting for its next
+   request (hyper's header timer bounds that wait too), a response write
+   that makes no progress and an upgraded connection silent in both
+   directions, so a client that stops reading cannot hold a connection, a
+   tunnel or a drain open. The cache and control directories are kept 0700
+   (existing ones restricted at start, links refused), and state and cache
+   files are written atomically, synced, with the directory synced after
+   the rename.
 
 7. **TLS without new dependencies.** Certificates come from an ACME CA (Let's
    Encrypt by default) through an RFC 8555 client written on hyper, rustls
@@ -92,8 +103,12 @@ configuration, and no new crate unless strictly necessary.
    encoder for the PKCS#10 request (encoding only; every primitive is ring's),
    HTTP-01 challenges answered on port 80. Certificates are obtained ahead of
    time when a TLS service is deployed and renewed 30 days before expiry by
-   one owned loop with exponential backoff; handshakes never wait for the CA
-   and fail for hosts that are not TLS services or have no certificate yet.
+   one owned loop with exponential backoff, whose cache file operations run
+   on the blocking pool; a challenge answer is withdrawn however its
+   issuance ends. Handshakes never wait for the CA and fail for hosts that
+   are not TLS services or have no certificate yet; a certificate is used
+   only when its key matches and its subject alternative names cover the
+   host.
    rustls serves TLS 1.2 and 1.3. The cache keeps autocert's layout so
    Forge-Go's proxy image can reuse it. A plain-HTTP ACME directory is
    refused except on loopback.
@@ -118,7 +133,10 @@ in the graph: `regex-automata` (forge-cli; RE2-compatible patterns and
 - The reviewed surface grows by an ACME client and a DER encoder. They are
   integration-tested against an in-test RFC 8555 server that verifies every
   JWS signature and nonce and has its CSRs verified and signed by `openssl`,
-  not against Let's Encrypt itself.
+  and against Pebble, Let's Encrypt's test CA, when
+  `FORGE_TEST_PEBBLE_DIRECTORY` is set (`crates/forge-proxy/tests/tls.rs`
+  shows the setup; CI does not start Pebble yet), not against Let's Encrypt
+  itself.
 - `forge-proxy` is HTTP/1.1 only and opens one application connection per
   request (no pool outlives a switch). HTTP/2 would need the `h2` crate.
 - `migrate` runs with the migrate role's env file, as in Forge-Go; for

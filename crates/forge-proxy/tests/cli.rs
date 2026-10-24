@@ -253,3 +253,12 @@ async fn run_serves_and_shuts_down() {
     );
     assert_eq!(run(&["run", "extra"]).await.0, EXIT_FAILED);
 }
+
+#[tokio::test]
+async fn run_refuses_a_non_positive_idle_timeout() {
+    for value in ["0s", "-1s"] {
+        let (code, _, err) = run(&["run", "-idle-timeout", value, "-state", ""]).await;
+        assert_eq!(code, EXIT_FAILED, "{value}: {err}");
+        assert!(err.contains("-idle-timeout must be positive"), "{err}");
+    }
+}

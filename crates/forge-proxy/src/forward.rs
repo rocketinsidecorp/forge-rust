@@ -18,7 +18,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -171,11 +171,14 @@ fn early(record: &mut AccessRecord, response: Response<ProxyBody>) -> Response<P
 
 impl Server {
     /// Answers one request that arrived from `peer` (over TLS when `tls`).
+    /// An upgraded connection it opens is closed after `idle_timeout`
+    /// without data in either direction.
     pub async fn handle(
         &self,
         request: Request<Incoming>,
         peer: SocketAddr,
         tls: bool,
+        idle_timeout: Duration,
     ) -> Response<ProxyBody> {
         let host = request_host(&request);
         if !tls
@@ -279,6 +282,7 @@ impl Server {
             &host,
             lease,
             settings.response_timeout.to_std(),
+            idle_timeout,
             flags,
             sent_rx,
             record,
@@ -413,6 +417,7 @@ impl Server {
         host: &str,
         lease: Lease,
         response_timeout: Duration,
+        idle_timeout: Duration,
         flags: Arc<BodyFlags>,
         mut sent: watch::Receiver<bool>,
         mut record: AccessRecord,
@@ -494,6 +499,7 @@ impl Server {
                 downstream_upgrade,
                 (!connection_done).then_some(connection),
                 lease,
+                idle_timeout,
                 record,
             );
         }
@@ -510,8 +516,10 @@ impl Server {
     }
 
     /// Completes a protocol switch (WebSocket): the client gets the 101 and
-    /// both connections are joined until either side closes. The lease is
-    /// held for the whole tunnel, so a drain waits for it.
+    /// both connections are joined until either side closes, or no data
+    /// moved in either direction for `idle_timeout`. The lease is held for
+    /// the whole tunnel, so a drain waits for it.
+    #[allow(clippy::too_many_arguments)]
     fn tunnel(
         &self,
         mut response: Response<Incoming>,
@@ -519,6 +527,7 @@ impl Server {
         downstream: Option<hyper::upgrade::OnUpgrade>,
         connection: Option<Pin<Box<UpgradeableConnection>>>,
         lease: Lease,
+        idle_timeout: Duration,
         mut record: AccessRecord,
     ) -> Response<ProxyBody> {
         let offered = upgrade_type(response.headers());
@@ -559,6 +568,7 @@ impl Server {
         record.status = StatusCode::SWITCHING_PROTOCOLS.as_u16();
         let shutdown = self.inner.shutdown.clone();
         self.inner.tunnels.spawn(async move {
+            let activity = Activity::new();
             // The connection hands its stream over to the upgrade; it may
             // already have done so.
             let upstream = async {
@@ -571,24 +581,110 @@ impl Server {
                 let (upstream, downstream) = tokio::join!(upstream, downstream);
                 if let (Ok(upstream), Ok(downstream)) = (upstream, downstream) {
                     let mut upstream = TokioIo::new(upstream);
-                    let mut downstream = TokioIo::new(downstream);
-                    if let Ok((_, to_client)) =
-                        tokio::io::copy_bidirectional(&mut downstream, &mut upstream).await
-                    {
-                        return to_client;
-                    }
+                    // Every byte of the tunnel crosses the client side.
+                    let mut downstream = Watched {
+                        inner: TokioIo::new(downstream),
+                        activity: &activity,
+                    };
+                    let _ = tokio::io::copy_bidirectional(&mut downstream, &mut upstream).await;
                 }
-                0
             };
             tokio::select! {
-                bytes = joined => record.bytes = bytes,
+                () = joined => {}
+                () = activity.idle_for(idle_timeout) => {}
                 () = shutdown.cancelled() => {}
             }
+            record.bytes = activity.to_client.load(Ordering::Relaxed);
             record.emit();
             drop(lease);
             drop(permit);
         });
         Response::from_parts(parts, empty())
+    }
+}
+
+/// When a tunnel last carried data, and how much it sent to the client.
+struct Activity {
+    started: Instant,
+    /// Milliseconds after `started`.
+    last: AtomicU64,
+    to_client: AtomicU64,
+}
+
+impl Activity {
+    fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            last: AtomicU64::new(0),
+            to_client: AtomicU64::new(0),
+        }
+    }
+
+    fn touch(&self) {
+        let elapsed = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.last.fetch_max(elapsed, Ordering::Relaxed);
+    }
+
+    /// Resolves once no data moved for `idle`.
+    async fn idle_for(&self, idle: Duration) {
+        loop {
+            let last = self.started + Duration::from_millis(self.last.load(Ordering::Relaxed));
+            let deadline = last + idle;
+            if deadline <= Instant::now() {
+                return;
+            }
+            tokio::time::sleep_until(deadline).await;
+        }
+    }
+}
+
+/// The client side of a tunnel, recording its traffic in an [`Activity`].
+struct Watched<'a, T> {
+    inner: T,
+    activity: &'a Activity,
+}
+
+impl<T: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for Watched<'_, T> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let before = buf.filled().len();
+        let result = Pin::new(&mut this.inner).poll_read(cx, buf);
+        if matches!(result, Poll::Ready(Ok(()))) && buf.filled().len() > before {
+            this.activity.touch();
+        }
+        result
+    }
+}
+
+impl<T: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for Watched<'_, T> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        let result = Pin::new(&mut this.inner).poll_write(cx, buf);
+        if let Poll::Ready(Ok(written)) = result
+            && written > 0
+        {
+            this.activity.touch();
+            this.activity
+                .to_client
+                .fetch_add(written as u64, Ordering::Relaxed);
+        }
+        result
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
     }
 }
 
