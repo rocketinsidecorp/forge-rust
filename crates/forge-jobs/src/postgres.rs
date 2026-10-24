@@ -612,12 +612,13 @@ impl PgJobStore {
     pub(crate) async fn check_worker_grants(&self) -> Result<(), JobsError> {
         let row = sqlx::query(
             r"SELECT current_user::text AS role,
+                     quote_ident(current_user) AS grantee,
                      EXISTS (
                          SELECT 1 FROM pg_proc AS p
                          WHERE p.proname = 'forge_jobs_claim' AND pg_function_is_visible(p.oid)
                      ) AS migrated,
                      ARRAY(
-                         SELECT DISTINCT p.proname::text FROM pg_proc AS p
+                         SELECT p.oid::regprocedure::text FROM pg_proc AS p
                          WHERE p.proname LIKE 'forge\_jobs\_%'
                            AND pg_function_is_visible(p.oid)
                            AND NOT has_function_privilege(p.oid, 'EXECUTE')
@@ -627,15 +628,16 @@ impl PgJobStore {
         .fetch_one(self.database.pool())
         .await?;
         let role: String = row.try_get("role")?;
+        let grantee: String = row.try_get("grantee")?;
         let migrated: bool = row.try_get("migrated")?;
         let denied: Vec<String> = row.try_get("denied")?;
         let detail = if !migrated {
             "the job schema is not migrated (forge_jobs_claim does not exist); run `forge migrate`"
                 .to_owned()
         } else if !denied.is_empty() {
+            let functions = denied.join(", ");
             format!(
-                "it lacks EXECUTE on {}; grant it by running `forge migrate` as the migration role with PGOPTIONS='-c forge.runtime_role={role}' (or forge.worker_role), or run the workers as the role that has it",
-                denied.join(", ")
+                "it lacks EXECUTE on {functions}; as the migration role run `GRANT EXECUTE ON FUNCTION {functions} TO {grantee};`, or run the workers as the role that has them (the job schema grants them when it is first migrated with PGOPTIONS='-c forge.runtime_role={role}' or forge.worker_role; re-running `forge migrate` later grants nothing)"
             )
         } else {
             return Ok(());

@@ -1323,12 +1323,27 @@ async fn a_role_without_worker_grants_fails_fast_with_the_documented_message() {
     for expected in [
         "cannot claim jobs",
         "lacks EXECUTE on",
-        "forge_jobs_claim",
+        "forge_jobs_claim(",
+        "GRANT EXECUTE ON FUNCTION forge_jobs_claim(",
         "PGOPTIONS='-c forge.runtime_role=",
     ] {
         assert!(message.contains(expected), "{message}");
     }
-    assert!(!message.contains("forge_jobs_complete"), "{message}");
+    assert!(!message.contains("forge_jobs_complete("), "{message}");
+    // The GRANT the message names is the fix: with it the same role starts.
+    let start = message.find("GRANT EXECUTE").expect("a GRANT statement");
+    let end = start + message[start..].find(';').expect("statement end");
+    sqlx::query(sqlx::AssertSqlSafe(message[start..end].to_owned()))
+        .execute(db.admin().pool())
+        .await
+        .expect("the named GRANT applies");
+    let mut jobs = Jobs::new();
+    jobs.register(Counter::default()).expect("register");
+    jobs.settings(fast());
+    let (shutdown, handle) = spawn_runtime(jobs, db.runtime());
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!handle.is_finished(), "the granted role must keep running");
+    stop(shutdown, handle).await;
     // The worker role holds every grant and starts.
     let mut jobs = Jobs::new();
     jobs.register(Counter::default()).expect("register");

@@ -476,23 +476,40 @@ fn tool_install_violations(name: &str, text: &str) -> Vec<String> {
     let mut violations = Vec::new();
     for (index, line) in lines.iter().enumerate() {
         let code = split_comment(line).0;
-        if let Some(position) = code.find("cargo install") {
-            let words: Vec<&str> = code[position..].split_whitespace().collect();
-            if !words.contains(&"--locked")
-                || !words.contains(&"--version")
-                || code[..position].contains("||")
+        let words: Vec<&str> = code.split_whitespace().collect();
+        // `cargo install`, `cargo +toolchain install`, in any spacing, and
+        // `cargo binstall`, which downloads prebuilt binaries instead.
+        let install = words.iter().enumerate().find_map(|(position, word)| {
+            (word.trim_start_matches(['(', '`', '"', '\'']) == "cargo").then(|| {
+                let next = position + 1;
+                let next =
+                    next + usize::from(words.get(next).is_some_and(|word| word.starts_with('+')));
+                (next, words.get(next).copied())
+            })
+        });
+        if let Some((position, Some(command @ ("install" | "binstall")))) = install {
+            let arguments = &words[position..];
+            // A skip because some binary is already there: `||` before the
+            // install, or a `command -v`, `which` or `hash` probe on the line.
+            let skipped = words[..position].contains(&"||")
                 || code.contains("command -v")
+                || words.iter().any(|word| matches!(*word, "which" | "hash"));
+            if command == "binstall"
+                || !arguments.contains(&"--locked")
+                || !arguments.contains(&"--version")
+                || skipped
             {
                 violations.push(format!(
-                    "{name}:{}: `{}` must name --version and --locked, and never skip the install because an older binary is on PATH",
+                    "{name}:{}: `{}` must be `cargo install` with --version and --locked, never skipped because an older binary is on PATH",
                     index + 1,
                     line.trim()
                 ));
             }
         }
-        if code.contains("command -v cargo-") {
+        let probe = ["command -v cargo-", "which cargo-", "hash cargo-"];
+        if probe.iter().any(|probe| words.join(" ").contains(probe)) {
             violations.push(format!(
-                "{name}:{}: a cached cargo tool is found by version, not by `command -v`",
+                "{name}:{}: a cached cargo tool is found by version, not by `command -v`, `which` or `hash`",
                 index + 1
             ));
         }
@@ -659,7 +676,15 @@ fn checkouts_keep_no_credentials() {
 
 #[test]
 fn tool_binaries_are_installed_by_exact_version() {
-    for (name, relative) in workflows_and_local_actions() {
+    let files = workflows_and_local_actions();
+    // The traversal reaches the local action the workflows install through.
+    assert!(
+        files
+            .iter()
+            .any(|(_, relative)| relative == ".github/actions/cargo-tool/action.yml"),
+        "the local actions were not followed: {files:?}"
+    );
+    for (name, relative) in files {
         assert_clean(&tool_install_violations(&name, &read(&relative)));
     }
 }
@@ -732,23 +757,73 @@ fn generated_application_ci_and_dockerfile_are_pinned() {
     );
 
     let proxy = dockerfile_bases(&read("crates/forge-proxy/Dockerfile"));
-    let template = dockerfile_bases(&read("crates/forge-cli/templates/app/Dockerfile.tmpl"));
-    assert_eq!(
-        template.len(),
-        2,
-        "the build and runtime base images: {template:?}"
-    );
-    for image in &template {
-        assert!(
-            has_digest(image),
-            "Dockerfile.tmpl: `{image}` must be pinned by digest"
+    for file in [
+        "crates/forge-cli/templates/app/Dockerfile.tmpl",
+        "examples/hello-forge/Dockerfile",
+    ] {
+        let bases = dockerfile_bases(&read(file));
+        assert_eq!(
+            bases.len(),
+            2,
+            "{file}: the build and runtime base images: {bases:?}"
         );
-        let digest = image.rsplit_once('@').map(|(_, digest)| digest);
+        for image in &bases {
+            assert!(
+                has_digest(image),
+                "{file}: `{image}` must be pinned by digest"
+            );
+            let digest = image.rsplit_once('@').map(|(_, digest)| digest);
+            assert!(
+                proxy
+                    .iter()
+                    .any(|pinned| pinned.rsplit_once('@').map(|(_, digest)| digest) == digest),
+                "{file}: `{image}` must use the digest of crates/forge-proxy/Dockerfile ({proxy:?})"
+            );
+        }
+    }
+
+    // The generated Compose file runs the database images CI tests with,
+    // pinned to the same digests; only the application's own image is local.
+    let framework_ci = read(".github/workflows/ci.yml");
+    let compose = read("crates/forge-cli/templates/app/compose.yaml.tmpl");
+    let images: Vec<&str> = compose
+        .lines()
+        .filter_map(|line| split_comment(line).0.trim().strip_prefix("image:"))
+        .map(|image| image.trim().trim_matches(['"', '\'']))
+        .filter(|image| !image.starts_with("%%APP_NAME%%"))
+        .collect();
+    assert!(images.len() >= 3, "compose.yaml.tmpl: {images:?}");
+    for image in images {
         assert!(
-            proxy
-                .iter()
-                .any(|pinned| pinned.rsplit_once('@').map(|(_, digest)| digest) == digest),
-            "Dockerfile.tmpl: `{image}` must use the digest of crates/forge-proxy/Dockerfile ({proxy:?})"
+            has_digest(image) && framework_ci.contains(&format!("image: {image}\n")),
+            "compose.yaml.tmpl: `{image}` must be pinned by digest, the same pin as .github/workflows/ci.yml"
+        );
+    }
+}
+
+/// Every crate takes the workspace version, so the release check (the tag is
+/// the `[workspace.package]` version) covers every crate a tag publishes.
+#[test]
+fn every_workspace_crate_takes_the_workspace_version() {
+    let workspace = read("Cargo.toml");
+    let members: Vec<&str> = workspace
+        .lines()
+        .skip_while(|line| !line.starts_with("members"))
+        .skip(1)
+        .take_while(|line| !line.starts_with(']'))
+        .map(|line| line.trim().trim_end_matches(',').trim_matches('"'))
+        .collect();
+    assert!(members.len() > 20, "{members:?}");
+    for member in members {
+        let manifest = read(&format!("{member}/Cargo.toml"));
+        assert!(
+            manifest
+                .lines()
+                .any(|line| line.trim() == "version.workspace = true")
+                && !manifest
+                    .lines()
+                    .any(|line| line.trim().starts_with("version = ")),
+            "{member}/Cargo.toml must say `version.workspace = true`"
         );
     }
 }
@@ -932,6 +1007,12 @@ fn the_tool_rule_rejects_installs_that_ignore_a_version_bump() {
         "        run: command -v cargo-fuzz >/dev/null || cargo install cargo-fuzz --version 0.13.2 --locked\n",
         "        run: cargo install cargo-fuzz --locked\n",
         "        run: cargo install cargo-fuzz --version 0.13.2\n",
+        "        run: cargo  install cargo-fuzz --locked\n",
+        "        run: cargo +nightly install cargo-fuzz --locked\n",
+        "        run: cargo binstall cargo-fuzz --version 0.13.2 --locked\n",
+        "        run: which cargo-fuzz || cargo install cargo-fuzz --version 0.13.2 --locked\n",
+        "        run: hash cargo-fuzz 2>/dev/null || cargo install cargo-fuzz --version 0.13.2 --locked\n",
+        "        run: |\n          if ! which cargo-fuzz; then\n            cargo install cargo-fuzz --version 0.13.2 --locked\n          fi\n",
         "      - uses: ./.github/actions/cargo-tool\n        with:\n          tool: cargo-fuzz\n          version: 0.13\n",
         "      - uses: ./.github/actions/cargo-tool\n        with:\n          tool: cargo-fuzz\n          version: ${{ inputs.version }}\n",
         "      - uses: ./.github/actions/cargo-tool\n        with:\n          tool: cargo-fuzz\n",
@@ -943,6 +1024,7 @@ fn the_tool_rule_rejects_installs_that_ignore_a_version_bump() {
     }
     for accepted in [
         "        run: cargo install cargo-auditable --version 0.7.7 --locked\n",
+        "        run: cargo  +1.98.1  install cargo-auditable --version 0.7.7 --locked\n",
         "      - uses: ./.github/actions/cargo-tool\n        with:\n          tool: cargo-llvm-cov\n          version: 0.9.1\n      - run: true\n",
     ] {
         assert_clean(&tool_install_violations("t.yml", accepted));

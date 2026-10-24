@@ -78,6 +78,8 @@ jobs:
         run: |
           sudo apt-get update -q
           sudo apt-get install -y -q --no-install-recommends openssh-server openssh-client
+          # The tests start their own sshd; the system service is not needed.
+          sudo systemctl disable --now ssh.service ssh.socket || true
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: |
@@ -212,6 +214,8 @@ jobs:
         run: |
           sudo apt-get update -q
           sudo apt-get install -y -q --no-install-recommends openssh-server openssh-client
+          # The tests start their own sshd; the system service is not needed.
+          sudo systemctl disable --now ssh.service ssh.socket || true
       - name: Every test, the database ones included (PostgreSQL 18)
         run: scripts/test-databases.sh
       - name: Every test, the database ones included (PostgreSQL 16)
@@ -285,6 +289,8 @@ jobs:
         run: |
           sudo apt-get update -q
           sudo apt-get install -y -q --no-install-recommends openssh-server openssh-client
+          # The tests start their own sshd; the system service is not needed.
+          sudo systemctl disable --now ssh.service ssh.socket || true
       - name: Coverage
         run: scripts/coverage.sh
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

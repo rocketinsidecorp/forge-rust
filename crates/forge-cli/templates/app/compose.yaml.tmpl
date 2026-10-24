@@ -2,7 +2,7 @@
 services:
 %%if postgresql%%
   db:
-    image: postgres:18.6-trixie@sha256:5a5a84b19854a9ffaa54082c166ff4ec27473a361e496e5ea167f298f2da9722
+    image: postgres:18.6-trixie@sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336
     environment:
       # Development-only credentials. Never reuse them in a deployment.
       POSTGRES_USER: postgres
@@ -27,7 +27,7 @@ services:
 %%if mysql%%
   db:
     # Pin the image by digest (image@sha256:...) for anything beyond local development.
-    image: mysql:8.4
+    image: mysql:8.4@sha256:0f51e63e537a1f176423fa03ef559aabe6fa4372a53160a44bc7e75da7d15364
     environment:
       # Development-only credentials. Never reuse them in a deployment.
       MYSQL_RANDOM_ROOT_PASSWORD: "yes"
@@ -51,7 +51,7 @@ services:
 %%if mariadb%%
   db:
     # Pin the image by digest (image@sha256:...) for anything beyond local development.
-    image: mariadb:11.8
+    image: mariadb:11.8@sha256:f16d7a344413e519dff518f27bdb221388f84b0d274c97c4fb5f2cb0dc1b34fa
     environment:
       # Development-only credentials. Never reuse them in a deployment.
       MARIADB_RANDOM_ROOT_PASSWORD: "1"

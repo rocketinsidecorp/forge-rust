@@ -213,8 +213,12 @@ does not match either form.
   fuzz target is not declared, seeded and documented, or `fuzz/` stops being
   a standalone workspace; when a `deny.toml` exception is past its
   `expires` date (the libfuzzer-sys NCSA exception must carry one); when a
-  `cargo install` lacks `--version`/`--locked` or is skipped because a binary
-  is on `PATH`; and when the coverage job or `.coverage-floor` goes missing.
+  `cargo install` (any spacing, `cargo +toolchain install`) lacks
+  `--version`/`--locked`, is skipped because a binary is on `PATH`
+  (`||`, `command -v`, `which`, `hash`), or is a `cargo binstall`; when a
+  workspace crate does not take `version.workspace = true` (so the release
+  tag check covers every crate); and when the coverage job or
+  `.coverage-floor` goes missing.
   Each rule is a function with negative tests on hand-written snippets, and
   the rules see through the spellings that once slipped past: flow style
   (`- { uses: ... }`, `permissions: { contents: write }`), anchors and
@@ -223,10 +227,12 @@ does not match either form.
   `SECRETS.X`, `secrets:  inherit`, `join(secrets, ...)`, comments after a
   tab. An `image:` is a container only under `services:` or `container:`; an
   action input under `with:` is not.
-- The generated application's CI (`templates/app/github/workflows/ci.yml.tmpl`)
-  and `Dockerfile.tmpl` follow the same rules: actions pinned by SHA,
-  checkouts without credentials, the PostgreSQL service by digest, and both
-  base images by the digests of `crates/forge-proxy/Dockerfile`.
+- The generated application's CI (`templates/app/github/workflows/ci.yml.tmpl`),
+  `Dockerfile.tmpl` (and `examples/hello-forge/Dockerfile`) and
+  `compose.yaml.tmpl` follow the same rules: actions pinned by SHA,
+  checkouts without credentials, both base images by the digests of
+  `crates/forge-proxy/Dockerfile`, and the PostgreSQL, MySQL and MariaDB
+  images by the same digests as `.github/workflows/ci.yml`.
 - Permissions are read-only by default (`contents: read`, or `{}` in
   `release.yml` and `scorecard.yml`); only the release image job holds
   `packages: write` and `id-token: write`. No workflow that runs on a pull

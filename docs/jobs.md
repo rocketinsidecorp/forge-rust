@@ -360,15 +360,16 @@ Before its first claim, the job runtime (`serve` with embedded workers, and
 stops with an error instead of retrying every poll interval:
 
 ```text
-database role "shop_web" cannot claim jobs: it lacks EXECUTE on forge_jobs_claim, ...; grant it by running `forge migrate` as the migration role with PGOPTIONS='-c forge.runtime_role=shop_web' (or forge.worker_role), or run the workers as the role that has it
+database role "shop_web" cannot claim jobs: it lacks EXECUTE on forge_jobs_claim(text,text[],integer,uuid,bigint), ...; as the migration role run `GRANT EXECUTE ON FUNCTION forge_jobs_claim(text,text[],integer,uuid,bigint), ... TO shop_web;`, or run the workers as the role that has them (...)
 ```
 
-An unmigrated database reports `the job schema is not migrated
-(forge_jobs_claim does not exist); run `forge migrate``. Re-running
-`forge migrate` with the right `PGOPTIONS` re-applies nothing: the grants are
-made when the job schema's migration runs, so for an already migrated
-database grant them by hand (`GRANT EXECUTE ON FUNCTION ... TO shop_web`, the
-list the error names) or revert and re-apply the framework migrations.
+Run the `GRANT` the message names, as the migration role (it lists every
+missing function with its signature), or point the workers at the role that
+holds the grants. Re-running `forge migrate` with other `PGOPTIONS` grants
+nothing on an already migrated database: the grants are made only when the
+job schema's migration first runs. An unmigrated database reports `the job
+schema is not migrated (forge_jobs_claim does not exist); run `forge
+migrate``.
 
 ## Tests
 

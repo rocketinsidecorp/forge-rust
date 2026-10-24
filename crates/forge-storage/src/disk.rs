@@ -500,7 +500,8 @@ impl Dirs {
         }
         let mut body = Vec::with_capacity(usize::try_from(info.size).unwrap_or(0));
         // One byte past the size: a file that grew since `stat` is refused, not truncated.
-        file.take(info.size + 1)
+        (&file)
+            .take(info.size + 1)
             .read_to_end(&mut body)
             .map_err(io_error)?;
         if body.len() as u64 != info.size {
@@ -508,8 +509,12 @@ impl Dirs {
                 "file changed while it was read",
             )));
         }
-        if pending.is_some_and(|digest| hex(&Sha256::digest(&body)) != digest) {
-            info = untrusted(info);
+        if let Some(digest) = pending {
+            if hex(&Sha256::digest(&body)) == digest {
+                self.remember_inode(key, &info, &file);
+            } else {
+                info = untrusted(info);
+            }
         }
         Ok(Blob {
             info,
@@ -533,11 +538,55 @@ impl Dirs {
             }
             hasher.update(&buffer[..read]);
         }
-        Ok(if hex(&hasher.finalize()) == digest {
-            info
-        } else {
-            untrusted(info)
-        })
+        if hex(&hasher.finalize()) != digest {
+            return Ok(untrusted(info));
+        }
+        self.remember_inode(key, &info, &file);
+        Ok(info)
+    }
+
+    /// Rewrites a record whose digest was just verified against `file` with
+    /// that file's inode, so the next read trusts it without hashing again
+    /// (records written before inodes were recorded, restored backups).
+    /// Best effort, and atomic like every metadata write: a temporary record
+    /// renamed over the old one, only while the blob under the key is still
+    /// `file` (a concurrent overwrite wins).
+    fn remember_inode(&self, key: &StorageKey, info: &Info, file: &File) {
+        let (Some(sha256), Ok(stat)) = (info.sha256.clone(), file.metadata()) else {
+            return;
+        };
+        let metadata = Metadata {
+            content_type: info.content_type.clone(),
+            filename: info.filename.clone(),
+            sha256,
+            size: info.size,
+            inode: Some(stat.ino()),
+        };
+        let Ok(encoded) = serde_json::to_vec(&metadata) else {
+            return;
+        };
+        let temp = format!("{}.meta", uuid::Uuid::now_v7().simple());
+        let current = || {
+            let directory = self.parent(&self.blobs, key, false).ok()?;
+            let leaf = statat(&directory, Self::leaf(key), AtFlags::SYMLINK_NOFOLLOW).ok()?;
+            Some(leaf.st_ino == stat.ino())
+        };
+        let stored = self.write_temp(&temp, &encoded).is_ok()
+            && current() == Some(true)
+            && self
+                .parent(&self.meta, key, false)
+                .and_then(|directory| {
+                    renameat(
+                        &self.tmp,
+                        temp.as_str(),
+                        &directory,
+                        Self::meta_leaf(key).as_str(),
+                    )
+                })
+                .is_ok();
+        if !stored {
+            let _ = unlinkat(&self.tmp, temp.as_str(), AtFlags::empty());
+        }
     }
 
     fn delete(&self, key: &StorageKey) -> Result<(), StorageError> {
@@ -578,7 +627,12 @@ impl Dirs {
             };
             let regular = rustix::fs::FileType::from_raw_mode(stat.st_mode)
                 == rustix::fs::FileType::RegularFile;
-            let modified = u64::try_from(stat.st_mtime).unwrap_or(u64::MAX);
+            // A hard-linked backup keeps the old file's mtime, which can be
+            // months old: the UUIDv7 in the name says when the write that
+            // made it began, and the later of the two counts.
+            let modified = u64::try_from(stat.st_mtime)
+                .unwrap_or(u64::MAX)
+                .max(staged_at(name).unwrap_or(0));
             if regular && modified <= cutoff && unlinkat(&self.tmp, name, AtFlags::empty()).is_ok()
             {
                 removed += 1;
@@ -631,6 +685,17 @@ impl Drop for CancelOnDrop {
             self.flag.store(true, Ordering::SeqCst);
         }
     }
+}
+
+/// When the write that created a `tmp/` file began, from the UUIDv7 its name
+/// starts with (`<uuid>`, `<uuid>.meta`, `<uuid>.old`, `<uuid>.oldblob`), in
+/// seconds since the epoch.
+fn staged_at(name: &std::ffi::CStr) -> Option<u64> {
+    let id = uuid::Uuid::try_parse(name.to_str().ok()?.get(..32)?).ok()?;
+    if id.get_version_num() != 7 {
+        return None;
+    }
+    Some(id.get_timestamp()?.to_unix().0)
 }
 
 /// `info` without what only its metadata could tell.
@@ -920,5 +985,95 @@ mod tests {
             storage.inner.stat(&key("x")).expect("stat").content_type,
             OCTET_STREAM
         );
+    }
+
+    #[test]
+    fn a_backup_linked_from_an_old_file_survives_pruning() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = DiskStorage::open(dir.path().join("root")).expect("open");
+        let root = dir.path().join("root");
+        // A blob written a year ago, then linked as the backup of a write that
+        // begins now: the link keeps the year-old mtime.
+        let old = root.join("blobs/old");
+        std::fs::write(&old, b"previous").expect("write");
+        let year_ago = SystemTime::now() - Duration::from_secs(365 * 86_400);
+        std::fs::File::options()
+            .write(true)
+            .open(&old)
+            .and_then(|file| file.set_modified(year_ago))
+            .expect("back-date");
+        let backup = root.join(format!("tmp/{}.oldblob", uuid::Uuid::now_v7().simple()));
+        std::fs::hard_link(&old, &backup).expect("link");
+        // A staged file whose write began two hours ago is stale.
+        let two_hours_ago = uuid::Timestamp::from_unix(
+            uuid::NoContext,
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_secs()
+                - 7_200,
+            0,
+        );
+        let stale = root.join(format!(
+            "tmp/{}.meta",
+            uuid::Uuid::new_v7(two_hours_ago).simple()
+        ));
+        std::fs::write(&stale, b"{}").expect("write");
+        std::fs::File::options()
+            .write(true)
+            .open(&stale)
+            .and_then(|file| file.set_modified(year_ago))
+            .expect("back-date");
+
+        let removed = storage
+            .inner
+            .prune_temp(Duration::from_secs(3_600))
+            .expect("prune");
+        assert_eq!(removed, 1);
+        assert!(
+            backup.exists(),
+            "the backup of a write in progress was pruned"
+        );
+        assert!(!stale.exists());
+    }
+
+    #[test]
+    fn a_verified_record_learns_its_inode_so_later_reads_do_not_hash() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = DiskStorage::open(dir.path().join("root")).expect("open");
+        let (target, body, options) = typed("legacy", b"content", "text/plain");
+        storage.inner.put(&target, &body, &options).expect("put");
+        let record = dir.path().join("root/meta/legacy.json");
+        let raw = std::fs::read_to_string(&record).expect("read");
+        let mut legacy: serde_json::Value = serde_json::from_str(&raw).expect("json");
+        let inode = legacy["inode"].clone();
+        legacy.as_object_mut().expect("object").remove("inode");
+        std::fs::write(&record, legacy.to_string()).expect("write");
+
+        let info = storage.inner.stat(&target).expect("stat");
+        assert_eq!(info.content_type, "text/plain");
+        let rewritten: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&record).expect("read")).expect("json");
+        assert_eq!(rewritten["inode"], inode, "the record names its blob again");
+        assert_eq!(rewritten["sha256"], legacy["sha256"]);
+        assert_eq!(rewritten["content_type"], "text/plain");
+        assert_eq!(file_count(&dir.path().join("root"), "tmp"), 0);
+
+        // A record that fails the digest check is left alone.
+        let mut wrong = legacy.clone();
+        wrong["sha256"] = serde_json::Value::from("00");
+        std::fs::write(&record, wrong.to_string()).expect("write");
+        assert_eq!(
+            storage
+                .inner
+                .open(&target, 100)
+                .expect("open")
+                .info
+                .content_type,
+            OCTET_STREAM
+        );
+        let kept: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&record).expect("read")).expect("json");
+        assert!(kept.get("inode").is_none());
     }
 }

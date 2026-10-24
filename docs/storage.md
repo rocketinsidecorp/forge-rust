@@ -194,7 +194,12 @@ depth, not a substitute.
   Each record names the inode of its blob; a record for another inode (the
   instant between the two renames of an overwrite, or a restored backup) is
   trusted only when the content matches its SHA-256, which reads the blob once
-  more.
+  more; the verified record is then rewritten with the blob's inode, so later
+  reads are cheap again.
+- `prune_temp` ages a temporary file by the later of its modification time and
+  the UUIDv7 its name starts with: an overwrite's backup (a hard link that
+  keeps the old blob's modification time) is never pruned while the write is
+  in progress.
 - Back up `blobs/` and `meta/` together. Disk storage is for one host, or hosts
   sharing a volume with working `rename` and `fsync` (not NFS). The disk adapter
   is Unix only.
