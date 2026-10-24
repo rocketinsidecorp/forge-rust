@@ -77,6 +77,8 @@ struct World {
     mailer: Option<forge::mail::PasswordResetMailer>,
     /// Runs once, inside the next session insert.
     before_session_insert: Mutex<Option<BeforeInsert>>,
+    /// Makes `find_by_principal` answer `Unavailable`.
+    principal_lookup_fails: Mutex<bool>,
 }
 
 /// PostgreSQL's `lower()` under common collations folds `İ` to `i` (no
@@ -142,6 +144,9 @@ impl PasswordCredentialStore for World {
         &self,
         principal: PrincipalId,
     ) -> Result<Option<PasswordCredential>, PasswordCredentialStoreError> {
+        if *lock(&self.principal_lookup_fails) {
+            return Err(PasswordCredentialStoreError::Unavailable);
+        }
         lock(&self.accounts)
             .iter()
             .find(|account| account.principal == principal)
@@ -2207,6 +2212,69 @@ async fn enrollment_routes_do_not_reveal_the_password_of_an_enrolled_account() -
         "auth.mfa.enrollment_started",
         AuditOutcome::Failed
     ));
+    Ok(())
+}
+
+/// A password reset redeemed while a password sign-in is storing its
+/// session revoked every session before that one existed: the sign-in checks
+/// the password version once the session is stored, ends it and refuses the
+/// old password like a wrong one.
+#[tokio::test]
+async fn a_reset_redeemed_during_a_sign_in_ends_its_password_only_session() -> TestResult {
+    let world = Arc::new(World::default());
+    let fixture = fixture_with_mfa(Arc::clone(&world), 10, Some(MFA_KEY), None)?;
+    let ada = fixture.ada;
+    let reset = Arc::clone(&world);
+    *lock(&world.before_session_insert) = Some(Box::pin(async move {
+        // What `redeem` does to the account: a new hash and the version
+        // bumped. Its revocation of every session finds none, because this
+        // runs before the sign-in's session is stored.
+        let Ok(hash) = fake_hash(b"a brand new passphrase") else {
+            return;
+        };
+        for account in lock(&reset.accounts).iter_mut() {
+            if account.principal == ada {
+                account.hash = hash.clone();
+                account.version += 1;
+            }
+        }
+    }));
+    let mut browser = Browser::default();
+    let response = browser
+        .sign_in(&fixture.router, "acme", "ada@example.com", PASSWORD)
+        .await?;
+    assert!(
+        lock(&world.before_session_insert).is_none(),
+        "the reset ran inside the session insert"
+    );
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(text(&response).contains("do not match an account"));
+    assert!(browser.cookie("__Host-forge_session").is_none());
+    assert_eq!(live_sessions(&world, ada), 0);
+    assert!(audited(&world, "auth.sign_in", AuditOutcome::Failed));
+    assert!(!audited(&world, "auth.sign_in", AuditOutcome::Succeeded));
+    Ok(())
+}
+
+/// A password store that cannot answer the check after the session insert
+/// fails the sign-in closed: no cookie, and the stored session ends.
+#[tokio::test]
+async fn a_sign_in_whose_password_cannot_be_rechecked_fails_closed() -> TestResult {
+    let world = Arc::new(World::default());
+    let fixture = fixture_with_mfa(Arc::clone(&world), 10, Some(MFA_KEY), None)?;
+    let ada = fixture.ada;
+    let store = Arc::clone(&world);
+    *lock(&world.before_session_insert) = Some(Box::pin(async move {
+        *lock(&store.principal_lookup_fails) = true;
+    }));
+    let mut browser = Browser::default();
+    let response = browser
+        .sign_in(&fixture.router, "acme", "ada@example.com", PASSWORD)
+        .await?;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(browser.cookie("__Host-forge_session").is_none());
+    assert_eq!(live_sessions(&world, ada), 0);
+    assert!(!audited(&world, "auth.sign_in", AuditOutcome::Succeeded));
     Ok(())
 }
 

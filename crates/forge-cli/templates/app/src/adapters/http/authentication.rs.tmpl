@@ -72,9 +72,9 @@ use forge::audit::{AuditAction, AuditActor, AuditEvent, AuditOutcome, AuditSink}
 use forge::auth::{
     AuthenticatedPrincipal, CanonicalLogin, LoginThrottle, MIN_PASSWORD_CHARS, MfaChallengeBinding,
     MfaChallengeToken, NewPassword, PASSWORD_RESET_LIFETIME_SECS, PasswordCredentialStore,
-    PasswordCredentialVersion, PasswordHasher, PasswordPolicyError, PasswordResetDelivery,
-    PasswordResetNotifier, PasswordResetToken, SessionStore, ThrottleDecision, ThrottleKey,
-    UnixTimestamp,
+    PasswordCredentialStoreError, PasswordCredentialVersion, PasswordHasher, PasswordPolicyError,
+    PasswordResetDelivery, PasswordResetNotifier, PasswordResetToken, SessionStore,
+    ThrottleDecision, ThrottleKey, UnixTimestamp,
 };
 use forge::core::{ErrorCategory, ForgeError};
 use forge::http::{HeaderValue, Method, Request, Response, StatusCode, header};
@@ -597,10 +597,10 @@ async fn create_session(pages: Arc<Pages>, request: Request) -> Response {
                 StatusCode::UNPROCESSABLE_ENTITY,
             );
         }
-        Err(_) => {
+        Err(error) => {
             // Never sent, so unusable; revoked anyway when the store answers.
             let _ = ports.sessions.revoke(issued.session.id(), now).await;
-            return unavailable("authentication_unavailable");
+            return unavailable_because("authentication_unavailable", error);
         }
     }
     record(
@@ -1272,11 +1272,8 @@ async fn password_is_current(
     credentials: &dyn PasswordCredentialStore,
     principal: PrincipalId,
     verified_version: PasswordCredentialVersion,
-) -> Result<bool, ()> {
-    let credential = credentials
-        .find_by_principal(principal)
-        .await
-        .map_err(|_| ())?;
+) -> Result<bool, PasswordCredentialStoreError> {
+    let credential = credentials.find_by_principal(principal).await?;
     Ok(credential.is_some_and(|credential| {
         !credential.disabled() && credential.version() == verified_version
     }))
