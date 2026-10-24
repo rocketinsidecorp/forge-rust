@@ -116,6 +116,7 @@ impl Tls {
         }
         crate::files::private_directory(&settings.cache)
             .map_err(|error| format!("ACME cache: {error}"))?;
+        crate::files::clean_up(server.logger(), &settings.cache);
         // Validates the URL now: fail at start, not at the first deploy.
         acme::Client::with_roots(
             &settings.directory,
@@ -302,8 +303,9 @@ impl Manager {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 let pkcs8 = crate::der::generate_p256()?;
                 let pem = pem_block("PRIVATE KEY", &pkcs8);
-                crate::files::write_atomically(&path, pem.as_bytes())
+                let written = crate::files::write_atomically(&path, pem.as_bytes())
                     .map_err(|error| format!("write {}: {error}", path.display()))?;
+                crate::files::report(self.server.logger(), &path, written);
                 pkcs8
             }
             Err(error) => return Err(format!("read {}: {error}", path.display())),
@@ -376,8 +378,10 @@ impl Manager {
         pem.push_str(chain);
         let loaded = self.certified(host, pem.as_bytes())?;
         let not_after = loaded.not_after;
-        crate::files::write_atomically(&self.settings.cache.join(host), pem.as_bytes())
+        let path = self.settings.cache.join(host);
+        let written = crate::files::write_atomically(&path, pem.as_bytes())
             .map_err(|error| format!("write certificate cache: {error}"))?;
+        crate::files::report(self.server.logger(), &path, written);
         write(&self.certificates).insert(host.to_owned(), loaded);
         Ok(not_after)
     }

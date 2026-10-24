@@ -1044,3 +1044,17 @@ async fn an_existing_control_directory_is_restricted_and_a_link_refused() {
     assert!(error.contains("is not a directory"), "{error}");
     assert_eq!(mode(&run), 0o755);
 }
+
+#[tokio::test]
+async fn a_restarted_proxy_removes_temporary_files_of_interrupted_writes() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let state = dir.path().join("state.json");
+    let leftover = dir.path().join(".state.json.0123456789ab.tmp");
+    std::fs::write(&leftover, b"{").expect("write");
+    let other = dir.path().join("notes.txt");
+    std::fs::write(&other, b"keep").expect("write");
+    let server = Server::new(Logger::discard(), Some(state)).expect("server");
+    assert!(!leftover.exists(), "stale temporary file kept");
+    assert!(other.exists());
+    drop(server);
+}

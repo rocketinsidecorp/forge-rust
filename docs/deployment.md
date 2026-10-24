@@ -855,9 +855,10 @@ volume, so it resumes routing after a restart. It:
   for any other host, or before the certificate exists, fails rather than
   presenting a wrong certificate; a cached or issued certificate is used only
   if its key matches and its subject alternative names cover the host. The
-  cache directory is kept `0700` (an existing one is restricted at start, a
-  symbolic link is refused) with `0600` files written atomically and synced
-  to disk. The cache uses autocert's file layout, so Forge-Go's proxy image
+  cache directory is kept `0700` (an existing one is restricted at start; a
+  symbolic link or a directory of another user is refused) with `0600`
+  files written atomically and synced to disk; temporary files of an
+  interrupted write are removed at start. The cache uses autocert's file layout, so Forge-Go's proxy image
   reuses it and vice versa;
 - is the internet edge: it drops any `Forwarded`, `X-Forwarded-*` and
   `X-Real-IP` headers the client sent, sets `X-Forwarded-For` to the
@@ -879,7 +880,10 @@ volume, so it resumes routing after a restart. It:
   (WebSocket) connection with no data in either direction. The application
   connection and the in-flight count are released with it, so a stalled
   client cannot hold a drain open. WebSocket applications should ping more
-  often than that;
+  often than that. There is no total time limit per connection: like
+  nginx's `send_timeout`, a client that reads or sends a little in every
+  interval keeps its connection, bounded only by the 10,000 connections per
+  listener (no per-address limit);
 - tunnels protocol upgrades (WebSocket) and counts them as in flight, so a
   switch drains them; refuses `CONNECT`;
 - writes JSON access logs (service, host, method, path without query,

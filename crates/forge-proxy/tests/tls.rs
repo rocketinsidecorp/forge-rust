@@ -760,8 +760,12 @@ async fn an_existing_cache_directory_is_restricted_and_a_link_refused() {
     let cache = dir.path().join("acme");
     std::fs::create_dir(&cache).expect("mkdir");
     std::fs::set_permissions(&cache, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    // A key half-written by a process that died before its rename.
+    let leftover = cache.join(".acme_account+key.0123456789ab.tmp");
+    std::fs::write(&leftover, b"half").expect("write");
     Tls::new(server.clone(), settings(cache.clone())).expect("tls");
     assert_eq!(mode(&cache), 0o700);
+    assert!(!leftover.exists(), "stale temporary file kept");
 
     // A link is refused, and its target left as it was.
     let link = dir.path().join("link");

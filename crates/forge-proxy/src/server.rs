@@ -268,6 +268,9 @@ impl Server {
             }),
         };
         if let Some(path) = server.inner.state_path.clone() {
+            if let Some(directory) = path.parent().filter(|dir| !dir.as_os_str().is_empty()) {
+                crate::files::clean_up(&server.inner.logger, directory);
+            }
             server.load_state(&path)?;
         }
         Ok(server)
@@ -380,8 +383,10 @@ impl Server {
         let mut content = serde_json::to_vec_pretty(&state).map_err(|e| e.to_string())?;
         content.push(b'\n');
         let _guard = lock(&self.inner.state_lock);
-        crate::files::write_atomically(path, &content)
-            .map_err(|error| format!("write proxy state: {error}"))
+        let written = crate::files::write_atomically(path, &content)
+            .map_err(|error| format!("write proxy state: {error}"))?;
+        crate::files::report(&self.inner.logger, path, written);
+        Ok(())
     }
 
     pub(crate) fn route(&self, host: &str) -> Option<Arc<Service>> {
