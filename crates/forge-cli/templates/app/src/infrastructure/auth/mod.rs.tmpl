@@ -275,6 +275,19 @@ impl SessionStore for PostgresSessionStore {
 
         let mut transaction = self.pool.begin().await.map_err(map_sqlx_error)?;
 
+        // The account row first, `FOR KEY SHARE` (the lock the replacement's
+        // foreign key takes anyway), then the session row: a factor change
+        // or a password reset locks the account row and then revokes its
+        // sessions, so taking the session row first and the account row
+        // second deadlocked with them (40P01). The replacement inserts no
+        // earlier than such a change commits, and one that starts later
+        // revokes it.
+        sqlx::query("SELECT 1 FROM forge_principals WHERE id = $1 FOR KEY SHARE")
+            .bind(replacement.principal_id().into_uuid())
+            .execute(&mut *transaction)
+            .await
+            .map_err(map_sqlx_error)?;
+
         let updated = sqlx::query(
             "UPDATE forge_sessions
              SET revoked_at = LEAST(

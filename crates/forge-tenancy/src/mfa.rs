@@ -132,6 +132,9 @@ pub struct MfaChallengeRecord {
     pub principal_id: PrincipalId,
     /// The tenant it signed in through.
     pub tenant_id: TenantId,
+    /// The credential version the password step verified (the account's
+    /// current one, since the challenge is live).
+    pub credential_version: PasswordCredentialVersion,
     /// The browser session it belongs to.
     pub binding: MfaChallengeBinding,
     /// The factor the challenge was issued for.
@@ -387,15 +390,54 @@ pub enum SecondFactor {
     BackupCode,
 }
 
-/// A step-up second factor [`MfaService::verify_step_up`] accepted. Pass it
-/// to the change it authorizes: a backup code is used up only by that
-/// change, in the transaction that applies it.
+/// A step-up second factor [`MfaService::verify_step_up`] accepted for one
+/// account. Only `verify_step_up` creates one, and the changes of an
+/// existing factor ([`MfaChangeRequest::Rotation`], [`MfaService::disable`],
+/// [`MfaService::regenerate_backup_codes`]) require one: a change refuses a
+/// proof of another account ([`MfaError::StepUpInvalid`]). A backup code is
+/// used up only by the change, in the transaction that applies it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StepUpProof {
+    principal: PrincipalId,
     backup_code: Option<MfaBackupCodeDigest>,
 }
 
+/// A change of the second factor, with the step-up proof a change of an
+/// existing factor requires.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MfaChangeRequest<'a> {
+    /// The first factor of an account that has none: the password is the
+    /// step-up, checked by the caller.
+    Enrollment,
+    /// A replacement of the active factor, authorized by a current code.
+    Rotation(&'a StepUpProof),
+}
+
+impl MfaChangeRequest<'_> {
+    /// The kind of change.
+    #[must_use]
+    pub const fn change(&self) -> MfaChange {
+        match self {
+            Self::Enrollment => MfaChange::Enrollment,
+            Self::Rotation(_) => MfaChange::Rotation,
+        }
+    }
+
+    const fn proof(&self) -> Option<&StepUpProof> {
+        match self {
+            Self::Enrollment => None,
+            Self::Rotation(proof) => Some(proof),
+        }
+    }
+}
+
 impl StepUpProof {
+    /// The account the proof was given for.
+    #[must_use]
+    pub const fn principal(&self) -> PrincipalId {
+        self.principal
+    }
+
     /// Which factor was given.
     #[must_use]
     pub const fn factor(&self) -> SecondFactor {
@@ -407,6 +449,14 @@ impl StepUpProof {
 
     fn backup_code(proof: Option<&Self>) -> Option<&MfaBackupCodeDigest> {
         proof.and_then(|proof| proof.backup_code.as_ref())
+    }
+
+    /// Refuses a proof given for another account.
+    fn bound_to(proof: Option<&Self>, principal: PrincipalId) -> Result<(), MfaError> {
+        match proof {
+            Some(proof) if proof.principal != principal => Err(MfaError::StepUpInvalid),
+            _ => Ok(()),
+        }
     }
 }
 
@@ -430,13 +480,19 @@ pub struct IssuedMfaChallenge {
     pub expires_at: UnixTimestamp,
 }
 
-/// A completed second factor: create the session now.
+/// A completed second factor: create the session now, then check
+/// [`MfaService::sign_in_is_current`] (and the credential version) so a factor
+/// change that committed in between ends it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MfaSignIn {
     /// The signed-in account.
     pub principal_id: PrincipalId,
     /// The tenant it signed in through.
     pub tenant_id: TenantId,
+    /// The credential version the password step verified.
+    pub credential_version: PasswordCredentialVersion,
+    /// The factor the second step was completed with.
+    pub factor_digest: TotpSecretDigest,
     /// The expiry the password step chose for the session.
     pub session_expires_at: UnixTimestamp,
     /// The factor that completed it.
@@ -507,18 +563,19 @@ impl MfaService {
 
     /// Starts an enrollment or a rotation: a new seed, pending for
     /// [`MFA_ENROLLMENT_LIFETIME_SECS`]. Call only after step-up
-    /// authentication of the signed-in account; `step_up` is its proof (a
-    /// backup code is used up only when the seed is stored).
+    /// authentication of the signed-in account; a rotation carries the
+    /// proof, whose backup code is used up only when the seed is stored.
     pub async fn begin(
         &self,
         principal: PrincipalId,
-        change: MfaChange,
+        request: MfaChangeRequest<'_>,
         issuer: &str,
         account: &str,
-        step_up: Option<&StepUpProof>,
         now: UnixTimestamp,
     ) -> Result<TotpEnrollment, MfaError> {
         let cipher = self.cipher()?;
+        let (change, step_up) = (request.change(), request.proof());
+        StepUpProof::bound_to(step_up, principal)?;
         let secret = TotpSecret::generate()?;
         let provisioning_uri = secret.provisioning_uri(issuer, account)?;
         let sealed = secret.seal(cipher)?;
@@ -582,12 +639,13 @@ impl MfaService {
     pub async fn confirm(
         &self,
         principal: PrincipalId,
-        change: MfaChange,
+        request: MfaChangeRequest<'_>,
         code: &str,
-        step_up: Option<&StepUpProof>,
         now: UnixTimestamp,
     ) -> Result<Vec<MfaBackupCode>, MfaError> {
         let cipher = self.cipher()?;
+        let (change, step_up) = (request.change(), request.proof());
+        StepUpProof::bound_to(step_up, principal)?;
         let pending = self
             .store
             .pending(principal, change, now)
@@ -667,10 +725,12 @@ impl MfaService {
     pub async fn disable(
         &self,
         principal: PrincipalId,
-        step_up: Option<&StepUpProof>,
+        step_up: &StepUpProof,
         now: UnixTimestamp,
     ) -> Result<(), MfaError> {
         self.cipher()?;
+        let step_up = Some(step_up);
+        StepUpProof::bound_to(step_up, principal)?;
         if self
             .store
             .disable(principal, StepUpProof::backup_code(step_up), now)
@@ -693,10 +753,12 @@ impl MfaService {
     pub async fn regenerate_backup_codes(
         &self,
         principal: PrincipalId,
-        step_up: Option<&StepUpProof>,
+        step_up: &StepUpProof,
         now: UnixTimestamp,
     ) -> Result<Vec<MfaBackupCode>, MfaError> {
         self.cipher()?;
+        let step_up = Some(step_up);
+        StepUpProof::bound_to(step_up, principal)?;
         let (codes, digests) = MfaBackupCode::generate_set(MFA_BACKUP_CODE_COUNT)?;
         if self
             .store
@@ -735,6 +797,7 @@ impl MfaService {
         if let Some(backup) = MfaBackupCode::parse(code) {
             return if self.store.has_backup_code(principal, &backup).await? {
                 Ok(StepUpProof {
+                    principal,
                     backup_code: Some(backup),
                 })
             } else {
@@ -742,7 +805,24 @@ impl MfaService {
             };
         }
         self.verify_totp(principal, code, now).await?;
-        Ok(StepUpProof { backup_code: None })
+        Ok(StepUpProof {
+            principal,
+            backup_code: None,
+        })
+    }
+
+    /// Whether the factor a completed second step used is still the
+    /// account's active factor. Call it once the session is stored: a factor
+    /// change that committed between the challenge and the session insert
+    /// revoked every session before this one existed (on PostgreSQL the
+    /// insert waits for the account row a factor change locks, so the change
+    /// is visible here), and the session must then end.
+    pub async fn sign_in_is_current(&self, sign_in: &MfaSignIn) -> Result<bool, MfaError> {
+        Ok(self
+            .store
+            .active(sign_in.principal_id)
+            .await?
+            .is_some_and(|active| *active.sealed.digest() == sign_in.factor_digest))
     }
 
     /// Checks and uses up a second factor of a signed-in account: a TOTP
@@ -896,6 +976,8 @@ impl MfaService {
         Ok(MfaSignIn {
             principal_id: record.principal_id,
             tenant_id: record.tenant_id,
+            credential_version: record.credential_version,
+            factor_digest: *record.factor.sealed.digest(),
             session_expires_at: record.session_expires_at,
             factor,
         })

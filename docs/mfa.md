@@ -54,7 +54,10 @@ current code is used up at once; a backup code is only checked then, and is
 used up by the change itself, in the transaction that applies it. A change
 that fails (a wrong code of the new key, a rotation that expired, an account
 changed meanwhile) therefore keeps the backup code, and a backup code used
-elsewhere in the meantime refuses the change with the step-up message. `POST /mfa` and `POST /mfa/confirm` need
+elsewhere in the meantime refuses the change with the step-up message. The
+counters are cleared only once a change succeeds (as in Forge-Go): wrong
+codes of a new key keep counting. A backup code a change used up is audited
+as `auth.mfa.backup_code_used`. `POST /mfa` and `POST /mfa/confirm` need
 no code, so for an account that already has a factor they answer the same
 way whatever the password (`303` back to `/mfa`, "changed meanwhile"): the
 account is refused before the password is checked, so these routes cannot
@@ -90,6 +93,11 @@ its session signs out every session before that one exists. The sign-in
 therefore checks for a factor again once its session is stored (on
 PostgreSQL, the insert waits for the account row the change locks), ends
 that session and asks for the code instead.
+
+A factor change or a password reset that commits after the code step
+accepted a code but before its session is stored ends that session too: the
+session is checked against the factor and the password once it is stored,
+and the browser is sent back to sign in.
 
 A challenge stops working when it expires, when the account signs in again,
 changes its password, is disabled, loses its membership of the tenant, or
@@ -134,7 +142,7 @@ deadlocking. Custom `MfaStore` implementations should keep that order.
 ```rust
 use std::sync::Arc;
 use forge::auth::{Aes256GcmSecretCipher, MemoryLoginThrottle, TotpSecret};
-use forge::tenancy::{MfaChange, MfaService, mfa_throttle_config};
+use forge::tenancy::{MfaChangeRequest, MfaService, mfa_throttle_config};
 
 let cipher = Aes256GcmSecretCipher::from_base64url(&key)?;
 let mfa = MfaService::new(
@@ -142,20 +150,27 @@ let mfa = MfaService::new(
     Some(Arc::new(cipher)),
     Arc::new(MemoryLoginThrottle::new(mfa_throttle_config())?),
 );
-let enrollment = mfa.begin(principal, MfaChange::Enrollment, "shop", "ada@example.com", None, now).await?;
-let backup_codes = mfa.confirm(principal, MfaChange::Enrollment, "123456", None, now).await?;
+let enrollment = mfa.begin(principal, MfaChangeRequest::Enrollment, "shop", "ada@example.com", now).await?;
+let backup_codes = mfa.confirm(principal, MfaChangeRequest::Enrollment, "123456", now).await?;
 
-// A change of an existing factor, after the password and a current code:
+// A change of an existing factor needs the proof of a current code:
 let proof = mfa.verify_step_up(principal, current_code, now).await?;
-mfa.disable(principal, Some(&proof), now).await?; // a backup code is used up here, with the change
+mfa.disable(principal, &proof, now).await?; // a backup code is used up here, with the change
 ```
 
-`verify_step_up` uses a TOTP code up at once but only checks a backup code;
-pass its proof to `begin`, `confirm`, `disable` or `regenerate_backup_codes`,
-which use the backup code up in the same transaction as the change, or
-refuse with `MfaError::StepUpInvalid` (changing nothing) when it was used
-meanwhile. `verify_second_factor` checks and uses a code up at once, for a
-step-up that does not change the factor.
+`verify_step_up` uses a TOTP code up at once but only checks a backup code,
+and returns a `StepUpProof` bound to that account. The changes of an
+existing factor require one: `MfaChangeRequest::Rotation(&proof)` for
+`begin` and `confirm`, `&proof` for `disable` and `regenerate_backup_codes`.
+They use the backup code up in the same transaction as the change, and
+refuse with `MfaError::StepUpInvalid` (changing nothing) a proof of another
+account or a code used meanwhile. `verify_second_factor` checks and uses a
+code up at once, for a step-up that does not change the factor.
+
+After `complete` accepts a code, store the session and then check
+`MfaService::sign_in_is_current` and the credential version
+(`MfaSignIn::credential_version`), revoking the session when either changed:
+the generated `issue_second_factor_session` does this.
 
 `forge::tenancy::testing::MemoryMfaStore` (feature `testing`) is the store's
 contract in memory, for tests. `forge::auth::TotpSecret::from_base32(key)?.code_at(now)`
@@ -164,6 +179,50 @@ computes the code an authenticator app shows, for end-to-end tests.
 To rotate `FORGE_AUTH_MFA_KEY`, implement `forge::auth::SecretCipher` with a
 key ring (decrypt with old keys, encrypt with the new one) and re-encrypt
 seeds in a job; the built-in cipher, like Forge-Go's, has one key.
+
+## Upgrading an existing application
+
+Release note (forge-rust#36, #10): the MFA contracts changed, and
+applications generated before must port four generated files.
+
+- `forge::tenancy::MfaService`: `begin` and `confirm` take an
+  `MfaChangeRequest` (`Enrollment`, or `Rotation(&StepUpProof)`) instead of
+  `MfaChange`; `disable` and `regenerate_backup_codes` take a `&StepUpProof`;
+  `pending` takes the `MfaChange`; `verify_step_up` is new (use it instead of
+  `verify_second_factor` before a change), and so are
+  `MfaError::StepUpInvalid`, `sign_in_is_current`,
+  `MfaSignIn::{credential_version, factor_digest}` and
+  `MfaChallengeRecord::credential_version`.
+- `forge::tenancy::MfaStore`: `begin`, `activate`, `disable` and
+  `replace_backup_codes` take `step_up: Option<&MfaBackupCodeDigest>` (use
+  the code up in the same transaction; `false` when it is not unused);
+  `pending` takes the `MfaChange` (a rotation's seed exactly when the account
+  has a factor, read in one statement); `has_backup_code` is new; `challenge`
+  fills `credential_version`. Every MFA transaction must lock the account row
+  first (see Storage).
+- `forge::auth::PasswordResetNotifier::can_deliver` is new (default `true`).
+- Generated files to port: `src/infrastructure/accounts/mod.rs` (the store,
+  the lock order, the reset redemption that locks the account row first),
+  `src/infrastructure/auth/mod.rs` (session rotation locks the account row
+  first), `src/adapters/http/authentication.rs` (the step-up proofs, the
+  throttle cleared after a successful change, `issue_second_factor_session`,
+  no reset queued without a mailer) and `src/bootstrap/mod.rs` (the reset
+  throttle). Generate a fresh application with the same options and compare:
+
+```bash
+(cd /tmp && forge new shop-new -d postgresql --skip-docker --skip-ci)
+for file in src/infrastructure/accounts/mod.rs src/infrastructure/auth/mod.rs \
+            src/adapters/http/authentication.rs src/bootstrap/mod.rs; do
+  diff -u "$file" "/tmp/shop-new/$file"
+done
+```
+
+  No migration changes.
+- Reset links: requests and submissions now use Forge-Go's recovery limits
+  (`forge::auth::password_reset_throttle_config`), per hour: 3 per login (or
+  link) and source, 10 per login (or link), 30 per source. Three rejected new
+  passwords on one link from one address lock that link for an hour (a new
+  link can be requested); without a mailer a reset request queues nothing.
 
 ## Not included
 

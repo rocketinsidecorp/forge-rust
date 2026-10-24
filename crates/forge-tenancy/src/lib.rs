@@ -31,9 +31,9 @@ pub use accounts::{
 pub use mfa::testing;
 pub use mfa::{
     ActiveTotp, IssuedMfaChallenge, MFA_CHALLENGE_LIFETIME_SECS, MFA_ENROLLMENT_LIFETIME_SECS,
-    MfaChallengeGrant, MfaChallengeRecord, MfaChange, MfaError, MfaRejection, MfaService,
-    MfaSignIn, MfaStatus, MfaStore, PendingTotp, SecondFactor, StepUpProof, TotpEnrollment,
-    mfa_throttle_config,
+    MfaChallengeGrant, MfaChallengeRecord, MfaChange, MfaChangeRequest, MfaError, MfaRejection,
+    MfaService, MfaSignIn, MfaStatus, MfaStore, PendingTotp, SecondFactor, StepUpProof,
+    TotpEnrollment, mfa_throttle_config,
 };
 
 /// Marker type for a tenant identity.

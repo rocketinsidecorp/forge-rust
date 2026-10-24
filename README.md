@@ -81,6 +81,12 @@ application gets the same files with `forge generate authentication`
 ([ADR 0026](docs/adr/0026-authentication-pages-and-setup.md),
 [docs/cli.md](docs/cli.md#forge-generate-authentication)).
 
+Release note: the MFA store and service contracts changed (step-up proofs
+are required and bound to the account, backup codes are used up with the
+change), reset links now allow 3 submissions per link and address per hour,
+and generated applications should port four files; see
+[upgrading](docs/mfa.md#upgrading-an-existing-application).
+
 ### From `forge new` to a working CRUD resource
 
 1. Generate the resource (the migration, entity, use cases, repository,

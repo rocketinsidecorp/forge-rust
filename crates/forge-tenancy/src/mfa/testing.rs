@@ -383,6 +383,7 @@ impl MfaStore for MemoryMfaStore {
         Ok(Some(MfaChallengeRecord {
             principal_id: grant.principal_id,
             tenant_id: grant.tenant_id,
+            credential_version: grant.credential_version,
             binding: grant.binding,
             factor: factor.active.clone(),
             expires_at: grant.expires_at,

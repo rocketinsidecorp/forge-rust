@@ -2043,9 +2043,19 @@ async fn confirming_a_new_authenticator_needs_the_password_and_a_current_code() 
         assert!(!body.contains(&new_key), "{body}");
     }
     // After step-up, a wrong new code shows the pending key again, and the
-    // backup code given as the current code is not used up by the failed
-    // confirmation: it confirms the rotation next.
-    for _ in 0..2 {
+    // backup code given as the current code is not used up (nor audited as
+    // used) by the failed confirmation: it confirms the rotation next. (Each
+    // of these attempts counts on the step-up throttle until a change
+    // succeeds: five in all.)
+    let used = || {
+        audit_count(
+            &fixture.world,
+            "auth.mfa.backup_code_used",
+            AuditOutcome::Succeeded,
+        )
+    };
+    let used_before = used();
+    {
         let retry = browser
             .post(
                 &fixture.router,
@@ -2078,6 +2088,11 @@ async fn confirming_a_new_authenticator_needs_the_password_and_a_current_code() 
         "auth.mfa.rotated",
         AuditOutcome::Succeeded
     ));
+    assert_eq!(
+        used(),
+        used_before + 1,
+        "the step-up backup code is audited once, when the change uses it"
+    );
     assert_eq!(live_sessions(&fixture.world, fixture.ada), 0);
     Ok(())
 }
@@ -2219,13 +2234,13 @@ async fn a_factor_installed_during_a_sign_in_ends_its_password_only_session() ->
         else {
             return;
         };
-        let change = forge::tenancy::MfaChange::Enrollment;
+        let change = forge::tenancy::MfaChangeRequest::Enrollment;
         if let Ok(enrollment) = other
-            .begin(ada, change, "app", "ada@example.com", None, now)
+            .begin(ada, change, "app", "ada@example.com", now)
             .await
         {
             let code = enrollment.secret.code_at(now);
-            let _ = other.confirm(ada, change, &code, None, now).await;
+            let _ = other.confirm(ada, change, &code, now).await;
         }
     }));
     let mut browser = Browser::default();
