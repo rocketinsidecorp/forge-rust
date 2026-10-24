@@ -20,6 +20,9 @@ use super::yaml::{self, Node, Tag, Value};
 pub(crate) const DEFAULT_CONFIG_PATH: &str = "config/deploy.yml";
 
 pub(crate) const DEFAULT_RETAIN: i64 = 5;
+/// `retain` counts the running version, so 1 would prune the previous one
+/// after every deploy and leave nothing to roll back to.
+pub(crate) const MIN_RETAIN: i64 = 2;
 pub(crate) const DEFAULT_APP_PORT: i64 = 8080;
 pub(crate) const DEFAULT_PARALLELISM: i64 = 4;
 pub(crate) const DEFAULT_HOOKS_DIR: &str = ".forge/hooks";
@@ -800,8 +803,8 @@ impl Config {
         if self.retain == 0 {
             self.retain = DEFAULT_RETAIN;
         }
-        if !(1..=100).contains(&self.retain) {
-            add("retain must be between 1 and 100".to_owned());
+        if !(MIN_RETAIN..=100).contains(&self.retain) {
+            add("retain must be between 2 and 100 (1 would remove the previous version, so rollback would be impossible)".to_owned());
         }
         duration_default(
             &mut self.stop_timeout,

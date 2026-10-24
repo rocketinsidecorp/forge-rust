@@ -659,7 +659,7 @@ accessories:
     volumes: ["shop-postgres:/var/lib/postgresql"]
     env: {secret: [POSTGRES_PASSWORD]}
 builder: {context: ., dockerfile: Dockerfile, platform: linux/amd64, args: {RUST_VERSION: "1.98.1"}}
-retain: 5                                    # stopped versions kept for rollback
+retain: 5                                    # versions kept per role (2 to 100; the running one counts)
 stop_timeout: 35s                            # > FORGE_SHUTDOWN_GRACE_SECS
 boot_timeout: 60s                            # readiness wait for non-proxied roles
 hooks: .forge/hooks
@@ -670,9 +670,12 @@ ssh: {user: deploy, port: 22, proxy_jump: bastion.example.com}
 Decoding is strict: unknown or duplicate keys, a second YAML document,
 durations that are not strings (`30s`), a tag in `image`, a password in
 `registry.password`, host names starting with `-` or containing shell
-characters, and more than one proxied role are errors. `servers.web` is
-proxied by default; set `proxy: true` or `false` on a role to change that. An
-accessory `port` of `5432` or `6543:5432` binds `127.0.0.1`; write
+characters, `retain` below 2, and more than one proxied role are errors.
+`retain` counts the running version, so `retain: 1` would prune the previous
+version after every deploy and leave nothing to roll back to; it is refused
+(the default is 5). `servers.web` is proxied by default; set `proxy: true`
+or `false` on a role to change that. An accessory `port` of `5432` or
+`6543:5432` binds `127.0.0.1`; write
 `IP:HOST_PORT:CONTAINER_PORT` to choose another address deliberately.
 Defaults are Forge-Go's, including `app_port: 8080`; `forge deploy init`
 writes `app_port: 3000` because Forge-Rust applications listen there.
@@ -746,9 +749,9 @@ forge app shell --image busybox:1.37                  # distroless images have n
 | `forge deploy rollback VERSION [--json]` | Restart the retained containers of VERSION on every host through the same health-gated switch. Migrations are not reverted. |
 | `forge deploy prune [--json]` | Remove stopped containers beyond `retain` per role, and images no remaining container uses. Never touches running containers. |
 | `forge deploy details [--json]` | Containers and versions per host and role, proxy routing and maintenance, lock holder, last deploys. |
-| `forge deploy lock status\|acquire\|release [--message M] [--force]` | Inspect or hold the lock. `release` refuses a lock held by someone else without `--force`. |
+| `forge deploy lock status\|acquire\|release [--message M] [--force]` | Inspect or hold the lock (for maintenance windows). `release` removes only a lock this performer holds, and only while its record is unchanged; it refuses one held by someone else (or without a record) unless `--force`. |
 | `forge deploy maintenance on\|off` | Serve forge-proxy's static 503 page instead of the application. |
-| `forge logs [-f] [--role R] [--host H] [--since 1h] [--grep REGEX] [--lines N]` | Stream `docker logs` of the current role container from every matching host, each line prefixed `host\|`. `--grep` (RE2 syntax) filters locally. Ctrl-C stops the remote `docker logs` processes too. |
+| `forge logs [-f] [--role R] [--host H] [--since 1h] [--grep REGEX] [--lines N]` | Stream `docker logs` of the current role container from every matching host, each line prefixed `host\|`. `--grep` (RE2 syntax) filters locally. Ctrl-C stops the remote `docker logs` processes too. Without `-f` at most `parallelism` hosts are read at once; `-f` keeps one stream (an SSH session) open per selected host, since a followed stream never ends. |
 | `forge app exec [--role R] [--host H] [--interactive] [--reuse] CMD...` | Run CMD on one host: by default in a one-off container of the image the role runs, with its env file (CMD goes to the image entrypoint); `--reuse` runs inside the running container. |
 | `forge app shell [--image IMAGE]` | Interactive shell over `ssh -t`; `--image busybox:1.37` starts a sidecar sharing the container's network and process namespaces, without the application's environment. |
 
@@ -764,7 +767,39 @@ with `ok`, `error` and `exit_code`.
 
 1. Take the lock on every host (`mkdir ~/.forge/SERVICE/lock`, atomic; the
    holder, time and message are recorded). It is released at the end, also on
-   failure.
+   failure, but only if its record is still the deploy's own: a lock somebody
+   else took after a `--force` release is left in place with a warning (or a
+   note that it was already released). The record is written to a temporary
+   file (created with `set -C`, so a leftover name is never truncated) and
+   claimed with `ln`, which fails if the lock already has one, so a record is
+   never seen half written. Only a successful `ln` wins: the hard link is
+   created atomically by `link(2)`, which fails with `EEXIST` when
+   `lock/info` exists, and `info` is removed only by a release whose record
+   matches or by `--force`. A lock directory without a record file (the
+   process was killed between the `mkdir` and the claim) older than a minute
+   (`find -mmin +1`, so up to about two minutes)
+   is taken over in place by the next deploy or `lock acquire` without
+   `--force`, with a warning printed after the claim has succeeded; nothing
+   is removed, so two deploys cannot both win it (a test forces the
+   interleaving: a second acquire completes between the first one's
+   staleness check and its claim). A younger one reports holder `unknown`,
+   and so does a lock with an empty record file (left by earlier versions);
+   `lock release --force` clears either at once. The release compares the
+   record and then removes the directory as separate shell steps, so it is
+   race-aware, not transactional: removing a foreign lock takes a force
+   release and a new acquire inside the same few milliseconds. The scripts
+   are Forge-Go's, byte for byte (the golden plans are shared).
+
+   The lock needs `~/.forge` on every host to be on a file system that
+   supports hard links (any local Linux file system does). Without them `ln`
+   fails and every acquire reports the lock as held, which fails closed:
+   nothing deploys. The remote acquire script writes `ln`'s own error to
+   its stderr, but `forge deploy` reports only the held lock (holder
+   `unknown`), so check the file system when a lock without a holder never
+   clears; an empty lock directory may be left behind (clear it with `lock
+   release --force`). On NFS, `link(2)` is atomic on a correctly configured
+   server, but client caching can delay what other hosts see; keep
+   `~/.forge` on local disk.
 2. Run `pre-build`, build and push the image (unless `--skip-build`), run
    `pre-deploy`.
 3. On all hosts in parallel (at most `parallelism`): registry login, `docker

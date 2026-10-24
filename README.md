@@ -302,7 +302,13 @@ forge deploy setup                   # docker check, network, forge-proxy (80/44
 forge deploy                         # build, push, migrate, switch; exit 4 = reverted everywhere
 forge logs -f
 forge deploy rollback <previous version>
+forge deploy lock release            # removes only your own lock; --force for anyone's
 ```
+
+Release note: `retain: 1` in `config/deploy.yml` is now refused (`retain`
+counts the running version, so 1 would prune the previous one and leave
+nothing to roll back to); use 2 to 100, default 5. The deploy lock also needs
+`~/.forge` on the hosts to be on a file system with hard links.
 
 ### Client addresses behind a proxy
 
