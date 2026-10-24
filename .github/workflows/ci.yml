@@ -142,9 +142,87 @@ jobs:
       - name: Scaffold PostgreSQL, SQLite and MySQL applications and run their gates
         run: cargo test -p forge-cli --test scaffold --locked -- --ignored
 
+  database:
+    # The #[ignore]d tests, which need database servers: PostgreSQL 18 and
+    # 16, MySQL 8.4 and MariaDB 11.8, through the FORGE_TEST_*_URL variables
+    # the crates read. scripts/test-databases.sh is the set; the
+    # generated-application suite stays in the scaffold job. One build, run
+    # once per PostgreSQL major version.
+    name: database (PostgreSQL 18 and 16, MySQL, MariaDB)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    services:
+      postgres:
+        image: postgres:18.6-trixie@sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336
+        env:
+          POSTGRES_PASSWORD: forge
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+      postgres16:
+        image: postgres:16.14-trixie@sha256:95206741a5b214807675e14165369d05b93a9cf692223b616d07cca227e74b0b
+        env:
+          POSTGRES_PASSWORD: forge
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+      mysql:
+        image: mysql:8.4@sha256:0f51e63e537a1f176423fa03ef559aabe6fa4372a53160a44bc7e75da7d15364
+        env:
+          MYSQL_ROOT_PASSWORD: forge
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -uroot -pforge"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
+      mariadb:
+        image: mariadb:11.8@sha256:f16d7a344413e519dff518f27bdb221388f84b0d274c97c4fb5f2cb0dc1b34fa
+        env:
+          MARIADB_ROOT_PASSWORD: forge
+        ports:
+          - 3307:3306
+        options: >-
+          --health-cmd "healthcheck.sh --connect --innodb_initialized"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
+    env:
+      FORGE_TEST_DATABASE_URL: postgres://postgres:forge@127.0.0.1:5432/postgres
+      FORGE_TEST_MYSQL_URL: mysql://root:forge@127.0.0.1:3306/mysql
+      FORGE_TEST_MARIADB_URL: mariadb://root:forge@127.0.0.1:3307/mysql
+      FORGE_TEST_REQUIRE_SSHD: "true"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install toolchain from rust-toolchain.toml
+        run: cargo --version
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: OpenSSH server for the deploy SSH tests
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends openssh-server openssh-client
+      - name: Every test, the database ones included (PostgreSQL 18)
+        run: scripts/test-databases.sh
+      - name: Every test, the database ones included (PostgreSQL 16)
+        env:
+          FORGE_TEST_DATABASE_URL: postgres://postgres:forge@127.0.0.1:5433/postgres
+        run: scripts/test-databases.sh
+
   coverage:
-    # Line coverage of the framework crates with cargo-llvm-cov, run as the
-    # test job runs them (PostgreSQL, real sshd). scripts/coverage.sh writes
+    # Line coverage of the framework crates with cargo-llvm-cov over the
+    # database job's test set (PostgreSQL 18, MySQL, MariaDB, real sshd).
+    # scripts/coverage.sh writes
     # the total and a per-crate table to the step summary and fails below
     # .coverage-floor, which only ever rises toward 95 (docs/test-strategy.md,
     # "Coverage").
@@ -163,8 +241,32 @@ jobs:
           --health-interval 2s
           --health-timeout 5s
           --health-retries 30
+      mysql:
+        image: mysql:8.4@sha256:0f51e63e537a1f176423fa03ef559aabe6fa4372a53160a44bc7e75da7d15364
+        env:
+          MYSQL_ROOT_PASSWORD: forge
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -uroot -pforge"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
+      mariadb:
+        image: mariadb:11.8@sha256:f16d7a344413e519dff518f27bdb221388f84b0d274c97c4fb5f2cb0dc1b34fa
+        env:
+          MARIADB_ROOT_PASSWORD: forge
+        ports:
+          - 3307:3306
+        options: >-
+          --health-cmd "healthcheck.sh --connect --innodb_initialized"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
     env:
       FORGE_TEST_DATABASE_URL: postgres://postgres:forge@127.0.0.1:5432/postgres
+      FORGE_TEST_MYSQL_URL: mysql://root:forge@127.0.0.1:3306/mysql
+      FORGE_TEST_MARIADB_URL: mariadb://root:forge@127.0.0.1:3307/mysql
       FORGE_TEST_REQUIRE_SSHD: "true"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

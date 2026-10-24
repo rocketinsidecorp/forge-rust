@@ -13,7 +13,7 @@ the same cosign signing.
 | --- | --- | --- |
 | Pull request, push to `main` | `ci.yml` job `fuzz` | Every fuzz target, discovered automatically, 10 s each after replaying its seeds. |
 | Pull request, push to `main` | `ci.yml` job `sbom` | CycloneDX and SPDX SBOMs of the `forge` and `forge-proxy` binaries and of `Cargo.lock` (artifact `sbom`). |
-| Pull request, push to `main` | `ci.yml` jobs `test`, `clippy`, `fmt`, `e2e`, `scaffold` | Includes `crates/forge/tests/supply_chain.rs`, the pin and permission gate. |
+| Pull request, push to `main` | `ci.yml` jobs `test`, `clippy`, `fmt`, `e2e`, `scaffold`, `database`, `coverage` | Includes `crates/forge/tests/supply_chain.rs`, the pin and permission gate; `database` runs the ignored database tests, `coverage` gates line coverage (docs/test-strategy.md). |
 | Pull request, push to `main`, daily 06:17 UTC | `supply-chain.yml` | Locked graph, `cargo deny` (advisories; bans, licenses, sources) for the workspace and for `fuzz/`. |
 | Nightly 03:17 UTC, or by hand | `fuzz.yml` | Each fuzz target on its own runner for 10 minutes (input `fuzztime`), with its corpus cached between nights. |
 | Weekly, Monday 04:41 UTC, or by hand | `scorecard.yml` | OpenSSF Scorecard; results stay in the run (artifact `scorecard`, summary). |
@@ -22,8 +22,9 @@ the same cosign signing.
 
 Nothing publishes outside a tag push: no pull request, branch, schedule or
 manual run can reach `release.yml`, and it refuses a tag that is not a
-version (`v1.2.3`, `v1.2.3-rc.1`) or that points at a commit outside the
-default branch.
+version (`v1.2.3`, `v1.2.3-rc.1`), that differs from the workspace version
+(`v` + `version` of `[workspace.package]` in `Cargo.toml`), or that points at
+a commit outside the default branch.
 
 ## Fuzzing
 
@@ -190,8 +191,15 @@ does not match either form.
 - New pins use releases at least a week old, so a compromised release has
   time to be noticed and withdrawn before Forge runs it. The same holds for
   the tool versions installed with `cargo install --locked`
-  (`cargo-fuzz 0.13.2`, `cargo-auditable 0.7.7`) and the nightly date in
-  `scripts/fuzz.sh`.
+  (`cargo-fuzz 0.13.2`, `cargo-auditable 0.7.7`, `cargo-llvm-cov 0.9.1`) and
+  the nightly date in `scripts/fuzz.sh`.
+- CI installs those tools through the local action
+  `.github/actions/cargo-tool` (`tool:` and an exact `version:`), which
+  installs into a directory named after the version, caches it under a key
+  that holds the version and puts it first on `PATH`: bumping a version
+  always installs it, where the former `command -v tool || cargo install`
+  kept whatever rust-cache restored. The release job installs without a
+  cache.
 - `crates/forge/tests/supply_chain.rs` fails `cargo test --workspace` when an
   action is not pinned by SHA with a version comment, a workflow container or
   service image or a Dockerfile base image is not pinned by digest, copies of
@@ -200,9 +208,25 @@ does not match either form.
   top-level `permissions:`, uses `pull_request_target`, asks for write access
   to the contents, reads a secret other than the release job's token, or holds
   `packages: write` or `id-token: write` outside `release.yml`; when the
-  release workflow gains a trigger other than `v*` tags or loses its tag
-  guard, signing or provenance; and when a fuzz target is not declared,
-  seeded and documented, or `fuzz/` stops being a standalone workspace.
+  release workflow gains a trigger other than `v*` tags or loses its tag,
+  workspace-version or default-branch guard, signing or provenance; when a
+  fuzz target is not declared, seeded and documented, or `fuzz/` stops being
+  a standalone workspace; when a `deny.toml` exception is past its
+  `expires` date (the libfuzzer-sys NCSA exception must carry one); when a
+  `cargo install` lacks `--version`/`--locked` or is skipped because a binary
+  is on `PATH`; and when the coverage job or `.coverage-floor` goes missing.
+  Each rule is a function with negative tests on hand-written snippets, and
+  the rules see through the spellings that once slipped past: flow style
+  (`- { uses: ... }`, `permissions: { contents: write }`), anchors and
+  aliases, `docker://` actions, a local `./` action's `action.yml`,
+  `Actions/Checkout` in any case (checked per step, not counted),
+  `SECRETS.X`, `secrets:  inherit`, `join(secrets, ...)`, comments after a
+  tab. An `image:` is a container only under `services:` or `container:`; an
+  action input under `with:` is not.
+- The generated application's CI (`templates/app/github/workflows/ci.yml.tmpl`)
+  and `Dockerfile.tmpl` follow the same rules: actions pinned by SHA,
+  checkouts without credentials, the PostgreSQL service by digest, and both
+  base images by the digests of `crates/forge-proxy/Dockerfile`.
 - Permissions are read-only by default (`contents: read`, or `{}` in
   `release.yml` and `scorecard.yml`); only the release image job holds
   `packages: write` and `id-token: write`. No workflow that runs on a pull
@@ -225,6 +249,9 @@ The pins in use:
 | `ghcr.io/anchore/syft` | v1.54.1 | registry digest of the tag |
 | `docker.io/docker/buildkit-syft-scanner` | stable-1 | registry digest of the tag |
 | `postgres` (CI service) | 18.6-trixie | registry digest of the tag |
+| `postgres` (`database` job) | 16.14-trixie | registry digest of the tag (Docker Hub, pushed 2026-08-05) |
+| `mysql`, `mariadb` (`database`, `coverage` jobs) | 8.4, 11.8 | Forge-Go's pins |
+| `cargo-llvm-cov` | 0.9.1 | crates.io, 2026-09-06, not yanked |
 | `rust` (forge-proxy build) | 1.98.1-slim-trixie | registry digest of the tag |
 | `gcr.io/distroless/cc-debian13` (forge-proxy runtime) | nonroot | registry digest of the tag |
 
@@ -252,7 +279,8 @@ copies to agree).
 - The `sigstore/cosign-installer` pin chooses the cosign version and verifies
   its checksum; Syft inside BuildKit's scanner image is whatever that digest
   holds.
-- `cargo install --locked` of `cargo-fuzz` and `cargo-auditable` builds the
+- `cargo install --locked` of `cargo-fuzz`, `cargo-auditable` and
+  `cargo-llvm-cov` builds the
   crate versions their own lockfiles name, downloaded from crates.io and
   checked against the index checksums; the versions are pinned, the crates'
   dependency trees are not part of the framework's `cargo deny` gate.

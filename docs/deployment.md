@@ -88,22 +88,24 @@ docker compose up --build
 Applications generated with `-d none` omit the database and the migration
 service while retaining the ordinary app container workflow.
 
-### Pinning base images for release builds
+### Pinned base images
 
-The generated `Dockerfile` references base images by tag, and generated
-Dependabot configuration proposes updates. For release or certification builds,
-pin both stages by immutable digest and keep the tag for readability
-([dependency policy](dependency-policy.md#supply-chain-gates)):
+The generated `Dockerfile` pins both stages by the digest of their
+multi-architecture index and keeps the tag for readability (the same pins as
+`crates/forge-proxy/Dockerfile`; the supply-chain gate requires both to agree,
+[dependency policy](dependency-policy.md#supply-chain-gates)). Docker builds
+the digest, not the tag: when `RUST_VERSION` changes, look up the new tag's
+digest and replace it in the same commit:
 
 ```sh
-docker buildx imagetools inspect rust:1.98.1-slim-trixie
-docker buildx imagetools inspect gcr.io/distroless/cc-debian13:nonroot
+docker buildx imagetools inspect rust:1.98.1-slim-trixie --format '{{ .Manifest.Digest }}'
+docker buildx imagetools inspect gcr.io/distroless/cc-debian13:nonroot --format '{{ .Manifest.Digest }}'
 ```
 
 ```dockerfile
-FROM rust:${RUST_VERSION}-slim-trixie@sha256:<digest> AS builder
+FROM rust:${RUST_VERSION}-slim-trixie@sha256:<digest> AS build
 # ...
-FROM gcr.io/distroless/cc-debian13:nonroot@sha256:<digest>
+FROM gcr.io/distroless/cc-debian13:nonroot@sha256:<digest> AS runtime
 ```
 
 Dependabot's `docker` ecosystem can update a `tag@digest` reference while

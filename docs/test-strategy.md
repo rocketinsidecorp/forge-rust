@@ -242,7 +242,7 @@ task, thread, log, and dependency diagnostics without secrets.
 
 Coverage identifies blind spots but is not a correctness proxy. Critical policy,
 tenant isolation, migration, execution, and error branches require explicit tests;
-the project will establish a measured baseline before setting a numeric line target.
+coverage is measured and gated as described in [Coverage](#coverage).
 
 CI retains test reports, failing minimized property cases, fuzz crash inputs,
 OpenAPI/generator diffs, dependency reports, and benchmark raw data. A quality gate
@@ -250,6 +250,72 @@ is reported as passed only when the recorded command exits successfully.
 
 See [architecture](architecture.md), [performance targets](performance-targets.md),
 and [dependency policy](dependency-policy.md).
+
+## Database tests in CI
+
+The PostgreSQL, MySQL and MariaDB tests are `#[ignore]`d so that a plain
+`cargo test` needs no server. CI's `database` job runs them all,
+`scripts/test-databases.sh` (`cargo test --workspace --all-targets
+--all-features --locked -- --include-ignored`, the generated-application
+suite `forge-cli --test scaffold` excepted, which the `scaffold` job runs),
+twice: against PostgreSQL 18 and against PostgreSQL 16, each time with
+MySQL 8.4 and MariaDB 11.8 and a real `sshd` (`FORGE_TEST_REQUIRE_SSHD=true`).
+Locally:
+
+```sh
+FORGE_TEST_DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5432/postgres \
+FORGE_TEST_MYSQL_URL=mysql://root:forge@127.0.0.1:3306/mysql \
+FORGE_TEST_MARIADB_URL=mariadb://root:forge@127.0.0.1:3307/mysql \
+scripts/test-databases.sh
+```
+
+An ignored test that needs something CI cannot provide must skip on its own
+environment variable with a reason (as `write_rust_values_for_go` does without
+`FORGE_INTEROP_DIR`), so `--include-ignored` stays green; it is never deleted
+or weakened.
+
+## Coverage
+
+CI's `coverage` job measures line coverage of the framework crates with
+[cargo-llvm-cov](https://github.com/taiki-e/cargo-llvm-cov) and fails when it
+drops below the committed floor in `.coverage-floor`:
+
+```sh
+rustup component add llvm-tools-preview
+cargo install cargo-llvm-cov --version 0.9.1 --locked
+scripts/coverage.sh                                  # measure, print the table, gate
+COVERAGE_JSON=summary.json scripts/coverage.sh       # report and gate an existing summary
+```
+
+- **How it is measured.** The test set of the `database` job
+  (`scripts/test-databases.sh llvm-cov --no-report`, the ignored database
+  tests included) against PostgreSQL 18, MySQL and MariaDB, then
+  `cargo llvm-cov report`. The job writes the total and a per-crate table to
+  the run's summary and uploads `target/coverage/summary.json`.
+  cargo-llvm-cov builds into its own `target/llvm-cov-target`, a second full
+  build: run it locally only with the disk to spare.
+- **Pinned tools.** cargo-llvm-cov 0.9.1 (2026-09-06, MSRV 1.87, not
+  yanked: the newest release at least two weeks old that builds with the
+  pinned Rust 1.98.1), installed `--locked` through
+  `.github/actions/cargo-tool`, cached under its exact version; llvm-tools
+  come from the pinned toolchain.
+- **The floor only rises.** It starts at 0 until the first CI run reports
+  the real number, is then set to that number rounded down to 0.1, and is
+  raised, never lowered, as tests are added, toward the project's target of
+  95%. Raise it in the pull request that raises coverage.
+- **Exclusions.** Only these, each for the reason given; nothing else may be
+  excluded, and a new exclusion needs a reason here:
+
+  | Excluded | Why |
+  | --- | --- |
+  | `forge-bench`, `forge-loadgen` | The benchmark and load-generation harnesses: they measure the framework, they are not part of it. `fuzz/` is outside the workspace. |
+  | `crates/forge-cli/templates/` | Generated-application templates: text that `forge new` renders, not code compiled into the framework. Their output is tested by the `scaffold` job. |
+  | `forge-cli --test scaffold` | The generated-application suite builds separate applications in other target directories; it runs in the `scaffold` job. |
+  | `tests/` directories, `tests.rs`, `*_tests.rs`, `test_support.rs` | Test code (cargo-llvm-cov's default for `tests/`; the others are `#[cfg(test)]` modules kept in their own files). The `testing` modules behind the `testing` features are shipped API and stay measured. |
+
+The Forge-Go twin (`scripts/coverage.sh`, `.coverage-floor`, the same job
+name) measures statement coverage with `go test -coverpkg`; see its
+`docs/TESTING.md`.
 
 ## Live updates tests
 

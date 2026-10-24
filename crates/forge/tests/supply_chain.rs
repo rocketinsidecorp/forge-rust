@@ -687,6 +687,72 @@ fn permissions_are_least_privilege_and_secrets_stay_out_of_pull_requests() {
     }
 }
 
+/// The `FROM` images of a Dockerfile (template), stage names excluded.
+fn dockerfile_bases(text: &str) -> Vec<String> {
+    let mut stages = Vec::new();
+    let mut bases = Vec::new();
+    for line in text.lines() {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        if !words
+            .first()
+            .is_some_and(|word| word.eq_ignore_ascii_case("FROM"))
+        {
+            continue;
+        }
+        let image = words.get(1).copied().unwrap_or_default();
+        if !stages.iter().any(|stage| stage == image) {
+            bases.push(image.to_owned());
+        }
+        if let Some(position) = words
+            .iter()
+            .position(|word| word.eq_ignore_ascii_case("AS"))
+        {
+            stages.extend(words.get(position + 1).map(|stage| (*stage).to_owned()));
+        }
+    }
+    bases
+}
+
+/// What `forge new` generates runs under the same rules: its CI pins every
+/// action by commit and every service by digest and keeps no credentials,
+/// and its Dockerfile pins both base images by digest, the same digests as
+/// forge-proxy's Dockerfile (which the gate ties to rust-toolchain.toml).
+#[test]
+fn generated_application_ci_and_dockerfile_are_pinned() {
+    let name = "templates/app/github/workflows/ci.yml.tmpl";
+    let ci = read("crates/forge-cli/templates/app/github/workflows/ci.yml.tmpl");
+    assert_clean(&pin_violations(name, &ci));
+    assert_clean(&checkout_violations(name, &ci));
+    assert_clean(&container_violations(name, &ci));
+    assert_clean(&permission_violations(name, &ci, false));
+    assert_clean(&secret_violations(name, &ci, false));
+    assert!(
+        ci.contains("FORGE_TEST_DATABASE_URL") && ci.contains("--include-ignored"),
+        "{name}: a PostgreSQL application's CI runs its database tests"
+    );
+
+    let proxy = dockerfile_bases(&read("crates/forge-proxy/Dockerfile"));
+    let template = dockerfile_bases(&read("crates/forge-cli/templates/app/Dockerfile.tmpl"));
+    assert_eq!(
+        template.len(),
+        2,
+        "the build and runtime base images: {template:?}"
+    );
+    for image in &template {
+        assert!(
+            has_digest(image),
+            "Dockerfile.tmpl: `{image}` must be pinned by digest"
+        );
+        let digest = image.rsplit_once('@').map(|(_, digest)| digest);
+        assert!(
+            proxy
+                .iter()
+                .any(|pinned| pinned.rsplit_once('@').map(|(_, digest)| digest) == digest),
+            "Dockerfile.tmpl: `{image}` must use the digest of crates/forge-proxy/Dockerfile ({proxy:?})"
+        );
+    }
+}
+
 #[test]
 fn the_release_workflow_runs_only_for_version_tags_and_signs_by_digest() {
     assert_clean(&release_violations(&read(".github/workflows/release.yml")));
