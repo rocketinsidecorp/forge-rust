@@ -322,7 +322,9 @@ fn refuse_second_permission_owner(
 ) -> Result<(), CliError> {
     let plural = &resource.plural;
     let permissions = [format!("{plural}:read"), format!("{plural}:write")];
-    let Some((owner, permission)) = generators::permission_owner(root, &permissions, &[]) else {
+    let Some((owner, permission)) = generators::permission_owner(root, &permissions, &[])
+        .map_err(|reason| fail(layers, reason))?
+    else {
         return Ok(());
     };
     let kind = layers.name();

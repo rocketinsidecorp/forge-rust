@@ -215,8 +215,27 @@ fn refuse_collisions(root: &Path, files: &[File]) -> Result<(), CliError> {
     }
     refuse(format!(
         "refusing to overwrite existing files; nothing was written:\n  {}",
-        existing.join("\n  ")
+        listed(&existing)
     ))
+}
+
+/// Files named in the refusal before it says how many more there are: the
+/// pages are about twenty files, which `forge new` already wrote in most
+/// applications, and listing them all buries the one-line reason.
+const MAX_LISTED: usize = 5;
+
+/// The first [`MAX_LISTED`] of `existing`, one per line, and the count of
+/// the rest.
+fn listed(existing: &[String]) -> String {
+    let mut lines: Vec<String> = existing.iter().take(MAX_LISTED).cloned().collect();
+    if existing.len() > MAX_LISTED {
+        lines.push(format!(
+            "... and {} more (the sign-in pages are already in this application: \
+             `forge new` generates them)",
+            existing.len() - MAX_LISTED
+        ));
+    }
+    lines.join("\n  ")
 }
 
 /// The module declarations and composition-root lines to add by hand.
@@ -346,10 +365,8 @@ mod tests {
         let error = generate(&root, false).expect_err("forge new already wrote them");
         let message = error.to_string();
         assert!(message.contains("refusing to overwrite"), "{message}");
-        assert!(
-            message.contains("src/adapters/http/authentication.rs"),
-            "{message}"
-        );
+        assert!(message.contains("... and "), "{message}");
+        assert!(message.contains("\n  src/"), "{message}");
 
         // A renamed authentication migration also counts.
         strip(&root);
@@ -365,6 +382,22 @@ mod tests {
                 .contains("20260101000000_forge_authentication")
         );
         assert!(!root.join("src/adapters/http/authentication.rs").exists());
+    }
+
+    #[test]
+    fn the_refusal_names_a_few_files_and_counts_the_rest() {
+        let few: Vec<String> = (0..MAX_LISTED).map(|n| format!("f{n}")).collect();
+        assert_eq!(listed(&few), "f0\n  f1\n  f2\n  f3\n  f4");
+        let many: Vec<String> = (0..20).map(|n| format!("f{n}")).collect();
+        let text = listed(&many);
+        assert!(text.contains("f4"), "{text}");
+        assert!(!text.contains("f5"), "{text}");
+        assert!(text.contains("... and 15 more"), "{text}");
+        let (_parent, root) = application(Database::Postgresql, true);
+        let message = generate(&root, false)
+            .expect_err("forge new already wrote them")
+            .to_string();
+        assert!(message.lines().count() <= 10, "{message}");
     }
 
     #[test]

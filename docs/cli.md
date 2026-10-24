@@ -315,7 +315,7 @@ Notes on the generated package:
   `forge generate scaffold` are wired at the end of `compose` with the
   database the composition provides; `--api` applications use
   `.routes(crate::adapters::http::routes)`.
-- Full-stack database applications have a `forge` dev-dependency with the
+- Database applications (full-stack and `--api`) have a `forge` dev-dependency with the
   `testing` feature, so repository tests can use
   `forge::db::testing::TestDatabase`.
 

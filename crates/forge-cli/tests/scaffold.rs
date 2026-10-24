@@ -381,6 +381,82 @@ fn sqlite_application_with_scaffolds_passes_its_gates() {
     }
 }
 
+/// `forge new --api` has no views, but a model needs none: it is generated,
+/// wired like the printed instructions say, and passes the application's own
+/// gates and its repository tests (the `forge::db::testing` dev-dependency
+/// is part of an `--api` application with a database).
+#[test]
+#[ignore = "slow: builds generated applications; run with --ignored"]
+fn api_application_with_a_model_passes_its_gates() {
+    let forge = env!("CARGO_BIN_EXE_forge");
+    let parent = tempfile::tempdir().unwrap_or_else(|error| panic!("{error}"));
+    let forge_path = workspace().join("crates/forge");
+    let forge_path = forge_path.to_string_lossy();
+    run(
+        parent.path(),
+        forge,
+        &[
+            "new",
+            "api-model",
+            "--api",
+            "-d",
+            "sqlite3",
+            "--skip-docker",
+            "--skip-ci",
+            "--skip-lockfile",
+            "--forge-path",
+            &forge_path,
+        ],
+        &[],
+    );
+    let root = parent.path().join("api-model");
+    let output = run(
+        &root,
+        forge,
+        &["generate", "model", "post", "title:string", "--global"],
+        &[],
+    );
+    let printed = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert!(printed.contains("tests/posts_repository.rs"), "{printed}");
+    assert!(
+        !root.join("templates").exists(),
+        "an API application has no templates"
+    );
+    declare_modules(&root, &printed);
+    // A scaffold writes pages, which an API application does not have.
+    let refused = run_unchecked(
+        &root,
+        forge,
+        &["generate", "scaffold", "note", "body:text", "--global"],
+        &[],
+        None,
+    );
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("--api"));
+
+    run(&root, "cargo", &["generate-lockfile", "--quiet"], &[]);
+    run(&root, "cargo", &["fmt", "--all", "--", "--check"], &[]);
+    run(
+        &root,
+        "cargo",
+        &[
+            "clippy",
+            "--all-targets",
+            "--locked",
+            "--quiet",
+            "--",
+            "-D",
+            "warnings",
+        ],
+        &[],
+    );
+    let tests = test_output(&root, false);
+    assert!(
+        tests.contains("sqlite_round_trip_locking_and_pages ... ok"),
+        "{tests}"
+    );
+}
+
 #[test]
 #[ignore = "slow: builds generated applications; run with --ignored"]
 fn mysql_application_with_scaffolds_passes_its_gates() {
@@ -440,6 +516,32 @@ fn postgresql_application_with_scaffolds_passes_its_gates_and_migrations_revert(
             .await
             .unwrap_or_else(|error| panic!("test database: {error}"));
         let url = database.url().expose().to_owned();
+        // The job queue is granted to the runtime role (`forge.runtime_role`
+        // names it for the migration), so the workers below run as that
+        // least-privileged role, not as the superuser that migrates: the
+        // grants on the job tables are exercised end to end. The role is
+        // cluster-wide, hence unique, and dropped at the end.
+        let runtime_role = format!("forge_rt_{}", uuid_simple());
+        let runtime_password = uuid_simple();
+        let pool = database.database().pool().clone();
+        let name = sqlx::query_scalar::<_, String>("SELECT current_database()")
+            .fetch_one(&pool)
+            .await
+            .unwrap_or_else(|error| panic!("{error}"));
+        for statement in [
+            format!(
+                "CREATE ROLE \"{runtime_role}\" LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB \
+                 NOCREATEROLE PASSWORD '{runtime_password}'"
+            ),
+            format!("ALTER DATABASE \"{name}\" SET forge.runtime_role = '{runtime_role}'"),
+        ] {
+            // Audited: names and password are this test's own hex identifiers.
+            sqlx::query(sqlx::AssertSqlSafe(statement))
+                .execute(&pool)
+                .await
+                .unwrap_or_else(|error| panic!("{error}"));
+        }
+        let runtime_url = with_credentials(&url, &runtime_role, &runtime_password);
         let migrate = |command: &str| {
             let output = run(
                 &root,
@@ -480,19 +582,47 @@ fn postgresql_application_with_scaffolds_passes_its_gates_and_migrations_revert(
             let seeded = migrate("seed");
             assert!(seeded.contains("Seed data loaded."), "{seeded}");
         }
-        run_the_job_workers(&root, &binary, &url);
+        run_the_job_workers(&root, &binary, &runtime_url);
         sign_in_use_a_tenant_scaffold_and_sign_out(&root, &binary, &url);
         database
             .cleanup()
             .await
             .unwrap_or_else(|error| panic!("cleanup: {error}"));
+        drop_role(&runtime_role).await;
     });
+}
+
+/// `url` with its user and password replaced: `postgres://user:password@host/db`.
+fn with_credentials(url: &str, user: &str, password: &str) -> String {
+    let (scheme, rest) = url
+        .split_once("://")
+        .unwrap_or_else(|| panic!("not a URL: {url}"));
+    let host = rest.rsplit_once('@').map_or(rest, |(_, host)| host);
+    format!("{scheme}://{user}:{password}@{host}")
+}
+
+/// Drops a cluster-wide role the test created, once its database is gone.
+async fn drop_role(role: &str) {
+    use forge_db::sqlx::Connection as _;
+
+    let admin = std::env::var("FORGE_TEST_DATABASE_URL")
+        .unwrap_or_else(|_| panic!("FORGE_TEST_DATABASE_URL is set when roles are created"));
+    let mut connection = forge_db::sqlx::PgConnection::connect(&admin)
+        .await
+        .unwrap_or_else(|error| panic!("admin connection: {error}"));
+    // Audited: the role name is this test's own hex identifier.
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP ROLE IF EXISTS \"{role}\""
+    )))
+    .execute(&mut connection)
+    .await
+    .unwrap_or_else(|error| panic!("drop role {role}: {error}"));
 }
 
 const OWNER_PASSWORD: &str = "correct horse battery";
 
 /// The job queue `forge new` wires: `migrate` applied its schema, `jobs
-/// status` reads it with the runtime URL, and `jobs work` runs the workers
+/// status` reads it with the runtime role's `url`, and `jobs work` runs the workers
 /// until `SIGTERM`, then drains and exits cleanly (`serve` runs them too,
 /// during the browser session that follows).
 fn run_the_job_workers(root: &Path, binary: &str, url: &str) {
@@ -529,6 +659,9 @@ fn run_the_job_workers(root: &Path, binary: &str, url: &str) {
         let _ = worker.kill();
         panic!("jobs work did not start:\n{}", read());
     }
+    // Long enough for several claim polls: with the grants of the runtime
+    // role missing, each one would log `claiming jobs failed`.
+    std::thread::sleep(Duration::from_millis(2500));
     let signalled = Command::new("kill")
         .args(["-TERM", &worker.id().to_string()])
         .status()
@@ -549,6 +682,10 @@ fn run_the_job_workers(root: &Path, binary: &str, url: &str) {
     let output = read();
     assert!(exit.success(), "{exit}:\n{output}");
     assert!(output.contains("job workers stopped"), "{output}");
+    assert!(
+        !output.contains("claiming jobs failed"),
+        "the runtime role cannot claim jobs:\n{output}"
+    );
 }
 
 /// A free loopback port.
@@ -1040,29 +1177,48 @@ fn postgresql_application_regains_its_sign_in_pages_with_generate_authentication
     );
     let root = parent.path().join("regained");
 
-    // forge new already has the pages: the generator refuses and lists them.
+    // forge new already has the pages: the generator refuses, names a few of
+    // the files and counts the rest.
     let refused = run_unchecked(&root, forge, &["generate", "authentication"], &[], None);
     assert!(!refused.status.success());
     let message = String::from_utf8_lossy(&refused.stderr).into_owned();
     assert!(message.contains("refusing to overwrite"), "{message}");
-    let files: Vec<String> = message
-        .lines()
-        .filter_map(|line| line.strip_prefix("  "))
-        .map(str::to_owned)
-        .collect();
-    assert!(files.len() >= 10, "{message}");
-
-    // Make it an application created before the generator: no files, no wiring.
-    let originals: Vec<(String, String)> = files
-        .iter()
-        .map(|file| {
-            let path = root.join(file);
+    assert!(message.contains("... and "), "{message}");
+    assert!(message.lines().count() <= 12, "{message}");
+    // Peel the pages off a few files at a time, until the refusal is gone.
+    let mut files: Vec<String> = Vec::new();
+    let mut originals: Vec<(String, String)> = Vec::new();
+    for _ in 0..10 {
+        let attempt = run_unchecked(
+            &root,
+            forge,
+            &["generate", "authentication", "--dry-run"],
+            &[],
+            None,
+        );
+        if attempt.status.success() {
+            break;
+        }
+        let message = String::from_utf8_lossy(&attempt.stderr).into_owned();
+        let listed: Vec<String> = message
+            .lines()
+            .filter_map(|line| line.strip_prefix("  "))
+            .filter(|line| !line.starts_with("..."))
+            .map(str::to_owned)
+            .collect();
+        assert!(!listed.is_empty(), "{message}");
+        for file in listed {
+            let path = root.join(&file);
             let content =
                 fs::read_to_string(&path).unwrap_or_else(|error| panic!("{file}: {error}"));
             fs::remove_file(&path).unwrap_or_else(|error| panic!("{file}: {error}"));
-            (file.clone(), content)
-        })
-        .collect();
+            files.push(file.clone());
+            originals.push((file, content));
+        }
+    }
+    assert!(files.len() >= 10, "{files:?}");
+
+    // Make it an application created before the generator: no files, no wiring.
     for (file, line) in [
         ("src/infrastructure/mod.rs", "pub mod accounts;\n"),
         ("src/adapters/http/mod.rs", "pub mod authentication;\n"),
