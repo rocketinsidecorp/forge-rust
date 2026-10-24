@@ -56,13 +56,20 @@ fn harness() -> Harness {
 async fn enrolled(harness: &Harness, principal: PrincipalId) -> (TotpSecret, Vec<MfaBackupCode>) {
     let enrollment = harness
         .service
-        .begin(principal, MfaChange::Enrollment, ISSUER, ACCOUNT, at(START))
+        .begin(
+            principal,
+            MfaChange::Enrollment,
+            ISSUER,
+            ACCOUNT,
+            None,
+            at(START),
+        )
         .await
         .expect("begin");
     let code = enrollment.secret.code_at(at(START));
     let codes = harness
         .service
-        .confirm(principal, MfaChange::Enrollment, &code, at(START))
+        .confirm(principal, MfaChange::Enrollment, &code, None, at(START))
         .await
         .expect("confirm");
     (enrollment.secret, codes)
@@ -96,7 +103,7 @@ async fn enrollment_installs_the_factor_with_backup_codes_and_revokes_sessions()
     assert_eq!(harness.service.status(ada).await, Ok(None));
     let enrollment = harness
         .service
-        .begin(ada, MfaChange::Enrollment, ISSUER, ACCOUNT, at(START))
+        .begin(ada, MfaChange::Enrollment, ISSUER, ACCOUNT, None, at(START))
         .await
         .expect("begin");
     assert_eq!(
@@ -114,7 +121,7 @@ async fn enrollment_installs_the_factor_with_backup_codes_and_revokes_sessions()
     assert_eq!(
         harness
             .service
-            .confirm(ada, MfaChange::Enrollment, "000000", at(START))
+            .confirm(ada, MfaChange::Enrollment, "000000", None, at(START))
             .await
             .err()
             .filter(|_| enrollment.secret.code_at(at(START)) != "000000"),
@@ -123,7 +130,7 @@ async fn enrollment_installs_the_factor_with_backup_codes_and_revokes_sessions()
     // The pending seed can be shown again after a wrong code.
     let again = harness
         .service
-        .pending(ada, ISSUER, ACCOUNT, at(START))
+        .pending(ada, MfaChange::Enrollment, ISSUER, ACCOUNT, at(START))
         .await
         .expect("pending")
         .expect("still pending");
@@ -132,7 +139,7 @@ async fn enrollment_installs_the_factor_with_backup_codes_and_revokes_sessions()
     let code = enrollment.secret.code_at(at(START));
     let codes = harness
         .service
-        .confirm(ada, MfaChange::Enrollment, &code, at(START))
+        .confirm(ada, MfaChange::Enrollment, &code, None, at(START))
         .await
         .expect("confirm");
     assert_eq!(codes.len(), MFA_BACKUP_CODE_COUNT);
@@ -143,11 +150,11 @@ async fn enrollment_installs_the_factor_with_backup_codes_and_revokes_sessions()
         }))
     );
     assert_eq!(*harness.revoked.lock().expect("lock"), vec![ada]);
-    // A second enrollment is refused; the confirmation used up the pending seed.
+    // A second enrollment is refused, and so is confirming the used one.
     assert_eq!(
         harness
             .service
-            .begin(ada, MfaChange::Enrollment, ISSUER, ACCOUNT, at(START))
+            .begin(ada, MfaChange::Enrollment, ISSUER, ACCOUNT, None, at(START))
             .await
             .err(),
         Some(MfaError::AlreadyEnabled)
@@ -155,10 +162,11 @@ async fn enrollment_installs_the_factor_with_backup_codes_and_revokes_sessions()
     assert_eq!(
         harness
             .service
-            .confirm(ada, MfaChange::Enrollment, &code, at(START))
+            .confirm(ada, MfaChange::Enrollment, &code, None, at(START))
             .await
             .err(),
-        Some(MfaError::EnrollmentInvalid)
+        Some(MfaError::AlreadyEnabled),
+        "an account with a factor has no enrollment to confirm"
     );
 }
 
@@ -168,7 +176,7 @@ async fn an_expired_enrollment_cannot_be_confirmed() {
     let ada = PrincipalId::new();
     let enrollment = harness
         .service
-        .begin(ada, MfaChange::Enrollment, ISSUER, ACCOUNT, at(START))
+        .begin(ada, MfaChange::Enrollment, ISSUER, ACCOUNT, None, at(START))
         .await
         .expect("begin");
     let late = START + MFA_ENROLLMENT_LIFETIME_SECS;
@@ -179,6 +187,7 @@ async fn an_expired_enrollment_cannot_be_confirmed() {
                 ada,
                 MfaChange::Enrollment,
                 &enrollment.secret.code_at(at(late)),
+                None,
                 at(late)
             )
             .await
@@ -518,7 +527,7 @@ async fn step_up_codes_are_single_use_and_regeneration_replaces_every_backup_cod
     );
     let fresh = harness
         .service
-        .regenerate_backup_codes(ada, at(now))
+        .regenerate_backup_codes(ada, None, at(now))
         .await
         .expect("regenerated");
     assert_eq!(fresh.len(), MFA_BACKUP_CODE_COUNT);
@@ -560,6 +569,7 @@ async fn rotation_keeps_the_old_factor_until_confirmed_and_disable_removes_it() 
                 MfaChange::Rotation,
                 ISSUER,
                 ACCOUNT,
+                None,
                 at(now)
             )
             .await
@@ -568,7 +578,7 @@ async fn rotation_keeps_the_old_factor_until_confirmed_and_disable_removes_it() 
     );
     let rotation = harness
         .service
-        .begin(ada, MfaChange::Rotation, ISSUER, ACCOUNT, at(now))
+        .begin(ada, MfaChange::Rotation, ISSUER, ACCOUNT, None, at(now))
         .await
         .expect("rotation");
     let pending_challenge = challenge(&harness, ada, tenant, now).await;
@@ -586,6 +596,7 @@ async fn rotation_keeps_the_old_factor_until_confirmed_and_disable_removes_it() 
             ada,
             MfaChange::Rotation,
             &rotation.secret.code_at(at(now + 30)),
+            None,
             at(now + 30),
         )
         .await
@@ -615,15 +626,284 @@ async fn rotation_keeps_the_old_factor_until_confirmed_and_disable_removes_it() 
 
     harness
         .service
-        .disable(ada, at(now + 90))
+        .disable(ada, None, at(now + 90))
         .await
         .expect("disabled");
     assert_eq!(harness.service.status(ada).await, Ok(None));
     assert_eq!(harness.revoked.lock().expect("lock").len(), 3);
     assert_eq!(
-        harness.service.disable(ada, at(now + 90)).await,
+        harness.service.disable(ada, None, at(now + 90)).await,
         Err(MfaError::NotEnabled)
     );
+}
+
+/// A step-up backup code is checked by `verify_step_up` and used up only by
+/// the change it authorizes, in the same store operation: a change that
+/// fails keeps the code, and a code used meanwhile refuses the change.
+#[tokio::test]
+async fn a_failed_change_keeps_the_step_up_backup_code() {
+    let harness = harness();
+    let ada = PrincipalId::new();
+    let (old, codes) = enrolled(&harness, ada).await;
+    let now = START + 1500;
+    let remaining = || async { harness.service.status(ada).await.ok().flatten() };
+    let step_up = |code: String, at_: u64| {
+        let service = harness.service.clone();
+        async move { service.verify_step_up(ada, &code, at(at_)).await }
+    };
+
+    // Checking a backup code uses nothing up; a wrong one is refused.
+    let proof = step_up(codes[0].expose().to_owned(), now)
+        .await
+        .expect("backup code");
+    assert_eq!(proof.factor(), SecondFactor::BackupCode);
+    assert!(step_up(codes[0].expose().to_owned(), now).await.is_ok());
+    assert_eq!(
+        step_up("AAAA-AAAA-AAAA-AAAA-AAAA-AAAA".to_owned(), now).await,
+        Err(MfaError::InvalidCode)
+    );
+    assert_eq!(
+        remaining().await.map(|s| s.remaining_backup_codes),
+        Some(10)
+    );
+
+    // Starting a rotation uses the proof's code up with the pending seed.
+    let rotation = harness
+        .service
+        .begin(
+            ada,
+            MfaChange::Rotation,
+            ISSUER,
+            ACCOUNT,
+            Some(&proof),
+            at(now),
+        )
+        .await
+        .expect("rotation");
+    assert_eq!(remaining().await.map(|s| s.remaining_backup_codes), Some(9));
+    assert_eq!(
+        harness
+            .service
+            .begin(
+                ada,
+                MfaChange::Rotation,
+                ISSUER,
+                ACCOUNT,
+                Some(&proof),
+                at(now)
+            )
+            .await
+            .err(),
+        Some(MfaError::StepUpInvalid),
+        "a used code authorizes nothing else"
+    );
+
+    // A wrong code of the new key, and an expired rotation, keep the
+    // step-up code.
+    let proof = step_up(codes[1].expose().to_owned(), now)
+        .await
+        .expect("backup code");
+    let wrong = if rotation.secret.code_at(at(now)) == "000000" {
+        "111111"
+    } else {
+        "000000"
+    };
+    assert_eq!(
+        harness
+            .service
+            .confirm(ada, MfaChange::Rotation, wrong, Some(&proof), at(now))
+            .await
+            .err(),
+        Some(MfaError::InvalidCode)
+    );
+    let expired = now + MFA_ENROLLMENT_LIFETIME_SECS;
+    assert_eq!(
+        harness
+            .service
+            .confirm(
+                ada,
+                MfaChange::Rotation,
+                &rotation.secret.code_at(at(expired)),
+                Some(&proof),
+                at(expired)
+            )
+            .await
+            .err(),
+        Some(MfaError::EnrollmentInvalid)
+    );
+    assert_eq!(remaining().await.map(|s| s.remaining_backup_codes), Some(9));
+    assert!(
+        harness
+            .store
+            .has_backup_code(
+                ada,
+                &MfaBackupCode::parse(codes[1].expose()).expect("digest")
+            )
+            .await
+            .expect("store")
+    );
+
+    // A code used elsewhere after the check refuses every change, which
+    // then changes nothing.
+    assert_eq!(
+        harness
+            .service
+            .verify_second_factor(ada, codes[1].expose(), at(now))
+            .await,
+        Ok(SecondFactor::BackupCode)
+    );
+    assert_eq!(
+        harness
+            .service
+            .confirm(
+                ada,
+                MfaChange::Rotation,
+                &rotation.secret.code_at(at(now + 30)),
+                Some(&proof),
+                at(now + 30)
+            )
+            .await
+            .err(),
+        Some(MfaError::StepUpInvalid)
+    );
+    assert_eq!(
+        harness
+            .service
+            .disable(ada, Some(&proof), at(now + 30))
+            .await,
+        Err(MfaError::StepUpInvalid)
+    );
+    assert_eq!(
+        harness
+            .service
+            .regenerate_backup_codes(ada, Some(&proof), at(now + 30))
+            .await
+            .err(),
+        Some(MfaError::StepUpInvalid)
+    );
+    assert_eq!(remaining().await.map(|s| s.remaining_backup_codes), Some(8));
+    assert!(
+        harness
+            .service
+            .pending(ada, MfaChange::Rotation, ISSUER, ACCOUNT, at(now + 30))
+            .await
+            .expect("pending")
+            .is_some(),
+        "the rotation is still pending"
+    );
+    assert_eq!(
+        harness
+            .service
+            .verify_second_factor(ada, &old.code_at(at(now + 60)), at(now + 60))
+            .await,
+        Ok(SecondFactor::Totp),
+        "the old factor is still the active one"
+    );
+
+    // A TOTP step-up records its period at once.
+    let totp = old.code_at(at(now + 90));
+    assert_eq!(
+        step_up(totp.clone(), now + 90)
+            .await
+            .map(|proof| proof.factor()),
+        Ok(SecondFactor::Totp)
+    );
+    assert_eq!(step_up(totp, now + 90).await, Err(MfaError::InvalidCode));
+
+    // A valid proof's change goes through and uses its code up.
+    let proof = step_up(codes[2].expose().to_owned(), now + 90)
+        .await
+        .expect("backup code");
+    let fresh = harness
+        .service
+        .regenerate_backup_codes(ada, Some(&proof), at(now + 90))
+        .await
+        .expect("regenerated");
+    let proof = step_up(fresh[0].expose().to_owned(), now + 90)
+        .await
+        .expect("backup code");
+    harness
+        .service
+        .disable(ada, Some(&proof), at(now + 90))
+        .await
+        .expect("disabled");
+    assert_eq!(harness.service.status(ada).await, Ok(None));
+    assert_eq!(
+        step_up(fresh[1].expose().to_owned(), now + 90).await,
+        Err(MfaError::InvalidCode)
+    );
+}
+
+/// The pending seed is an enrollment's while the account has no factor and
+/// a rotation's while it has one: a confirmation or a second look of the
+/// other kind never checks or shows it.
+#[tokio::test]
+async fn a_pending_seed_is_never_checked_or_shown_as_the_other_kind() {
+    let harness = harness();
+    let ada = PrincipalId::new();
+    enrolled(&harness, ada).await;
+    let now = START + 1500;
+    let rotation = harness
+        .service
+        .begin(ada, MfaChange::Rotation, ISSUER, ACCOUNT, None, at(now))
+        .await
+        .expect("rotation");
+    for code in [
+        "000000",
+        "111111",
+        rotation.secret.code_at(at(now)).as_str(),
+    ] {
+        assert_eq!(
+            harness
+                .service
+                .confirm(ada, MfaChange::Enrollment, code, None, at(now))
+                .await
+                .err(),
+            Some(MfaError::AlreadyEnabled),
+            "never InvalidCode, which would show the pending seed again"
+        );
+    }
+    assert!(
+        harness
+            .service
+            .pending(ada, MfaChange::Enrollment, ISSUER, ACCOUNT, at(now))
+            .await
+            .expect("pending")
+            .is_none()
+    );
+    assert!(
+        harness
+            .store
+            .pending(ada, MfaChange::Rotation, at(now))
+            .await
+            .expect("pending")
+            .is_some()
+    );
+
+    let bob = PrincipalId::new();
+    let enrollment = harness
+        .service
+        .begin(bob, MfaChange::Enrollment, ISSUER, ACCOUNT, None, at(now))
+        .await
+        .expect("enrollment");
+    assert!(
+        harness
+            .service
+            .pending(bob, MfaChange::Rotation, ISSUER, ACCOUNT, at(now))
+            .await
+            .expect("pending")
+            .is_none()
+    );
+    for code in ["000000", enrollment.secret.code_at(at(now)).as_str()] {
+        assert_eq!(
+            harness
+                .service
+                .confirm(bob, MfaChange::Rotation, code, None, at(now))
+                .await
+                .err(),
+            Some(MfaError::NotEnabled)
+        );
+    }
 }
 
 /// The pending seed of a rotation sits where an enrollment's does: an
@@ -638,7 +918,7 @@ async fn an_enrollment_confirmation_of_an_account_with_a_factor_is_refused() {
     let now = START + 1500;
     let rotation = harness
         .service
-        .begin(ada, MfaChange::Rotation, ISSUER, ACCOUNT, at(now))
+        .begin(ada, MfaChange::Rotation, ISSUER, ACCOUNT, None, at(now))
         .await
         .expect("rotation");
     let revoked = harness.revoked.lock().expect("lock").len();
@@ -649,6 +929,7 @@ async fn an_enrollment_confirmation_of_an_account_with_a_factor_is_refused() {
                 ada,
                 MfaChange::Enrollment,
                 &rotation.secret.code_at(at(now)),
+                None,
                 at(now)
             )
             .await
@@ -671,6 +952,7 @@ async fn an_enrollment_confirmation_of_an_account_with_a_factor_is_refused() {
             ada,
             MfaChange::Rotation,
             &rotation.secret.code_at(at(now + 30)),
+            None,
             at(now + 30),
         )
         .await
@@ -680,7 +962,7 @@ async fn an_enrollment_confirmation_of_an_account_with_a_factor_is_refused() {
     let bob = PrincipalId::new();
     let enrollment = harness
         .service
-        .begin(bob, MfaChange::Enrollment, ISSUER, ACCOUNT, at(now))
+        .begin(bob, MfaChange::Enrollment, ISSUER, ACCOUNT, None, at(now))
         .await
         .expect("begin");
     assert_eq!(
@@ -690,6 +972,7 @@ async fn an_enrollment_confirmation_of_an_account_with_a_factor_is_refused() {
                 bob,
                 MfaChange::Rotation,
                 &enrollment.secret.code_at(at(now)),
+                None,
                 at(now)
             )
             .await
@@ -778,7 +1061,7 @@ async fn without_a_key_every_operation_but_status_fails_closed() {
         Some(MfaError::NotConfigured)
     );
     assert_eq!(
-        unconfigured.disable(ada, now).await,
+        unconfigured.disable(ada, None, now).await,
         Err(MfaError::NotConfigured)
     );
     assert_eq!(
@@ -788,6 +1071,7 @@ async fn without_a_key_every_operation_but_status_fails_closed() {
                 MfaChange::Enrollment,
                 ISSUER,
                 ACCOUNT,
+                None,
                 now
             )
             .await
@@ -796,6 +1080,10 @@ async fn without_a_key_every_operation_but_status_fails_closed() {
     );
     assert_eq!(
         unconfigured.verify_second_factor(ada, "123456", now).await,
+        Err(MfaError::NotConfigured)
+    );
+    assert_eq!(
+        unconfigured.verify_step_up(ada, "123456", now).await,
         Err(MfaError::NotConfigured)
     );
     assert!(format!("{unconfigured:?}").contains("configured: false"));
@@ -808,10 +1096,16 @@ async fn labels_are_validated_before_anything_is_stored() {
     assert_eq!(
         harness
             .service
-            .begin(ada, MfaChange::Enrollment, "", ACCOUNT, at(START))
+            .begin(ada, MfaChange::Enrollment, "", ACCOUNT, None, at(START))
             .await
             .err(),
         Some(MfaError::InvalidLabel)
     );
-    assert_eq!(harness.store.pending(ada, at(START)).await, Ok(None));
+    assert_eq!(
+        harness
+            .store
+            .pending(ada, MfaChange::Enrollment, at(START))
+            .await,
+        Ok(None)
+    );
 }

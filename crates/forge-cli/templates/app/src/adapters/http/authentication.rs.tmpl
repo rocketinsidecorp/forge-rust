@@ -81,7 +81,8 @@ use forge::http::{HeaderValue, Method, Request, Response, StatusCode, header};
 use forge::security::PrincipalId;
 use forge::tenancy::{
     MembershipState, MembershipStore, MfaChange, MfaError, MfaService, PasswordResetGrant,
-    PasswordResetStore, SecondFactor, TenantDirectory, TenantId, TenantSlug, TotpEnrollment,
+    PasswordResetStore, SecondFactor, StepUpProof, TenantDirectory, TenantId, TenantSlug,
+    TotpEnrollment,
 };
 use forge::views::{
     FieldErrors, Flash, SignInRedirect, Translation, csrf_cookie, csrf_field, csrf_token,
@@ -685,9 +686,17 @@ async fn request_password_reset(pages: Arc<Pages>, request: Request) -> Response
         }
         Err(_) => return unavailable("password_reset_throttle_unavailable"),
     }
-    // Only well-formed requests are worth queueing; the rest name no
-    // account and get the same answer.
-    if let (Ok(tenant), Some(login)) = (TenantSlug::parse_input(&tenant), login) {
+    // Only well-formed requests are worth queueing, and only when a link can
+    // be delivered: without a mailer (`UndeliverablePasswordResets`) nothing
+    // is queued, so no token row is issued for a link nobody receives and a
+    // flood cannot fill the queue. Every case gets the same answer.
+    if !pages.ports.notifier.can_deliver() {
+        forge::web::report(&ForgeError::new(
+            ErrorCategory::Infrastructure,
+            "password_reset_delivery_not_configured",
+            "password reset request ignored: no delivery configured",
+        ));
+    } else if let (Ok(tenant), Some(login)) = (TenantSlug::parse_input(&tenant), login) {
         let queued = pages.resets.submit(ResetRequest {
             tenant,
             login,
@@ -1186,16 +1195,19 @@ async fn begin_mfa_change(pages: Arc<Pages>, request: Request, change: MfaChange
     };
     let form = request.form::<StepUpForm>().unwrap_or_default();
     let code = (change == MfaChange::Rotation).then_some(form.code.as_str());
-    let login = match step_up(&pages, &request, principal, &form.password, code, now).await {
-        Ok(login) => login,
+    let (login, proof) = match step_up(&pages, &request, principal, &form.password, code, now).await
+    {
+        Ok(verified) => verified,
         Err(failure) => {
             return step_up_failed(&pages, &request, principal, action, failure, now).await;
         }
     };
     let ports = &pages.ports;
+    // A backup code given for the step-up is used up only if the new key is
+    // stored.
     match ports
         .mfa
-        .begin(principal, change, MFA_ISSUER, &login, now)
+        .begin(principal, change, MFA_ISSUER, &login, proof.as_ref(), now)
         .await
     {
         Ok(enrollment) => {
@@ -1209,6 +1221,17 @@ async fn begin_mfa_change(pages: Arc<Pages>, request: Request, change: MfaChange
             )
             .await;
             render_mfa_new(&pages, &request, &enrollment, change, None, StatusCode::OK)
+        }
+        Err(MfaError::StepUpInvalid) => {
+            step_up_failed(
+                &pages,
+                &request,
+                principal,
+                action,
+                StepUpFailure::Denied,
+                now,
+            )
+            .await
         }
         Err(error) => {
             record(
@@ -1251,7 +1274,7 @@ async fn confirm_mfa_change(pages: Arc<Pages>, request: Request, change: MfaChan
     // it again after a wrong code, takes the same step-up, so a stolen
     // session can neither read the key nor guess its codes.
     let current_code = (change == MfaChange::Rotation).then_some(form.current_code.as_str());
-    let login = match step_up(
+    let (login, proof) = match step_up(
         &pages,
         &request,
         principal,
@@ -1261,13 +1284,30 @@ async fn confirm_mfa_change(pages: Arc<Pages>, request: Request, change: MfaChan
     )
     .await
     {
-        Ok(login) => login,
+        Ok(verified) => verified,
         Err(failure) => {
             return step_up_failed(&pages, &request, principal, action, failure, now).await;
         }
     };
     let ports = &pages.ports;
-    let result = ports.mfa.confirm(principal, change, &form.code, now).await;
+    // A backup code given as the current code is used up only if the new
+    // key is installed: a wrong code of the new key, or an expired rotation,
+    // keeps it.
+    let result = ports
+        .mfa
+        .confirm(principal, change, &form.code, proof.as_ref(), now)
+        .await;
+    if matches!(result, Err(MfaError::StepUpInvalid)) {
+        return step_up_failed(
+            &pages,
+            &request,
+            principal,
+            action,
+            StepUpFailure::Denied,
+            now,
+        )
+        .await;
+    }
     let outcome = if result.is_ok() {
         AuditOutcome::Succeeded
     } else {
@@ -1296,7 +1336,13 @@ async fn confirm_mfa_change(pages: Arc<Pages>, request: Request, change: MfaChan
             response
         }
         Err(MfaError::InvalidCode) => {
-            match ports.mfa.pending(principal, MFA_ISSUER, &login, now).await {
+            // Only a pending key of this kind: an enrollment's while the
+            // account has no factor, a rotation's while it has one.
+            match ports
+                .mfa
+                .pending(principal, change, MFA_ISSUER, &login, now)
+                .await
+            {
                 Ok(Some(enrollment)) => {
                     let message = pages
                         .site
@@ -1329,7 +1375,7 @@ async fn regenerate_backup_codes(pages: Arc<Pages>, request: Request) -> Respons
     };
     let action = "auth.mfa.backup_codes_regenerated";
     let form = request.form::<StepUpForm>().unwrap_or_default();
-    if let Err(failure) = step_up(
+    let proof = match step_up(
         &pages,
         &request,
         principal,
@@ -1339,10 +1385,17 @@ async fn regenerate_backup_codes(pages: Arc<Pages>, request: Request) -> Respons
     )
     .await
     {
-        return step_up_failed(&pages, &request, principal, action, failure, now).await;
-    }
+        Ok((_, proof)) => proof,
+        Err(failure) => {
+            return step_up_failed(&pages, &request, principal, action, failure, now).await;
+        }
+    };
     let ports = &pages.ports;
-    match ports.mfa.regenerate_backup_codes(principal, now).await {
+    match ports
+        .mfa
+        .regenerate_backup_codes(principal, proof.as_ref(), now)
+        .await
+    {
         Ok(codes) => {
             record(
                 ports,
@@ -1355,6 +1408,17 @@ async fn regenerate_backup_codes(pages: Arc<Pages>, request: Request) -> Respons
             .await;
             let codes = codes.iter().map(|code| code.expose().to_owned()).collect();
             render_backup_codes(&pages, &request, codes, false)
+        }
+        Err(MfaError::StepUpInvalid) => {
+            step_up_failed(
+                &pages,
+                &request,
+                principal,
+                action,
+                StepUpFailure::Denied,
+                now,
+            )
+            .await
         }
         Err(error) => mfa_change_failed(&pages, &request, error),
     }
@@ -1369,7 +1433,7 @@ async fn disable_mfa(pages: Arc<Pages>, request: Request) -> Response {
     };
     let action = "auth.mfa.disabled";
     let form = request.form::<StepUpForm>().unwrap_or_default();
-    if let Err(failure) = step_up(
+    let proof = match step_up(
         &pages,
         &request,
         principal,
@@ -1379,10 +1443,13 @@ async fn disable_mfa(pages: Arc<Pages>, request: Request) -> Response {
     )
     .await
     {
-        return step_up_failed(&pages, &request, principal, action, failure, now).await;
-    }
+        Ok((_, proof)) => proof,
+        Err(failure) => {
+            return step_up_failed(&pages, &request, principal, action, failure, now).await;
+        }
+    };
     let ports = &pages.ports;
-    match ports.mfa.disable(principal, now).await {
+    match ports.mfa.disable(principal, proof.as_ref(), now).await {
         Ok(()) => {
             record(
                 ports,
@@ -1395,6 +1462,17 @@ async fn disable_mfa(pages: Arc<Pages>, request: Request) -> Response {
             .await;
             let notice = pages.site.i18n(&request).t("mfa.disabled").text();
             signed_out(SIGN_IN_PATH, Flash::new().with_notice(notice))
+        }
+        Err(MfaError::StepUpInvalid) => {
+            step_up_failed(
+                &pages,
+                &request,
+                principal,
+                action,
+                StepUpFailure::Denied,
+                now,
+            )
+            .await
         }
         Err(error) => {
             record(
@@ -1426,13 +1504,14 @@ enum StepUpFailure {
 }
 
 /// Step-up authentication of the signed-in `principal`: the password, and
-/// `code` (an authenticator or backup code, used up) when given. Counted on
-/// the second-factor throttle before anything is checked. Without `code`, an
-/// account that already has a factor is refused next, before the password
-/// is checked, so the answer never tells a right password from a wrong one.
-/// A success clears the counters: it checked a code or the account has no
-/// factor. Returns the stored login, the account label of the authenticator
-/// entry.
+/// `code` (an authenticator code, used up, or an unused backup code) when
+/// given. Counted on the second-factor throttle before anything is checked.
+/// Without `code`, an account that already has a factor is refused next,
+/// before the password is checked, so the answer never tells a right
+/// password from a wrong one. A success clears the counters: it checked a
+/// code or the account has no factor. Returns the stored login, the account
+/// label of the authenticator entry, and the code's proof: pass it to the
+/// change, which uses a backup code up only if it succeeds.
 async fn step_up(
     pages: &Pages,
     request: &Request,
@@ -1440,7 +1519,7 @@ async fn step_up(
     password: &str,
     code: Option<&str>,
     now: UnixTimestamp,
-) -> Result<String, StepUpFailure> {
+) -> Result<(String, Option<StepUpProof>), StepUpFailure> {
     let ports = &pages.ports;
     let key = ThrottleKey::new(
         "mfa_step_up",
@@ -1480,15 +1559,16 @@ async fn step_up(
             return Err(StepUpFailure::Unavailable("authentication_unavailable"));
         }
     };
-    if let Some(code) = code {
-        match ports.mfa.verify_second_factor(principal, code, now).await {
-            Ok(_) => {}
+    let proof = match code {
+        None => None,
+        Some(code) => match ports.mfa.verify_step_up(principal, code, now).await {
+            Ok(proof) => Some(proof),
             Err(MfaError::InvalidCode | MfaError::NotEnabled) => {
                 return Err(StepUpFailure::Denied);
             }
             Err(_) => return Err(StepUpFailure::Unavailable("mfa_unavailable")),
-        }
-    }
+        },
+    };
     // A code was checked, or the account has no factor (checked above): the
     // password alone never clears the counters of an account with a factor,
     // since they guard its codes, and clearing them would let a session
@@ -1497,7 +1577,7 @@ async fn step_up(
     if ports.mfa.throttle().success(&key).await.is_err() {
         return Err(StepUpFailure::Unavailable("mfa_throttle_unavailable"));
     }
-    Ok(login)
+    Ok((login, proof))
 }
 
 /// Records a refused step-up as the denied `action` and shows the settings

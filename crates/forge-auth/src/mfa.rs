@@ -19,6 +19,13 @@
 //! accepted only for a period later than the last accepted one, so a code
 //! can never be replayed. Seeds, codes, provisioning URIs and tokens are
 //! redacted in `Debug` output and never part of an error.
+//!
+//! Seeds, provisioning URIs, backup codes and challenge tokens are wiped
+//! (`zeroize`) when dropped, and so are the buffers that held a seed while
+//! it was sealed, opened or parsed. This is best-effort hygiene: a value
+//! the caller copies out (such as [`TotpSecret::base32`] or an exposed
+//! code), and copies the compiler makes when it moves a value, are not
+//! tracked, and the HMAC state of a code computation is not wiped.
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use hmac::{Hmac, KeyInit, Mac};
@@ -27,6 +34,7 @@ use sha1::Sha1;
 use sha2::{Digest as _, Sha256};
 use subtle::ConstantTimeEq;
 use thiserror::Error;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::UnixTimestamp;
 
@@ -46,6 +54,8 @@ const BACKUP_CODE_BYTES: usize = 15;
 const CHALLENGE_TOKEN_BYTES: usize = 32;
 const TAG_LEN: usize = 16;
 const BACKUP_DOMAIN: &[u8] = b"mfa-backup\0";
+const TOTP_DIGITS_TEXT: &str = "6";
+const TOTP_PERIOD_TEXT: &str = "30";
 
 /// Failure of an MFA primitive. It never carries secret material.
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
@@ -143,9 +153,21 @@ digest_type!(
     MfaChallengeBinding
 );
 
-/// A TOTP seed (160 random bits).
+/// A TOTP seed (160 random bits), wiped when dropped.
 #[derive(Clone)]
 pub struct TotpSecret([u8; TOTP_SECRET_BYTES]);
+
+impl Drop for TotpSecret {
+    fn drop(&mut self) {
+        self.wipe();
+    }
+}
+
+impl TotpSecret {
+    fn wipe(&mut self) {
+        self.0.zeroize();
+    }
+}
 
 impl TotpSecret {
     /// Generates a seed from the operating-system CSPRNG.
@@ -169,7 +191,8 @@ impl TotpSecret {
     }
 
     /// The seed as unpadded RFC 4648 Base32 (32 characters), to type into an
-    /// authenticator app.
+    /// authenticator app. The returned text is the caller's copy: it is not
+    /// wiped on drop (wrap it in `zeroize::Zeroizing` to wipe it).
     #[must_use]
     pub fn base32(&self) -> String {
         base32_encode(&self.0)
@@ -256,11 +279,31 @@ impl TotpSecret {
             return Err(MfaPrimitiveError::InvalidLabel);
         }
         let label = percent_encode(&format!("{issuer}:{account}"));
-        Ok(TotpProvisioningUri(format!(
-            "otpauth://totp/{label}?algorithm=SHA1&digits={TOTP_DIGITS}&issuer={}&period={TOTP_PERIOD_SECS}&secret={}",
-            percent_encode(issuer),
-            self.base32()
-        )))
+        let issuer = percent_encode(issuer);
+        let secret = self.base32_zeroizing();
+        let parameters = [
+            "otpauth://totp/",
+            label.as_str(),
+            "?algorithm=SHA1&digits=",
+            TOTP_DIGITS_TEXT,
+            "&issuer=",
+            issuer.as_str(),
+            "&period=",
+            TOTP_PERIOD_TEXT,
+            "&secret=",
+            secret.as_str(),
+        ];
+        // Sized up front, so the text holding the seed is never reallocated
+        // (a reallocation would leave a copy behind that nothing wipes).
+        let mut uri = String::with_capacity(parameters.iter().map(|part| part.len()).sum());
+        for part in parameters {
+            uri.push_str(part);
+        }
+        Ok(TotpProvisioningUri(uri))
+    }
+
+    fn base32_zeroizing(&self) -> Zeroizing<String> {
+        Zeroizing::new(base32_encode(&self.0))
     }
 
     /// Encrypts the seed for persistence.
@@ -280,9 +323,11 @@ impl TotpSecret {
         cipher: &dyn SecretCipher,
         sealed: &SealedTotpSecret,
     ) -> Result<Self, MfaPrimitiveError> {
-        let plaintext = cipher
-            .open(&sealed.ciphertext)
-            .map_err(|_| MfaPrimitiveError::Cipher)?;
+        let plaintext = Zeroizing::new(
+            cipher
+                .open(&sealed.ciphertext)
+                .map_err(|_| MfaPrimitiveError::Cipher)?,
+        );
         let secret = Self::from_bytes(&plaintext).map_err(|_| MfaPrimitiveError::Cipher)?;
         if secret.digest() != sealed.digest {
             return Err(MfaPrimitiveError::Cipher);
@@ -316,8 +361,21 @@ fn percent_encode(value: &str) -> String {
 }
 
 /// An `otpauth://` provisioning URI. It contains the seed: never log it.
+/// Wiped when dropped.
 #[derive(Clone)]
 pub struct TotpProvisioningUri(String);
+
+impl Drop for TotpProvisioningUri {
+    fn drop(&mut self) {
+        self.wipe();
+    }
+}
+
+impl TotpProvisioningUri {
+    fn wipe(&mut self) {
+        self.0.zeroize();
+    }
+}
 
 impl TotpProvisioningUri {
     /// Exposes the URI only to the page that shows it once.
@@ -373,10 +431,13 @@ impl std::fmt::Debug for SealedTotpSecret {
 /// rotation implement this port; [`Aes256GcmSecretCipher`] is the built-in
 /// single-key cipher.
 pub trait SecretCipher: Send + Sync {
-    /// Encrypts `plaintext` with a fresh nonce.
+    /// Encrypts `plaintext` with a fresh nonce. Implementations should wipe
+    /// any working copy of `plaintext` they make.
     fn seal(&self, plaintext: &[u8]) -> Result<Vec<u8>, SecretCipherError>;
 
-    /// Decrypts and authenticates what [`SecretCipher::seal`] returned.
+    /// Decrypts and authenticates what [`SecretCipher::seal`] returned. The
+    /// caller wipes the returned plaintext; implementations should leave no
+    /// other copy of it behind.
     fn open(&self, sealed: &[u8]) -> Result<Vec<u8>, SecretCipherError>;
 }
 
@@ -442,42 +503,65 @@ pub fn parse_mfa_key(encoded: &str) -> Result<[u8; MFA_KEY_BYTES], SecretCipherE
 }
 
 impl SecretCipher for Aes256GcmSecretCipher {
+    /// Encrypts in one buffer sized for `nonce || ciphertext || tag`, so the
+    /// plaintext is never copied to a buffer that is reallocated or dropped
+    /// unwiped; on failure the buffer is wiped.
     fn seal(&self, plaintext: &[u8]) -> Result<Vec<u8>, SecretCipherError> {
         let nonce: [u8; NONCE_LEN] = random().map_err(|_| SecretCipherError::Seal)?;
-        let mut in_out = plaintext.to_vec();
-        self.key
-            .seal_in_place_append_tag(
+        let mut sealed = Zeroizing::new(Vec::with_capacity(NONCE_LEN + plaintext.len() + TAG_LEN));
+        sealed.extend_from_slice(&nonce);
+        sealed.extend_from_slice(plaintext);
+        let tag = self
+            .key
+            .seal_in_place_separate_tag(
                 Nonce::assume_unique_for_key(nonce),
                 Aad::empty(),
-                &mut in_out,
+                &mut sealed[NONCE_LEN..],
             )
             .map_err(|_| SecretCipherError::Seal)?;
-        let mut sealed = Vec::with_capacity(NONCE_LEN + in_out.len());
-        sealed.extend_from_slice(&nonce);
-        sealed.extend_from_slice(&in_out);
-        Ok(sealed)
+        sealed.extend_from_slice(tag.as_ref());
+        // Only ciphertext is left: hand the buffer out without wiping it.
+        Ok(std::mem::take(&mut *sealed))
     }
 
+    /// Decrypts in place and returns that buffer, truncated to the
+    /// plaintext, so no second copy exists; on failure the buffer is wiped.
     fn open(&self, sealed: &[u8]) -> Result<Vec<u8>, SecretCipherError> {
         if sealed.len() < NONCE_LEN + TAG_LEN {
             return Err(SecretCipherError::Open);
         }
         let (nonce, ciphertext) = sealed.split_at(NONCE_LEN);
         let nonce = Nonce::try_assume_unique_for_key(nonce).map_err(|_| SecretCipherError::Open)?;
-        let mut in_out = ciphertext.to_vec();
-        let plaintext = self
+        let mut in_out = Zeroizing::new(ciphertext.to_vec());
+        let length = self
             .key
             .open_in_place(nonce, Aad::empty(), &mut in_out)
-            .map_err(|_| SecretCipherError::Open)?;
-        Ok(plaintext.to_vec())
+            .map_err(|_| SecretCipherError::Open)?
+            .len();
+        // The bytes past the plaintext are the authentication tag, which is
+        // not secret.
+        in_out.truncate(length);
+        Ok(std::mem::take(&mut *in_out))
     }
 }
 
 /// A one-time backup (recovery) code: 120 random bits as 24 Base32
 /// characters in groups of four (`ABCD-EFGH-...`). Only its digest is
-/// persisted; the code is shown once.
+/// persisted; the code is shown once. Wiped when dropped.
 #[derive(Clone)]
 pub struct MfaBackupCode(String);
+
+impl Drop for MfaBackupCode {
+    fn drop(&mut self) {
+        self.wipe();
+    }
+}
+
+impl MfaBackupCode {
+    fn wipe(&mut self) {
+        self.0.zeroize();
+    }
+}
 
 impl MfaBackupCode {
     /// Generates `count` distinct codes (1 to 100) and their digests.
@@ -490,13 +574,13 @@ impl MfaBackupCode {
         let mut codes = Vec::with_capacity(count);
         let mut digests: Vec<MfaBackupCodeDigest> = Vec::with_capacity(count);
         while codes.len() < count {
-            let raw: [u8; BACKUP_CODE_BYTES] = random()?;
-            let digest = backup_digest(&raw);
+            let raw = Zeroizing::new(random::<BACKUP_CODE_BYTES>()?);
+            let digest = backup_digest(raw.as_slice());
             if digests.contains(&digest) {
                 continue;
             }
             digests.push(digest);
-            codes.push(Self(group(&base32_encode(&raw))));
+            codes.push(Self(group(&Zeroizing::new(base32_encode(raw.as_slice())))));
         }
         Ok((codes, digests))
     }
@@ -544,11 +628,24 @@ fn group(encoded: &str) -> String {
 
 /// The opaque token of a pending second-factor sign-in: 256 random bits as
 /// unpadded base64url (43 characters), held in a `HttpOnly` cookie. Only
-/// its SHA-256 digest is persisted.
+/// its SHA-256 digest is persisted. Wiped when dropped.
 #[derive(Clone, Eq, PartialEq)]
 pub struct MfaChallengeToken {
     encoded: String,
     raw: [u8; CHALLENGE_TOKEN_BYTES],
+}
+
+impl Drop for MfaChallengeToken {
+    fn drop(&mut self) {
+        self.wipe();
+    }
+}
+
+impl MfaChallengeToken {
+    fn wipe(&mut self) {
+        self.encoded.zeroize();
+        self.raw.zeroize();
+    }
 }
 
 impl MfaChallengeToken {
@@ -563,12 +660,14 @@ impl MfaChallengeToken {
 
     /// Accepts only the canonical encoding of 32 bytes.
     pub fn new(value: &str) -> Result<Self, MfaPrimitiveError> {
-        let decoded = URL_SAFE_NO_PAD
-            .decode(value)
-            .map_err(|_| MfaPrimitiveError::InvalidSecret)?;
+        let decoded = Zeroizing::new(
+            URL_SAFE_NO_PAD
+                .decode(value)
+                .map_err(|_| MfaPrimitiveError::InvalidSecret)?,
+        );
         let raw = <[u8; CHALLENGE_TOKEN_BYTES]>::try_from(decoded.as_slice())
             .map_err(|_| MfaPrimitiveError::InvalidSecret)?;
-        if URL_SAFE_NO_PAD.encode(raw) != value {
+        if *Zeroizing::new(URL_SAFE_NO_PAD.encode(raw)) != value {
             return Err(MfaPrimitiveError::InvalidSecret);
         }
         Ok(Self {
@@ -599,15 +698,21 @@ impl std::fmt::Debug for MfaChallengeToken {
 
 const BASE32_ALPHABET: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
 
-/// Uppercase without spaces or hyphens.
-fn compact_base32(text: &str) -> String {
-    text.chars()
-        .filter(|character| !character.is_whitespace() && *character != '-')
-        .map(|character| character.to_ascii_uppercase())
-        .collect()
+/// Uppercase without spaces or hyphens, wiped when dropped. The text never
+/// grows (ASCII uppercasing keeps every character's length), so it is never
+/// reallocated.
+fn compact_base32(text: &str) -> Zeroizing<String> {
+    let mut compact = Zeroizing::new(String::with_capacity(text.len()));
+    for character in text.chars() {
+        if !character.is_whitespace() && character != '-' {
+            compact.push(character.to_ascii_uppercase());
+        }
+    }
+    compact
 }
 
-/// RFC 4648 Base32 of whole 5-byte groups, so there is never padding.
+/// RFC 4648 Base32 of whole 5-byte groups, so there is never padding. The
+/// text is allocated at its final size.
 fn base32_encode(bytes: &[u8]) -> String {
     let mut encoded = String::with_capacity(bytes.len() * 8 / 5);
     for chunk in bytes.chunks(5) {
@@ -627,12 +732,13 @@ fn base32_encode(bytes: &[u8]) -> String {
     encoded
 }
 
-/// Decodes unpadded uppercase Base32 of whole 8-character groups.
-fn base32_decode(text: &str) -> Option<Vec<u8>> {
+/// Decodes unpadded uppercase Base32 of whole 8-character groups into a
+/// buffer allocated at its final size and wiped when dropped.
+fn base32_decode(text: &str) -> Option<Zeroizing<Vec<u8>>> {
     if text.is_empty() || !text.len().is_multiple_of(8) {
         return None;
     }
-    let mut bytes = Vec::with_capacity(text.len() * 5 / 8);
+    let mut bytes = Zeroizing::new(Vec::with_capacity(text.len() * 5 / 8));
     for chunk in text.as_bytes().chunks(8) {
         let mut bits = 0_u64;
         for character in chunk {
@@ -913,10 +1019,51 @@ mod tests {
     }
 
     #[test]
+    fn secret_material_is_wiped_when_dropped() {
+        // Each type runs its wipe on drop (needs_drop is false for a bare
+        // byte array, so the seed and token types have their own Drop).
+        assert!(std::mem::needs_drop::<TotpSecret>());
+        assert!(std::mem::needs_drop::<MfaChallengeToken>());
+
+        let mut secret = rfc_secret();
+        secret.wipe();
+        assert_eq!(secret.0, [0_u8; TOTP_SECRET_BYTES]);
+
+        let mut uri = rfc_secret()
+            .provisioning_uri("Acme", "ada@example.com")
+            .expect("labels");
+        assert_eq!(uri.0.len(), uri.0.capacity(), "built at its final size");
+        uri.wipe();
+        assert!(uri.0.is_empty());
+
+        let (mut codes, _) = MfaBackupCode::generate_set(1).expect("codes");
+        codes[0].wipe();
+        assert!(codes[0].expose().is_empty());
+
+        let mut token = MfaChallengeToken::generate().expect("random");
+        token.wipe();
+        assert_eq!(token.raw, [0_u8; CHALLENGE_TOKEN_BYTES]);
+        assert!(token.expose().is_empty());
+
+        // Opening returns the decryption buffer itself, cut to the seed.
+        let cipher = Aes256GcmSecretCipher::new(&[7_u8; 32]).expect("key");
+        let sealed = cipher.seal(b"12345678901234567890").expect("seal");
+        assert_eq!(sealed.len(), sealed.capacity(), "sealed in one buffer");
+        let opened = cipher.open(&sealed).expect("open");
+        assert_eq!(opened, b"12345678901234567890");
+        assert_eq!(opened.capacity(), TOTP_SECRET_BYTES + TAG_LEN);
+        assert_eq!(TOTP_DIGITS.to_string(), TOTP_DIGITS_TEXT);
+        assert_eq!(TOTP_PERIOD_SECS.to_string(), TOTP_PERIOD_TEXT);
+    }
+
+    #[test]
     fn base32_matches_rfc_4648_vectors() {
         assert_eq!(base32_encode(b"fooba"), "MZXW6YTB");
-        assert_eq!(base32_decode("MZXW6YTB").as_deref(), Some(&b"fooba"[..]));
-        assert_eq!(base32_decode("MZXW6YT1"), None);
-        assert_eq!(base32_decode("MZXW6YT"), None);
+        assert_eq!(
+            base32_decode("MZXW6YTB").as_deref().map(Vec::as_slice),
+            Some(&b"fooba"[..])
+        );
+        assert!(base32_decode("MZXW6YT1").is_none());
+        assert!(base32_decode("MZXW6YT").is_none());
     }
 }

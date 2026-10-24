@@ -10,14 +10,18 @@
 //!
 //! Applications without a delivery mechanism use
 //! [`UndeliverablePasswordResets`], which fails closed: it never reports a
-//! delivery it did not make. The page that requests a reset answers the same
-//! whether or not an account exists or a message was delivered.
+//! delivery it did not make, and it says it cannot deliver
+//! ([`PasswordResetNotifier::can_deliver`]) so callers issue no token for
+//! it. The page that requests a reset answers the same whether or not an
+//! account exists or a message was delivered.
+
+use std::time::Duration;
 
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::{CredentialError, UnixTimestamp, validate_secret_token};
+use crate::{CredentialError, ThrottleConfig, UnixTimestamp, validate_secret_token};
 
 /// How long a reset link stays valid: 15 minutes.
 pub const PASSWORD_RESET_LIFETIME_SECS: u64 = 15 * 60;
@@ -25,6 +29,22 @@ pub const PASSWORD_RESET_LIFETIME_SECS: u64 = 15 * 60;
 /// The path of the page a reset link opens; the token is its `token` query
 /// parameter.
 pub const PASSWORD_RESET_PATH: &str = "/passwords/edit";
+
+/// The limits of reset requests and reset submissions, Forge-Go's
+/// `DefaultRecoveryThrottleConfig`: in one hour, 3 per account and source,
+/// 10 per account (a mailbox cannot be flooded from many sources) and 30 per
+/// source (one source cannot fill the reset queue), with at most 20,000
+/// counters.
+#[must_use]
+pub fn password_reset_throttle_config() -> ThrottleConfig {
+    ThrottleConfig {
+        window: Duration::from_secs(60 * 60),
+        pair_limit: 3,
+        account_limit: 10,
+        source_limit: 30,
+        max_entries: 20_000,
+    }
+}
 
 /// Raw one-time password reset token.
 #[derive(Clone, Eq, PartialEq)]
@@ -177,6 +197,14 @@ pub trait PasswordResetNotifier: Send + Sync {
         &self,
         delivery: &PasswordResetDelivery,
     ) -> Result<(), PasswordResetDeliveryError>;
+
+    /// Whether this notifier can deliver at all. `false` means every
+    /// [`deliver`](Self::deliver) fails with
+    /// [`PasswordResetDeliveryError::NotConfigured`]: callers then issue no
+    /// token and queue no work. The default is `true`.
+    fn can_deliver(&self) -> bool {
+        true
+    }
 }
 
 /// Fail-closed [`PasswordResetNotifier`] for applications without a mailer:
@@ -192,6 +220,10 @@ impl PasswordResetNotifier for UndeliverablePasswordResets {
         _delivery: &PasswordResetDelivery,
     ) -> Result<(), PasswordResetDeliveryError> {
         Err(PasswordResetDeliveryError::NotConfigured)
+    }
+
+    fn can_deliver(&self) -> bool {
+        false
     }
 }
 
@@ -267,5 +299,20 @@ mod tests {
             UndeliverablePasswordResets.deliver(&delivery).await,
             Err(PasswordResetDeliveryError::NotConfigured)
         );
+        assert!(
+            !UndeliverablePasswordResets.can_deliver(),
+            "callers issue no token for it"
+        );
+    }
+
+    #[test]
+    fn reset_limits_match_forge_go_and_are_valid() {
+        let config = password_reset_throttle_config();
+        assert_eq!(config.window, Duration::from_secs(3_600));
+        assert_eq!(
+            (config.pair_limit, config.account_limit, config.source_limit),
+            (3, 10, 30)
+        );
+        assert!(crate::MemoryLoginThrottle::new(config).is_ok());
     }
 }
