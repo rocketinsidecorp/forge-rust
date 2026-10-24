@@ -1286,6 +1286,72 @@ async fn worker_functions_refuse_tenant_scope_and_can_be_split_from_the_runtime_
     db.cleanup().await.expect("cleanup");
 }
 
+/// Runs a one-handler runtime on `database` and returns its result, which
+/// must come back at once: the grant check runs before any loop starts.
+async fn run_briefly(database: &PgDatabase) -> Result<(), JobsError> {
+    let mut jobs = Jobs::new();
+    jobs.register(Counter::default()).expect("register");
+    jobs.settings(fast());
+    let shutdown = Cancellation::new();
+    let run = jobs.run(PgJobStore::new(database.clone()), shutdown.clone());
+    match tokio::time::timeout(Duration::from_secs(5), run).await {
+        Ok(result) => result,
+        Err(_) => {
+            shutdown.cancel();
+            panic!("the runtime kept running instead of failing fast");
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs FORGE_TEST_DATABASE_URL"]
+async fn a_role_without_worker_grants_fails_fast_with_the_documented_message() {
+    // The request-serving role of a split setup holds forge_jobs_complete
+    // only: what `serve` meets when it runs with a role that was not
+    // forge.runtime_role at `forge migrate`.
+    let db = RlsTestDatabase::create_with_worker(&[migrator()])
+        .await
+        .expect(IGNORE);
+    let error = run_briefly(db.runtime())
+        .await
+        .expect_err("a role that cannot claim must not start");
+    assert!(
+        matches!(&error, JobsError::WorkerNotGranted { role, .. } if role == db.runtime_role()),
+        "{error:?}"
+    );
+    let message = error.to_string();
+    for expected in [
+        "cannot claim jobs",
+        "lacks EXECUTE on",
+        "forge_jobs_claim",
+        "PGOPTIONS='-c forge.runtime_role=",
+    ] {
+        assert!(message.contains(expected), "{message}");
+    }
+    assert!(!message.contains("forge_jobs_complete"), "{message}");
+    // The worker role holds every grant and starts.
+    let mut jobs = Jobs::new();
+    jobs.register(Counter::default()).expect("register");
+    jobs.settings(fast());
+    let (shutdown, handle) = spawn_runtime(jobs, db.worker());
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!handle.is_finished(), "the worker role must keep running");
+    stop(shutdown, handle).await;
+    db.cleanup().await.expect("cleanup");
+
+    // Without the job schema there is nothing to grant: migrate first.
+    let empty = RlsTestDatabase::create(&[]).await.expect(IGNORE);
+    let message = run_briefly(empty.runtime())
+        .await
+        .expect_err("an unmigrated schema must not start")
+        .to_string();
+    assert!(
+        message.contains("cannot claim jobs") && message.contains("run `forge migrate`"),
+        "{message}"
+    );
+    empty.cleanup().await.expect("cleanup");
+}
+
 #[derive(Serialize, Deserialize)]
 struct Holder {
     hold: bool,

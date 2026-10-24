@@ -53,8 +53,10 @@ jobs:
         with:
           workspaces: fuzz
           shared-key: fuzz-${{ hashFiles('scripts/fuzz.sh', 'fuzz/Cargo.lock') }}
-      - name: Install cargo-fuzz
-        run: command -v cargo-fuzz >/dev/null || cargo install cargo-fuzz --version 0.13.2 --locked
+      - uses: ./.github/actions/cargo-tool
+        with:
+          tool: cargo-fuzz
+          version: 0.13.2
       # The corpus is cached per target; the target directory above would only
       # carry one target's corpus into the others'.
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0

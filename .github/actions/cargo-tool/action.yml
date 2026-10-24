@@ -1,0 +1,39 @@
+name: Install a cargo tool by exact version
+description: >-
+  Installs a cargo tool at an exact version, locked, into a directory named
+  after that version and cached under a key that holds it, and puts its bin/
+  first on PATH. Bumping the version therefore always installs the new one:
+  rust-cache's restored ~/.cargo/bin can no longer shadow it, as the former
+  skip-when-on-PATH install did (crates/forge/tests/supply_chain.rs requires
+  an exact X.Y.Z here).
+
+inputs:
+  tool:
+    description: The crate to install, such as cargo-fuzz.
+    required: true
+  version:
+    description: Its exact version, X.Y.Z.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Restore ${{ inputs.tool }} ${{ inputs.version }}
+      id: cache
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ~/.forge-tools/${{ inputs.tool }}-${{ inputs.version }}
+        key: forge-tool-${{ inputs.tool }}-${{ inputs.version }}-${{ runner.os }}-${{ runner.arch }}
+    - name: Install ${{ inputs.tool }} ${{ inputs.version }}
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      env:
+        TOOL: ${{ inputs.tool }}
+        VERSION: ${{ inputs.version }}
+      run: cargo install "$TOOL" --version "$VERSION" --locked --root "$HOME/.forge-tools/$TOOL-$VERSION"
+    - name: Put ${{ inputs.tool }} ${{ inputs.version }} on PATH
+      shell: bash
+      env:
+        TOOL: ${{ inputs.tool }}
+        VERSION: ${{ inputs.version }}
+      run: echo "$HOME/.forge-tools/$TOOL-$VERSION/bin" >> "$GITHUB_PATH"

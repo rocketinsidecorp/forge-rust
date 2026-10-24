@@ -312,6 +312,11 @@ impl Jobs {
     /// Every loop is a task owned by this future; none outlives it. If a loop
     /// panics, the others are stopped gracefully and the panic is reported as
     /// [`JobsError::TaskFailed`].
+    ///
+    /// Before starting any loop it checks that the store's role can run the
+    /// worker functions, and returns [`JobsError::WorkerNotGranted`] when it
+    /// cannot (an unmigrated schema, or a role that was not
+    /// `forge.runtime_role`/`forge.worker_role` at migration).
     pub async fn run(self, store: PgJobStore, shutdown: Cancellation) -> Result<(), JobsError> {
         self.validate()?;
         crate::panics::redact_attempt_panics();
@@ -331,6 +336,12 @@ impl Jobs {
                 .entry(handler.queue())
                 .or_default()
                 .insert(name, handler);
+        }
+
+        // Fail closed before anything starts: a role without the worker
+        // grants would otherwise log a failed claim every poll interval.
+        if !queues.is_empty() || !schedules.is_empty() || pruning.is_some() {
+            store.check_worker_grants().await?;
         }
 
         let stop = shutdown.child();

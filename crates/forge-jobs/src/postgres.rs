@@ -30,9 +30,9 @@ pub const MIGRATIONS_TABLE: &str = "_forge_jobs_migrations";
 /// Apply it with the migration role, e.g. `database.migrate(&migrator())`;
 /// `forge::App::jobs` does so in the application's `migrate` command. The
 /// runtime role that receives grants is read from the `forge.runtime_role`
-/// setting (`ALTER DATABASE app SET forge.runtime_role = 'svc_runtime'`) and
-/// defaults to `app_runtime`; an explicitly named role that does not exist
-/// fails the migration.
+/// session setting (`PGOPTIONS='-c forge.runtime_role=svc_runtime' forge
+/// migrate`) and defaults to `app_runtime`; an explicitly named role that does
+/// not exist fails the migration.
 #[must_use]
 pub fn migrator() -> Migrator {
     use sqlx::{
@@ -605,6 +605,42 @@ impl PgJobStore {
             }
         }
         Ok(total)
+    }
+
+    /// Checks that the connected role can run every `forge_jobs_*` function
+    /// the workers, scheduler and pruner call.
+    pub(crate) async fn check_worker_grants(&self) -> Result<(), JobsError> {
+        let row = sqlx::query(
+            r"SELECT current_user::text AS role,
+                     EXISTS (
+                         SELECT 1 FROM pg_proc AS p
+                         WHERE p.proname = 'forge_jobs_claim' AND pg_function_is_visible(p.oid)
+                     ) AS migrated,
+                     ARRAY(
+                         SELECT DISTINCT p.proname::text FROM pg_proc AS p
+                         WHERE p.proname LIKE 'forge\_jobs\_%'
+                           AND pg_function_is_visible(p.oid)
+                           AND NOT has_function_privilege(p.oid, 'EXECUTE')
+                         ORDER BY 1
+                     ) AS denied",
+        )
+        .fetch_one(self.database.pool())
+        .await?;
+        let role: String = row.try_get("role")?;
+        let migrated: bool = row.try_get("migrated")?;
+        let denied: Vec<String> = row.try_get("denied")?;
+        let detail = if !migrated {
+            "the job schema is not migrated (forge_jobs_claim does not exist); run `forge migrate`"
+                .to_owned()
+        } else if !denied.is_empty() {
+            format!(
+                "it lacks EXECUTE on {}; grant it by running `forge migrate` as the migration role with PGOPTIONS='-c forge.runtime_role={role}' (or forge.worker_role), or run the workers as the role that has it",
+                denied.join(", ")
+            )
+        } else {
+            return Ok(());
+        };
+        Err(JobsError::WorkerNotGranted { role, detail })
     }
 
     pub(crate) async fn claim(

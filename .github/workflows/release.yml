@@ -28,12 +28,18 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: The tag is a version on the default branch
+      - name: The tag is the workspace version, on the default branch
         env:
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           if ! [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
             echo "::error::the tag is not a version such as v1.2.3 or v1.2.3-rc.1"
+            exit 1
+          fi
+          # The version every crate inherits ([workspace.package] of Cargo.toml).
+          version="$(sed -n '/^\[workspace\.package\]/,/^\[/s/^version = "\(.*\)"$/\1/p' Cargo.toml)"
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::$GITHUB_REF_NAME does not match the workspace version ${version:-(none)} of Cargo.toml"
             exit 1
           fi
           if ! git merge-base --is-ancestor "$GITHUB_SHA" "origin/$DEFAULT_BRANCH"; then

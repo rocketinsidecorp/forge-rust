@@ -675,7 +675,10 @@ frame-ancestors 'none'
 `unsafe-eval`: inline event handlers, inline `<script>` and `style=""`
 attributes are blocked by design. The policy also sets `Referrer-Policy:
 strict-origin-when-cross-origin`. As a layer it skips responses that already
-carry a policy (SVG assets keep their sandbox). Extra inline scripts can be
+carry a policy (SVG assets keep their sandbox), and keeps a handler's own
+`Referrer-Policy` only when it is at least as strict (`no-referrer`,
+`same-origin`, `strict-origin`); a weaker one such as `unsafe-url` or
+`origin` is replaced. Extra inline scripts can be
 allowed only by hash (`with_script_hash`, which validates the base64 digest
 so policy syntax cannot be injected). Turbo's progress bar injects an inline
 stylesheet that the policy blocks; the generated `application.css` carries

@@ -116,11 +116,44 @@ impl ContentSecurityPolicy {
     }
 }
 
+/// Whether a handler's `Referrer-Policy` leaks no more than
+/// `strict-origin-when-cross-origin`: the policy browsers apply (the last
+/// token they recognize, per the Referrer Policy specification) is
+/// `no-referrer`, `same-origin`, `strict-origin` or
+/// `strict-origin-when-cross-origin`. `unsafe-url`, `origin`,
+/// `origin-when-cross-origin`, `no-referrer-when-downgrade`, an empty or
+/// unknown value are weaker or unreliable.
+fn referrer_policy_is_strict(value: &HeaderValue) -> bool {
+    let Ok(value) = value.to_str() else {
+        return false;
+    };
+    let effective = value.rsplit(',').map(str::trim).find(|token| {
+        matches!(
+            token.to_ascii_lowercase().as_str(),
+            "no-referrer"
+                | "same-origin"
+                | "strict-origin"
+                | "strict-origin-when-cross-origin"
+                | "unsafe-url"
+                | "origin"
+                | "origin-when-cross-origin"
+                | "no-referrer-when-downgrade"
+        )
+    });
+    effective.is_some_and(|token| {
+        matches!(
+            token.to_ascii_lowercase().as_str(),
+            "no-referrer" | "same-origin" | "strict-origin" | "strict-origin-when-cross-origin"
+        )
+    })
+}
+
 /// As a request layer, the policy is applied to every response that does not
 /// already carry a `Content-Security-Policy` (an SVG asset keeps its own
 /// sandboxing policy), so no HTML page can be served without it. A
-/// `Referrer-Policy` the handler set is kept (for example `no-referrer` on a
-/// page whose URL carries a password reset token):
+/// `Referrer-Policy` the handler set is kept only when it is at least as
+/// strict (for example `no-referrer` on a page whose URL carries a password
+/// reset token); a weaker one (`unsafe-url`, `origin`, ...) is replaced:
 ///
 /// ```
 /// let mut router = forge_http::Router::new();
@@ -134,7 +167,11 @@ impl Middleware for ContentSecurityPolicy {
                 .headers()
                 .contains_key(header::CONTENT_SECURITY_POLICY)
             {
-                let referrer = response.headers().get(header::REFERRER_POLICY).cloned();
+                let referrer = response
+                    .headers()
+                    .get(header::REFERRER_POLICY)
+                    .filter(|value| referrer_policy_is_strict(value))
+                    .cloned();
                 self.apply(&mut response);
                 if let Some(referrer) = referrer {
                     response
@@ -297,6 +334,46 @@ mod tests {
             Some(strict.as_str())
         );
         assert_eq!(header_of(&reset, "referrer-policy"), Some("no-referrer"));
+    }
+
+    #[tokio::test]
+    async fn the_layer_replaces_a_weaker_referrer_policy() {
+        for (set, kept) in [
+            ("no-referrer", "no-referrer"),
+            ("same-origin", "same-origin"),
+            ("Strict-Origin", "Strict-Origin"),
+            ("unsafe-url, no-referrer", "unsafe-url, no-referrer"),
+            ("unsafe-url", "strict-origin-when-cross-origin"),
+            ("origin", "strict-origin-when-cross-origin"),
+            (
+                "origin-when-cross-origin",
+                "strict-origin-when-cross-origin",
+            ),
+            (
+                "no-referrer-when-downgrade",
+                "strict-origin-when-cross-origin",
+            ),
+            // Browsers apply the last token they know: this is unsafe-url.
+            ("no-referrer, unsafe-url", "strict-origin-when-cross-origin"),
+            ("no-referrer, bogus", "no-referrer, bogus"),
+            ("bogus", "strict-origin-when-cross-origin"),
+            ("", "strict-origin-when-cross-origin"),
+        ] {
+            let mut router = forge_http::Router::new();
+            router.layer(ContentSecurityPolicy::strict());
+            router
+                .route(forge_http::Method::GET, "/", move |_| async move {
+                    let mut response = Response::empty(StatusCode::OK);
+                    response.headers_mut().insert(
+                        header::REFERRER_POLICY,
+                        HeaderValue::from_str(set).expect("header value"),
+                    );
+                    response
+                })
+                .expect("route");
+            let response = router.dispatch(crate::test_support::get("/")).await;
+            assert_eq!(header_of(&response, "referrer-policy"), Some(kept), "{set}");
+        }
     }
 
     #[test]
