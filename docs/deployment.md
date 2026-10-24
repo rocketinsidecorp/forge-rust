@@ -777,6 +777,7 @@ with `ok`, `error` and `exit_code`.
    `lock/info` exists, and `info` is removed only by a release whose record
    matches or by `--force`. A lock directory without a record file (the
    process was killed between the `mkdir` and the claim) older than a minute
+   (`find -mmin +1`, so up to about two minutes)
    is taken over in place by the next deploy or `lock acquire` without
    `--force`, with a warning printed after the claim has succeeded; nothing
    is removed, so two deploys cannot both win it (a test forces the
@@ -792,8 +793,10 @@ with `ok`, `error` and `exit_code`.
    The lock needs `~/.forge` on every host to be on a file system that
    supports hard links (any local Linux file system does). Without them `ln`
    fails and every acquire reports the lock as held, which fails closed:
-   nothing deploys. The acquire prints `ln`'s own error on stderr in that
-   case, and an empty lock directory may be left behind (clear it with `lock
+   nothing deploys. The remote acquire script writes `ln`'s own error to
+   its stderr, but `forge deploy` reports only the held lock (holder
+   `unknown`), so check the file system when a lock without a holder never
+   clears; an empty lock directory may be left behind (clear it with `lock
    release --force`). On NFS, `link(2)` is atomic on a correctly configured
    server, but client caching can delay what other hosts see; keep
    `~/.forge` on local disk.
