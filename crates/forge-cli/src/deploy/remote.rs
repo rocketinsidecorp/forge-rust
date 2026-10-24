@@ -127,8 +127,13 @@ impl Deployer {
 
     /// Streams the logs of the current role container from every selected
     /// host, each line prefixed `host|`, until every stream ended or
-    /// `cancel` fired; cancellation stops the remote `docker logs`. One
-    /// scoped thread per host.
+    /// `cancel` fired; cancellation stops the remote `docker logs`.
+    ///
+    /// Without `follow` every stream ends, so at most `parallelism` hosts
+    /// are read at once, like every other multi-host operation. A `follow`
+    /// stream never ends on its own, so a host waiting for a free slot would
+    /// never be shown: every selected host gets its own scoped thread and
+    /// SSH session at once (narrow them with `--role` and `--host`).
     pub(crate) fn logs(
         &self,
         cancel: &Cancel,
@@ -159,22 +164,26 @@ impl Deployer {
         let command = self
             .cmds
             .logs(&role, options.follow, &options.since, options.lines);
+        let stream_host = |cancel: &Cancel, host: &str| {
+            let writer = PrefixWriter::new(
+                format!("{host}|"),
+                Arc::clone(&out),
+                grep.clone(),
+                self.redactor.clone(),
+            );
+            let result = self.stream(cancel, host, &command, &writer);
+            writer.flush();
+            result
+        };
+        if !options.follow {
+            return self.each_host(cancel, &hosts, stream_host);
+        }
         let errors: Vec<DeployError> = std::thread::scope(|scope| {
             let handles: Vec<_> = hosts
                 .iter()
                 .map(|host| {
-                    let writer = PrefixWriter::new(
-                        format!("{host}|"),
-                        Arc::clone(&out),
-                        grep.clone(),
-                        self.redactor.clone(),
-                    );
-                    let command = &command;
-                    scope.spawn(move || {
-                        let result = self.stream(cancel, host, command, &writer);
-                        writer.flush();
-                        result
-                    })
+                    let stream_host = &stream_host;
+                    scope.spawn(move || stream_host(cancel, host))
                 })
                 .collect();
             handles

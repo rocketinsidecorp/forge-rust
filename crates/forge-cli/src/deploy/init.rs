@@ -104,7 +104,7 @@ builder:
   dockerfile: Dockerfile
   # platform: linux/amd64
 
-retain: 5            # stopped versions kept per role for rollback
+retain: 5            # versions kept per role for rollback (2 or more; the running one counts)
 stop_timeout: 35s    # SIGTERM grace; above FORGE_SHUTDOWN_GRACE_SECS (15s)
 
 ssh:

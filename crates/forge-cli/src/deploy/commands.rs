@@ -10,6 +10,7 @@
 use std::collections::BTreeMap;
 
 use super::config::{Config, publish_spec};
+use super::errors::{LOCK_GONE_EXIT_STATUS, LOCK_HELD_EXIT_STATUS, LOCK_NOT_OURS_EXIT_STATUS};
 use super::secrets::Secrets;
 
 pub(crate) const NETWORK_NAME: &str = "forge";
@@ -21,6 +22,10 @@ pub(crate) const LABEL_SERVICE: &str = "forge.service";
 pub(crate) const LABEL_ROLE: &str = "forge.role";
 pub(crate) const LABEL_VERSION: &str = "forge.version";
 const LABEL_ACCESSORY: &str = "forge.accessory";
+/// Printed by [`Commands::acquire_lock`] on stderr after it took over a lock
+/// that never got its record.
+pub(crate) const STALE_LOCK_NOTICE: &str =
+    "took over a stale lock without a record (an earlier acquire was interrupted)";
 
 /// The application setting that lists the proxies whose `X-Forwarded-For`
 /// the application believes (ADR 0032).
@@ -102,6 +107,10 @@ impl Commands {
 
     fn lock_dir(&self) -> String {
         format!("{}/lock", self.state_dir())
+    }
+
+    fn lock_info(&self) -> String {
+        format!("{}/info", self.lock_dir())
     }
 
     fn log_file(&self) -> String {
@@ -532,32 +541,96 @@ impl Commands {
         ))
     }
 
+    /// Stores the record in a temporary file and claims the lock by
+    /// hard-linking it to `lock/info`: `ln` fails when `info` exists, so
+    /// exactly one claimant wins and the record is never visible half
+    /// written. Only a successful `ln` wins; nothing else in the script can
+    /// turn a loss into a win or a win into a loss, and the takeover notice
+    /// is printed after the win is decided. The directory comes from an
+    /// atomic `mkdir`. A directory with no `info` file at all (the acquire
+    /// was killed between `mkdir` and `ln`) that is older than a minute is
+    /// taken over in place with the same `ln`, so nothing is ever removed and
+    /// two recoverers cannot both win; the script says so on stderr
+    /// ([`STALE_LOCK_NOTICE`]). An empty `info` file (left by earlier
+    /// versions) is not taken over: `--force` clears it.
+    ///
+    /// The temporary file is created under noclobber (`set -C`), so a name
+    /// left by an earlier process with the same PID, possibly still linked
+    /// to `lock/info`, is never truncated: the redirection fails and the
+    /// acquire exits 1. When `ln` fails and `info` does not exist (hard
+    /// links unsupported on the file system), its own error is printed on
+    /// stderr before the acquire reports the lock as held.
+    ///
+    /// The text is Forge-Go's `acquireLock`, byte for byte.
     pub(crate) fn acquire_lock(&self, record: Vec<u8>) -> RemoteCommand {
-        RemoteCommand {
-            script: format!(
-                "{} && if {} 2>/dev/null; then {} > {}; else {} 2>/dev/null; exit {}; fi",
+        let lock = quote(&self.lock_dir());
+        let info = quote(&self.lock_info());
+        let tmp = format!("{}$$", quote(&format!("{}/lock.tmp.", self.state_dir())));
+        let script = [
+            format!(
+                "set -C; {} && {} > {tmp} || {{ rm -f {tmp}; exit 1; }}; ",
                 join(&["mkdir", "-p", &self.state_dir()]),
-                join(&["mkdir", &self.lock_dir()]),
-                join(&["cat"]),
-                quote(&format!("{}/info", self.lock_dir())),
-                join(&["cat", &format!("{}/info", self.lock_dir())]),
-                super::errors::LOCK_HELD_EXIT_STATUS
+                join(&["cat"])
             ),
+            format!(
+                "claim() {{ if err=$(ln {tmp} {info} 2>&1); then return 0; fi; [ -e {info} ] || echo \"$err\" >&2; return 1; }}; "
+            ),
+            format!(
+                "won=; if {} 2>/dev/null; then claim && won=1; ",
+                join(&["mkdir", &self.lock_dir()])
+            ),
+            format!(
+                "elif [ ! -e {info} ] && [ -n \"$(find {lock} -maxdepth 0 -mmin +1 2>/dev/null)\" ]; then "
+            ),
+            format!(
+                "if claim; then won=1; {{ echo {} >&2; true; }}; fi; fi; ",
+                quote(STALE_LOCK_NOTICE)
+            ),
+            format!("rm -f {tmp}; [ -n \"$won\" ] && exit 0; "),
+            format!(
+                "{} 2>/dev/null; exit {LOCK_HELD_EXIT_STATUS}",
+                join(&["cat", &self.lock_info()])
+            ),
+        ]
+        .concat();
+        RemoteCommand {
+            script,
             stdin: Some(record),
             stdin_note: "lock record (holder, time, message)".to_owned(),
             read_only: false,
         }
     }
 
+    /// Prints the record, or `{}` for a lock without one.
     pub(crate) fn lock_status(&self) -> RemoteCommand {
         RemoteCommand::read_only(format!(
-            "if [ -d {} ]; then {}; fi",
+            "if [ -d {} ]; then if [ -s {} ]; then {}; else echo '{{}}'; fi; fi",
             quote(&self.lock_dir()),
-            join(&["cat", &format!("{}/info", self.lock_dir())])
+            quote(&self.lock_info()),
+            join(&["cat", &self.lock_info()])
         ))
     }
 
-    pub(crate) fn release_lock(&self) -> RemoteCommand {
+    /// Removes the lock only while its record is the one on stdin, so a lock
+    /// somebody else took after a `--force` release is left alone (exit
+    /// [`LOCK_NOT_OURS_EXIT_STATUS`]); a lock that is already gone exits
+    /// [`LOCK_GONE_EXIT_STATUS`]. The compare and the `rm` are not atomic;
+    /// the window needs a force release and a new acquire inside it.
+    pub(crate) fn release_lock(&self, record: Vec<u8>) -> RemoteCommand {
+        let lock = quote(&self.lock_dir());
+        let info = quote(&self.lock_info());
+        RemoteCommand {
+            script: format!(
+                "record=$(cat) && if [ ! -d {lock} ]; then echo 'lock is already released' >&2; exit {LOCK_GONE_EXIT_STATUS}; elif [ -n \"$record\" ] && [ \"$(cat {info} 2>/dev/null)\" = \"$record\" ]; then rm -rf {lock}; else echo 'lock is held by someone else; left in place' >&2; exit {LOCK_NOT_OURS_EXIT_STATUS}; fi"
+            ),
+            stdin: Some(record),
+            stdin_note: "own lock record (release only if unchanged)".to_owned(),
+            read_only: false,
+        }
+    }
+
+    /// Removes the lock whoever holds it (`lock release --force`).
+    pub(crate) fn force_release_lock(&self) -> RemoteCommand {
         RemoteCommand::new(join(&["rm", "-rf", &self.lock_dir()]))
     }
 

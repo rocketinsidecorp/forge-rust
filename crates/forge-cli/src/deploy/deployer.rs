@@ -12,10 +12,13 @@ use std::time::Duration;
 use forge_proxy::clock::Timestamp;
 use serde::Serialize;
 
-use super::commands::{Commands, LABEL_ROLE, LABEL_SERVICE, LABEL_VERSION, RemoteCommand};
+use super::commands::{
+    Commands, LABEL_ROLE, LABEL_SERVICE, LABEL_VERSION, RemoteCommand, STALE_LOCK_NOTICE,
+};
 use super::config::{Config, VERSION};
 use super::errors::{
-    DeployError, EXIT_HOOK_FAILED, EXIT_LOCK_HELD, LOCK_HELD_EXIT_STATUS, LockInfo,
+    DeployError, EXIT_HOOK_FAILED, EXIT_LOCK_HELD, LOCK_GONE_EXIT_STATUS, LOCK_HELD_EXIT_STATUS,
+    LOCK_NOT_OURS_EXIT_STATUS, LockInfo,
 };
 use super::runner::{Cancel, DryLocal, DryRunner, LocalRunner, Output, RunError, Runner, Sink};
 use super::secrets::{Redactor, Secrets};
@@ -246,7 +249,8 @@ impl Deployer {
     }
 
     /// Takes the deploy lock on every host. The returned guard releases it
-    /// on drop, also after a failure or a signal.
+    /// on drop, also after a failure or a signal, but only where the lock
+    /// still carries this acquire's record.
     pub(crate) fn acquire(
         &self,
         cancel: &Cancel,
@@ -263,21 +267,18 @@ impl Deployer {
         record.push(b'\n');
         let acquired = Mutex::new(Vec::new());
         let held = Mutex::new(BTreeMap::new());
-        let command = self.cmds.acquire_lock(record);
+        let command = self.cmds.acquire_lock(record.clone());
         let result = self.each_host(cancel, hosts, |cancel, host| {
             match self.runner.run(cancel, host, &command) {
-                Ok(_) => {
+                Ok(output) => {
                     lock(&acquired).push(host.to_owned());
+                    if output.stderr.contains(STALE_LOCK_NOTICE) {
+                        self.logf("warning", &format!("{host}: {STALE_LOCK_NOTICE}"));
+                    }
                     Ok(())
                 }
                 Err(RunError::Remote(remote)) if remote.exit_code == LOCK_HELD_EXIT_STATUS => {
-                    let info = serde_json::from_str::<LockInfo>(remote.stdout.trim())
-                        .unwrap_or_else(|_| LockInfo {
-                            holder: "unknown".to_owned(),
-                            message: "unreadable lock record".to_owned(),
-                            acquired_at: Timestamp::go_zero(),
-                        });
-                    lock(&held).insert(host.to_owned(), info);
+                    lock(&held).insert(host.to_owned(), parse_lock_info(&remote.stdout));
                     Ok(())
                 }
                 Err(error) => Err(self.redact_error(error)),
@@ -288,6 +289,7 @@ impl Deployer {
             hosts: acquired
                 .into_inner()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
+            record,
         };
         let held = held
             .into_inner()
@@ -314,55 +316,82 @@ impl Deployer {
         Ok(())
     }
 
-    /// The lock record per host; hosts without a lock are absent.
+    /// The raw record per host; hosts without a lock are absent, and a lock
+    /// without a record is `{}`.
+    fn lock_records(&self, cancel: &Cancel) -> Result<BTreeMap<String, String>, DeployError> {
+        let records = Mutex::new(BTreeMap::new());
+        let command = self.cmds.lock_status();
+        self.each_host(cancel, &self.config.all_hosts(), |cancel, host| {
+            let output = self.run(cancel, host, &command)?;
+            let record = output.stdout.trim();
+            if !record.is_empty() {
+                lock(&records).insert(host.to_owned(), record.to_owned());
+            }
+            Ok(())
+        })?;
+        Ok(records
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner))
+    }
+
+    /// The lock record per host; hosts without a lock are absent. A lock
+    /// left without a record reports holder `unknown`.
     pub(crate) fn lock_status(
         &self,
         cancel: &Cancel,
     ) -> Result<BTreeMap<String, LockInfo>, DeployError> {
         self.prepare()?;
-        let locks = Mutex::new(BTreeMap::new());
-        let command = self.cmds.lock_status();
-        self.each_host(cancel, &self.config.all_hosts(), |cancel, host| {
-            let output = self.run(cancel, host, &command)?;
-            if output.stdout.trim().is_empty() {
-                return Ok(());
-            }
-            let info =
-                serde_json::from_str::<LockInfo>(output.stdout.trim()).unwrap_or_else(|_| {
-                    LockInfo {
-                        holder: "unknown".to_owned(),
-                        message: "unreadable lock record".to_owned(),
-                        acquired_at: Timestamp::go_zero(),
-                    }
-                });
-            lock(&locks).insert(host.to_owned(), info);
-            Ok(())
-        })?;
-        Ok(locks
-            .into_inner()
-            .unwrap_or_else(std::sync::PoisonError::into_inner))
+        Ok(self
+            .lock_records(cancel)?
+            .into_iter()
+            .map(|(host, record)| (host, parse_lock_info(&record)))
+            .collect())
     }
 
-    /// Removes the deploy lock. Without `force` it refuses to release a
-    /// lock held by someone else.
+    /// Removes the deploy lock. Without `force` it removes only locks held
+    /// by this performer, and only while the record is unchanged; it refuses
+    /// one held by someone else (or without a record).
     pub(crate) fn lock_release(&self, cancel: &Cancel, force: bool) -> Result<(), DeployError> {
         self.prepare()?;
-        if !force {
-            for (host, info) in self.lock_status(cancel)? {
-                if info.holder != self.performer {
-                    return Err(DeployError::new(format!(
-                        "{host}: lock is held by {} ({}); pass --force to release it anyway",
-                        info.holder, info.message
-                    ))
-                    .with_code(EXIT_LOCK_HELD));
-                }
+        if force {
+            let command = self.cmds.force_release_lock();
+            return self.each_host(cancel, &self.config.all_hosts(), |cancel, host| {
+                self.run(cancel, host, &command)?;
+                self.logf(host, "lock released");
+                Ok(())
+            });
+        }
+        let records = self.lock_records(cancel)?;
+        for (host, record) in &records {
+            let info = parse_lock_info(record);
+            if record == "{}" || info.holder != self.performer {
+                return Err(DeployError::new(format!(
+                    "{host}: lock is held by {} ({}); pass --force to release it anyway",
+                    info.holder, info.message
+                ))
+                .with_code(EXIT_LOCK_HELD));
             }
         }
-        let command = self.cmds.release_lock();
-        self.each_host(cancel, &self.config.all_hosts(), |cancel, host| {
-            self.run(cancel, host, &command)?;
-            self.logf(host, "lock released");
-            Ok(())
+        let hosts: Vec<String> = records.keys().cloned().collect();
+        self.each_host(cancel, &hosts, |cancel, host| {
+            let record = records.get(host).cloned().unwrap_or_default() + "\n";
+            match self.run(cancel, host, &self.cmds.release_lock(record.into_bytes())) {
+                Ok(_) => {
+                    self.logf(host, "lock released");
+                    Ok(())
+                }
+                Err(error) if error.remote_exit == Some(LOCK_GONE_EXIT_STATUS) => {
+                    self.logf(host, "lock was already released");
+                    Ok(())
+                }
+                Err(error) if error.remote_exit == Some(LOCK_NOT_OURS_EXIT_STATUS) => {
+                    Err(DeployError::new(format!(
+                        "{host}: the lock changed while releasing it; left in place (pass --force to release it anyway)"
+                    ))
+                    .with_code(EXIT_LOCK_HELD))
+                }
+                Err(error) => Err(error),
+            }
         })
     }
 
@@ -528,10 +557,12 @@ impl Deployer {
     }
 }
 
-/// Releases the deploy lock on the hosts that took it, when dropped.
+/// Releases the deploy lock on the hosts that took it, when dropped, where
+/// the lock still carries `record`.
 pub(crate) struct LockGuard<'a> {
     deployer: &'a Deployer,
     hosts: Vec<String>,
+    record: Vec<u8>,
 }
 
 impl Drop for LockGuard<'_> {
@@ -540,11 +571,31 @@ impl Drop for LockGuard<'_> {
             return;
         }
         let deployer = self.deployer;
-        let command = deployer.cmds.release_lock();
+        let command = deployer.cmds.release_lock(self.record.clone());
         // Released even after a signal, within 30 seconds.
         let cancel = Cancel::detached(Duration::from_secs(30));
         if let Err(error) = deployer.each_host(&cancel, &self.hosts, |cancel, host| {
-            deployer.run(cancel, host, &command).map(|_| ())
+            match deployer.run(cancel, host, &command) {
+                Ok(_) => Ok(()),
+                Err(error) if error.remote_exit == Some(LOCK_GONE_EXIT_STATUS) => {
+                    deployer.logf(
+                        "warning",
+                        &format!("{host}: the deploy lock was already released (by --force?)"),
+                    );
+                    Ok(())
+                }
+                Err(error) if error.remote_exit == Some(LOCK_NOT_OURS_EXIT_STATUS) => {
+                    // Somebody force-released and took the lock: not ours to remove.
+                    deployer.logf(
+                        "warning",
+                        &format!(
+                            "{host}: the deploy lock is now held by someone else and was left in place"
+                        ),
+                    );
+                    Ok(())
+                }
+                Err(error) => Err(error),
+            }
         }) {
             deployer.logf(
                 "warning",
@@ -559,6 +610,24 @@ impl LockGuard<'_> {
     pub(crate) fn keep(mut self) {
         self.hosts.clear();
     }
+}
+
+/// Reads the stdout of the lock commands. An empty record or `{}` is a lock
+/// whose acquire was interrupted before it wrote the record.
+pub(crate) fn parse_lock_info(stdout: &str) -> LockInfo {
+    let text = stdout.trim();
+    if text.is_empty() || text == "{}" {
+        return LockInfo {
+            holder: "unknown".to_owned(),
+            message: "lock without a record: an acquire was interrupted; a deploy takes it over once it is a minute old if its info file is missing, otherwise use forge deploy lock release --force".to_owned(),
+            acquired_at: Timestamp::go_zero(),
+        };
+    }
+    serde_json::from_str::<LockInfo>(text).unwrap_or_else(|_| LockInfo {
+        holder: "unknown".to_owned(),
+        message: "unreadable lock record".to_owned(),
+        acquired_at: Timestamp::go_zero(),
+    })
 }
 
 pub(crate) fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {

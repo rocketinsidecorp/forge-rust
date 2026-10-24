@@ -1,8 +1,8 @@
-192.0.2.10      $ mkdir -p .forge/shop && if mkdir .forge/shop/lock 2>/dev/null; then cat > .forge/shop/lock/info; else cat .forge/shop/lock/info 2>/dev/null; exit 75; fi
+192.0.2.10      $ set -C; mkdir -p .forge/shop && cat > .forge/shop/lock.tmp.$$ || { rm -f .forge/shop/lock.tmp.$$; exit 1; }; claim() { if err=$(ln .forge/shop/lock.tmp.$$ .forge/shop/lock/info 2>&1); then return 0; fi; [ -e .forge/shop/lock/info ] || echo "$err" >&2; return 1; }; won=; if mkdir .forge/shop/lock 2>/dev/null; then claim && won=1; elif [ ! -e .forge/shop/lock/info ] && [ -n "$(find .forge/shop/lock -maxdepth 0 -mmin +1 2>/dev/null)" ]; then if claim; then won=1; { echo 'took over a stale lock without a record (an earlier acquire was interrupted)' >&2; true; }; fi; fi; rm -f .forge/shop/lock.tmp.$$; [ -n "$won" ] && exit 0; cat .forge/shop/lock/info 2>/dev/null; exit 75
 192.0.2.10      < stdin: lock record (holder, time, message)
-192.0.2.11      $ mkdir -p .forge/shop && if mkdir .forge/shop/lock 2>/dev/null; then cat > .forge/shop/lock/info; else cat .forge/shop/lock/info 2>/dev/null; exit 75; fi
+192.0.2.11      $ set -C; mkdir -p .forge/shop && cat > .forge/shop/lock.tmp.$$ || { rm -f .forge/shop/lock.tmp.$$; exit 1; }; claim() { if err=$(ln .forge/shop/lock.tmp.$$ .forge/shop/lock/info 2>&1); then return 0; fi; [ -e .forge/shop/lock/info ] || echo "$err" >&2; return 1; }; won=; if mkdir .forge/shop/lock 2>/dev/null; then claim && won=1; elif [ ! -e .forge/shop/lock/info ] && [ -n "$(find .forge/shop/lock -maxdepth 0 -mmin +1 2>/dev/null)" ]; then if claim; then won=1; { echo 'took over a stale lock without a record (an earlier acquire was interrupted)' >&2; true; }; fi; fi; rm -f .forge/shop/lock.tmp.$$; [ -n "$won" ] && exit 0; cat .forge/shop/lock/info 2>/dev/null; exit 75
 192.0.2.11      < stdin: lock record (holder, time, message)
-192.0.2.20      $ mkdir -p .forge/shop && if mkdir .forge/shop/lock 2>/dev/null; then cat > .forge/shop/lock/info; else cat .forge/shop/lock/info 2>/dev/null; exit 75; fi
+192.0.2.20      $ set -C; mkdir -p .forge/shop && cat > .forge/shop/lock.tmp.$$ || { rm -f .forge/shop/lock.tmp.$$; exit 1; }; claim() { if err=$(ln .forge/shop/lock.tmp.$$ .forge/shop/lock/info 2>&1); then return 0; fi; [ -e .forge/shop/lock/info ] || echo "$err" >&2; return 1; }; won=; if mkdir .forge/shop/lock 2>/dev/null; then claim && won=1; elif [ ! -e .forge/shop/lock/info ] && [ -n "$(find .forge/shop/lock -maxdepth 0 -mmin +1 2>/dev/null)" ]; then if claim; then won=1; { echo 'took over a stale lock without a record (an earlier acquire was interrupted)' >&2; true; }; fi; fi; rm -f .forge/shop/lock.tmp.$$; [ -n "$won" ] && exit 0; cat .forge/shop/lock/info 2>/dev/null; exit 75
 192.0.2.20      < stdin: lock record (holder, time, message)
 192.0.2.10      # lock acquired (setup)
 192.0.2.11      # lock acquired (setup)
@@ -30,6 +30,9 @@
 192.0.2.20      < stdin: env file: 0 clear, 1 secret (POSTGRES_PASSWORD), values not shown
 192.0.2.20      $ docker container inspect shop-db >/dev/null 2>&1 && docker start shop-db >/dev/null || docker run --detach --name shop-db --network forge --restart unless-stopped --env-file .forge/shop/env/accessory-db.env --label forge.accessory=shop/db --publish 127.0.0.1:5432:5432 --volume shop-pg:/var/lib/postgresql postgres:18-alpine
 192.0.2.20      # accessory db running
-192.0.2.10      $ rm -rf .forge/shop/lock
-192.0.2.11      $ rm -rf .forge/shop/lock
-192.0.2.20      $ rm -rf .forge/shop/lock
+192.0.2.10      $ record=$(cat) && if [ ! -d .forge/shop/lock ]; then echo 'lock is already released' >&2; exit 77; elif [ -n "$record" ] && [ "$(cat .forge/shop/lock/info 2>/dev/null)" = "$record" ]; then rm -rf .forge/shop/lock; else echo 'lock is held by someone else; left in place' >&2; exit 76; fi
+192.0.2.10      < stdin: own lock record (release only if unchanged)
+192.0.2.11      $ record=$(cat) && if [ ! -d .forge/shop/lock ]; then echo 'lock is already released' >&2; exit 77; elif [ -n "$record" ] && [ "$(cat .forge/shop/lock/info 2>/dev/null)" = "$record" ]; then rm -rf .forge/shop/lock; else echo 'lock is held by someone else; left in place' >&2; exit 76; fi
+192.0.2.11      < stdin: own lock record (release only if unchanged)
+192.0.2.20      $ record=$(cat) && if [ ! -d .forge/shop/lock ]; then echo 'lock is already released' >&2; exit 77; elif [ -n "$record" ] && [ "$(cat .forge/shop/lock/info 2>/dev/null)" = "$record" ]; then rm -rf .forge/shop/lock; else echo 'lock is held by someone else; left in place' >&2; exit 76; fi
+192.0.2.20      < stdin: own lock record (release only if unchanged)

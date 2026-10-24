@@ -10,7 +10,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use super::config::VERSION;
-use super::deployer::{Container, Deployer, lock};
+use super::deployer::{Container, Deployer, lock, parse_lock_info};
 use super::errors::{
     DeployError, EXIT_FAILED, EXIT_INCONSISTENT, EXIT_MIGRATION_FAILED, EXIT_UNHEALTHY, LockInfo,
 };
@@ -772,9 +772,8 @@ impl Deployer {
                 }
                 if let Ok(output) = self.run(cancel, host, &self.cmds.lock_status())
                     && !output.stdout.trim().is_empty()
-                    && let Ok(info) = serde_json::from_str::<LockInfo>(output.stdout.trim())
                 {
-                    detail.lock = Some(info);
+                    detail.lock = Some(parse_lock_info(&output.stdout));
                 }
                 if let Ok(output) = self.run(cancel, host, &self.cmds.read_log(5)) {
                     for line in output.stdout.lines() {

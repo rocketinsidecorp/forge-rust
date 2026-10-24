@@ -1,6 +1,6 @@
-192.0.2.10      $ mkdir -p .forge/shop && if mkdir .forge/shop/lock 2>/dev/null; then cat > .forge/shop/lock/info; else cat .forge/shop/lock/info 2>/dev/null; exit 75; fi
+192.0.2.10      $ set -C; mkdir -p .forge/shop && cat > .forge/shop/lock.tmp.$$ || { rm -f .forge/shop/lock.tmp.$$; exit 1; }; claim() { if err=$(ln .forge/shop/lock.tmp.$$ .forge/shop/lock/info 2>&1); then return 0; fi; [ -e .forge/shop/lock/info ] || echo "$err" >&2; return 1; }; won=; if mkdir .forge/shop/lock 2>/dev/null; then claim && won=1; elif [ ! -e .forge/shop/lock/info ] && [ -n "$(find .forge/shop/lock -maxdepth 0 -mmin +1 2>/dev/null)" ]; then if claim; then won=1; { echo 'took over a stale lock without a record (an earlier acquire was interrupted)' >&2; true; }; fi; fi; rm -f .forge/shop/lock.tmp.$$; [ -n "$won" ] && exit 0; cat .forge/shop/lock/info 2>/dev/null; exit 75
 192.0.2.10      < stdin: lock record (holder, time, message)
-192.0.2.11      $ mkdir -p .forge/shop && if mkdir .forge/shop/lock 2>/dev/null; then cat > .forge/shop/lock/info; else cat .forge/shop/lock/info 2>/dev/null; exit 75; fi
+192.0.2.11      $ set -C; mkdir -p .forge/shop && cat > .forge/shop/lock.tmp.$$ || { rm -f .forge/shop/lock.tmp.$$; exit 1; }; claim() { if err=$(ln .forge/shop/lock.tmp.$$ .forge/shop/lock/info 2>&1); then return 0; fi; [ -e .forge/shop/lock/info ] || echo "$err" >&2; return 1; }; won=; if mkdir .forge/shop/lock 2>/dev/null; then claim && won=1; elif [ ! -e .forge/shop/lock/info ] && [ -n "$(find .forge/shop/lock -maxdepth 0 -mmin +1 2>/dev/null)" ]; then if claim; then won=1; { echo 'took over a stale lock without a record (an earlier acquire was interrupted)' >&2; true; }; fi; fi; rm -f .forge/shop/lock.tmp.$$; [ -n "$won" ] && exit 0; cat .forge/shop/lock/info 2>/dev/null; exit 75
 192.0.2.11      < stdin: lock record (holder, time, message)
 192.0.2.10      # lock acquired (prune)
 192.0.2.11      # lock acquired (prune)
@@ -15,5 +15,7 @@
 192.0.2.11      # pruned shop-jobs-v0-999999, shop-web-v0-999999
 192.0.2.11      ? docker image ls --format '{{json .}}' registry.example.com/acme/shop
 192.0.2.11      $ docker image rm registry.example.com/acme/shop:v0
-192.0.2.10      $ rm -rf .forge/shop/lock
-192.0.2.11      $ rm -rf .forge/shop/lock
+192.0.2.10      $ record=$(cat) && if [ ! -d .forge/shop/lock ]; then echo 'lock is already released' >&2; exit 77; elif [ -n "$record" ] && [ "$(cat .forge/shop/lock/info 2>/dev/null)" = "$record" ]; then rm -rf .forge/shop/lock; else echo 'lock is held by someone else; left in place' >&2; exit 76; fi
+192.0.2.10      < stdin: own lock record (release only if unchanged)
+192.0.2.11      $ record=$(cat) && if [ ! -d .forge/shop/lock ]; then echo 'lock is already released' >&2; exit 77; elif [ -n "$record" ] && [ "$(cat .forge/shop/lock/info 2>/dev/null)" = "$record" ]; then rm -rf .forge/shop/lock; else echo 'lock is held by someone else; left in place' >&2; exit 76; fi
+192.0.2.11      < stdin: own lock record (release only if unchanged)
