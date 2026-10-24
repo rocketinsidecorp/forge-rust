@@ -14,8 +14,8 @@ use forge_proxy::{ControlRequest, DeployRequest, GoDuration, Server, call, liste
 use http::Request;
 use http_body_util::{BodyExt as _, Full};
 use support::{
-    Handler, TEST_HOST, backend, fast_request, front, front_with, get, post_chunked, send, status,
-    text,
+    Handler, TEST_HOST, backend, fast_request, front, front_with, front_with_limits, get, limits,
+    post_chunked, send, status, text,
 };
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio_util::sync::CancellationToken;
@@ -792,9 +792,9 @@ async fn access_log_omits_the_query() {
     assert!(!text.contains("s3cr3t"), "query string logged");
 }
 
-#[tokio::test]
-async fn upgrade_through_proxy() {
-    let app = backend(
+/// A backend whose `Upgrade: echo` connections echo what they receive.
+async fn echo_backend() -> support::Backend {
+    backend(
         "app",
         handler(|mut request: Request<hyper::body::Incoming>| async move {
             let upgrade = hyper::upgrade::on(&mut request);
@@ -819,16 +819,12 @@ async fn upgrade_through_proxy() {
             response
         }),
     )
-    .await;
-    let front = front(None).await;
-    front
-        .server
-        .deploy(fast_request(&app.addr))
-        .await
-        .expect("deploy");
-    let mut stream = tokio::net::TcpStream::connect(front.addr)
-        .await
-        .expect("connect");
+    .await
+}
+
+/// Opens an `echo` tunnel through the proxy at `addr`.
+async fn open_tunnel(addr: std::net::SocketAddr) -> tokio::net::TcpStream {
+    let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
     stream
         .write_all(format!("GET /ws HTTP/1.1\r\nHost: {TEST_HOST}\r\nConnection: Upgrade\r\nUpgrade: echo\r\n\r\n").as_bytes())
         .await
@@ -842,6 +838,19 @@ async fn upgrade_through_proxy() {
     let head = String::from_utf8_lossy(&head).to_ascii_lowercase();
     assert!(head.starts_with("http/1.1 101"), "{head}");
     assert!(head.contains("upgrade: echo"), "{head}");
+    stream
+}
+
+#[tokio::test]
+async fn upgrade_through_proxy() {
+    let app = echo_backend().await;
+    let front = front(None).await;
+    front
+        .server
+        .deploy(fast_request(&app.addr))
+        .await
+        .expect("deploy");
+    let mut stream = open_tunnel(front.addr).await;
     stream.write_all(b"hello").await.expect("write");
     let mut echoed = [0_u8; 5];
     tokio::time::timeout(Duration::from_secs(2), stream.read_exact(&mut echoed))
@@ -852,4 +861,200 @@ async fn upgrade_through_proxy() {
     // The tunnel holds the target: status shows it in flight.
     assert_eq!(front.server.status()[0].in_flight, 1);
     drop(stream);
+}
+
+/// Limits with a short idle timeout.
+fn idle_limits(idle: Duration) -> forge_proxy::HttpLimits {
+    forge_proxy::HttpLimits {
+        idle_timeout: idle,
+        ..limits()
+    }
+}
+
+/// Reads until the peer closes; `None` if it stays open for `wait`.
+async fn closed_within(stream: &mut tokio::net::TcpStream, wait: Duration) -> Option<usize> {
+    let mut total = 0;
+    let mut buffer = vec![0_u8; 64 << 10];
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        match tokio::time::timeout_at(deadline, stream.read(&mut buffer)).await {
+            Err(_) => return None,
+            Ok(Ok(0) | Err(_)) => return Some(total),
+            Ok(Ok(n)) => total += n,
+        }
+    }
+}
+
+async fn wait_for_in_flight(server: &Server, expected: i64, wait: Duration) {
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        let in_flight = server.status().first().map_or(0, |status| status.in_flight);
+        if in_flight == expected {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "in flight stayed {in_flight}, expected {expected}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test]
+async fn idle_keep_alive_connections_are_closed() {
+    let app = backend("app", None).await;
+    let front = front_with_limits(
+        Server::new(Logger::discard(), None).expect("server"),
+        idle_limits(Duration::from_millis(300)),
+    )
+    .await;
+    front
+        .server
+        .deploy(fast_request(&app.addr))
+        .await
+        .expect("deploy");
+    let mut stream = tokio::net::TcpStream::connect(front.addr)
+        .await
+        .expect("connect");
+    stream
+        .write_all(format!("GET / HTTP/1.1\r\nHost: {TEST_HOST}\r\n\r\n").as_bytes())
+        .await
+        .expect("request");
+    let started = std::time::Instant::now();
+    let mut response = Vec::new();
+    let mut buffer = [0_u8; 1024];
+    while !String::from_utf8_lossy(&response).ends_with("app") {
+        let n = stream.read(&mut buffer).await.expect("response");
+        assert!(n > 0, "closed before the response");
+        response.extend_from_slice(&buffer[..n]);
+    }
+    assert!(String::from_utf8_lossy(&response).starts_with("HTTP/1.1 200"));
+    // Kept alive, then closed once idle for the idle timeout (shorter than
+    // the 10 s header timeout here).
+    assert_eq!(
+        closed_within(&mut stream, Duration::from_secs(5)).await,
+        Some(0),
+        "idle connection kept open"
+    );
+    assert!(started.elapsed() >= Duration::from_millis(300));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_client_that_stops_reading_is_disconnected_and_releases_the_target() {
+    const BODY: usize = 64 << 20;
+    let app = backend(
+        "app",
+        handler(|_request| async { text(Bytes::from(vec![b'x'; BODY])) }),
+    )
+    .await;
+    let front = front_with_limits(
+        Server::new(Logger::discard(), None).expect("server"),
+        idle_limits(Duration::from_millis(300)),
+    )
+    .await;
+    front
+        .server
+        .deploy(fast_request(&app.addr))
+        .await
+        .expect("deploy");
+    let mut stream = tokio::net::TcpStream::connect(front.addr)
+        .await
+        .expect("connect");
+    stream
+        .write_all(format!("GET /large HTTP/1.1\r\nHost: {TEST_HOST}\r\n\r\n").as_bytes())
+        .await
+        .expect("request");
+    // The response is in flight while the client reads nothing...
+    wait_for_in_flight(&front.server, 1, Duration::from_secs(5)).await;
+    // ...until the proxy gives up on the stalled write: the lease (which a
+    // drain would wait for) and the connection are released.
+    wait_for_in_flight(&front.server, 0, Duration::from_secs(10)).await;
+    let received = closed_within(&mut stream, Duration::from_secs(10))
+        .await
+        .expect("connection closed");
+    assert!(received < BODY, "the whole body arrived ({received} bytes)");
+}
+
+#[tokio::test]
+async fn idle_tunnels_are_closed_and_active_ones_kept() {
+    let app = echo_backend().await;
+    let front = front_with_limits(
+        Server::new(Logger::discard(), None).expect("server"),
+        idle_limits(Duration::from_millis(400)),
+    )
+    .await;
+    front
+        .server
+        .deploy(fast_request(&app.addr))
+        .await
+        .expect("deploy");
+    let mut stream = open_tunnel(front.addr).await;
+    // Traffic every 100 ms for twice the idle timeout keeps it open.
+    for round in 0..8_u8 {
+        stream.write_all(&[round]).await.expect("write");
+        let mut echoed = [0_u8; 1];
+        tokio::time::timeout(Duration::from_secs(2), stream.read_exact(&mut echoed))
+            .await
+            .expect("echo in time")
+            .expect("echo");
+        assert_eq!(echoed, [round]);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(front.server.status()[0].in_flight, 1);
+    // Silence in both directions closes it and releases the target.
+    let silent = std::time::Instant::now();
+    assert_eq!(
+        closed_within(&mut stream, Duration::from_secs(5)).await,
+        Some(0),
+        "idle tunnel kept open"
+    );
+    // The last echo was 100 ms before `silent`: about 300 ms remain.
+    assert!(silent.elapsed() >= Duration::from_millis(200));
+    wait_for_in_flight(&front.server, 0, Duration::from_secs(5)).await;
+}
+
+#[tokio::test]
+async fn an_existing_control_directory_is_restricted_and_a_link_refused() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = tempfile::Builder::new()
+        .prefix("fp")
+        .tempdir_in("/tmp")
+        .expect("tempdir");
+    let mode = |path: &std::path::Path| {
+        std::fs::symlink_metadata(path)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o7777
+    };
+    let run = dir.path().join("run");
+    std::fs::create_dir(&run).expect("mkdir");
+    std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o777)).expect("chmod");
+    let socket = run.join("control.sock");
+    let listener = listen_control(&socket).expect("listen");
+    assert_eq!(mode(&run), 0o700);
+    assert_eq!(mode(&socket) & 0o777, 0o600);
+    drop(listener);
+
+    let link = dir.path().join("link");
+    std::os::unix::fs::symlink(&run, &link).expect("symlink");
+    std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    let error = listen_control(&link.join("control.sock")).expect_err("link refused");
+    assert!(error.contains("is not a directory"), "{error}");
+    assert_eq!(mode(&run), 0o755);
+}
+
+#[tokio::test]
+async fn a_restarted_proxy_removes_temporary_files_of_interrupted_writes() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let state = dir.path().join("state.json");
+    let leftover = dir.path().join(".state.json.0123456789ab.tmp");
+    std::fs::write(&leftover, b"{").expect("write");
+    let other = dir.path().join("notes.txt");
+    std::fs::write(&other, b"keep").expect("write");
+    let server = Server::new(Logger::discard(), Some(state)).expect("server");
+    assert!(!leftover.exists(), "stale temporary file kept");
+    assert!(other.exists());
+    drop(server);
 }

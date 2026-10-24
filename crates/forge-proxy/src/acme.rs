@@ -170,6 +170,23 @@ impl Client {
     ///
     /// The key is not a P-256 PKCS#8 key, or the TLS configuration failed.
     pub fn new(directory_url: &str, account_pkcs8: &[u8], email: &str) -> Result<Self, String> {
+        Self::with_roots(directory_url, account_pkcs8, email, &[])
+    }
+
+    /// [`Client::new`] that also trusts `extra_roots` for the directory's
+    /// HTTPS certificate, on top of the webpki roots: a private or test CA
+    /// such as Pebble's. `forge-proxy run` passes none.
+    ///
+    /// # Errors
+    ///
+    /// The key is not a P-256 PKCS#8 key, a root is not a usable trust
+    /// anchor, or the TLS configuration failed.
+    pub fn with_roots(
+        directory_url: &str,
+        account_pkcs8: &[u8],
+        email: &str,
+        extra_roots: &[rustls::pki_types::CertificateDer<'static>],
+    ) -> Result<Self, String> {
         let key = EcdsaKeyPair::from_pkcs8(
             &ECDSA_P256_SHA256_FIXED_SIGNING,
             account_pkcs8,
@@ -188,6 +205,11 @@ impl Client {
             b64(ring::digest::digest(&ring::digest::SHA256, canonical.as_bytes()).as_ref());
         let mut roots = rustls::RootCertStore::empty();
         roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        for root in extra_roots {
+            roots
+                .add(root.clone())
+                .map_err(|error| format!("acme: trust anchor: {error}"))?;
+        }
         let config = rustls::ClientConfig::builder_with_provider(Arc::new(
             rustls::crypto::ring::default_provider(),
         ))
@@ -448,15 +470,13 @@ impl Client {
             .as_str()
             .ok_or_else(|| "acme: challenge without URL".to_owned())?
             .to_owned();
+        // Withdrawn when this future ends in any way: validated, failed,
+        // or dropped because the issuance budget expired or the proxy is
+        // stopping.
         let key_authorization = self.key_authorization(&token);
-        lock(challenges).insert(token.clone(), key_authorization);
-        let outcome = async {
-            self.post(&challenge_url, Some(&json!({})), false).await?;
-            self.poll(url, "authorization").await.map(|_| ())
-        }
-        .await;
-        lock(challenges).remove(&token);
-        outcome
+        let _published = Published::new(challenges, token, key_authorization);
+        self.post(&challenge_url, Some(&json!({})), false).await?;
+        self.poll(url, "authorization").await.map(|_| ())
     }
 
     /// Polls `url` until its status is `valid`.
@@ -485,6 +505,28 @@ impl Client {
             }
             tokio::time::sleep(response.retry_after()).await;
         }
+    }
+}
+
+/// An HTTP-01 key authorization served while this guard lives.
+struct Published {
+    challenges: Challenges,
+    token: String,
+}
+
+impl Published {
+    fn new(challenges: &Challenges, token: String, key_authorization: String) -> Self {
+        lock(challenges).insert(token.clone(), key_authorization);
+        Self {
+            challenges: Arc::clone(challenges),
+            token,
+        }
+    }
+}
+
+impl Drop for Published {
+    fn drop(&mut self) {
+        lock(&self.challenges).remove(&self.token);
     }
 }
 
@@ -566,6 +608,90 @@ mod tests {
         assert!(endpoint("https://acme.example.com/dir").is_ok());
         assert!(endpoint("http://acme.example.com/dir").is_err());
         assert!(endpoint("ftp://127.0.0.1/dir").is_err());
+    }
+
+    #[test]
+    fn published_challenges_are_withdrawn_when_the_guard_drops() {
+        let challenges = Challenges::default();
+        let published = Published::new(&challenges, "tok".to_owned(), "tok.key".to_owned());
+        assert_eq!(
+            lock(&challenges).get("tok").map(String::as_str),
+            Some("tok.key")
+        );
+        drop(published);
+        assert!(lock(&challenges).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_authorization_withdraws_its_challenge() {
+        // A CA that accepts the challenge POST but never answers it: the
+        // issuance is cancelled while the key authorization is published.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let base = format!("http://{}", listener.local_addr().expect("addr"));
+        let stop = tokio_util::sync::CancellationToken::new();
+        let ca = {
+            let (base, stop) = (base.clone(), stop.clone());
+            async move {
+                let mut connections = tokio::task::JoinSet::new();
+                loop {
+                    let (stream, _) = tokio::select! {
+                        accepted = listener.accept() => match accepted {
+                            Ok(accepted) => accepted,
+                            Err(_) => continue,
+                        },
+                        () = stop.cancelled() => return,
+                    };
+                    let base = base.clone();
+                    connections.spawn(async move {
+                        let service = hyper::service::service_fn(move |request: Request<hyper::body::Incoming>| {
+                            let base = base.clone();
+                            async move {
+                                let path = request.uri().path().to_owned();
+                                let body = match path.as_str() {
+                                    "/directory" => json!({"newNonce": format!("{base}/nonce"), "newAccount": format!("{base}/account"), "newOrder": format!("{base}/order")}),
+                                    "/authz" => json!({"status": "pending", "challenges": [{"type": "http-01", "token": "tok-1", "url": format!("{base}/chall")}]}),
+                                    "/chall" => std::future::pending::<Value>().await,
+                                    _ => json!({}),
+                                };
+                                let mut response = http::Response::new(Full::new(Bytes::from(body.to_string())));
+                                response.headers_mut().insert("replay-nonce", HeaderValue::from_static("n"));
+                                response.headers_mut().insert(header::LOCATION, HeaderValue::from_static("http://127.0.0.1/acct"));
+                                Ok::<_, std::convert::Infallible>(response)
+                            }
+                        });
+                        let _ = hyper::server::conn::http1::Builder::new()
+                            .serve_connection(TokioIo::new(stream), service)
+                            .await;
+                    });
+                }
+            }
+        };
+        let client_side = async {
+            let pkcs8 = crate::der::generate_p256().expect("key");
+            let mut client = Client::new(&format!("{base}/directory"), &pkcs8, "").expect("client");
+            client.ensure_account().await.expect("account");
+            let challenges = Challenges::default();
+            let authorization = format!("{base}/authz");
+            let mut authorize = Box::pin(client.authorize(&authorization, &challenges));
+            // Published while the CA validates.
+            let published = async {
+                while lock(&challenges).is_empty() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            };
+            tokio::select! {
+                () = published => {}
+                result = &mut authorize => panic!("authorization ended: {result:?}"),
+            }
+            assert!(lock(&challenges).contains_key("tok-1"));
+            // The issuance budget expires: the future is dropped.
+            drop(authorize);
+            assert!(lock(&challenges).is_empty(), "challenge left published");
+            stop.cancel();
+        };
+        tokio::join!(ca, client_side);
     }
 
     #[test]

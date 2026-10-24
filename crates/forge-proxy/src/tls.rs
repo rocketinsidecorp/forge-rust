@@ -6,7 +6,9 @@
 //! deployed and when one has less than 30 days left — by one owned renewal
 //! loop, never during a handshake. A handshake for a host that is not a TLS
 //! service, or has no certificate yet, fails: nothing is served with a
-//! wrong or self-signed certificate.
+//! wrong or self-signed certificate. A cached or issued certificate is used
+//! only when its key matches and its subject alternative names cover the
+//! host. Cache files are read and written on the blocking pool.
 //!
 //! The cache directory (on the proxy's volume) holds `acme_account+key` and
 //! one file per host with its private key and certificate chain in PEM, the
@@ -19,8 +21,8 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use rustls::pki_types::pem::PemObject as _;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-use rustls::server::{ClientHello, ResolvesServerCert};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
+use rustls::server::{ClientHello, ParsedCertificate, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -42,14 +44,19 @@ const MAX_BACKOFF: Duration = Duration::from_secs(3600);
 const ACCOUNT_FILE: &str = "acme_account+key";
 
 /// Where and from whom certificates come.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct AcmeSettings {
-    /// Cache directory (created 0700).
+    /// Cache directory (created 0700; an existing one is restricted to
+    /// 0700).
     pub cache: PathBuf,
     /// Contact address registered with the CA.
     pub email: String,
     /// Directory URL; empty is Let's Encrypt production.
     pub directory: String,
+    /// Extra trust anchors for the directory's HTTPS certificate, on top of
+    /// the webpki roots (a private or test CA such as Pebble's). `forge-proxy
+    /// run` has no flag for it and passes none.
+    pub directory_roots: Vec<CertificateDer<'static>>,
 }
 
 struct Loaded {
@@ -100,24 +107,22 @@ impl Tls {
     ///
     /// # Errors
     ///
-    /// The cache directory cannot be created, or the directory URL is not
-    /// usable (plain HTTP is refused except on loopback).
+    /// The cache directory cannot be created or restricted to 0700 (or is
+    /// a link), or the directory URL is not usable (plain HTTP is refused
+    /// except on loopback).
     pub fn new(server: Server, mut settings: AcmeSettings) -> Result<Self, String> {
-        use std::os::unix::fs::DirBuilderExt as _;
-
         if settings.directory.is_empty() {
             acme::LETS_ENCRYPT.clone_into(&mut settings.directory);
         }
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(&settings.cache)
-            .map_err(|error| format!("create ACME cache {}: {error}", settings.cache.display()))?;
+        crate::files::private_directory(&settings.cache)
+            .map_err(|error| format!("ACME cache: {error}"))?;
+        crate::files::clean_up(server.logger(), &settings.cache);
         // Validates the URL now: fail at start, not at the first deploy.
-        acme::Client::new(
+        acme::Client::with_roots(
             &settings.directory,
             &crate::der::generate_p256()?,
             &settings.email,
+            &settings.directory_roots,
         )?;
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let manager = Arc::new(Manager {
@@ -151,6 +156,8 @@ impl Tls {
     }
 
     /// Keeps certificates for every TLS host until `stop` is cancelled.
+    /// Cache reads and writes run on the blocking pool and are awaited to
+    /// completion, so no file operation outlives this call.
     pub async fn run(&self, stop: CancellationToken) {
         let manager = &self.manager;
         let mut client: Option<acme::Client> = None;
@@ -160,7 +167,13 @@ impl Tls {
                 if stop.is_cancelled() {
                     return;
                 }
-                if manager.fresh(&host) {
+                let fresh = {
+                    let host = host.clone();
+                    blocking(manager, move |manager| manager.fresh(&host))
+                        .await
+                        .unwrap_or(false)
+                };
+                if fresh {
                     continue;
                 }
                 if let Some((next, _)) = lock(&manager.failures).get(&host)
@@ -169,20 +182,8 @@ impl Tls {
                     wake = wake.min(*next);
                     continue;
                 }
-                let attempt = async {
-                    if client.is_none() {
-                        client = Some(manager.client()?);
-                    }
-                    let Some(client) = client.as_mut() else {
-                        return Err("acme client unavailable".to_owned());
-                    };
-                    manager.issue(client, &host).await
-                };
-                let outcome = tokio::select! {
-                    outcome = tokio::time::timeout(ISSUE_BUDGET, attempt) => {
-                        outcome.unwrap_or_else(|_| Err("certificate issuance timed out".to_owned()))
-                    }
-                    () = stop.cancelled() => return,
+                let Some(outcome) = manager.obtain(&mut client, &host, &stop).await else {
+                    return;
                 };
                 match outcome {
                     Ok(not_after) => {
@@ -238,7 +239,62 @@ impl Tls {
     }
 }
 
+/// Runs blocking file work for `manager` on the blocking pool and waits for
+/// it.
+async fn blocking<T, F>(manager: &Arc<Manager>, work: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce(&Manager) -> T + Send + 'static,
+{
+    let manager = Arc::clone(manager);
+    tokio::task::spawn_blocking(move || work(&manager))
+        .await
+        .map_err(|error| format!("certificate cache: {error}"))
+}
+
 impl Manager {
+    /// Obtains and caches a certificate for `host`; `None` when `stop` was
+    /// cancelled first. Only the exchange with the CA is bounded by
+    /// [`ISSUE_BUDGET`] and cut short by `stop`; the cache file operations
+    /// around it always run to completion.
+    async fn obtain(
+        self: &Arc<Self>,
+        client: &mut Option<acme::Client>,
+        host: &str,
+        stop: &CancellationToken,
+    ) -> Option<Result<i64, String>> {
+        if client.is_none() {
+            match blocking(self, Self::client).await.and_then(|result| result) {
+                Ok(created) => *client = Some(created),
+                Err(error) => return Some(Err(error)),
+            }
+        }
+        let Some(client) = client.as_mut() else {
+            return Some(Err("acme client unavailable".to_owned()));
+        };
+        let pkcs8 = match crate::der::generate_p256() {
+            Ok(pkcs8) => pkcs8,
+            Err(error) => return Some(Err(error)),
+        };
+        let exchange = client.issue(host, &pkcs8, &self.challenges);
+        let chain = tokio::select! {
+            chain = tokio::time::timeout(ISSUE_BUDGET, exchange) => {
+                chain.unwrap_or_else(|_| Err("certificate issuance timed out".to_owned()))
+            }
+            () = stop.cancelled() => return None,
+        };
+        let chain = match chain {
+            Ok(chain) => chain,
+            Err(error) => return Some(Err(error)),
+        };
+        let host = host.to_owned();
+        Some(
+            blocking(self, move |manager| manager.store(&host, &pkcs8, &chain))
+                .await
+                .and_then(|result| result),
+        )
+    }
+
     fn client(&self) -> Result<acme::Client, String> {
         let path = self.settings.cache.join(ACCOUNT_FILE);
         let pkcs8 = match std::fs::read(&path) {
@@ -247,13 +303,19 @@ impl Manager {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 let pkcs8 = crate::der::generate_p256()?;
                 let pem = pem_block("PRIVATE KEY", &pkcs8);
-                crate::server::write_atomically(&path, pem.as_bytes())
+                let written = crate::files::write_atomically(&path, pem.as_bytes())
                     .map_err(|error| format!("write {}: {error}", path.display()))?;
+                crate::files::report(self.server.logger(), &path, written);
                 pkcs8
             }
             Err(error) => return Err(format!("read {}: {error}", path.display())),
         };
-        acme::Client::new(&self.settings.directory, &pkcs8, &self.settings.email)
+        acme::Client::with_roots(
+            &self.settings.directory,
+            &pkcs8,
+            &self.settings.email,
+            &self.settings.directory_roots,
+        )
     }
 
     /// Whether `host` has a certificate with more than [`RENEW_BEFORE`]
@@ -267,7 +329,7 @@ impl Manager {
         let Ok(pem) = std::fs::read(self.settings.cache.join(host)) else {
             return false;
         };
-        match self.certified(&pem) {
+        match self.certified(host, &pem) {
             Ok(loaded) => {
                 let fresh = loaded.not_after > renew_at;
                 write(&self.certificates).insert(host.to_owned(), loaded);
@@ -283,14 +345,22 @@ impl Manager {
         }
     }
 
-    /// A key and chain from PEM, checked to belong together.
-    fn certified(&self, pem: &[u8]) -> Result<Loaded, String> {
+    /// A key and chain from PEM for `host`, checked to belong together and
+    /// to name `host` among the leaf's subject alternative names (the
+    /// common name is not consulted, as by browsers).
+    fn certified(&self, host: &str, pem: &[u8]) -> Result<Loaded, String> {
         let key =
             PrivateKeyDer::from_pem_slice(pem).map_err(|error| format!("private key: {error}"))?;
         let chain: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(pem)
             .collect::<Result<_, _>>()
             .map_err(|error| format!("certificate: {error}"))?;
         let leaf = chain.first().ok_or_else(|| "no certificate".to_owned())?;
+        let name =
+            ServerName::try_from(host).map_err(|_| format!("{host:?} is not a valid host name"))?;
+        let parsed =
+            ParsedCertificate::try_from(leaf).map_err(|error| format!("certificate: {error}"))?;
+        rustls::client::verify_server_name(&parsed, &name)
+            .map_err(|_| format!("certificate is not valid for {host}"))?;
         let not_after = crate::der::not_after(leaf)
             .ok_or_else(|| "certificate validity unreadable".to_owned())?;
         let key = CertifiedKey::from_der(chain, key, &self.provider)
@@ -301,15 +371,17 @@ impl Manager {
         })
     }
 
-    async fn issue(&self, client: &mut acme::Client, host: &str) -> Result<i64, String> {
-        let pkcs8 = crate::der::generate_p256()?;
-        let chain = client.issue(host, &pkcs8, &self.challenges).await?;
-        let mut pem = pem_block("PRIVATE KEY", &pkcs8);
-        pem.push_str(&chain);
-        let loaded = self.certified(pem.as_bytes())?;
+    /// Checks the issued chain against its key and `host`, caches it and
+    /// serves it. Blocks.
+    fn store(&self, host: &str, pkcs8: &[u8], chain: &str) -> Result<i64, String> {
+        let mut pem = pem_block("PRIVATE KEY", pkcs8);
+        pem.push_str(chain);
+        let loaded = self.certified(host, pem.as_bytes())?;
         let not_after = loaded.not_after;
-        crate::server::write_atomically(&self.settings.cache.join(host), pem.as_bytes())
+        let path = self.settings.cache.join(host);
+        let written = crate::files::write_atomically(&path, pem.as_bytes())
             .map_err(|error| format!("write certificate cache: {error}"))?;
+        crate::files::report(self.server.logger(), &path, written);
         write(&self.certificates).insert(host.to_owned(), loaded);
         Ok(not_after)
     }
@@ -394,10 +466,10 @@ impl Tls {
     ///
     /// # Errors
     ///
-    /// The PEM does not hold a matching key and chain.
+    /// The PEM does not hold a matching key and chain for `host`.
     #[doc(hidden)]
     pub fn install(&self, host: &str, pem: &[u8]) -> Result<(), String> {
-        let loaded = self.manager.certified(pem)?;
+        let loaded = self.manager.certified(host, pem)?;
         write(&self.manager.certificates).insert(host.to_owned(), loaded);
         Ok(())
     }
