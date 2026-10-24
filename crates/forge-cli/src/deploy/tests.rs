@@ -25,7 +25,7 @@ use super::runner::{Cancel, LocalRunner, Output, RunError, Runner, Sink, SshRunn
 use super::secrets::{REDACTED, Secrets};
 
 /// Forge-Go's `validConfig` fixture, verbatim.
-const VALID_CONFIG: &str = r#"
+pub(super) const VALID_CONFIG: &str = r#"
 service: shop
 image: registry.example.com/acme/shop
 registry:
@@ -71,7 +71,7 @@ ssh:
   proxy_jump: ops@bastion.example.com
 "#;
 
-fn parse(text: &str) -> Config {
+pub(super) fn parse(text: &str) -> Config {
     Config::parse(text.as_bytes()).unwrap_or_else(|error| panic!("{error}"))
 }
 
@@ -300,6 +300,11 @@ fn parse_rejects_invalid_configurations() {
             "negative retain",
             replace("retain: 3", "retain: -1"),
             "retain must be",
+        ),
+        (
+            "retain one",
+            replace("retain: 3", "retain: 1"),
+            "retain must be between 2 and 100 (1 would remove the previous version, so rollback would be impossible)",
         ),
         (
             "health path",
@@ -725,7 +730,7 @@ impl LocalRunner for RecordingLocal {
 }
 
 #[derive(Clone, Default)]
-struct Buffer(Arc<Mutex<Vec<u8>>>);
+pub(super) struct Buffer(Arc<Mutex<Vec<u8>>>);
 
 impl std::io::Write for Buffer {
     fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
@@ -738,17 +743,17 @@ impl std::io::Write for Buffer {
 }
 
 impl Buffer {
-    fn text(&self) -> String {
+    pub(super) fn text(&self) -> String {
         String::from_utf8_lossy(&self.0.lock().expect("lock")).into_owned()
     }
 
-    fn writer(&self) -> LogWriter {
+    pub(super) fn writer(&self) -> LogWriter {
         Arc::new(Mutex::new(Box::new(self.clone())))
     }
 }
 
 /// 2026-10-19T12:00:00Z, Forge-Go's `planEpoch`.
-fn plan_epoch() -> Timestamp {
+pub(super) fn plan_epoch() -> Timestamp {
     Timestamp {
         unix_seconds: 1_792_411_200,
         nanos: 0,
@@ -769,7 +774,7 @@ fn image_json(tag: &str) -> String {
     format!("{{\"Repository\":\"registry.example.com/acme/shop\",\"Tag\":{tag:?}}}\n")
 }
 
-const PLAN_SECRETS: [(&str, &str); 3] = [
+pub(super) const PLAN_SECRETS: [(&str, &str); 3] = [
     ("REGISTRY_PASSWORD", "registry-secret-1"),
     ("FORGE_DATABASE_URL", "postgres://shop:db-secret-2@db/shop"),
     ("POSTGRES_PASSWORD", "pg-secret-3"),
@@ -1012,7 +1017,7 @@ fn deploy_log_entry_and_lock_record_are_forge_go_json() {
     let records = Arc::new(Mutex::new(Vec::new()));
     let seen = Arc::clone(&records);
     fixture.runner.fail_with(move |host, command| {
-        if command.script.contains("deploys.log") || command.script.contains("lock/info;") {
+        if command.script.contains("deploys.log") || command.stdin_note.starts_with("lock record") {
             seen.lock()
                 .expect("lock")
                 .push((host.to_owned(), command.stdin.clone().unwrap_or_default()));
@@ -1272,11 +1277,21 @@ fn held_lock_is_reported_and_partial_locks_released() {
         "deploy lock is held: 192.0.2.11: held by bob@ci since 2026-10-19 11:00:00 UTC (maintenance window); wait, or release it with forge deploy lock release"
     );
     let calls = fixture.runner.calls().join("\n");
+    // Only the lock this deploy took is released, and only while it still
+    // carries its record.
     assert!(
-        calls.contains("192.0.2.10: rm -rf .forge/shop/lock"),
+        calls.contains("192.0.2.10: record=$(cat) && if [ ! -d .forge/shop/lock ]"),
         "{calls}"
     );
-    assert!(!calls.contains("192.0.2.11: rm -rf"), "{calls}");
+    assert!(!calls.contains("192.0.2.11: record="), "{calls}");
+    assert!(
+        !fixture
+            .runner
+            .calls()
+            .iter()
+            .any(|call| call.ends_with(": rm -rf .forge/shop/lock")),
+        "a deploy force-released a lock:\n{calls}"
+    );
 }
 
 #[test]
@@ -1576,6 +1591,100 @@ fn logs_validate_options_and_prefix_lines() {
     );
 }
 
+/// Counts the `docker logs` streams running at once. A stream stays open
+/// until `hold_until` streams are open together, or for `hold` at most.
+struct StreamCounter {
+    state: Mutex<(usize, usize, usize)>, // active, peak, total
+    changed: std::sync::Condvar,
+    hold_until: usize,
+    hold: Duration,
+}
+
+impl Runner for Arc<StreamCounter> {
+    fn run(
+        &self,
+        _cancel: &Cancel,
+        _host: &str,
+        _command: &RemoteCommand,
+    ) -> Result<Output, RunError> {
+        Ok(Output::default())
+    }
+
+    fn stream(
+        &self,
+        _cancel: &Cancel,
+        _host: &str,
+        _command: &RemoteCommand,
+        _out: &dyn Sink,
+    ) -> Result<(), RunError> {
+        let mut state = self.state.lock().expect("lock");
+        state.0 += 1;
+        state.1 = state.1.max(state.0);
+        state.2 += 1;
+        self.changed.notify_all();
+        let (mut state, _) = self
+            .changed
+            .wait_timeout_while(state, self.hold, |state| state.0 < self.hold_until)
+            .expect("lock");
+        state.0 -= 1;
+        Ok(())
+    }
+
+    fn interactive(&self, _cancel: &Cancel, _host: &str, _script: &str) -> Result<(), RunError> {
+        Ok(())
+    }
+
+    fn close(&self) {}
+}
+
+/// `forge logs` reads at most `parallelism` hosts at once, except with
+/// `--follow`: a followed stream never ends, so every host streams at once.
+#[test]
+fn logs_respect_parallelism_unless_following() {
+    let hosts = "[192.0.2.10, 192.0.2.11, 192.0.2.12, 192.0.2.13, 192.0.2.14]";
+    let text = format!(
+        "{}parallelism: 2\n",
+        VALID_CONFIG.replacen("[192.0.2.10, 192.0.2.11]", hosts, 1)
+    );
+    for (follow, hold_until, hold, want_peak) in [
+        (false, 3, Duration::from_millis(300), 2),
+        (true, 5, Duration::from_secs(10), 5),
+    ] {
+        let counter = Arc::new(StreamCounter {
+            state: Mutex::new((0, 0, 0)),
+            changed: std::sync::Condvar::new(),
+            hold_until,
+            hold,
+        });
+        let root = tempfile::tempdir().expect("tempdir");
+        let deployer = Deployer::new(Parts {
+            config: parse(&text),
+            secrets: Secrets::from_values(PLAN_SECRETS),
+            runner: Box::new(Arc::clone(&counter)),
+            local: Box::new(RecordingLocal::default()),
+            root: root.path().to_owned(),
+            log: Buffer::default().writer(),
+            performer: Some("alice@laptop".to_owned()),
+            now: Some(Box::new(plan_epoch)),
+            suffix: None,
+            dry_run: false,
+        });
+        deployer
+            .logs(
+                &Cancel::never(),
+                Buffer::default().writer(),
+                LogsOptions {
+                    follow,
+                    ..LogsOptions::default()
+                },
+            )
+            .expect("logs");
+        let (active, peak, total) = *counter.state.lock().expect("lock");
+        assert_eq!((active, total), (0, 5), "follow={follow}");
+        assert_eq!(peak, want_peak, "follow={follow}: streams open at once");
+    }
+}
+
 fn common(_root: &Path) -> Common {
     Common {
         config: PathBuf::from(DEFAULT_CONFIG_PATH),
@@ -1818,7 +1927,7 @@ accessories:
     volumes: ["shop-postgres:/var/lib/postgresql"]
     env: {secret: [POSTGRES_PASSWORD]}
 builder: {context: ., dockerfile: Dockerfile, platform: linux/amd64, args: {GO_VERSION: "1.27"}}
-retain: 5                                    # stopped versions kept for rollback
+retain: 5                                    # versions kept per role (2 to 100; the running one counts)
 stop_timeout: 35s                            # > FORGE_HTTP_SHUTDOWN_TIMEOUT
 boot_timeout: 60s                            # readiness wait for non-proxied roles
 hooks: .forge/hooks

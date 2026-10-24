@@ -15,6 +15,8 @@ pub(crate) mod config;
 pub(crate) mod deployer;
 pub(crate) mod errors;
 pub(crate) mod init;
+#[cfg(all(test, unix))]
+mod lock_tests;
 pub(crate) mod operations;
 pub(crate) mod remote;
 pub(crate) mod runner;

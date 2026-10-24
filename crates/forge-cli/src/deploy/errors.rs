@@ -22,6 +22,12 @@ pub(crate) const EXIT_INCONSISTENT: u8 = 7;
 
 /// The remote exit status `acquireLock` uses when the lock is held.
 pub(crate) const LOCK_HELD_EXIT_STATUS: i32 = 75;
+/// The remote exit status of a release that found a lock whose record is
+/// not ours (someone took it after a `--force` release); it is left alone.
+pub(crate) const LOCK_NOT_OURS_EXIT_STATUS: i32 = 76;
+/// The remote exit status of a release that found no lock (it was already
+/// released, or force-released).
+pub(crate) const LOCK_GONE_EXIT_STATUS: i32 = 77;
 
 /// A remote command that exited non-zero.
 #[derive(Clone, Debug, Eq, PartialEq)]
