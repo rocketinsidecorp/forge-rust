@@ -24,6 +24,16 @@
 //!   consumed in the same transaction instead.
 //! - Every failure is uniform: wrong code, replayed code, foreign browser and
 //!   unknown backup code are all [`MfaError::InvalidCode`].
+//! - Step-up authentication before a factor change
+//!   ([`MfaService::verify_step_up`]) records a TOTP code's period at once
+//!   but only checks a backup code: the change itself uses the code up, in
+//!   the store transaction that applies it, so a change that fails (a wrong
+//!   code of the new key, an expired rotation, a precondition that no longer
+//!   holds) leaves the backup code unused.
+//! - A pending seed is an enrollment's while the account has no factor and a
+//!   rotation's while it has one ([`MfaStore::pending`] reads both in one
+//!   snapshot), so the seed of one kind is never checked, confirmed or shown
+//!   as the other.
 
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -144,17 +154,26 @@ pub trait MfaStore: Send + Sync {
     /// Stores (or replaces) the account's pending seed. `false` when the
     /// account is missing or disabled, or for an enrollment already has a
     /// factor, or for a rotation has none.
+    ///
+    /// `step_up`, here and in the other changes, is a backup code given for
+    /// step-up authentication: it is used up in the same transaction, and
+    /// the change is refused (`false`, nothing changed) when it is not an
+    /// unused code of the account.
     async fn begin(
         &self,
         principal: PrincipalId,
         change: MfaChange,
         pending: &PendingTotp,
+        step_up: Option<&MfaBackupCodeDigest>,
     ) -> Result<bool, AccountStoreError>;
 
-    /// The account's unexpired pending seed.
+    /// The account's unexpired pending seed of kind `change`: an
+    /// enrollment's when the account has no factor, a rotation's when it has
+    /// one, decided in the same snapshot as the seed is read.
     async fn pending(
         &self,
         principal: PrincipalId,
+        change: MfaChange,
         now: UnixTimestamp,
     ) -> Result<Option<PendingTotp>, AccountStoreError>;
 
@@ -162,8 +181,10 @@ pub trait MfaStore: Send + Sync {
     /// factor, with `counter` as its last accepted period and `backup_codes`
     /// as its only backup codes; revokes every session of the account,
     /// consumes its pending challenges and deletes the pending seed. `false`
-    /// when there is no such seed, the account is disabled, or the
-    /// [`MfaChange`] precondition no longer holds.
+    /// when there is no such seed, the account is disabled, the
+    /// [`MfaChange`] precondition no longer holds or `step_up` is not an
+    /// unused code.
+    #[allow(clippy::too_many_arguments)]
     async fn activate(
         &self,
         principal: PrincipalId,
@@ -171,14 +192,17 @@ pub trait MfaStore: Send + Sync {
         digest: &TotpSecretDigest,
         counter: u64,
         backup_codes: &[MfaBackupCodeDigest],
+        step_up: Option<&MfaBackupCodeDigest>,
         now: UnixTimestamp,
     ) -> Result<bool, AccountStoreError>;
 
     /// Removes the factor, pending seed and backup codes; revokes every
-    /// session and consumes pending challenges. `false` without a factor.
+    /// session and consumes pending challenges. `false` without a factor or
+    /// when `step_up` is not an unused code.
     async fn disable(
         &self,
         principal: PrincipalId,
+        step_up: Option<&MfaBackupCodeDigest>,
         now: UnixTimestamp,
     ) -> Result<bool, AccountStoreError>;
 
@@ -203,14 +227,24 @@ pub trait MfaStore: Send + Sync {
         now: UnixTimestamp,
     ) -> Result<bool, AccountStoreError>;
 
+    /// Whether `code` is an unused backup code of the account's factor,
+    /// without using it.
+    async fn has_backup_code(
+        &self,
+        principal: PrincipalId,
+        code: &MfaBackupCodeDigest,
+    ) -> Result<bool, AccountStoreError>;
+
     /// Replaces every backup code of the account's factor. `false` without
-    /// a factor. Like Forge-Go's, it revokes no session and voids no pending
-    /// challenge: neither depends on the backup codes, and an old code stops
-    /// completing a challenge because it is gone.
+    /// a factor or when `step_up` is not an unused code. Like Forge-Go's, it
+    /// revokes no session and voids no pending challenge: neither depends on
+    /// the backup codes, and an old code stops completing a challenge
+    /// because it is gone.
     async fn replace_backup_codes(
         &self,
         principal: PrincipalId,
         backup_codes: &[MfaBackupCodeDigest],
+        step_up: Option<&MfaBackupCodeDigest>,
         now: UnixTimestamp,
     ) -> Result<bool, AccountStoreError>;
 
@@ -272,6 +306,10 @@ pub enum MfaError {
     /// A change of a factor the account does not have.
     #[error("MFA is not enabled")]
     NotEnabled,
+    /// The backup code given for step-up authentication was used or
+    /// replaced before the change could use it up: nothing changed.
+    #[error("multi-factor step-up code is no longer valid")]
+    StepUpInvalid,
     /// Too many attempts; retry after the given time.
     #[error("too many multi-factor attempts")]
     Throttled {
@@ -347,6 +385,29 @@ pub enum SecondFactor {
     Totp,
     /// A one-time backup code (now used up).
     BackupCode,
+}
+
+/// A step-up second factor [`MfaService::verify_step_up`] accepted. Pass it
+/// to the change it authorizes: a backup code is used up only by that
+/// change, in the transaction that applies it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StepUpProof {
+    backup_code: Option<MfaBackupCodeDigest>,
+}
+
+impl StepUpProof {
+    /// Which factor was given.
+    #[must_use]
+    pub const fn factor(&self) -> SecondFactor {
+        match self.backup_code {
+            Some(_) => SecondFactor::BackupCode,
+            None => SecondFactor::Totp,
+        }
+    }
+
+    fn backup_code(proof: Option<&Self>) -> Option<&MfaBackupCodeDigest> {
+        proof.and_then(|proof| proof.backup_code.as_ref())
+    }
 }
 
 /// A started enrollment or rotation: shown once, never persisted in clear.
@@ -446,13 +507,15 @@ impl MfaService {
 
     /// Starts an enrollment or a rotation: a new seed, pending for
     /// [`MFA_ENROLLMENT_LIFETIME_SECS`]. Call only after step-up
-    /// authentication of the signed-in account.
+    /// authentication of the signed-in account; `step_up` is its proof (a
+    /// backup code is used up only when the seed is stored).
     pub async fn begin(
         &self,
         principal: PrincipalId,
         change: MfaChange,
         issuer: &str,
         account: &str,
+        step_up: Option<&StepUpProof>,
         now: UnixTimestamp,
     ) -> Result<TotpEnrollment, MfaError> {
         let cipher = self.cipher()?;
@@ -462,13 +525,19 @@ impl MfaService {
         let expires_at = later(now, MFA_ENROLLMENT_LIFETIME_SECS)?;
         let stored = self
             .store
-            .begin(principal, change, &PendingTotp { sealed, expires_at })
+            .begin(
+                principal,
+                change,
+                &PendingTotp { sealed, expires_at },
+                StepUpProof::backup_code(step_up),
+            )
             .await?;
         if !stored {
-            return Err(match change {
+            let otherwise = match change {
                 MfaChange::Enrollment => MfaError::AlreadyEnabled,
                 MfaChange::Rotation => MfaError::NotEnabled,
-            });
+            };
+            return Err(self.refusal(principal, change, step_up, otherwise).await?);
         }
         Ok(TotpEnrollment {
             secret,
@@ -477,16 +546,20 @@ impl MfaService {
         })
     }
 
-    /// The pending seed again (after a wrong confirming code).
+    /// The pending seed of kind `change` again (after a wrong confirming
+    /// code): `None` when none is pending, or the one pending is of the other
+    /// kind. Call only after step-up authentication: the seed is a
+    /// credential.
     pub async fn pending(
         &self,
         principal: PrincipalId,
+        change: MfaChange,
         issuer: &str,
         account: &str,
         now: UnixTimestamp,
     ) -> Result<Option<TotpEnrollment>, MfaError> {
         let cipher = self.cipher()?;
-        let Some(pending) = self.store.pending(principal, now).await? else {
+        let Some(pending) = self.store.pending(principal, change, now).await? else {
             return Ok(None);
         };
         let secret = TotpSecret::open(cipher, &pending.sealed)?;
@@ -498,26 +571,33 @@ impl MfaService {
         }))
     }
 
-    /// Confirms the pending seed with a live code of it: installs the
-    /// factor and returns its [`MFA_BACKUP_CODE_COUNT`] backup codes, to
-    /// show once. Every session of the account is revoked. An enrollment of
-    /// an account that has a factor is [`MfaError::AlreadyEnabled`] and a
-    /// rotation of one without is [`MfaError::NotEnabled`], whatever is
-    /// pending.
+    /// Confirms the pending seed of kind `change` with a live code of it:
+    /// installs the factor and returns its [`MFA_BACKUP_CODE_COUNT`] backup
+    /// codes, to show once. Every session of the account is revoked. An
+    /// enrollment of an account that has a factor is
+    /// [`MfaError::AlreadyEnabled`] and a rotation of one without is
+    /// [`MfaError::NotEnabled`], whatever is pending: the code is never
+    /// checked against a seed of the other kind. A wrong code is
+    /// [`MfaError::InvalidCode`] and uses up no step-up backup code.
     pub async fn confirm(
         &self,
         principal: PrincipalId,
         change: MfaChange,
         code: &str,
+        step_up: Option<&StepUpProof>,
         now: UnixTimestamp,
     ) -> Result<Vec<MfaBackupCode>, MfaError> {
         let cipher = self.cipher()?;
-        let Some(pending) = self.store.pending(principal, now).await? else {
-            return Err(MfaError::EnrollmentInvalid);
+        let pending = self
+            .store
+            .pending(principal, change, now)
+            .await?
+            .filter(|pending| pending.expires_at > now);
+        let Some(pending) = pending else {
+            return Err(self
+                .refusal(principal, change, None, MfaError::EnrollmentInvalid)
+                .await?);
         };
-        if pending.expires_at <= now {
-            return Err(MfaError::EnrollmentInvalid);
-        }
         let secret = TotpSecret::open(cipher, &pending.sealed)?;
         let counter = secret
             .verify(code, now, None)
@@ -531,68 +611,153 @@ impl MfaService {
                 pending.sealed.digest(),
                 counter,
                 &digests,
+                StepUpProof::backup_code(step_up),
                 now,
             )
             .await?;
         if !activated {
-            // The store refused under the account lock. Say why when the
-            // factor itself is the reason: the pending seed of a rotation is
-            // never confirmed as an enrollment, nor the reverse.
-            return Err(match (change, self.store.status(principal).await?) {
-                (MfaChange::Enrollment, Some(_)) => MfaError::AlreadyEnabled,
-                (MfaChange::Rotation, None) => MfaError::NotEnabled,
-                _ => MfaError::EnrollmentInvalid,
-            });
+            return Err(self
+                .refusal(principal, change, step_up, MfaError::EnrollmentInvalid)
+                .await?);
         }
         Ok(codes)
     }
 
-    /// Disables the factor (after step-up authentication). Every session of
+    /// Why the store refused a change of kind `change` (nothing changed):
+    /// the factor itself (an enrollment of an account that has one, a
+    /// rotation of one without), then a step-up backup code used or replaced
+    /// meanwhile, else `otherwise`.
+    async fn refusal(
+        &self,
+        principal: PrincipalId,
+        change: MfaChange,
+        step_up: Option<&StepUpProof>,
+        otherwise: MfaError,
+    ) -> Result<MfaError, MfaError> {
+        match (change, self.store.status(principal).await?) {
+            (MfaChange::Enrollment, Some(_)) => return Ok(MfaError::AlreadyEnabled),
+            (MfaChange::Rotation, None) => return Ok(MfaError::NotEnabled),
+            _ => {}
+        }
+        Ok(self
+            .step_up_refusal(principal, step_up)
+            .await?
+            .unwrap_or(otherwise))
+    }
+
+    /// [`MfaError::StepUpInvalid`] when `step_up` is a backup code that is
+    /// no longer unused.
+    async fn step_up_refusal(
+        &self,
+        principal: PrincipalId,
+        step_up: Option<&StepUpProof>,
+    ) -> Result<Option<MfaError>, MfaError> {
+        let Some(code) = StepUpProof::backup_code(step_up) else {
+            return Ok(None);
+        };
+        Ok(
+            (!self.store.has_backup_code(principal, code).await?)
+                .then_some(MfaError::StepUpInvalid),
+        )
+    }
+
+    /// Disables the factor (after step-up authentication; `step_up` is its
+    /// proof, a backup code used up only with the factor). Every session of
     /// the account is revoked.
     pub async fn disable(
         &self,
         principal: PrincipalId,
+        step_up: Option<&StepUpProof>,
         now: UnixTimestamp,
     ) -> Result<(), MfaError> {
         self.cipher()?;
-        if self.store.disable(principal, now).await? {
-            Ok(())
-        } else {
-            Err(MfaError::NotEnabled)
+        if self
+            .store
+            .disable(principal, StepUpProof::backup_code(step_up), now)
+            .await?
+        {
+            return Ok(());
         }
+        if self.store.status(principal).await?.is_none() {
+            return Err(MfaError::NotEnabled);
+        }
+        Err(self
+            .step_up_refusal(principal, step_up)
+            .await?
+            .unwrap_or(MfaError::NotEnabled))
     }
 
-    /// Replaces the backup codes (after step-up authentication) and returns
-    /// the new ones, to show once.
+    /// Replaces the backup codes (after step-up authentication; `step_up`
+    /// is its proof, a backup code used up only with the replacement) and
+    /// returns the new ones, to show once.
     pub async fn regenerate_backup_codes(
         &self,
         principal: PrincipalId,
+        step_up: Option<&StepUpProof>,
         now: UnixTimestamp,
     ) -> Result<Vec<MfaBackupCode>, MfaError> {
         self.cipher()?;
         let (codes, digests) = MfaBackupCode::generate_set(MFA_BACKUP_CODE_COUNT)?;
         if self
             .store
-            .replace_backup_codes(principal, &digests, now)
+            .replace_backup_codes(principal, &digests, StepUpProof::backup_code(step_up), now)
             .await?
         {
-            Ok(codes)
-        } else {
-            Err(MfaError::NotEnabled)
+            return Ok(codes);
         }
+        if self.store.status(principal).await?.is_none() {
+            return Err(MfaError::NotEnabled);
+        }
+        Err(self
+            .step_up_refusal(principal, step_up)
+            .await?
+            .unwrap_or(MfaError::NotEnabled))
     }
 
     /// Checks a second factor of a signed-in account for step-up
-    /// authentication: a TOTP code (its period is recorded, so it cannot be
-    /// used again) or a backup code (used up). The caller counts the attempt
-    /// on [`MfaService::throttle`] first.
+    /// authentication before a factor change: a TOTP code (its period is
+    /// recorded at once, so it cannot be used again) or an unused backup
+    /// code, which is only checked here. Pass the proof to the change
+    /// ([`MfaService::begin`], [`MfaService::confirm`],
+    /// [`MfaService::disable`], [`MfaService::regenerate_backup_codes`]):
+    /// it uses the backup code up in the transaction that applies the
+    /// change, so a change that fails costs no backup code. The caller
+    /// counts the attempt on [`MfaService::throttle`] first. A wrong,
+    /// replayed or used code is [`MfaError::InvalidCode`], an account
+    /// without a factor [`MfaError::NotEnabled`].
+    pub async fn verify_step_up(
+        &self,
+        principal: PrincipalId,
+        code: &str,
+        now: UnixTimestamp,
+    ) -> Result<StepUpProof, MfaError> {
+        self.cipher()?;
+        if let Some(backup) = MfaBackupCode::parse(code) {
+            return if self.store.has_backup_code(principal, &backup).await? {
+                Ok(StepUpProof {
+                    backup_code: Some(backup),
+                })
+            } else {
+                Err(MfaError::InvalidCode)
+            };
+        }
+        self.verify_totp(principal, code, now).await?;
+        Ok(StepUpProof { backup_code: None })
+    }
+
+    /// Checks and uses up a second factor of a signed-in account: a TOTP
+    /// code (its period is recorded, so it cannot be used again) or a backup
+    /// code (used up at once). For a step-up before a factor change use
+    /// [`MfaService::verify_step_up`] instead, so a failed change keeps the
+    /// backup code. The caller counts the attempt on
+    /// [`MfaService::throttle`] first.
     pub async fn verify_second_factor(
         &self,
         principal: PrincipalId,
         code: &str,
         now: UnixTimestamp,
     ) -> Result<SecondFactor, MfaError> {
-        let cipher = self.cipher()?;
+        self.cipher()?;
         if let Some(backup) = MfaBackupCode::parse(code) {
             return if self.store.use_backup_code(principal, &backup, now).await? {
                 Ok(SecondFactor::BackupCode)
@@ -600,6 +765,18 @@ impl MfaService {
                 Err(MfaError::InvalidCode)
             };
         }
+        self.verify_totp(principal, code, now).await?;
+        Ok(SecondFactor::Totp)
+    }
+
+    /// Checks a TOTP code of the active factor and records its period.
+    async fn verify_totp(
+        &self,
+        principal: PrincipalId,
+        code: &str,
+        now: UnixTimestamp,
+    ) -> Result<(), MfaError> {
+        let cipher = self.cipher()?;
         let Some(active) = self.store.active(principal).await? else {
             return Err(MfaError::NotEnabled);
         };
@@ -612,7 +789,7 @@ impl MfaService {
             .use_totp_counter(principal, active.sealed.digest(), counter)
             .await?
         {
-            Ok(SecondFactor::Totp)
+            Ok(())
         } else {
             Err(MfaError::InvalidCode)
         }

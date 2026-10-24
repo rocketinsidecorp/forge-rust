@@ -42,14 +42,14 @@ the work is finished and waiting for its review; **Planned** means not started.
 ## Parity follow-ups
 
 - TOTP MFA ([ADR 0040](adr/0040-totp-multi-factor-authentication.md)): the
-  primitives, storage format, key, throttle limits and audit names match
-  Forge-Go. Forge-Rust's generated application also has the enrollment,
-  rotation, backup-code regeneration and disable pages behind password and
-  code step-up, which Forge-Go's scaffold leaves to the application (its
-  bootstrap comment "MFA enrollment/management routes"); Forge-Go adopts the
-  same pages and `auth.mfa.backup_codes_regenerated` in a follow-up pull
-  request. Forge-Rust has no JSON login API, so it has no
-  `/auth/mfa/complete` bearer route, and does not port `PruneMFA` yet.
+  primitives, storage format, key, throttle limits, audit names (including
+  `auth.mfa.backup_codes_regenerated`) and the HTML enrollment, rotation,
+  backup-code and disable pages behind password and code step-up match
+  Forge-Go (its ADR 0045). Both use a step-up backup code up only with the
+  change it authorizes. Forge-Rust has no JSON login API, so it has no
+  `/auth/mfa/complete` bearer route, does not port `PruneMFA` yet, and has no
+  shared (PostgreSQL) login throttle: its MFA and sign-in counters are per
+  process ([MFA](mfa.md#how-sign-in-works)).
 
 - Benchmarks ([benchmarks](benchmarks.md), rocketinsidecorp/forge-rust#41): the
   scenario names, variants and output formats are Forge-Go's, and results are

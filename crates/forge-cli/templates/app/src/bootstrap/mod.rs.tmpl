@@ -150,7 +150,12 @@ fn compose(composition: &mut forge::Composition<'_>) -> Result<(), forge::Compos
         notifier,
         audit: std::sync::Arc::new(crate::infrastructure::audit::PgAuditSink::new(pool)),
         sign_in_throttle: throttle()?,
-        reset_throttle: throttle()?,
+        // Forge-Go's recovery limits: 3 per login and source, 10 per login
+        // and 30 per source in an hour.
+        reset_throttle: std::sync::Arc::new(
+            forge::auth::MemoryLoginThrottle::new(forge::auth::password_reset_throttle_config())
+                .map_err(forge::ComposeError::other)?,
+        ),
         mfa,
     };
     crate::adapters::http::authentication::routes(composition, &site, ports)?;

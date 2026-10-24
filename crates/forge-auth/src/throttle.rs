@@ -16,11 +16,14 @@
 //! full it evicts the oldest counters that are not blocking anything, and
 //! refuses only when every counter is blocking, so filling the table from
 //! many sources neither flushes a blocked attacker nor locks everyone out.
+//! Counters are indexed in expiry order, so an attempt removes only the
+//! counters that expired since the last one and never scans the table under
+//! its lock (Forge-Go's `MemoryLoginThrottler` keeps a creation-order list).
 //! A horizontally scaled deployment needs a shared [`LoginThrottle`]
 //! implementation; counters of one process do not limit another.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap, hash_map::Entry},
     net::IpAddr,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -180,22 +183,133 @@ struct Bucket {
     count: u32,
     limit: u32,
     resets_at: Instant,
+    /// Creation sequence: with `resets_at`, the counter's place in
+    /// [`Table::order`].
+    sequence: u64,
 }
 
 impl Bucket {
     fn blocking(&self) -> bool {
         self.count >= self.limit
     }
+
+    fn order_key(&self) -> (Instant, u64) {
+        (self.resets_at, self.sequence)
+    }
 }
 
 type Clock = Arc<dyn Fn() -> Instant + Send + Sync>;
 type BucketKey = (Scope, [u8; 32]);
 
+/// The counters and an index of them in expiry order, so expired counters
+/// are removed from the front and the oldest idle ones found without
+/// scanning the whole table under the lock.
+#[derive(Default)]
+struct Table {
+    buckets: HashMap<BucketKey, Bucket>,
+    /// Every counter by `(resets_at, sequence)`: oldest (soonest to expire)
+    /// first.
+    order: BTreeMap<(Instant, u64), BucketKey>,
+    /// Counters at or over their limit.
+    blocking: usize,
+    next_sequence: u64,
+}
+
+impl Table {
+    fn len(&self) -> usize {
+        self.buckets.len()
+    }
+
+    fn remove(&mut self, key: &BucketKey) {
+        if let Some(bucket) = self.buckets.remove(key) {
+            self.order.remove(&bucket.order_key());
+            if bucket.blocking() {
+                self.blocking = self.blocking.saturating_sub(1);
+            }
+        }
+    }
+
+    /// Removes the counters whose window ended, from the front of the
+    /// expiry order: the cost is the number removed (each in `O(log n)`),
+    /// never the size of the table.
+    fn expire(&mut self, now: Instant) {
+        while let Some((&(resets_at, _), &key)) = self.order.first_key_value() {
+            if now < resets_at {
+                return;
+            }
+            self.remove(&key);
+        }
+    }
+
+    /// The live counter of `key`; one whose window ended is removed first.
+    fn live(&mut self, key: &BucketKey, now: Instant) -> Option<&Bucket> {
+        if self
+            .buckets
+            .get(key)
+            .is_some_and(|bucket| now >= bucket.resets_at)
+        {
+            self.remove(key);
+        }
+        self.buckets.get(key)
+    }
+
+    /// Counts one attempt on `key`, creating its counter (window from `now`)
+    /// when it has none.
+    fn count(&mut self, key: BucketKey, limit: u32, resets_at: Instant) {
+        let bucket = match self.buckets.entry(key) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => {
+                let sequence = self.next_sequence;
+                self.next_sequence = self.next_sequence.wrapping_add(1);
+                self.order.insert((resets_at, sequence), key);
+                entry.insert(Bucket {
+                    count: 0,
+                    limit,
+                    resets_at,
+                    sequence,
+                })
+            }
+        };
+        let was_blocking = bucket.blocking();
+        bucket.count = bucket.count.saturating_add(1);
+        if !was_blocking && bucket.blocking() {
+            self.blocking += 1;
+        }
+    }
+
+    /// Removes the `count` oldest counters that block nothing and are not
+    /// part of the current attempt. `false` (nothing removed) when there are
+    /// not enough of them. The walk from the oldest counter passes only
+    /// blocking and current counters before it finds the victims.
+    fn evict(&mut self, current: &[(BucketKey, u32)], count: usize) -> bool {
+        let victims: Vec<BucketKey> = self
+            .order
+            .values()
+            .filter(|bucket_key| {
+                !current.iter().any(|(key, _)| key == *bucket_key)
+                    && self
+                        .buckets
+                        .get(*bucket_key)
+                        .is_some_and(|bucket| !bucket.blocking())
+            })
+            .take(count)
+            .copied()
+            .collect();
+        if victims.len() < count {
+            return false;
+        }
+        for victim in &victims {
+            self.remove(victim);
+        }
+        true
+    }
+}
+
 /// Bounded in-memory [`LoginThrottle`] for one process.
 pub struct MemoryLoginThrottle {
     config: ThrottleConfig,
     clock: Clock,
-    buckets: Mutex<HashMap<BucketKey, Bucket>>,
+    table: Mutex<Table>,
 }
 
 impl std::fmt::Debug for MemoryLoginThrottle {
@@ -229,7 +343,7 @@ impl MemoryLoginThrottle {
         Ok(Self {
             config,
             clock: Arc::new(clock),
-            buckets: Mutex::new(HashMap::new()),
+            table: Mutex::new(Table::default()),
         })
     }
 
@@ -244,31 +358,41 @@ impl MemoryLoginThrottle {
         keys
     }
 
+    /// Decides one attempt. The work under the lock is proportional to the
+    /// counters that expired since the last attempt and, when the table is
+    /// full, to the blocking counters older than the evicted ones; it never
+    /// scans every counter.
     fn decide(&self, key: &ThrottleKey) -> Result<ThrottleDecision, ThrottleError> {
         let now = (self.clock)();
-        let mut buckets = self.buckets.lock().map_err(|_| ThrottleError)?;
-        buckets.retain(|_, bucket| now < bucket.resets_at);
+        let mut table = self.table.lock().map_err(|_| ThrottleError)?;
+        table.expire(now);
         let keys = self.keys(key);
 
-        let retry_after = keys
-            .iter()
-            .filter_map(|(bucket_key, _)| {
-                buckets
-                    .get(bucket_key)
-                    .filter(|bucket| bucket.blocking())
-                    .map(|bucket| bucket.resets_at.saturating_duration_since(now))
-            })
-            .max();
+        let mut retry_after = None;
+        let mut missing = 0;
+        let mut present = 0;
+        for (bucket_key, _) in &keys {
+            match table.live(bucket_key, now) {
+                None => missing += 1,
+                Some(bucket) => {
+                    present += 1;
+                    if bucket.blocking() {
+                        let wait = bucket.resets_at.saturating_duration_since(now);
+                        retry_after = retry_after.max(Some(wait));
+                    }
+                }
+            }
+        }
         if let Some(retry_after) = retry_after {
             return Ok(ThrottleDecision::Throttled { retry_after });
         }
 
-        let missing = keys
-            .iter()
-            .filter(|(bucket_key, _)| !buckets.contains_key(bucket_key))
-            .count();
-        let overflow = (buckets.len() + missing).saturating_sub(self.config.max_entries);
-        if overflow > 0 && !evict(&mut buckets, &keys, overflow) {
+        let overflow = (table.len() + missing).saturating_sub(self.config.max_entries);
+        // Every present counter of this attempt is idle (a blocking one was
+        // refused above) and must stay, so only the others can go.
+        if overflow > 0
+            && (table.len() - table.blocking - present < overflow || !table.evict(&keys, overflow))
+        {
             return Ok(ThrottleDecision::Throttled {
                 retry_after: self.config.window,
             });
@@ -276,42 +400,10 @@ impl MemoryLoginThrottle {
 
         let resets_at = now + self.config.window;
         for (bucket_key, limit) in keys {
-            buckets
-                .entry(bucket_key)
-                .or_insert(Bucket {
-                    count: 0,
-                    limit,
-                    resets_at,
-                })
-                .count += 1;
+            table.count(bucket_key, limit, resets_at);
         }
         Ok(ThrottleDecision::Allowed)
     }
-}
-
-/// Removes the `count` oldest counters that block nothing and are not part
-/// of the current attempt. `false` (nothing removed) when there are not
-/// enough of them.
-fn evict(
-    buckets: &mut HashMap<BucketKey, Bucket>,
-    current: &[(BucketKey, u32)],
-    count: usize,
-) -> bool {
-    let mut candidates: Vec<(Instant, BucketKey)> = buckets
-        .iter()
-        .filter(|(bucket_key, bucket)| {
-            !bucket.blocking() && !current.iter().any(|(key, _)| key == *bucket_key)
-        })
-        .map(|(bucket_key, bucket)| (bucket.resets_at, *bucket_key))
-        .collect();
-    if candidates.len() < count {
-        return false;
-    }
-    candidates.sort_unstable_by_key(|(resets_at, _)| *resets_at);
-    for (_, bucket_key) in candidates.into_iter().take(count) {
-        buckets.remove(&bucket_key);
-    }
-    true
 }
 
 #[async_trait]
@@ -321,10 +413,10 @@ impl LoginThrottle for MemoryLoginThrottle {
     }
 
     async fn success(&self, key: &ThrottleKey) -> Result<(), ThrottleError> {
-        let mut buckets = self.buckets.lock().map_err(|_| ThrottleError)?;
-        buckets.remove(&(Scope::Account, key.account));
+        let mut table = self.table.lock().map_err(|_| ThrottleError)?;
+        table.remove(&(Scope::Account, key.account));
         if let Some(pair) = key.pair {
-            buckets.remove(&(Scope::Pair, pair));
+            table.remove(&(Scope::Pair, pair));
         }
         Ok(())
     }
@@ -513,6 +605,72 @@ mod tests {
                 retry_after: Duration::from_secs(60)
             })
         );
+    }
+
+    /// The table's index and blocking count agree with its counters.
+    fn consistent(throttle: &MemoryLoginThrottle) -> usize {
+        let table = throttle.table.lock().expect("table");
+        assert_eq!(table.order.len(), table.buckets.len());
+        for (order_key, bucket_key) in &table.order {
+            assert_eq!(
+                table.buckets.get(bucket_key).map(Bucket::order_key),
+                Some(*order_key)
+            );
+        }
+        assert_eq!(
+            table.blocking,
+            table
+                .buckets
+                .values()
+                .filter(|bucket| bucket.blocking())
+                .count()
+        );
+        table.len()
+    }
+
+    #[tokio::test]
+    async fn expired_counters_leave_from_the_front_and_the_index_stays_consistent() {
+        let (throttle, offset) = throttle(config());
+        for last in 1..=5 {
+            offset.store(u64::from(last), Ordering::SeqCst);
+            let key = ThrottleKey::new("sign_in", &format!("user{last}"), source(last));
+            assert!(allowed(&throttle, &key).await);
+        }
+        // One pair blocking (2 of 2), then cleared by a success.
+        let blocked = ThrottleKey::new("sign_in", "user1", source(1));
+        assert!(allowed(&throttle, &blocked).await);
+        assert!(!allowed(&throttle, &blocked).await);
+        assert_eq!(consistent(&throttle), 15);
+        throttle.success(&blocked).await.expect("success");
+        assert_eq!(consistent(&throttle), 13);
+
+        // The first three attempts' windows end; only theirs are removed.
+        offset.store(63, Ordering::SeqCst);
+        let late = ThrottleKey::new("sign_in", "late", source(9));
+        assert!(allowed(&throttle, &late).await);
+        assert_eq!(consistent(&throttle), 2 * 3 + 3);
+        // The rest expire; a key whose window ended starts over.
+        offset.store(200, Ordering::SeqCst);
+        assert!(allowed(&throttle, &late).await);
+        assert_eq!(consistent(&throttle), 3);
+    }
+
+    #[tokio::test]
+    async fn a_full_table_refuses_without_evicting_when_only_blocking_counters_remain() {
+        let (throttle, _) = throttle(ThrottleConfig {
+            account_limit: 1,
+            max_entries: 4,
+            ..config()
+        });
+        for name in ["a", "b", "c"] {
+            assert!(allowed(&throttle, &ThrottleKey::new("sign_in", name, None)).await);
+        }
+        // One idle slot left: a new account fits, the next does not, and the
+        // blocking counters are all kept.
+        assert!(allowed(&throttle, &ThrottleKey::new("sign_in", "d", None)).await);
+        assert!(!allowed(&throttle, &ThrottleKey::new("sign_in", "e", None)).await);
+        assert_eq!(consistent(&throttle), 4);
+        assert!(!allowed(&throttle, &ThrottleKey::new("sign_in", "a", None)).await);
     }
 
     #[test]

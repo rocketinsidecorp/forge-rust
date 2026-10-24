@@ -71,6 +71,8 @@ struct World {
     hashes: Mutex<u32>,
     membership_lookups: Mutex<u32>,
     deliver_fails: bool,
+    /// Says it cannot deliver, as `UndeliverablePasswordResets` does.
+    undeliverable: bool,
     /// Delivers through the real mail adapter instead of recording tokens.
     mailer: Option<forge::mail::PasswordResetMailer>,
     /// Runs once, inside the next session insert.
@@ -351,6 +353,10 @@ impl PasswordResetNotifier for World {
             delivery.token().expose().to_owned(),
         ));
         Ok(())
+    }
+
+    fn can_deliver(&self) -> bool {
+        !self.undeliverable
     }
 }
 
@@ -1098,6 +1104,37 @@ async fn reset_requests_answer_the_same_whether_or_not_the_account_exists() -> T
         );
         assert_eq!(lock(&fixture.world.resets).len(), 1);
     }
+    Ok(())
+}
+
+/// Without a mailer (`UndeliverablePasswordResets`), a reset request answers
+/// the same but queues nothing: no token row is issued for a link nobody
+/// receives, and a flood fills no queue.
+#[tokio::test]
+async fn reset_requests_issue_nothing_when_no_link_can_be_delivered() -> TestResult {
+    let delivering = fixture_with(false, 100)?;
+    let known = reset_request(&delivering, "acme", "ada@example.com").await?;
+    let fixture = fixture_for(
+        World {
+            undeliverable: true,
+            ..World::default()
+        },
+        100,
+    )?;
+    for (tenant, email) in [("acme", "ada@example.com"), ("acme", "nobody@example.com")] {
+        assert_eq!(
+            reset_request(&fixture, tenant, email).await?,
+            known,
+            "{tenant} {email}"
+        );
+    }
+    assert!(lock(&fixture.world.resets).is_empty(), "no token row");
+    assert!(lock(&fixture.world.deliveries).is_empty());
+    assert!(!audited(
+        &fixture.world,
+        "auth.password_reset.requested",
+        AuditOutcome::Succeeded
+    ));
     Ok(())
 }
 
@@ -2005,27 +2042,31 @@ async fn confirming_a_new_authenticator_needs_the_password_and_a_current_code() 
         assert!(!body.contains("otpauth://"), "{body}");
         assert!(!body.contains(&new_key), "{body}");
     }
-    // After step-up, a wrong new code shows the pending key again.
-    let retry = browser
-        .post(
-            &fixture.router,
-            "/mfa/rotation/confirm",
-            &[
-                ("password", PASSWORD),
-                ("current_code", &codes[2]),
-                ("code", &wrong_totp(&new_key)?),
-            ],
-        )
-        .await?;
-    assert_eq!(retry.status(), StatusCode::UNPROCESSABLE_ENTITY);
-    assert_eq!(mfa_key_of(&retry)?, new_key);
+    // After step-up, a wrong new code shows the pending key again, and the
+    // backup code given as the current code is not used up by the failed
+    // confirmation: it confirms the rotation next.
+    for _ in 0..2 {
+        let retry = browser
+            .post(
+                &fixture.router,
+                "/mfa/rotation/confirm",
+                &[
+                    ("password", PASSWORD),
+                    ("current_code", &codes[2]),
+                    ("code", &wrong_totp(&new_key)?),
+                ],
+            )
+            .await?;
+        assert_eq!(retry.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(mfa_key_of(&retry)?, new_key);
+    }
     let rotated = browser
         .post(
             &fixture.router,
             "/mfa/rotation/confirm",
             &[
                 ("password", PASSWORD),
-                ("current_code", &codes[3]),
+                ("current_code", &codes[2]),
                 ("code", &totp(&new_key, 0)?),
             ],
         )
@@ -2180,11 +2221,11 @@ async fn a_factor_installed_during_a_sign_in_ends_its_password_only_session() ->
         };
         let change = forge::tenancy::MfaChange::Enrollment;
         if let Ok(enrollment) = other
-            .begin(ada, change, "app", "ada@example.com", now)
+            .begin(ada, change, "app", "ada@example.com", None, now)
             .await
         {
             let code = enrollment.secret.code_at(now);
-            let _ = other.confirm(ada, change, &code, now).await;
+            let _ = other.confirm(ada, change, &code, None, now).await;
         }
     }));
     let mut browser = Browser::default();

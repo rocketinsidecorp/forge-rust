@@ -12,6 +12,21 @@
 //! backup codes and sign-in challenges only as SHA-256 digests. Every change
 //! of a factor, a backup code or a challenge is one transaction that locks
 //! the rows it reads, so a code is accepted once even under concurrency.
+//!
+//! Lock order: every MFA transaction locks the account's `forge_principals`
+//! row first and only then its enrollment, factor, backup code, session and
+//! challenge rows. Factor changes take it `FOR UPDATE` ([`lock_account`]);
+//! issuing and completing a sign-in challenge take it `FOR NO KEY UPDATE`
+//! ([`lock_sign_in`]). The two modes conflict with each other and with
+//! themselves, so the MFA transactions of one account run one at a time and
+//! none of them ever waits for the account row while it holds an MFA row: no
+//! two of them can deadlock (a sign-in that locked its factor first and then
+//! waited for the account row, which a disable held while waiting for the
+//! factor, ended in `40P01`). The single statements that wait without holding
+//! anything (`use_totp_counter`, `use_backup_code`, session inserts and
+//! revocations) close no cycle. `FOR NO KEY UPDATE` still lets a session
+//! insert take its foreign-key lock on the account row, while `FOR UPDATE`
+//! makes it wait for a factor change, which the password sign-in relies on.
 
 use async_trait::async_trait;
 use forge::audit::{AuditAction, AuditActor, AuditEvent, AuditOutcome};
@@ -295,12 +310,15 @@ impl MfaStore for PgMfaStore {
         principal: PrincipalId,
         change: MfaChange,
         pending: &PendingTotp,
+        step_up: Option<&MfaBackupCodeDigest>,
     ) -> Result<bool, AccountStoreError> {
         let mut transaction = self.pool.begin().await.map_err(classify)?;
         let Some(enabled) = lock_account(&mut transaction, principal).await? else {
             return Ok(false);
         };
-        if enabled != (change == MfaChange::Rotation) {
+        if enabled != (change == MfaChange::Rotation)
+            || !spend_step_up(&mut transaction, principal, step_up).await?
+        {
             return Ok(false);
         }
         sqlx::query(
@@ -327,8 +345,11 @@ impl MfaStore for PgMfaStore {
     async fn pending(
         &self,
         principal: PrincipalId,
+        change: MfaChange,
         now: UnixTimestamp,
     ) -> Result<Option<PendingTotp>, AccountStoreError> {
+        // One statement, one snapshot: the seed is a rotation's exactly when
+        // the account has a factor.
         let row = sqlx::query_as::<_, (Vec<u8>, Vec<u8>, i64)>(
             "SELECT pending.secret_digest, pending.secret_ciphertext,
                     EXTRACT(EPOCH FROM pending.expires_at)::bigint
@@ -336,10 +357,15 @@ impl MfaStore for PgMfaStore {
              JOIN forge_principals AS principal ON principal.id = pending.principal_id
              WHERE pending.principal_id = $1
                AND pending.expires_at > to_timestamp($2::double precision)
-               AND principal.disabled_at IS NULL",
+               AND principal.disabled_at IS NULL
+               AND EXISTS (
+                   SELECT 1 FROM forge_totp_factors AS factor
+                   WHERE factor.principal_id = pending.principal_id
+               ) = $3",
         )
         .bind(principal.into_uuid())
         .bind(seconds(now)?)
+        .bind(change == MfaChange::Rotation)
         .fetch_optional(&self.pool)
         .await
         .map_err(classify)?;
@@ -359,6 +385,7 @@ impl MfaStore for PgMfaStore {
         digest: &TotpSecretDigest,
         counter: u64,
         backup_codes: &[MfaBackupCodeDigest],
+        step_up: Option<&MfaBackupCodeDigest>,
         now: UnixTimestamp,
     ) -> Result<bool, AccountStoreError> {
         let counter = i64::try_from(counter).map_err(|_| AccountStoreError::Corrupt)?;
@@ -391,6 +418,9 @@ impl MfaStore for PgMfaStore {
         else {
             return Ok(false);
         };
+        if !spend_step_up(&mut transaction, principal, step_up).await? {
+            return Ok(false);
+        }
 
         let installed = match change {
             MfaChange::Enrollment => sqlx::query(
@@ -431,10 +461,13 @@ impl MfaStore for PgMfaStore {
     async fn disable(
         &self,
         principal: PrincipalId,
+        step_up: Option<&MfaBackupCodeDigest>,
         now: UnixTimestamp,
     ) -> Result<bool, AccountStoreError> {
         let mut transaction = self.pool.begin().await.map_err(classify)?;
-        if lock_account(&mut transaction, principal).await? != Some(true) {
+        if lock_account(&mut transaction, principal).await? != Some(true)
+            || !spend_step_up(&mut transaction, principal, step_up).await?
+        {
             return Ok(false);
         }
         for statement in [
@@ -526,14 +559,41 @@ impl MfaStore for PgMfaStore {
         Ok(used.rows_affected() == 1)
     }
 
+    async fn has_backup_code(
+        &self,
+        principal: PrincipalId,
+        code: &MfaBackupCodeDigest,
+    ) -> Result<bool, AccountStoreError> {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (
+                SELECT 1
+                FROM forge_mfa_backup_codes AS code
+                JOIN forge_totp_factors AS factor ON factor.principal_id = code.principal_id
+                JOIN forge_principals AS principal ON principal.id = code.principal_id
+                WHERE code.principal_id = $1
+                  AND code.code_digest = $2
+                  AND code.consumed_at IS NULL
+                  AND principal.disabled_at IS NULL
+             )",
+        )
+        .bind(principal.into_uuid())
+        .bind(code.as_bytes().as_slice())
+        .fetch_one(&self.pool)
+        .await
+        .map_err(classify)
+    }
+
     async fn replace_backup_codes(
         &self,
         principal: PrincipalId,
         backup_codes: &[MfaBackupCodeDigest],
+        step_up: Option<&MfaBackupCodeDigest>,
         _now: UnixTimestamp,
     ) -> Result<bool, AccountStoreError> {
         let mut transaction = self.pool.begin().await.map_err(classify)?;
-        if lock_account(&mut transaction, principal).await? != Some(true) {
+        if lock_account(&mut transaction, principal).await? != Some(true)
+            || !spend_step_up(&mut transaction, principal, step_up).await?
+        {
             return Ok(false);
         }
         store_backup_codes(&mut transaction, principal, backup_codes).await?;
@@ -545,17 +605,22 @@ impl MfaStore for PgMfaStore {
         let version = i64::try_from(grant.credential_version.get())
             .map_err(|_| AccountStoreError::Corrupt)?;
         let mut transaction = self.pool.begin().await.map_err(classify)?;
+        // The account row first (see the module's lock order), with the
+        // credential version the password step verified: the factor below
+        // can then change only after this transaction ends.
+        if !lock_sign_in(
+            &mut transaction,
+            grant.principal_id.into_uuid(),
+            Some(version),
+        )
+        .await?
+        {
+            return Ok(false);
+        }
         let factor = sqlx::query_scalar::<_, Vec<u8>>(
-            "SELECT factor.secret_digest
-             FROM forge_totp_factors AS factor
-             JOIN forge_principals AS principal ON principal.id = factor.principal_id
-             WHERE factor.principal_id = $1
-               AND principal.disabled_at IS NULL
-               AND principal.version = $2
-             FOR UPDATE OF factor",
+            "SELECT secret_digest FROM forge_totp_factors WHERE principal_id = $1",
         )
         .bind(grant.principal_id.into_uuid())
-        .bind(version)
         .fetch_optional(&mut *transaction)
         .await
         .map_err(classify)?;
@@ -647,6 +712,9 @@ impl MfaStore for PgMfaStore {
     ) -> Result<bool, AccountStoreError> {
         let counter = i64::try_from(counter).map_err(|_| AccountStoreError::Corrupt)?;
         let mut transaction = self.pool.begin().await.map_err(classify)?;
+        if !lock_challenge_account(&mut transaction, digest).await? {
+            return Ok(false);
+        }
         let row = sqlx::query_as::<_, (Uuid, Uuid, i64)>(concat!(
             "SELECT challenge.id, challenge.principal_id, factor.last_counter",
             challenge_tables!(),
@@ -695,6 +763,9 @@ impl MfaStore for PgMfaStore {
     ) -> Result<bool, AccountStoreError> {
         let at = seconds(now)?;
         let mut transaction = self.pool.begin().await.map_err(classify)?;
+        if !lock_challenge_account(&mut transaction, digest).await? {
+            return Ok(false);
+        }
         let row = sqlx::query_as::<_, (Uuid, Uuid)>(concat!(
             "SELECT challenge.id, code.id",
             challenge_tables!(),
@@ -767,6 +838,78 @@ async fn lock_account(
     .await
     .map_err(classify)?;
     Ok(Some(enabled))
+}
+
+/// Locks the account row of a sign-in step (issuing or completing a
+/// challenge) `FOR NO KEY UPDATE`, before any MFA row (see the module's lock
+/// order); `false` when the account is missing, disabled or, with
+/// `version`, at another credential version.
+async fn lock_sign_in(
+    transaction: &mut Transaction<'_, Postgres>,
+    principal: Uuid,
+    version: Option<i64>,
+) -> Result<bool, AccountStoreError> {
+    let locked = sqlx::query_scalar::<_, i32>(
+        "SELECT 1
+         FROM forge_principals
+         WHERE id = $1
+           AND disabled_at IS NULL
+           AND ($2::bigint IS NULL OR version = $2)
+         FOR NO KEY UPDATE",
+    )
+    .bind(principal)
+    .bind(version)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(classify)?;
+    Ok(locked.is_some())
+}
+
+/// [`lock_sign_in`] for the account of the challenge `digest`; `false` when
+/// there is no such challenge or account. The challenge row itself is
+/// locked afterwards, with the account row held.
+async fn lock_challenge_account(
+    transaction: &mut Transaction<'_, Postgres>,
+    digest: &MfaChallengeDigest,
+) -> Result<bool, AccountStoreError> {
+    let principal = sqlx::query_scalar::<_, Uuid>(
+        "SELECT principal_id FROM forge_mfa_challenges WHERE token_digest = $1",
+    )
+    .bind(digest.as_bytes().as_slice())
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(classify)?;
+    match principal {
+        Some(principal) => lock_sign_in(transaction, principal, None).await,
+        None => Ok(false),
+    }
+}
+
+/// Uses up `step_up`, a backup code given for step-up authentication, with
+/// the account row locked: `true` when it was an unused code of the account
+/// (or there is none), `false` otherwise, and the caller then changes
+/// nothing (its transaction rolls back).
+async fn spend_step_up(
+    transaction: &mut Transaction<'_, Postgres>,
+    principal: PrincipalId,
+    step_up: Option<&MfaBackupCodeDigest>,
+) -> Result<bool, AccountStoreError> {
+    let Some(code) = step_up else {
+        return Ok(true);
+    };
+    let used = sqlx::query(
+        "UPDATE forge_mfa_backup_codes
+         SET consumed_at = clock_timestamp()
+         WHERE principal_id = $1
+           AND code_digest = $2
+           AND consumed_at IS NULL",
+    )
+    .bind(principal.into_uuid())
+    .bind(code.as_bytes().as_slice())
+    .execute(&mut **transaction)
+    .await
+    .map_err(classify)?;
+    Ok(used.rows_affected() == 1)
 }
 
 /// Replaces the account's backup codes with `codes`.

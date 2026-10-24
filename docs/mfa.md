@@ -49,7 +49,12 @@ or use a backup code (the pages say so).
 
 Every change counts one attempt on the second-factor throttle (five per
 account in five minutes) before anything is checked, and is audited, refusals
-as the action with outcome `denied`. `POST /mfa` and `POST /mfa/confirm` need
+as the action with outcome `denied`. An authenticator code given as the
+current code is used up at once; a backup code is only checked then, and is
+used up by the change itself, in the transaction that applies it. A change
+that fails (a wrong code of the new key, a rotation that expired, an account
+changed meanwhile) therefore keeps the backup code, and a backup code used
+elsewhere in the meantime refuses the change with the step-up message. `POST /mfa` and `POST /mfa/confirm` need
 no code, so for an account that already has a factor they answer the same
 way whatever the password (`303` back to `/mfa`, "changed meanwhile"): the
 account is refused before the password is checked, so these routes cannot
@@ -70,6 +75,12 @@ authenticator: both sign out everywhere.
 2. The code step accepts a code of the current period or one period before or
    after, or an unused backup code. It counts five attempts per account and 60
    per network address in five minutes before checking anything.
+   The counters, like the sign-in ones, live in the memory of each process
+   (`MemoryLoginThrottle`): with several replicas the limits multiply by the
+   number of replicas, a restart clears them, and under pressure counters
+   below their limit can be evicted. A deployment that scales out needs a
+   shared `forge::auth::LoginThrottle` implementation; Forge-Rust does not
+   ship one yet (Forge-Go has a PostgreSQL one).
 3. The challenge and the code are consumed in one transaction: a code (its
    period) and a backup code work once, also under concurrent requests. Then
    the session and a new CSRF token are issued as for a password sign-in.
@@ -103,6 +114,21 @@ either framework. The key never reaches the database. The runtime role can
 read and change these tables but can only mark a backup code or a challenge
 used, never rewrite its digest or binding.
 
+In memory, seeds, provisioning links, backup codes and challenge tokens are
+wiped (`zeroize`) when dropped, and so are the buffers that hold a seed while
+it is sealed, opened or parsed. This is best effort: text a page renders
+(such as `TotpSecret::base32()`) is the caller's copy.
+
+A pending seed in `forge_totp_enrollments` is an enrollment's while the
+account has no factor and a rotation's while it has one; the store reads the
+two together, so a seed of one kind is never confirmed or shown as the other.
+
+Every transaction that changes these tables locks the account's
+`forge_principals` row first, then its MFA rows (factor changes `FOR UPDATE`,
+issuing and completing a sign-in challenge `FOR NO KEY UPDATE`), so a sign-in
+and a factor change of the same account wait for each other instead of
+deadlocking. Custom `MfaStore` implementations should keep that order.
+
 ## In code
 
 ```rust
@@ -116,9 +142,20 @@ let mfa = MfaService::new(
     Some(Arc::new(cipher)),
     Arc::new(MemoryLoginThrottle::new(mfa_throttle_config())?),
 );
-let enrollment = mfa.begin(principal, MfaChange::Enrollment, "shop", "ada@example.com", now).await?;
-let backup_codes = mfa.confirm(principal, MfaChange::Enrollment, "123456", now).await?;
+let enrollment = mfa.begin(principal, MfaChange::Enrollment, "shop", "ada@example.com", None, now).await?;
+let backup_codes = mfa.confirm(principal, MfaChange::Enrollment, "123456", None, now).await?;
+
+// A change of an existing factor, after the password and a current code:
+let proof = mfa.verify_step_up(principal, current_code, now).await?;
+mfa.disable(principal, Some(&proof), now).await?; // a backup code is used up here, with the change
 ```
+
+`verify_step_up` uses a TOTP code up at once but only checks a backup code;
+pass its proof to `begin`, `confirm`, `disable` or `regenerate_backup_codes`,
+which use the backup code up in the same transaction as the change, or
+refuse with `MfaError::StepUpInvalid` (changing nothing) when it was used
+meanwhile. `verify_second_factor` checks and uses a code up at once, for a
+step-up that does not change the factor.
 
 `forge::tenancy::testing::MemoryMfaStore` (feature `testing`) is the store's
 contract in memory, for tests. `forge::auth::TotpSecret::from_base32(key)?.code_at(now)`

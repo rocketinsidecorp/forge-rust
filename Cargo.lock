@@ -602,6 +602,7 @@ dependencies = [
  "subtle",
  "thiserror",
  "tokio",
+ "zeroize",
 ]
 
 [[package]]

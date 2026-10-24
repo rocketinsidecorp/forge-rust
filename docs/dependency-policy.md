@@ -456,7 +456,7 @@ the `forge-encryption` and `forge-credentials` crates and **no new package to
 | Crate | Version | Used by | Purpose | Feature policy |
 | --- | --- | --- | --- | --- |
 | `ring` | `0.17.14` | `forge-encryption` | AES-256-GCM, HKDF-SHA256, HMAC-SHA256 | defaults disabled; already in every application through rustls and `forge-auth` |
-| `zeroize` | `1.9.1` | `forge-encryption`, `forge-credentials`, `forge-cli` | wipes key material, plaintexts and key text on drop | `alloc` only, no `zeroize_derive`; already locked through rustls |
+| `zeroize` | `1.9.1` | `forge-encryption`, `forge-credentials`, `forge-cli`, `forge-auth` | wipes key material, plaintexts and key text on drop (in `forge-auth`: TOTP seeds, provisioning links, backup codes and challenge tokens) | `alloc` only, no `zeroize_derive`; already locked through rustls |
 | `rustix` | `1.1.5` | `forge-credentials` (Unix) | `O_NOFOLLOW` and `ELOOP` constants for key files, no `unsafe` | the workspace `fs`, `std` entry |
 | `base64`, `getrandom`, `serde`, `serde_json`, `thiserror`, `async-trait`, `uuid`, `sqlx` | as admitted | both crates | encodings, CSPRNG, documents, errors, the `Rewriter` port, UUID keys, the SQLx adapters (optional, backend features) | unchanged workspace entries |
 

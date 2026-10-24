@@ -99,6 +99,29 @@ impl MemoryMfaStore {
 }
 
 impl State {
+    /// Uses up `step_up` when it is an unused backup code of the account (or
+    /// there is none); `false` otherwise. Call last, once every other
+    /// precondition holds, so a refused change uses nothing up.
+    fn spend(&mut self, principal: PrincipalId, step_up: Option<&MfaBackupCodeDigest>) -> bool {
+        let Some(code) = step_up else {
+            return true;
+        };
+        let Some(factor) = self.factors.get_mut(&principal) else {
+            return false;
+        };
+        match factor
+            .backup_codes
+            .iter_mut()
+            .find(|(stored, used)| stored == code && !used)
+        {
+            Some((_, used)) => {
+                *used = true;
+                true
+            }
+            None => false,
+        }
+    }
+
     fn consume_challenges_of(&mut self, principal: PrincipalId) {
         for challenge in &mut self.challenges {
             if challenge.grant.principal_id == principal {
@@ -145,10 +168,11 @@ impl MfaStore for MemoryMfaStore {
         principal: PrincipalId,
         change: MfaChange,
         pending: &PendingTotp,
+        step_up: Option<&MfaBackupCodeDigest>,
     ) -> Result<bool, AccountStoreError> {
         let mut state = self.lock();
         let enabled = state.factors.contains_key(&principal);
-        if enabled != (change == MfaChange::Rotation) {
+        if enabled != (change == MfaChange::Rotation) || !state.spend(principal, step_up) {
             return Ok(false);
         }
         state.pending.insert(principal, pending.clone());
@@ -158,10 +182,14 @@ impl MfaStore for MemoryMfaStore {
     async fn pending(
         &self,
         principal: PrincipalId,
+        change: MfaChange,
         now: UnixTimestamp,
     ) -> Result<Option<PendingTotp>, AccountStoreError> {
-        Ok(self
-            .lock()
+        let state = self.lock();
+        if state.factors.contains_key(&principal) != (change == MfaChange::Rotation) {
+            return Ok(None);
+        }
+        Ok(state
             .pending
             .get(&principal)
             .filter(|pending| pending.expires_at > now)
@@ -175,6 +203,7 @@ impl MfaStore for MemoryMfaStore {
         digest: &TotpSecretDigest,
         counter: u64,
         backup_codes: &[MfaBackupCodeDigest],
+        step_up: Option<&MfaBackupCodeDigest>,
         now: UnixTimestamp,
     ) -> Result<bool, AccountStoreError> {
         {
@@ -186,6 +215,7 @@ impl MfaStore for MemoryMfaStore {
             if pending.sealed.digest() != digest
                 || pending.expires_at <= now
                 || enabled != (change == MfaChange::Rotation)
+                || !state.spend(principal, step_up)
             {
                 return Ok(false);
             }
@@ -209,13 +239,15 @@ impl MfaStore for MemoryMfaStore {
     async fn disable(
         &self,
         principal: PrincipalId,
+        step_up: Option<&MfaBackupCodeDigest>,
         now: UnixTimestamp,
     ) -> Result<bool, AccountStoreError> {
         {
             let mut state = self.lock();
-            if state.factors.remove(&principal).is_none() {
+            if !state.factors.contains_key(&principal) || !state.spend(principal, step_up) {
                 return Ok(false);
             }
+            state.factors.remove(&principal);
             state.pending.remove(&principal);
             state.consume_challenges_of(principal);
         }
@@ -279,13 +311,30 @@ impl MfaStore for MemoryMfaStore {
         }
     }
 
+    async fn has_backup_code(
+        &self,
+        principal: PrincipalId,
+        code: &MfaBackupCodeDigest,
+    ) -> Result<bool, AccountStoreError> {
+        Ok(self.lock().factors.get(&principal).is_some_and(|factor| {
+            factor
+                .backup_codes
+                .iter()
+                .any(|(stored, used)| stored == code && !used)
+        }))
+    }
+
     async fn replace_backup_codes(
         &self,
         principal: PrincipalId,
         backup_codes: &[MfaBackupCodeDigest],
+        step_up: Option<&MfaBackupCodeDigest>,
         _now: UnixTimestamp,
     ) -> Result<bool, AccountStoreError> {
         let mut state = self.lock();
+        if !state.spend(principal, step_up) {
+            return Ok(false);
+        }
         let Some(factor) = state.factors.get_mut(&principal) else {
             return Ok(false);
         };

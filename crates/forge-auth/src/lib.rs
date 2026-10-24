@@ -44,7 +44,7 @@ pub use password_policy::{
 pub use password_reset::{
     PASSWORD_RESET_LIFETIME_SECS, PASSWORD_RESET_PATH, PasswordResetDelivery,
     PasswordResetDeliveryError, PasswordResetNotifier, PasswordResetToken,
-    PasswordResetTokenDigest, UndeliverablePasswordResets,
+    PasswordResetTokenDigest, UndeliverablePasswordResets, password_reset_throttle_config,
 };
 pub use throttle::{
     LoginThrottle, MemoryLoginThrottle, ThrottleConfig, ThrottleConfigError, ThrottleDecision,

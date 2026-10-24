@@ -5,7 +5,9 @@
 //! two-factor codes, backup codes and sign-in challenges that work once,
 //! expire, die with a password change and fail closed on a wrong key or a
 //! tampered seed; factor changes that see a factor installed while they
-//! waited for the account lock.
+//! waited for the account lock; sign-in steps that lock the account before
+//! any MFA row, so they never deadlock with a factor change; step-up backup
+//! codes used up only by a change that commits.
 //!
 //! PostgreSQL tests need `FORGE_TEST_DATABASE_URL` (a role that may create
 //! databases) and are ignored by default:
@@ -34,8 +36,13 @@ use forge::tenancy::{
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 
-use forge::auth::{Aes256GcmSecretCipher, MemoryLoginThrottle, MfaBackupCode, MfaChallengeBinding};
-use forge::tenancy::{MfaChange, MfaError, MfaService, MfaStore as _, mfa_throttle_config};
+use forge::auth::{
+    Aes256GcmSecretCipher, MemoryLoginThrottle, MfaBackupCode, MfaChallengeBinding,
+    MfaChallengeToken,
+};
+use forge::tenancy::{
+    MfaChallengeGrant, MfaChange, MfaError, MfaService, MfaStore as _, mfa_throttle_config,
+};
 
 type TestResult = Result<(), Box<dyn Error>>;
 
@@ -366,6 +373,7 @@ async fn two_factor_codes_and_challenges_work_once_and_fail_closed() -> TestResu
             MfaChange::Enrollment,
             "shop",
             "owner@example.com",
+            None,
             now,
         )
         .await?;
@@ -375,6 +383,7 @@ async fn two_factor_codes_and_challenges_work_once_and_fail_closed() -> TestResu
             principal,
             MfaChange::Enrollment,
             &enrollment.secret.code_at(now),
+            None,
             now,
         )
         .await?;
@@ -575,7 +584,7 @@ async fn two_factor_codes_and_challenges_work_once_and_fail_closed() -> TestResu
 
     // Disabling removes the factor and its codes and signs out everywhere.
     let last = issue_persisted_session(&sessions, principal, now, after(now, 3_600)).await?;
-    service.disable(principal, after(now, 150)).await?;
+    service.disable(principal, None, after(now, 150)).await?;
     assert_eq!(service.status(principal).await?, None);
     let remaining: i64 = sqlx::query_scalar("SELECT count(*) FROM forge_mfa_backup_codes")
         .fetch_one(&pool)
@@ -678,6 +687,7 @@ async fn factor_changes_are_refused_under_the_account_lock() -> TestResult {
             MfaChange::Enrollment,
             "shop",
             "owner@example.com",
+            None,
             now,
         )
         .await?;
@@ -686,6 +696,7 @@ async fn factor_changes_are_refused_under_the_account_lock() -> TestResult {
             principal,
             MfaChange::Enrollment,
             &enrollment.secret.code_at(now),
+            None,
             now,
         )
         .await?;
@@ -696,6 +707,7 @@ async fn factor_changes_are_refused_under_the_account_lock() -> TestResult {
             MfaChange::Rotation,
             "shop",
             "owner@example.com",
+            None,
             now,
         )
         .await?;
@@ -708,7 +720,8 @@ async fn factor_changes_are_refused_under_the_account_lock() -> TestResult {
                 &rotation.secret.digest(),
                 1,
                 &digests,
-                now,
+                None,
+                now
             )
             .await?,
         "the store refuses an enrollment of an account with a factor"
@@ -719,6 +732,7 @@ async fn factor_changes_are_refused_under_the_account_lock() -> TestResult {
                 principal,
                 MfaChange::Enrollment,
                 &rotation.secret.code_at(now),
+                None,
                 now
             )
             .await
@@ -758,6 +772,7 @@ async fn factor_changes_are_refused_under_the_account_lock() -> TestResult {
             principal,
             MfaChange::Rotation,
             &rotation.secret.code_at(later),
+            None,
             later,
         )
         .await?;
@@ -768,7 +783,7 @@ async fn factor_changes_are_refused_under_the_account_lock() -> TestResult {
             .is_err(),
         "the rotation replaced the backup codes"
     );
-    service.disable(principal, later).await?;
+    service.disable(principal, None, later).await?;
 
     // An enrollment that waited for the account lock while a factor was
     // being installed sees that factor.
@@ -779,6 +794,7 @@ async fn factor_changes_are_refused_under_the_account_lock() -> TestResult {
             MfaChange::Enrollment,
             "shop",
             "owner@example.com",
+            None,
             now
         ),
         async {
@@ -811,6 +827,373 @@ async fn factor_changes_are_refused_under_the_account_lock() -> TestResult {
     assert!(
         service.status(principal).await?.is_some(),
         "the factor is visible once the session is stored"
+    );
+    database.cleanup().await?;
+    Ok(())
+}
+
+/// A provisioned owner with a confirmed factor: the owner, the tenant, the
+/// seed and the backup codes.
+struct Enrolled {
+    principal: forge::security::PrincipalId,
+    tenant: forge::tenancy::TenantId,
+    secret: forge::auth::TotpSecret,
+    codes: Vec<MfaBackupCode>,
+}
+
+async fn enrolled_owner(
+    pool: &sqlx::PgPool,
+    service: &MfaService,
+    now: UnixTimestamp,
+) -> Result<Enrolled, Box<dyn Error>> {
+    let owner = provision_owner(
+        pool,
+        &OwnerAccount {
+            tenant: TenantSlug::new("acme")?,
+            organization: "Acme".to_owned(),
+            login: CanonicalLogin::parse("owner@example.com")?,
+            password_hash: Argon2idPasswordHasher.hash(PASSWORD.as_bytes()).await?,
+            now,
+        },
+    )
+    .await?;
+    let principal = owner.principal_id;
+    let enrollment = service
+        .begin(
+            principal,
+            MfaChange::Enrollment,
+            "shop",
+            "owner@example.com",
+            None,
+            now,
+        )
+        .await?;
+    let codes = service
+        .confirm(
+            principal,
+            MfaChange::Enrollment,
+            &enrollment.secret.code_at(now),
+            None,
+            now,
+        )
+        .await?;
+    Ok(Enrolled {
+        principal,
+        tenant: owner.tenant_id,
+        secret: enrollment.secret,
+        codes,
+    })
+}
+
+/// What a factor change does once it holds the account row, done by hand
+/// while a sign-in step waits for that row: the rows the step would need are
+/// taken `NOWAIT`, which fails (`55P03`) if the waiting step held any of
+/// them, then the factor and its backup codes are removed and the
+/// challenges voided, as `disable` does.
+async fn disable_while_waiting(
+    pool: &sqlx::PgPool,
+    mut holder: sqlx::Transaction<'static, sqlx::Postgres>,
+    principal: forge::security::PrincipalId,
+) -> TestResult {
+    until_a_statement_waits(pool).await?;
+    for statement in [
+        "SELECT 1 FROM forge_totp_factors WHERE principal_id = $1 FOR UPDATE NOWAIT",
+        "SELECT 1 FROM forge_mfa_backup_codes WHERE principal_id = $1 FOR UPDATE NOWAIT",
+        "SELECT 1 FROM forge_mfa_challenges WHERE principal_id = $1 FOR UPDATE NOWAIT",
+        "DELETE FROM forge_mfa_backup_codes WHERE principal_id = $1",
+        "DELETE FROM forge_totp_factors WHERE principal_id = $1",
+        "UPDATE forge_mfa_challenges SET consumed_at = clock_timestamp()
+         WHERE principal_id = $1 AND consumed_at IS NULL",
+    ] {
+        sqlx::query(statement)
+            .bind(principal.into_uuid())
+            .execute(&mut *holder)
+            .await
+            .map_err(|error| format!("{statement}: {error}"))?;
+    }
+    holder.commit().await?;
+    Ok(())
+}
+
+/// Locks the account row as a factor change does (`FOR UPDATE`), leaving
+/// the transaction open.
+async fn lock_account_row(
+    pool: &sqlx::PgPool,
+    principal: forge::security::PrincipalId,
+) -> Result<sqlx::Transaction<'static, sqlx::Postgres>, Box<dyn Error>> {
+    let mut holder = pool.begin().await?;
+    sqlx::query("SELECT 1 FROM forge_principals WHERE id = $1 FOR UPDATE")
+        .bind(principal.into_uuid())
+        .execute(&mut *holder)
+        .await?;
+    Ok(holder)
+}
+
+/// Issuing and completing a sign-in challenge lock the account row before
+/// any MFA row (the store's lock order). A sign-in step that runs while a
+/// factor change holds the account row therefore waits holding nothing: the
+/// change takes the factor, the backup codes and the challenges without
+/// waiting and commits, and the step then refuses cleanly instead of
+/// deadlocking (`40P01`, a `503`). Before, issuing locked the factor first
+/// and completing locked the challenge first, then waited for rows the
+/// change held.
+#[tokio::test]
+#[ignore = "needs FORGE_TEST_DATABASE_URL"]
+async fn sign_in_steps_lock_the_account_before_any_mfa_row() -> TestResult {
+    let database = TestDatabase::<sqlx::Postgres>::create(&MIGRATOR).await?;
+    let pool = database.database().pool().clone();
+    let now = now()?;
+    let service = mfa(&pool, [7; 32])?;
+    let store = PgMfaStore::new(pool.clone());
+    let owner = enrolled_owner(&pool, &service, now).await?;
+    let principal = owner.principal;
+    let credentials = PostgresPasswordCredentialStore::new(pool.clone());
+    let verified = verify_password(
+        &credentials,
+        &Argon2idPasswordHasher,
+        "owner@example.com",
+        PASSWORD.as_bytes(),
+    )
+    .await?;
+    let grant = || -> Result<MfaChallengeGrant, Box<dyn Error>> {
+        Ok(MfaChallengeGrant {
+            digest: MfaChallengeToken::generate()?.digest(),
+            principal_id: principal,
+            tenant_id: owner.tenant,
+            credential_version: verified.version,
+            binding: binding(),
+            expires_at: after(now, 300),
+            session_expires_at: after(now, 3_600),
+        })
+    };
+    let reenroll = || async {
+        let enrollment = service
+            .begin(
+                principal,
+                MfaChange::Enrollment,
+                "shop",
+                "owner@example.com",
+                None,
+                now,
+            )
+            .await?;
+        let codes = service
+            .confirm(
+                principal,
+                MfaChange::Enrollment,
+                &enrollment.secret.code_at(now),
+                None,
+                now,
+            )
+            .await?;
+        Result::<_, Box<dyn Error>>::Ok((enrollment.secret, codes))
+    };
+
+    // Issuing a challenge while the factor is being disabled.
+    let holder = lock_account_row(&pool, principal).await?;
+    let pending = grant()?;
+    let (issued, disabled) = tokio::join!(
+        store.create_challenge(&pending),
+        disable_while_waiting(&pool, holder, principal),
+    );
+    disabled?;
+    assert!(
+        !issued?,
+        "the challenge waited for the change and saw no factor"
+    );
+
+    // Completing a challenge with a code while the factor is being disabled.
+    let (secret, _) = reenroll().await?;
+    let live = grant()?;
+    assert!(store.create_challenge(&live).await?);
+    let later = after(now, 30);
+    let counter = forge::auth::TotpSecret::counter_at(later);
+    let factor = secret.digest();
+    let holder = lock_account_row(&pool, principal).await?;
+    let (consumed, disabled) = tokio::join!(
+        store.consume_challenge_with_totp(&live.digest, &factor, counter, later),
+        disable_while_waiting(&pool, holder, principal),
+    );
+    disabled?;
+    assert!(!consumed?, "the challenge died with the factor");
+
+    // Completing a challenge with a backup code while the factor is being
+    // disabled.
+    let (_, codes) = reenroll().await?;
+    let live = grant()?;
+    assert!(store.create_challenge(&live).await?);
+    let backup = MfaBackupCode::parse(codes[0].expose()).ok_or("backup code")?;
+    let holder = lock_account_row(&pool, principal).await?;
+    let (consumed, disabled) = tokio::join!(
+        store.consume_challenge_with_backup_code(&live.digest, &backup, later),
+        disable_while_waiting(&pool, holder, principal),
+    );
+    disabled?;
+    assert!(!consumed?, "the challenge died with the factor");
+
+    // The real operations racing each other end without an error.
+    for _ in 0..5 {
+        let (secret, _) = reenroll().await?;
+        let live = grant()?;
+        assert!(store.create_challenge(&live).await?);
+        let next = grant()?;
+        let factor = secret.digest();
+        let (issued, consumed, disabled) = tokio::join!(
+            store.create_challenge(&next),
+            store.consume_challenge_with_totp(
+                &live.digest,
+                &factor,
+                forge::auth::TotpSecret::counter_at(later),
+                later,
+            ),
+            service.disable(principal, None, later),
+        );
+        issued?;
+        consumed?;
+        disabled?;
+    }
+    database.cleanup().await?;
+    Ok(())
+}
+
+/// A step-up backup code is used up in the transaction of the change it
+/// authorizes: a change that fails keeps it, and a code used meanwhile
+/// refuses the change, which then changes nothing. The pending seed of a
+/// rotation is never read as an enrollment's.
+#[tokio::test]
+#[ignore = "needs FORGE_TEST_DATABASE_URL"]
+async fn step_up_backup_codes_are_used_up_only_by_a_change_that_commits() -> TestResult {
+    let database = TestDatabase::<sqlx::Postgres>::create(&MIGRATOR).await?;
+    let pool = database.database().pool().clone();
+    let now = now()?;
+    let service = mfa(&pool, [7; 32])?;
+    let store = PgMfaStore::new(pool.clone());
+    let Enrolled {
+        principal,
+        secret,
+        codes,
+        ..
+    } = enrolled_owner(&pool, &service, now).await?;
+    let unused = || async {
+        Result::<_, Box<dyn Error>>::Ok(
+            service
+                .status(principal)
+                .await?
+                .map(|status| status.remaining_backup_codes),
+        )
+    };
+
+    let proof = service
+        .verify_step_up(principal, codes[0].expose(), now)
+        .await?;
+    assert_eq!(unused().await?, Some(10), "checking uses nothing up");
+    let rotation = service
+        .begin(
+            principal,
+            MfaChange::Rotation,
+            "shop",
+            "owner@example.com",
+            Some(&proof),
+            now,
+        )
+        .await?;
+    assert_eq!(unused().await?, Some(9), "the rotation used the code up");
+    assert!(
+        store
+            .pending(principal, MfaChange::Enrollment, now)
+            .await?
+            .is_none(),
+        "a rotation's seed is not an enrollment's"
+    );
+    assert!(
+        store
+            .pending(principal, MfaChange::Rotation, now)
+            .await?
+            .is_some()
+    );
+
+    // A wrong code of the new key keeps the step-up code.
+    let proof = service
+        .verify_step_up(principal, codes[1].expose(), now)
+        .await?;
+    let wrong = if rotation.secret.code_at(now) == "000000" {
+        "111111"
+    } else {
+        "000000"
+    };
+    assert_eq!(
+        service
+            .confirm(principal, MfaChange::Rotation, wrong, Some(&proof), now)
+            .await
+            .err(),
+        Some(MfaError::InvalidCode)
+    );
+    assert_eq!(unused().await?, Some(9));
+
+    // Used elsewhere meanwhile: every change is refused and nothing changes.
+    let backup = MfaBackupCode::parse(codes[1].expose()).ok_or("backup code")?;
+    assert!(store.use_backup_code(principal, &backup, now).await?);
+    let later = after(now, 30);
+    assert_eq!(
+        service
+            .confirm(
+                principal,
+                MfaChange::Rotation,
+                &rotation.secret.code_at(later),
+                Some(&proof),
+                later,
+            )
+            .await
+            .err(),
+        Some(MfaError::StepUpInvalid)
+    );
+    assert_eq!(
+        service.disable(principal, Some(&proof), later).await,
+        Err(MfaError::StepUpInvalid)
+    );
+    assert_eq!(
+        service
+            .regenerate_backup_codes(principal, Some(&proof), later)
+            .await
+            .err(),
+        Some(MfaError::StepUpInvalid)
+    );
+    let factor: Vec<u8> =
+        sqlx::query_scalar("SELECT secret_digest FROM forge_totp_factors WHERE principal_id = $1")
+            .bind(principal.into_uuid())
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(factor, secret.digest().as_bytes().to_vec(), "not rotated");
+    assert_eq!(unused().await?, Some(8));
+    assert!(
+        store
+            .pending(principal, MfaChange::Rotation, later)
+            .await?
+            .is_some(),
+        "the rotation is still pending"
+    );
+
+    // A valid proof's rotation commits and uses the code up with it.
+    let proof = service
+        .verify_step_up(principal, codes[2].expose(), later)
+        .await?;
+    let fresh = service
+        .confirm(
+            principal,
+            MfaChange::Rotation,
+            &rotation.secret.code_at(later),
+            Some(&proof),
+            later,
+        )
+        .await?;
+    assert_eq!(fresh.len(), 10);
+    assert!(
+        !store
+            .has_backup_code(
+                principal,
+                &MfaBackupCode::parse(codes[2].expose()).ok_or("backup code")?
+            )
+            .await?
     );
     database.cleanup().await?;
     Ok(())
