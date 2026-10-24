@@ -7,10 +7,9 @@ deploy configuration. It is the Forge-Rust version of the Rails "Getting
 Started" guide and follows the
 [Forge-Go guide](https://github.com/rocketinsidecorp/forge-go/blob/main/docs/GETTING_STARTED.md)
 with the same command names. The order differs in places: this guide adds
-two-factor sign-in, `forge routes` and encrypted credentials (section 11),
-and leaves out Forge-Go's live-updates demo, its model/controller "comments"
-section and its SQLite walkthrough (`forge generate model` and `controller`,
-`--broadcast` and `-d sqlite3` exist here too; see their documentation). Every command in it was run
+two-factor sign-in, `forge routes` and encrypted credentials (section 11), and
+keeps Forge-Go's live-updates demo (5.2), its "comments" model and controller
+(5.4) and its SQLite note (end of section 4) as subsections. Every command in it was run
 against this repository on Linux with PostgreSQL 16, except the Docker
 commands (sections 4, 12 and 13): no Docker daemon was available for that run,
 and the text says so where it matters. Absolute paths in the samples are
@@ -325,12 +324,42 @@ database reachability: the server accepts connections
 toolchain: cargo 1.98.1 (797e8a9bc 2026-08-05); rustc 1.98.1 (48a229cea 2026-09-01)
 ```
 
+### SQLite instead of PostgreSQL
+
+```sh
+forge new blog -d sqlite3 --forge-path "$PWD/forge-rust/crates/forge"
+cd blog
+export FORGE_MIGRATION_DATABASE_URL='sqlite://storage/development.sqlite3?mode=rwc'
+export FORGE_DATABASE_URL='sqlite://storage/development.sqlite3?mode=rwc'
+forge db prepare        # creates storage/development.sqlite3
+forge dev
+```
+
+```text
+sqlite database storage/development.sqlite3 does not exist
+created sqlite database storage/development.sqlite3
+... INFO forge::database::commands: no pending migrations app="blog"
+Seed data loaded.
+```
+
+Generators, tests, views, translations, OpenAPI and `forge destroy` work the
+same, and no Docker is needed. What SQLite does not have is Forge identity:
+there is no `forge setup` (the application refuses it), no sign-in pages
+(`forge generate authentication` is refused, with the reason) and nothing that
+supplies a tenant, so scaffold with `--global` instead of `--tenant-scoped`;
+tenant isolation on SQLite rests on the application layer, not on row-level
+security. A scaffold's pages refuse everyone (`DenyAll`) until you replace it
+in the printed wiring with your own `GlobalAccess`. Sections 5 (without
+sign-in), 7, 8, 10 and 14 apply; the rest of this guide was run on PostgreSQL. The
+same goes for `-d mysql` and `-d mariadb`; see
+[ADR 0021](adr/0021-selectable-database-backends.md) for what each backend has.
+
 ## 5. Scaffold posts
 
 In terminal 2:
 
 ```sh
-forge generate scaffold post title:string body:text --tenant-scoped
+forge generate scaffold post title:string body:text --tenant-scoped --broadcast
 ```
 
 ```text
@@ -341,6 +370,7 @@ forge generate scaffold post title:string body:text --tenant-scoped
   create       src/application/use_cases/posts.rs
   create       src/infrastructure/database/posts.rs
   create       src/adapters/http/access.rs
+  create       src/adapters/http/streams.rs
   create       src/adapters/http/posts.rs
   create       src/adapters/http/views/posts.rs
   create       templates/posts/index.html
@@ -349,6 +379,7 @@ forge generate scaffold post title:string body:text --tenant-scoped
   create       templates/posts/edit.html
   create       templates/posts/_form.html
   create       templates/posts/not_found.html
+  create       templates/posts/_row.html
   create       config/locales/posts.en.json
   create       tests/posts_http.rs
   create       tests/posts_repository.rs
@@ -356,7 +387,7 @@ forge generate scaffold post title:string body:text --tenant-scoped
 
 This is `rails g scaffold`: a migration, the entity, a repository port, use
 cases, a PostgreSQL repository, HTML pages with CSRF-protected forms,
-translations and tests for every layer. After the file list the generator prints
+translations, live updates and tests for every layer. After the file list the generator prints
 the wiring (not repeated here).
 
 - `post` is the singular name (`snake_case` or `PascalCase`); fields are
@@ -366,13 +397,14 @@ the wiring (not repeated here).
 - `--tenant-scoped` binds every query to the signed-in organization (routes
   live under `/tenants/{tenant_id}/`) and, on PostgreSQL, enforces it again
   with row-level security. `--global` is for data every tenant shares.
-- `--broadcast` adds live updates over Server-Sent Events (it needs the
-  `FORGE_STREAMS_KEY` setting in production; see [views](views.md)).
+- `--broadcast` adds live updates over Server-Sent Events (section 5.2; it
+  needs the `FORGE_STREAMS_KEY` setting in production, see [views](views.md)).
+  Leave it out for a resource that does not change under the reader.
 - Add `--dry-run` to any generator to list its files without writing them.
 
 ### 5.1 Wire it into the application
 
-The wiring has two parts: seven `pub mod` lines, and a block of code at the
+The wiring has two parts: eight `pub mod` lines, and a block of code at the
 end of `fn compose` in `src/bootstrap/mod.rs`, before its `Ok(())`. First a
 helper for the second part. It takes the code on standard input and inserts it
 at the end of `compose` (or of the function you name; section 9 uses
@@ -390,7 +422,7 @@ echo 'pub mod post;' >> src/domain/entities/mod.rs
 echo 'pub mod post_repository;' >> src/application/ports/mod.rs
 echo 'pub mod posts;' >> src/application/use_cases/mod.rs
 perl -0pi -e 's/\n\nuse forge::tenancy/\n\npub mod posts;\n\nuse forge::tenancy/' src/infrastructure/database/mod.rs
-perl -0pi -e 's/^pub mod authentication;/pub mod access;\npub mod authentication;\npub mod posts;/m' src/adapters/http/mod.rs
+perl -0pi -e 's/^pub mod authentication;/pub mod access;\npub mod authentication;\npub mod posts;\npub mod streams;/m' src/adapters/http/mod.rs
 perl -0pi -e 's/^pub mod welcome;/pub mod posts;\npub mod welcome;/m' src/adapters/http/views/mod.rs
 ```
 
@@ -420,6 +452,11 @@ wire <<'EOF'
         std::sync::Arc::new(crate::infrastructure::tenancy::PgMembershipStore::new(pool)),
         policy,
     );
+    // Live updates, once for every broadcasting resource. FORGE_STREAMS_KEY
+    // (`openssl rand -base64 32`, the same on every replica) is required in
+    // production.
+    let streams =
+        crate::adapters::http::streams::Streams::register(composition, forge::Fanout::Postgres)?;
     let posts = crate::application::use_cases::posts::PostService::new(std::sync::Arc::new(
         crate::infrastructure::database::posts::PgPostRepository::new(
             composition.postgres()?.clone(),
@@ -430,6 +467,7 @@ wire <<'EOF'
         &site,
         posts,
         std::sync::Arc::new(access),
+        &streams,
     )?;
 EOF
 forge format
@@ -503,9 +541,191 @@ location: /tenants/01a15b83-4594-75f5-9685-f9591edbba09/posts/01a15b84-d22d-7468
 (Once two-factor authentication is on, section 6, the sign-in answers `303`
 to `/session/mfa` and this script stops there; use the browser.)
 
-The scaffold's tests cover validation, the permission checks, CSRF and tenant
-isolation. Repository tests need a database server and are ignored by default;
-section 10 shows how to run them.
+### 5.2 Live updates
+
+Because the posts were scaffolded with `--broadcast`, the index page
+subscribes to a stream: open `/tenants/TENANT_ID/posts` in two browser windows,
+signed in to the same organization, and create, edit or delete a post in one;
+the other changes without a reload. The server pushes Turbo Streams over
+Server-Sent Events, on a channel whose name is signed (HMAC-SHA256, expiring
+after 24 hours) and bound to the tenant, and serves it only to callers the
+access policy grants `posts:read`. Delivery is at most once and without
+replay, so the next page load is always authoritative. `Fanout::Postgres`
+(in the wiring) reaches every replica through `LISTEN/NOTIFY`.
+
+Without a second browser, watch the stream from the terminal. The page
+carries the signed stream address in a `<turbo-stream-source>` element; open
+it with `curl -N` and, in another terminal, create a post:
+
+```sh
+B=http://localhost:3000 JAR=$(mktemp)
+TENANT_ID=$(psql "$FORGE_MIGRATION_DATABASE_URL" -Atc "select id from forge_tenants where slug = 'acme'")
+token() { sed -n 's/.*name="csrf_token" value="\([^"]*\)".*/\1/p' | head -1; }
+printf 'Owner password: '; read -rs OWNER_PASSWORD; echo   # bash or zsh
+T=$(curl -s -c $JAR -b $JAR "$B/session/new?tenant=acme" | token)
+printf '%s' "$OWNER_PASSWORD" | curl -s -o /dev/null -c $JAR -b $JAR -d "csrf_token=$T" -d tenant=acme -d email=owner@example.com --data-urlencode 'password@-' $B/session
+unset OWNER_PASSWORD
+SRC=$(curl -s -b $JAR $B/tenants/$TENANT_ID/posts | sed -n 's/.*<turbo-stream-source src="\([^"]*\)".*/\1/p')
+curl -sN -b $JAR "$B$SRC"        # stays open; Ctrl-C ends it
+```
+
+In a third terminal, with the same `$B`, `$JAR`, `$TENANT_ID` and `token`
+(run it from the same shell session, or define them again):
+
+```sh
+T=$(curl -s -c $JAR -b $JAR $B/tenants/$TENANT_ID/posts/new | token)
+curl -s -o /dev/null -c $JAR -b $JAR -d "csrf_token=$T" --data-urlencode "title=Hello Forge" --data-urlencode "body=My first post" $B/tenants/$TENANT_ID/posts
+```
+
+The first terminal prints the keep-alive and then the change, as the
+fragments the browser applies:
+
+```text
+retry: 3000
+: connected
+
+data: <turbo-stream action="remove" target="posts_empty"></turbo-stream>
+data: <turbo-stream action="append" target="posts"><template><tr id="post_01a16f17-6a6d-7035-960e-6d14e0042555">
+data:       <td>Hello Forge</td>
+data:       <td>My first post</td>
+data:       <td><a href="/tenants/01a16f13-5299-721e-a22c-3e7da64be2a4/posts/01a16f17-6a6d-7035-960e-6d14e0042555">Show</a> <a href="/tenants/01a16f13-5299-721e-a22c-3e7da64be2a4/posts/01a16f17-6a6d-7035-960e-6d14e0042555/edit">Edit</a></td>
+data: </tr></template></turbo-stream>
+data: 
+```
+
+In development the signing key is random per process (the application logs
+`FORGE_STREAMS_KEY is not set`, and open pages stop updating after a
+restart). Set `FORGE_STREAMS_KEY` to the same value on every replica in
+staging and production (`openssl rand -base64 32`). [Views](views.md#live-updates)
+has the protections and the limits.
+
+### 5.3 Test
+
+```sh
+forge test
+```
+
+```text
+test result: ok. 21 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.75s
+...
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+test postgres_round_trip_locking_and_pages ... ignored, needs FORGE_TEST_DATABASE_URL
+test postgres_row_level_security_isolates_tenants ... ignored, needs FORGE_TEST_DATABASE_URL
+```
+
+`forge test` is `cargo test --all-targets --all-features` in the application
+(arguments pass through; section 10 has the rest of the toolbox). The
+scaffold's tests cover validation, optimistic locking, the permission checks,
+CSRF, tenant isolation (the repository tests, with row-level security forced
+on the table's owner) and an end-to-end event stream. The repository tests
+need a database server and are `ignored` by default; section 10 shows how to
+run them.
+
+### 5.4 Comments: a model and a controller
+
+A **model** is the data and its rules without any HTTP; a **controller** is
+read-only pages without any data. Generate the model first. A comment belongs
+to a post, but there is no `references` type: `post_id:uuid` is a plain `uuid`
+column and the migration adds no foreign key:
+
+```sh
+forge generate model comment post_id:uuid body:text --tenant-scoped
+```
+
+```text
+  create       migrations/1792865223274081083_create_comments.up.sql
+  create       migrations/1792865223274081083_create_comments.down.sql
+  create       src/domain/entities/comment.rs
+  create       src/application/ports/comment_repository.rs
+  create       src/application/use_cases/comments.rs
+  create       src/infrastructure/database/comments.rs
+  create       tests/comments_repository.rs
+```
+
+These are the scaffold's model files without the pages, the access policy and
+the stream. Declare the four modules it prints, apply the migration and test:
+
+```sh
+echo 'pub mod comment;' >> src/domain/entities/mod.rs
+echo 'pub mod comment_repository;' >> src/application/ports/mod.rs
+echo 'pub mod comments;' >> src/application/use_cases/mod.rs
+perl -0pi -e 's/\n\npub mod posts;/\n\npub mod comments;\npub mod posts;/' src/infrastructure/database/mod.rs
+forge migrate
+forge test
+```
+
+The second wiring step it prints builds `CommentService` where you need it (in
+a handler or a job). Rust warns about an unused variable, so do not paste it
+before something uses it. For CRUD pages for comments use
+`forge generate scaffold comment ...` instead of the model; a model and a
+scaffold of the same plural collide on purpose.
+
+Now a guarded page. It reuses the model's `comments:read` permission (a
+permission has one owner, so the controller does not declare a second one):
+
+```sh
+forge generate controller comments index
+```
+
+```text
+  create       src/adapters/http/comments_controller.rs
+  create       src/adapters/http/views/comments_controller.rs
+  create       templates/comments/index.html
+  create       tests/comments_controller_http.rs
+  reuse        src/adapters/http/access.rs
+```
+
+Declare its two modules and paste its route registration, which the generator
+printed with `DenyAll`:
+
+```sh
+perl -0pi -e 's/^pub mod authentication;/pub mod authentication;\npub mod comments_controller;/m' src/adapters/http/mod.rs
+perl -0pi -e 's/^pub mod posts;/pub mod comments_controller;\npub mod posts;/m' src/adapters/http/views/mod.rs
+wire <<'EOF'
+    crate::adapters::http::comments_controller::routes(
+        composition.router(),
+        &site,
+        std::sync::Arc::new(crate::adapters::http::access::DenyAll),
+    )?;
+EOF
+```
+
+Edit the page: the layout and the heading stay, replace the text in
+`templates/comments/index.html`, then check the route, the tests and the
+guard:
+
+```sh
+cat > templates/comments/index.html <<'EOF'
+{% extends "layouts/application.html" %}
+
+{% block title %}{{ title }}{% endblock %}
+
+{% block content %}
+<h1>{{ title }}</h1>
+<p>Moderation tools will live here.</p>
+{% endblock %}
+EOF
+forge format
+forge routes | grep -E 'METHOD|comments'
+forge test
+curl -si http://127.0.0.1:3000/comments | head -1
+```
+
+```text
+METHOD  PATH                                          ACTION  SOURCE
+GET     /comments                                     -       src/adapters/http/comments_controller.rs:65
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+HTTP/1.1 403 Forbidden
+```
+
+The `403` is the point: a controller is never public by accident. It stays
+closed until you replace `DenyAll` with your own `GlobalAccess`
+implementation (`src/adapters/http/access.rs` explains it), or generate it
+with `--public` for pages anyone may read. Other actions are other arguments:
+`forge generate controller reports monthly` is `GET /reports/monthly` guarded
+by `reports:read`, `--api` makes JSON handlers under `/v1`, and controllers
+answer `GET` only; anything that changes data is a scaffold
+([generators](generators.md#controller)).
 
 ## 6. Authentication and two-factor authentication
 
@@ -1090,7 +1310,7 @@ unset REGISTRY_PASSWORD
 ```
 
 ```text
-192.0.2.10      $ mkdir -p .forge/blog && if mkdir .forge/blog/lock 2>/dev/null; then cat > .forge/blog/lock/info; else cat .forge/blog/lock/info 2>/dev/null; exit 75; fi
+192.0.2.10      $ set -C; mkdir -p .forge/blog && cat > .forge/blog/lock.tmp.$$ || { rm -f .forge/blog/lock.tmp.$$; exit 1; }; claim() { if err=$(ln .forge/blog/lock.tmp.$$ .forge/blog/lock/info 2>&1); then return 0; fi; [ -e .forge/blog/lock/info ] || echo "$err" >&2; return 1; }; won=; if mkdir .forge/blog/lock 2>/dev/null; then claim && won=1; elif [ ! -e .forge/blog/lock/info ] && [ -n "$(find .forge/blog/lock -maxdepth 0 -mmin +1 2>/dev/null)" ]; then if claim; then won=1; { echo 'took over a stale lock without a record (an earlier acquire was interrupted)' >&2; true; }; fi; fi; rm -f .forge/blog/lock.tmp.$$; [ -n "$won" ] && exit 0; cat .forge/blog/lock/info 2>/dev/null; exit 75
 192.0.2.10      < stdin: lock record (holder, time, message)
 192.0.2.10      # lock acquired (setup)
 192.0.2.10      ? docker version --format '{{.Server.Version}}'
@@ -1101,7 +1321,8 @@ unset REGISTRY_PASSWORD
 192.0.2.10      < stdin: registry password (REGISTRY_PASSWORD)
 192.0.2.10      $ docker container inspect forge-proxy >/dev/null 2>&1 && docker start forge-proxy >/dev/null || docker run --detach --name forge-proxy --network forge --restart unless-stopped --publish 80:8080 --publish 443:8443 ...
 192.0.2.10      # forge-proxy running
-192.0.2.10      $ rm -rf .forge/blog/lock
+192.0.2.10      $ record=$(cat) && if [ ! -d .forge/blog/lock ]; then echo 'lock is already released' >&2; exit 77; elif [ -n "$record" ] && [ "$(cat .forge/blog/lock/info 2>/dev/null)" = "$record" ]; then rm -rf .forge/blog/lock; else echo 'lock is held by someone else; left in place' >&2; exit 76; fi
+192.0.2.10      < stdin: own lock record (release only if unchanged)
 warning: proxy.image registry.example.com/acme/forge-proxy:0.1.0 is not pinned by digest; pin it (image@sha256:...) so every host runs the reviewed build
 dry run: nothing was changed (20ms)
 ```

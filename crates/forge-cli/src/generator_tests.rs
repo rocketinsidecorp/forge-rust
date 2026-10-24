@@ -225,11 +225,56 @@ fn models_need_a_database_and_its_test_support_but_no_views() {
         fs::read_to_string(sqlite.join("src/adapters/http/views/mod.rs")).unwrap_or_default(),
         views
     );
-    // `forge new --api` has no `forge::db::testing` dev-dependency yet: the
-    // repository tests could not compile, so the model says what to add.
+    // An `--api` application has no views, and a model needs none: it gets the
+    // layers below HTTP, plus the repository tests (`forge new --api` has the
+    // `forge::db::testing` dev-dependency for them).
     let (_parent, api) = application(Database::Sqlite3, false, Locale::En);
+    let outcome = scaffold::generate(
+        &api,
+        &resource("post", &["title:string"], Scope::Global, Layers::Model),
+        VERSION,
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
+    assert!(
+        outcome
+            .created
+            .iter()
+            .any(|path| path == "tests/posts_repository.rs"),
+        "{:?}",
+        outcome.created
+    );
+    assert!(
+        outcome
+            .created
+            .iter()
+            .all(|path| !path.starts_with("templates/")
+                && !path.contains("views")
+                && !path.starts_with("config/locales/")
+                && path != "src/adapters/http/posts.rs"),
+        "no view or page files in an API application: {:?}",
+        outcome.created
+    );
+    // A scaffold is still refused: it writes pages.
     let refusal = scaffold::generate(
         &api,
+        &resource("note", &["title:string"], Scope::Global, Layers::Scaffold),
+        VERSION,
+    )
+    .err()
+    .map(|error| error.to_string())
+    .unwrap_or_default();
+    assert!(refusal.contains("--api"), "{refusal}");
+    // An application generated before the dev-dependency had `testing` in
+    // `--api` mode is told what to add.
+    let (_parent, old_api) = application(Database::Sqlite3, false, Locale::En);
+    let manifest = fs::read_to_string(old_api.join("Cargo.toml")).unwrap_or_default();
+    fs::write(
+        old_api.join("Cargo.toml"),
+        manifest.replace("\"testing\"", "\"jobs\""),
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
+    let refusal = scaffold::generate(
+        &old_api,
         &resource("post", &["title:string"], Scope::Global, Layers::Model),
         VERSION,
     )

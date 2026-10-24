@@ -1171,6 +1171,18 @@ pub(crate) fn render_template(
 }
 
 pub(crate) fn write_new_file(path: &Path, content: &str) -> Result<(), CliError> {
+    write_new_file_with(path, content, |file, bytes| file.write_all(bytes))
+}
+
+/// Creates `path` (it must not exist) and fills it with `write`. A file this
+/// call created is removed again when filling it fails (a full disk), so a
+/// failed write never leaves an empty or truncated file behind for the
+/// caller's rollback to miss.
+fn write_new_file_with(
+    path: &Path,
+    content: &str,
+    write: impl FnOnce(&mut fs::File, &[u8]) -> std::io::Result<()>,
+) -> Result<(), CliError> {
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -1185,11 +1197,16 @@ pub(crate) fn write_new_file(path: &Path, content: &str) -> Result<(), CliError>
                 }
             }
         })?;
-    file.write_all(content.as_bytes())
-        .map_err(|source| CliError::WriteFile {
+    if let Err(source) = write(&mut file, content.as_bytes()) {
+        drop(file);
+        // Only this call's own file: `create_new` proves it did not exist.
+        let _ = fs::remove_file(path);
+        return Err(CliError::WriteFile {
             path: path.to_path_buf(),
             source,
-        })
+        });
+    }
+    Ok(())
 }
 
 fn write_file(path: &Path, content: impl AsRef<[u8]>) -> Result<(), CliError> {
@@ -1210,6 +1227,25 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
+
+    #[test]
+    fn a_failed_content_write_removes_the_file_it_created() {
+        let directory = tempfile::tempdir().unwrap_or_else(|error| panic!("{error}"));
+        let path = directory.path().join("new.sql");
+        let error = write_new_file_with(&path, "content", |_, _| {
+            Err(std::io::Error::other("disk full"))
+        })
+        .err()
+        .map(|error| error.to_string())
+        .unwrap_or_default();
+        assert!(error.contains("disk full"), "{error}");
+        assert!(!path.exists(), "the half-created file is removed");
+
+        // An existing file is never touched or removed by a refused create.
+        fs::write(&path, "mine").unwrap_or_else(|error| panic!("{error}"));
+        assert!(write_new_file_with(&path, "x", |_, _| Ok(())).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap_or_default(), "mine");
+    }
 
     fn options(name: &str) -> NewApplication {
         NewApplication {
@@ -1265,6 +1301,12 @@ mod tests {
                 .key_ring(&["encryption"])
                 .expect("an encryption key ring");
             assert!(read(&root, ".gitignore").contains("/config/credentials/*.key"));
+            // The file mail sink (`FORGE_MAIL_URL=file:tmp/mail`) writes under tmp/.
+            assert!(
+                read(&root, ".gitignore")
+                    .lines()
+                    .any(|line| line == "/tmp/")
+            );
             assert!(read(&root, ".dockerignore").contains("config/credentials/*.key"));
             let readme = read(&root, "README.md");
             assert!(
@@ -2041,6 +2083,10 @@ mod tests {
             let layout = read(&root, "templates/layouts/application.html");
             assert!(layout.contains("{{ csrf_meta|safe }}"));
             assert!(layout.contains("{{ layout.import_map|safe }}"));
+            assert!(
+                layout.contains("<body class=\"{% block body_class %}{% endblock %}\">"),
+                "the block holds the class value, inside the attribute"
+            );
             assert!(layout.contains("<script type=\"module\" src=\"{{ layout.javascript }}\">"));
             assert!(
                 !layout.contains("<script>"),
@@ -2082,7 +2128,19 @@ mod tests {
                 assert!(!manifest.contains(needle), "{database:?}: {needle}");
             }
             // tests/openapi.rs runs in every application.
-            assert!(manifest.contains("[dev-dependencies]\n# tests/openapi.rs"));
+            // A database application, API-only too, keeps the `testing` feature of
+            // `forge` that `forge generate model`'s repository tests need.
+            assert_eq!(
+                manifest.contains("[dev-dependencies]\n# `forge::db::testing::TestDatabase`"),
+                database.is_enabled(),
+                "{database:?}"
+            );
+            assert_eq!(
+                manifest.contains("\"testing\"] }"),
+                database.is_enabled(),
+                "{database:?}: TestDatabase dev-dependency"
+            );
+            assert!(manifest.contains("# tests/openapi.rs"));
             assert!(root.join("tests/openapi.rs").exists());
             assert!(read(&root, "src/adapters/http/status.rs").contains("typed("));
             assert!(

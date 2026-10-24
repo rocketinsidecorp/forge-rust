@@ -7,7 +7,9 @@
 //! `--force`. Migrations are kept unless `--migrations` says the database no
 //! longer has them, because a migration that already ran is history. Shared
 //! files (the access policy, the live-update transport, module directories)
-//! are never planned, and nothing is removed through a symlink.
+//! are never planned, and nothing is removed through a symlink. Each file is
+//! checked again right before it is removed, so one edited (or replaced by
+//! a link) between the check and the removal is left alone too.
 
 use std::fs;
 use std::io;
@@ -82,7 +84,8 @@ pub(crate) fn apply(
     let mut actions: Vec<(String, &'static str, &'static str)> = Vec::new();
     let mut kept = Vec::new();
     let mut modified = Vec::new();
-    let mut removable = Vec::new();
+    // The path and the bytes that were checked: removal needs them unchanged.
+    let mut removable: Vec<(String, Vec<u8>)> = Vec::new();
     for file in &plan.files {
         if file.role == Role::Shared {
             continue;
@@ -130,7 +133,7 @@ pub(crate) fn apply(
                 "differs from what the generator writes; removed because of --force",
             ));
         }
-        removable.push(file.path.clone());
+        removable.push((file.path.clone(), current));
     }
     if !modified.is_empty() && !flags.force {
         return Err(refused(format!(
@@ -156,14 +159,22 @@ pub(crate) fn apply(
         ));
     }
     if !flags.dry_run {
-        for path in &removable {
-            fs::remove_file(root.join(path)).map_err(|error| {
-                refused(format!(
-                    "could not remove {path}: {error} (files listed before it were removed)"
-                ))
-            })?;
+        let mut removed: Vec<String> = Vec::new();
+        for (path, checked) in &removable {
+            if let Err(reason) = remove_checked(root, path, checked) {
+                remove_empty_parents(root, &removed);
+                return Err(refused(format!(
+                    "{reason}; {}",
+                    if removed.is_empty() {
+                        "nothing was removed".to_owned()
+                    } else {
+                        format!("removed before it: {}", removed.join(", "))
+                    }
+                )));
+            }
+            removed.push(path.clone());
         }
-        remove_empty_parents(root, &removable);
+        remove_empty_parents(root, &removed);
     }
     for (path, verb, reason) in &actions {
         let verb = if flags.dry_run && *verb == "remove" {
@@ -189,6 +200,34 @@ pub(crate) fn apply(
          the generator printed as:\n{wiring}\n  Then run `forge test`.\n"
     )
     .map_err(CliError::Output)
+}
+
+/// Removes `path` only if it is still, right now, what was checked: not a
+/// symlink, and byte-identical to `checked`. The check ran earlier, and a
+/// file edited or swapped for a link since then (by an editor, a build or
+/// another process) must not be removed on the strength of it. A file that
+/// is already gone counts as removed. A final race between this check and
+/// the unlink cannot be closed without a descriptor-relative unlink, which
+/// std does not offer; the window is the width of one read.
+fn remove_checked(root: &Path, path: &str, checked: &[u8]) -> Result<(), String> {
+    refuse_symlinks(root, [path])
+        .map_err(|reason| format!("refusing to remove {path}: {reason}"))?;
+    let full = root.join(path);
+    match fs::read(&full) {
+        Ok(current) if current == checked => {}
+        Ok(_) => {
+            return Err(format!(
+                "refusing to remove {path}: it changed while the command was running"
+            ));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("could not read {path} again: {error}")),
+    }
+    match fs::remove_file(&full) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("could not remove {path}: {error}")),
+    }
 }
 
 /// Removes the directories the removed files were in, and their parents,
@@ -368,6 +407,61 @@ mod tests {
             .unwrap_or_default();
         assert!(refusal.contains("the scaffold needs it"), "{refusal}");
         assert!(root.join("src/adapters/http/pages.rs").exists());
+    }
+
+    #[test]
+    fn a_file_edited_after_the_check_is_not_removed() {
+        let directory = tempfile::tempdir().unwrap_or_else(|error| panic!("{error}"));
+        let root = directory.path();
+        write(root, "src/page.rs", "generated");
+        // Unchanged: removed.
+        assert_eq!(remove_checked(root, "src/page.rs", b"generated"), Ok(()));
+        assert!(!root.join("src/page.rs").exists());
+        // Already gone: nothing to do.
+        assert_eq!(remove_checked(root, "src/page.rs", b"generated"), Ok(()));
+
+        // Edited between the check and the removal: kept, with or without --force
+        // (the check is of the bytes that were verified, not of the flag).
+        write(root, "src/page.rs", "generated");
+        write(root, "src/page.rs", "my own work");
+        let error = remove_checked(root, "src/page.rs", b"generated")
+            .err()
+            .unwrap_or_default();
+        assert!(
+            error.contains("changed while the command was running"),
+            "{error}"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("src/page.rs")).unwrap_or_default(),
+            "my own work"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_swapped_for_a_symlink_after_the_check_is_not_removed() {
+        let directory = tempfile::tempdir().unwrap_or_else(|error| panic!("{error}"));
+        let root = directory.path();
+        let outside = tempfile::tempdir().unwrap_or_else(|error| panic!("{error}"));
+        write(outside.path(), "secret", "generated");
+        write(root, "src/page.rs", "generated");
+        fs::remove_file(root.join("src/page.rs")).unwrap_or_else(|error| panic!("{error}"));
+        std::os::unix::fs::symlink(outside.path().join("secret"), root.join("src/page.rs"))
+            .unwrap_or_else(|error| panic!("{error}"));
+        let error = remove_checked(root, "src/page.rs", b"generated")
+            .err()
+            .unwrap_or_default();
+        assert!(error.contains("symbolic link"), "{error}");
+        assert!(outside.path().join("secret").exists());
+
+        // The same for a directory swapped for a link.
+        fs::remove_file(root.join("src/page.rs")).unwrap_or_else(|error| panic!("{error}"));
+        write(outside.path(), "page.rs", "generated");
+        fs::remove_dir(root.join("src")).unwrap_or_else(|error| panic!("{error}"));
+        std::os::unix::fs::symlink(outside.path(), root.join("src"))
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert!(remove_checked(root, "src/page.rs", b"generated").is_err());
+        assert!(outside.path().join("page.rs").exists());
     }
 
     #[cfg(unix)]

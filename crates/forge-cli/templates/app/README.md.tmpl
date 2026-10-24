@@ -392,6 +392,24 @@ To scale web and worker processes separately, change
 ```bash
 cargo run -- jobs work                  # workers and cron schedules, without HTTP
 ```
+
+The job migration grants the queue to the database role that serves requests,
+`app_runtime` (what Compose creates). If your production role has another
+name, set `forge.runtime_role` to it for the migration (the role must exist, or
+the migration fails). Without it, and with no role called `app_runtime`, the
+migration grants nothing and every worker logs `claiming jobs failed` about
+once a second. A migration role that is not a superuser cannot persist the
+setting with `ALTER DATABASE`, but it can pass it for one run:
+
+```bash
+PGOPTIONS='-c forge.runtime_role=myapp_runtime' forge migrate
+```
+
+A superuser may instead run `ALTER DATABASE %%DATABASE_NAME%% SET
+forge.runtime_role = 'myapp_runtime'` once. `forge.worker_role` (default: the
+runtime role) names a separate role for `jobs work` and the operator commands
+above; see the
+[jobs guide](https://github.com/rocketinsidecorp/forge-rust/blob/main/docs/jobs.md#database-roles-and-rls).
 %%end%%
 
 ## OpenAPI

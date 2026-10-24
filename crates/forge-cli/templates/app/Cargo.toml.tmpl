@@ -36,11 +36,10 @@ forge-views = %%FORGE_VIEWS_BUILD_DEPENDENCY%%
 %%end%%
 
 [dev-dependencies]
-%%if views%%
 %%if database%%
-# `forge::db::testing::TestDatabase` for repository integration tests.
+# `forge::db::testing::TestDatabase` for repository integration tests (the
+# ones `forge generate model` and `forge generate scaffold` write).
 forge = %%FORGE_TEST_DEPENDENCY%%
-%%end%%
 %%end%%
 # tests/openapi.rs reads the served OpenAPI document.
 serde_json = "1"

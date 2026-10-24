@@ -26,6 +26,12 @@ const RESERVED_METHODS: &[&str] = &[
     "unconfigured",
 ];
 
+/// Mailer names the application's own `/_mail` previews already use: the
+/// password-reset email of `forge new` is previewed at `/_mail/password_reset`,
+/// so a mailer of that name would be mounted on the same path (a method of
+/// that name in another mailer is fine: it is served under its mailer).
+const RESERVED_MAILERS: &[&str] = &["password_reset"];
+
 const MAILER: &str = include_str!("../templates/mailer/mailer.rs.tmpl");
 const TESTS: &str = include_str!("../templates/mailer/tests.rs.tmpl");
 
@@ -61,6 +67,14 @@ fn parse(options: &MailerOptions) -> Result<Vec<Method>, CliError> {
         return Err(fail(format!(
             "mailer name `{name}` ends in _mailer, which Forge adds to the names; name it \
              `{stem}`"
+        )));
+    }
+    if RESERVED_MAILERS.contains(&name.as_str()) {
+        return Err(fail(format!(
+            "mailer name `{name}` is the name of a built-in email preview ({}): its previews \
+             would be served at /_mail/{name}, the path of the built-in one. Choose another \
+             name (the email can still be a method of another mailer)",
+            RESERVED_MAILERS.join(", ")
         )));
     }
     if options.methods.is_empty() {
@@ -517,6 +531,11 @@ mod tests {
             .unwrap_or_else(|error| panic!("{error}"));
         assert_eq!(methods[0].fields, ["name", "url"]);
         assert!(methods[1].fields.is_empty());
+        let refusal = parse(&options("password_reset", &["welcome"]))
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_default();
+        assert!(refusal.contains("/_mail/password_reset"), "{refusal}");
         for (name, declarations) in [
             ("user_mailer", &["welcome"][..]),
             ("User", &["welcome"][..]),
@@ -532,6 +551,9 @@ mod tests {
             ("user", &["welcome:na-me"][..]),
             ("mail", &["error"][..]),
             ("app", &["config"][..]),
+            // A mailer of that name would be mounted on the built-in
+            // password-reset preview's path.
+            ("password_reset", &["welcome"][..]),
         ] {
             assert!(
                 parse(&options(name, declarations)).is_err(),

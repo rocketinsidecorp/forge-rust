@@ -217,48 +217,103 @@ pub(crate) fn existing_migrations(root: &Path, name: &str) -> (Vec<String>, Vec<
 }
 
 /// The first Rust file under `src/` (other than `except`) that names one of
-/// `permissions` as a string literal (`"posts:read"`), and the permission.
+/// `permissions`, and the permission.
 ///
 /// Every permission has exactly one owner, the generated module that
 /// declares its constant: a controller reuses a model's `READ_PERMISSION`
 /// instead of declaring it again, and a model or scaffold refuses a plural
 /// whose permissions another module already declares (ADR 0038). Any
-/// mention counts, so hand-written code is found too.
+/// mention counts, so hand-written code is found too: a string literal
+/// (`"posts:read"`), or a name assembled by `concat!`/`format!` from the
+/// literals `"posts"` and `":read"` (best effort: a name built at runtime
+/// cannot be found by reading source).
+///
+/// The scan fails closed. A symbolic link to a directory or a `.rs` file, or
+/// a file or directory that cannot be read, is an error rather than a
+/// silent gap, because the code behind it could declare the permission. A
+/// file that is not UTF-8 is still searched.
 pub(crate) fn permission_owner(
     root: &Path,
     permissions: &[String],
     except: &[&str],
-) -> Option<(String, String)> {
+) -> Result<Option<(String, String)>, String> {
     let mut files = Vec::new();
-    rust_files(root, &root.join("src"), &mut files);
+    rust_files(root, &root.join("src"), &mut files)?;
     files.sort();
-    files
+    for path in files
         .into_iter()
         .filter(|path| !except.contains(&path.as_str()))
-        .find_map(|path| {
-            let source = fs::read_to_string(root.join(&path)).ok()?;
-            permissions
-                .iter()
-                .find(|permission| source.contains(&format!("\"{permission}\"")))
-                .map(|permission| (path, permission.clone()))
-        })
-}
-
-fn rust_files(root: &Path, directory: &Path, files: &mut Vec<String>) {
-    let Ok(entries) = fs::read_dir(directory) else {
-        return;
-    };
-    for entry in entries.filter_map(Result::ok) {
-        let Ok(kind) = entry.file_type() else {
-            continue;
-        };
-        let path = entry.path();
-        if kind.is_dir() {
-            rust_files(root, &path, files);
-        } else if kind.is_file() && path.extension().is_some_and(|extension| extension == "rs") {
-            files.push(relative(root, &path));
+    {
+        let bytes = fs::read(root.join(&path))
+            .map_err(|error| format!("could not read {path} to look for permissions: {error}"))?;
+        let source = String::from_utf8_lossy(&bytes);
+        if let Some(permission) = permissions
+            .iter()
+            .find(|permission| mentions(&source, permission))
+        {
+            return Ok(Some((path, permission.clone())));
         }
     }
+    Ok(None)
+}
+
+/// Whether `source` names `permission` (`posts:read`) as a literal or as
+/// the pieces of a `concat!`/`format!`.
+fn mentions(source: &str, permission: &str) -> bool {
+    if source.contains(&format!("\"{permission}\"")) {
+        return true;
+    }
+    let Some((namespace, action)) = permission.split_once(':') else {
+        return false;
+    };
+    (source.contains("concat!") || source.contains("format!"))
+        && (source.contains(&format!("\"{namespace}\""))
+            || source.contains(&format!("\"{namespace}:")))
+        && source.contains(&format!(":{action}\""))
+}
+
+fn rust_files(root: &Path, directory: &Path, files: &mut Vec<String>) -> Result<(), String> {
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(format!(
+                "could not read {} to look for permissions: {error}",
+                relative(root, directory)
+            ));
+        }
+    };
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            format!(
+                "could not read {} to look for permissions: {error}",
+                relative(root, directory)
+            )
+        })?;
+        let path = entry.path();
+        let shown = relative(root, &path);
+        let kind = entry
+            .file_type()
+            .map_err(|error| format!("could not inspect {shown}: {error}"))?;
+        if kind.is_symlink() {
+            // A link to code (a directory or a Rust file) is code this scan
+            // cannot vouch for; a link to anything else, or a dangling one,
+            // holds none.
+            let holds_code = fs::metadata(&path)
+                .is_ok_and(|target| target.is_dir() || path.extension().is_some_and(|e| e == "rs"));
+            if holds_code {
+                return Err(format!(
+                    "{shown} is a symbolic link under src/: the code behind it could already                      declare a permission, and the generator does not follow links. Replace \
+                     the link with the real files (or move it aside) and run the command again"
+                ));
+            }
+        } else if kind.is_dir() {
+            rust_files(root, &path, files)?;
+        } else if kind.is_file() && path.extension().is_some_and(|extension| extension == "rs") {
+            files.push(shown);
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -310,12 +365,93 @@ mod tests {
         let permissions = ["posts:read".to_owned(), "posts:write".to_owned()];
         assert_eq!(
             permission_owner(root, &permissions, &[]),
-            Some(("src/a/b.rs".to_owned(), "posts:read".to_owned()))
+            Ok(Some(("src/a/b.rs".to_owned(), "posts:read".to_owned())))
         );
-        assert_eq!(permission_owner(root, &permissions, &["src/a/b.rs"]), None);
+        assert_eq!(
+            permission_owner(root, &permissions, &["src/a/b.rs"]),
+            Ok(None)
+        );
         assert_eq!(
             permission_owner(root, &["notes:read".to_owned()], &[]),
-            None
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn permissions_assembled_by_macros_or_in_non_utf8_files_are_found() {
+        let directory = tempfile::tempdir().unwrap_or_else(|error| panic!("{error}"));
+        let root = directory.path();
+        fs::create_dir_all(root.join("src")).unwrap_or_else(|error| panic!("{error}"));
+        fs::write(
+            root.join("src/assembled.rs"),
+            "const P: &str = concat!(\"posts\", \":read\");",
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+        fs::write(
+            root.join("src/formatted.rs"),
+            "fn p() -> String { format!(\"posts:{}\", \"x\") } // \":write\"",
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+        let permissions = ["posts:read".to_owned(), "posts:write".to_owned()];
+        assert_eq!(
+            permission_owner(root, &permissions, &["src/formatted.rs"]),
+            Ok(Some((
+                "src/assembled.rs".to_owned(),
+                "posts:read".to_owned()
+            )))
+        );
+        assert_eq!(
+            permission_owner(root, &["posts:write".to_owned()], &["src/assembled.rs"]),
+            Ok(Some((
+                "src/formatted.rs".to_owned(),
+                "posts:write".to_owned()
+            )))
+        );
+        // A name that merely shares a word is not a mention.
+        assert_eq!(
+            permission_owner(root, &["tags:read".to_owned()], &[]),
+            Ok(None)
+        );
+
+        let mut bytes = b"// \xff\xfe not utf-8\nconst P: &str = \"notes:read\";\n".to_vec();
+        bytes.push(b'\n');
+        fs::write(root.join("src/binary.rs"), bytes).unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(
+            permission_owner(root, &["notes:read".to_owned()], &[]),
+            Ok(Some(("src/binary.rs".to_owned(), "notes:read".to_owned())))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_to_code_under_src_stops_the_permission_scan() {
+        let directory = tempfile::tempdir().unwrap_or_else(|error| panic!("{error}"));
+        let root = directory.path();
+        let outside = tempfile::tempdir().unwrap_or_else(|error| panic!("{error}"));
+        fs::write(
+            outside.path().join("hidden.rs"),
+            "const P: &str = \"posts:read\";",
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+        fs::create_dir_all(root.join("src")).unwrap_or_else(|error| panic!("{error}"));
+        std::os::unix::fs::symlink(outside.path(), root.join("src/linked"))
+            .unwrap_or_else(|error| panic!("{error}"));
+        let error = permission_owner(root, &["posts:read".to_owned()], &[])
+            .err()
+            .unwrap_or_default();
+        assert!(error.contains("src/linked is a symbolic link"), "{error}");
+
+        // A linked Rust file is refused too; a dangling or non-code link holds nothing.
+        fs::remove_file(root.join("src/linked")).unwrap_or_else(|error| panic!("{error}"));
+        std::os::unix::fs::symlink(outside.path().join("hidden.rs"), root.join("src/hidden.rs"))
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert!(permission_owner(root, &["posts:read".to_owned()], &[]).is_err());
+        fs::remove_file(root.join("src/hidden.rs")).unwrap_or_else(|error| panic!("{error}"));
+        std::os::unix::fs::symlink(outside.path().join("missing"), root.join("src/dangling"))
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(
+            permission_owner(root, &["posts:read".to_owned()], &[]),
+            Ok(None)
         );
     }
 }

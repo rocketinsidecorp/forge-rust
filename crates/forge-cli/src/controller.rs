@@ -291,11 +291,14 @@ fn plan(root: &Path, options: &ControllerOptions, destroy: bool) -> Result<Plan,
     } else {
         let owner_module = format!("src/application/use_cases/{name}.rs");
         match generators::permission_owner(root, &[format!("{name}:read")], &[&controller_path]) {
-            None => Permission::Own,
-            Some((owner, _)) if owner == owner_module => Permission::Reused,
+            Ok(None) => Permission::Own,
+            Ok(Some((owner, _))) if owner == owner_module => Permission::Reused,
             // Destroy renders what the controller declared: its own constant.
-            Some(_) if destroy => Permission::Own,
-            Some((owner, permission)) => {
+            // A source tree the scan cannot read (a symlink) is compared by
+            // content afterwards, so destroy still removes only what matches.
+            Ok(Some(_)) | Err(_) if destroy => Permission::Own,
+            Err(reason) => return Err(fail(reason)),
+            Ok(Some((owner, permission))) => {
                 return Err(fail(format!(
                     "{owner} already declares the permission `{permission}`. A permission has \
                      one owner; a controller reuses only the one a model or scaffold declares \
