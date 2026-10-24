@@ -23,6 +23,12 @@ pub const UUID_V7_PATTERN: &str =
 /// `Option<Box<Self>>`) has no named object for a `$ref` to end at.
 const MAX_NESTING: usize = 64;
 
+/// Where an object schema keeps the member names a request may use without
+/// the document listing them (`skip_serializing` members, `alias`es). It is
+/// read by `unknown_member` and removed when the document is built, so it is
+/// never published.
+pub(crate) const ACCEPTS_KEY: &str = "x-forge-accepts";
+
 /// The `$ref` text of a component before names are assigned; rewritten when
 /// the document is built, so names do not depend on the order types are met.
 pub(crate) const REF_PLACEHOLDER: &str = "\u{0}forge-component:";
@@ -169,6 +175,7 @@ pub struct Field {
     doc: Option<String>,
     example: Option<String>,
     format: Option<String>,
+    aliases: Vec<String>,
 }
 
 impl Field {
@@ -210,6 +217,14 @@ impl Field {
     #[must_use]
     pub fn example(mut self, text: impl Into<String>) -> Self {
         self.example = Some(text.into());
+        self
+    }
+
+    /// Another name a request may use for the member (`#[serde(alias)]`). It
+    /// is not part of the document: typed decoding accepts it, nothing more.
+    #[must_use]
+    pub fn alias(mut self, name: impl Into<String>) -> Self {
+        self.aliases.push(name.into());
         self
     }
 
@@ -255,6 +270,7 @@ pub struct ObjectSchema {
     required: BTreeSet<String>,
     additional: Option<Value>,
     description: Option<String>,
+    accepted: BTreeSet<String>,
 }
 
 impl ObjectSchema {
@@ -281,6 +297,16 @@ impl ObjectSchema {
         if options.is_required() {
             self.required.insert(name.to_owned());
         }
+        self.accepted.extend(options.aliases);
+        self
+    }
+
+    /// Names a request may carry although the object does not describe them:
+    /// members serde reads but never writes (`skip_serializing`, such as a
+    /// password) and aliases. Typed decoding accepts them (their values are
+    /// not checked); the document does not list them.
+    pub fn accept<'a>(&mut self, names: impl IntoIterator<Item = &'a str>) -> &mut Self {
+        self.accepted.extend(names.into_iter().map(str::to_owned));
         self
     }
 
@@ -333,6 +359,7 @@ impl ObjectSchema {
             self.properties.insert(name, schema);
         }
         self.required.extend(inner.required);
+        self.accepted.extend(inner.accepted);
         if let Some(additional) = inner.additional {
             if self.additional.is_some() {
                 generator.fail(format!(
@@ -372,6 +399,12 @@ impl ObjectSchema {
         }
         if let Some(description) = self.description {
             object.insert("description".to_owned(), Value::String(description));
+        }
+        if !self.accepted.is_empty() {
+            object.insert(
+                ACCEPTS_KEY.to_owned(),
+                Value::Array(self.accepted.into_iter().map(Value::String).collect()),
+            );
         }
         Value::Object(object)
     }

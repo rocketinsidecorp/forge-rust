@@ -151,7 +151,9 @@ file under `tmp/mail` and only its path is logged; a warning at start-up says
 mail is not delivered. Open the newest file in any mail client. The directory
 is created `0700`; an existing one that is group- or world-accessible is
 tightened to `0700` (with a warning), and one that cannot be tightened is an
-error. A sticky shared directory such as `/tmp` is left alone with a warning.
+error. A sticky shared directory such as `/tmp`, and a symbolic link, are left
+alone with a warning; the check and the change use one open handle, so the
+path cannot be swapped in between.
 
 For a browser preview with fixture data, register previews. They need
 `FORGE_ENV` development or test **and** `FORGE_MAIL_PREVIEW=true` (an unset

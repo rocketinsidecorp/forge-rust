@@ -85,7 +85,8 @@ enough to commit and diff.
    derivation (`getV1PostsById`).
 5. **Typed handlers.** `forge::openapi::typed(status, operation, |request,
    body| async { ... })` takes `Json<T>` (decoded with
-   `forge::web::decode_json`) or `NoBody`, writes the `Ok` value with
+   `forge::web::decode_json_strict`: `application/json` only, and no member
+   the schema of `T` does not list) or `NoBody`, writes the `Ok` value with
    `forge::web::json` and the `ForgeError` with `forge::web::error`, and
    derives the request body and the success response from its types. A
    status that is not a 2xx with a body makes the description invalid

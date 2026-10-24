@@ -19,7 +19,8 @@ use crate::{MailError, Message, Sender, encode, encoding};
 /// or other permissions is tightened to `0700` (the owner bits are kept) so
 /// file names and timing stay private too; one that cannot be tightened is
 /// an error. A sticky directory such as `/tmp` is a shared system location
-/// and is left alone with a warning (the files in it are `0600` anyway).
+/// and a symbolic link may point anywhere: both are left alone with a warning
+/// (the files in them are `0600` anyway).
 ///
 /// It exists to read mail without a mail server and is never used in
 /// production: configuration validation and [`from_config`] refuse it
@@ -96,12 +97,34 @@ impl Sender for FileSender {
 }
 
 /// Removes group and other access from an existing directory (Unix).
+///
+/// The directory is inspected and changed through one open handle (`fstat`,
+/// `fchmod`), so the path cannot be swapped for another between the check and
+/// the change. std cannot open a directory with `O_NOFOLLOW` portably without
+/// a new dependency, so a symbolic link is detected beforehand with
+/// `symlink_metadata`, and the handle must be the very directory that call
+/// saw (same device and inode); a link, or a path swapped in between, is not
+/// tightened.
 #[cfg(unix)]
 fn tighten_directory(dir: &Path) -> Result<(), MailError> {
-    use std::os::unix::fs::PermissionsExt as _;
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
     let file_error = |error: std::io::Error| MailError::File { kind: error.kind() };
-    let metadata = std::fs::metadata(dir).map_err(file_error)?;
+    let before = std::fs::symlink_metadata(dir).map_err(file_error)?;
+    if before.file_type().is_symlink() {
+        tracing::warn!(
+            dir = %dir.display(),
+            "development mail directory is a symbolic link and was not tightened"
+        );
+        return Ok(());
+    }
+    let handle = std::fs::File::open(dir).map_err(file_error)?;
+    let metadata = handle.metadata().map_err(file_error)?;
+    if !metadata.is_dir() || metadata.dev() != before.dev() || metadata.ino() != before.ino() {
+        return Err(MailError::File {
+            kind: std::io::ErrorKind::InvalidInput,
+        });
+    }
     let mode = metadata.permissions().mode();
     if mode & 0o077 == 0 {
         return Ok(());
@@ -113,7 +136,8 @@ fn tighten_directory(dir: &Path) -> Result<(), MailError> {
         );
         return Ok(());
     }
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode & 0o7700))
+    handle
+        .set_permissions(std::fs::Permissions::from_mode(mode & 0o7700))
         .map_err(file_error)?;
     tracing::warn!(
         dir = %dir.display(),
@@ -209,6 +233,24 @@ mod tests {
         let mode = std::fs::metadata(&dir).expect("meta").permissions().mode();
         assert_eq!(mode & 0o777, 0o500);
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symbolic_link_is_not_followed_to_change_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().expect("temporary directory");
+        let target = root.path().join("target");
+        std::fs::create_dir(&target).expect("create");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let link = root.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink");
+        FileSender::new(&link).expect("accepted");
+        let mode = std::fs::metadata(&target)
+            .expect("meta")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o755, "the target was not changed");
     }
 
     #[cfg(unix)]

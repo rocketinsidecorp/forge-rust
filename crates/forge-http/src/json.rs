@@ -29,6 +29,11 @@ pub enum JsonBodyError {
         /// the client's own text: truncate it before echoing it.
         member: String,
     },
+    /// The description of the target type cannot be built (the OpenAPI
+    /// document cannot either), so its members cannot be checked. This is a
+    /// bug in the application, not in the request.
+    #[error("the description of the request type is invalid: {0}")]
+    Description(String),
 }
 
 /// Whether `headers` declare exactly one `application/json` body, with at
@@ -50,6 +55,7 @@ fn is_json_media_type(value: &HeaderValue) -> bool {
     if !media_type.eq_ignore_ascii_case(JSON_CONTENT_TYPE) {
         return false;
     }
+    // RFC 9110 allows empty parameters (`application/json;`).
     parts.all(|parameter| match parameter.split_once('=') {
         Some((name, value)) => {
             let value = value.trim();
@@ -59,7 +65,7 @@ fn is_json_media_type(value: &HeaderValue) -> bool {
                 .unwrap_or(value);
             name.trim().eq_ignore_ascii_case("charset") && value.eq_ignore_ascii_case("utf-8")
         }
-        None => false,
+        None => parameter.trim().is_empty(),
     })
 }
 
@@ -88,7 +94,8 @@ impl Request {
     /// member the description does not list is refused with
     /// [`JsonBodyError::UnknownMember`], so decoding accepts what the
     /// document publishes (`additionalProperties: false`) and no more.
-    /// A `#[serde(alias)]` is not a listed member.
+    /// A `skip_serializing` member and a `#[serde(alias)]` are accepted
+    /// (their values unchecked) although the document does not list them.
     pub fn json_body_strict<T: DeserializeOwned + OpenApiSchema + 'static>(
         &self,
     ) -> Result<T, JsonBodyError> {
@@ -97,10 +104,12 @@ impl Request {
         }
         let value: serde_json::Value =
             serde_json::from_slice(&self.body).map_err(JsonBodyError::Malformed)?;
-        if let Some(member) = unknown_member::<T>(&value) {
+        if let Some(member) = unknown_member::<T>(&value).map_err(JsonBodyError::Description)? {
             return Err(JsonBodyError::UnknownMember { member });
         }
-        serde_json::from_value(value).map_err(JsonBodyError::Malformed)
+        // Decode from the bytes, not the `Value`, so numbers and duplicate
+        // keys behave exactly as in `json_body` (the body is parsed twice).
+        serde_json::from_slice(&self.body).map_err(JsonBodyError::Malformed)
     }
 }
 
@@ -165,6 +174,8 @@ mod tests {
             "Application/JSON",
             "application/json; charset=utf-8",
             "application/json;charset=\"UTF-8\"",
+            "application/json;",
+            "application/json; ; charset=utf-8",
         ] {
             assert!(request(Some(accepted), OK).is_json(), "{accepted}");
         }
@@ -175,6 +186,7 @@ mod tests {
             "application/problem+json",
             "application/json; charset=latin1",
             "application/json; boundary=x",
+            "application/json; charset",
             "",
         ] {
             let request = request(Some(refused), OK);
@@ -243,12 +255,35 @@ mod tests {
     }
 
     #[test]
-    fn an_alias_is_not_a_listed_member() {
+    fn aliases_are_accepted_but_not_other_names() {
         let body = r#"{"name":"a","address":{"city":"x"},"tags":[],"old":"v"}"#;
-        assert!(request(JSON, body).json_body::<Input>().is_ok());
+        assert_eq!(
+            request(JSON, body)
+                .json_body_strict::<Input>()
+                .expect("alias accepted")
+                .other
+                .as_deref(),
+            Some("v")
+        );
+        let body = r#"{"name":"a","address":{"city":"x"},"tags":[],"older":"v"}"#;
         assert!(matches!(
             request(JSON, body).json_body_strict::<Input>(),
             Err(JsonBodyError::UnknownMember { .. })
         ));
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug, Deserialize, forge_openapi::OpenApiSchema)]
+    #[openapi(crate = "forge_openapi")]
+    struct NewUser {
+        email: String,
+        #[serde(skip_serializing)]
+        password: String,
+    }
+
+    #[test]
+    fn write_only_members_are_accepted() {
+        let body = r#"{"email":"a@b.c","password":"s3cret"}"#;
+        assert!(request(JSON, body).json_body_strict::<NewUser>().is_ok());
     }
 }

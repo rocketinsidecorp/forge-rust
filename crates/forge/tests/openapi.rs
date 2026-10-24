@@ -31,6 +31,17 @@ struct Comment {
     author: Option<String>,
 }
 
+/// A write-only password: never written, so not in the document, but a
+/// request carries it.
+#[derive(Deserialize, OpenApiSchema)]
+struct NewUser {
+    email: String,
+    #[serde(skip_serializing)]
+    password: String,
+    #[serde(default, alias = "nick")]
+    nickname: Option<String>,
+}
+
 fn request(method: Method, path: &str, body: &str) -> Result<Request, Box<dyn Error>> {
     request_as(method, path, body, Some("application/json"))
 }
@@ -85,6 +96,20 @@ fn router() -> Result<Router, Box<dyn Error>> {
             StatusCode::CREATED,
             Operation::new().summary("Create a comment"),
             |_request: Request, Json(comment): Json<Comment>| async move { Ok(comment) },
+        ),
+    )?;
+    router.route(
+        Method::POST,
+        "/v1/users",
+        typed(
+            StatusCode::CREATED,
+            Operation::new().summary("Create a user"),
+            |_request: Request, Json(user): Json<NewUser>| async move {
+                Ok(Comment {
+                    text: format!("{}:{}", user.email, user.password.len()),
+                    author: user.nickname,
+                })
+            },
         ),
     )?;
     router.route(
@@ -212,5 +237,40 @@ async fn typed_requests_enforce_the_media_type_and_the_listed_members() -> Resul
     // The handler never ran: nothing about the refused member is echoed
     // beyond its name.
     assert!(!report.to_string().contains("true"), "{report}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn write_only_members_and_aliases_are_not_unknown_and_not_published()
+-> Result<(), Box<dyn Error>> {
+    let mut router = router()?;
+    let document = router.openapi(&Info::new("app", "0.1.0"))?;
+    let schema = &document.as_value()["components"]["schemas"]["NewUser"];
+    let mut members: Vec<&String> = schema["properties"]
+        .as_object()
+        .map(|properties| properties.keys().collect())
+        .unwrap_or_default();
+    members.sort();
+    assert_eq!(members, ["email", "nickname"], "{schema}");
+    let published = document.as_value().to_string();
+    assert!(!published.contains("password") && !published.contains("x-forge"));
+    router.layer(CheckResponses::new(document, |failure| panic!("{failure}")));
+    for body in [
+        r#"{"email":"a@b.c","password":"s3cret"}"#,
+        r#"{"email":"a@b.c","password":"s3cret","nick":"ada"}"#,
+    ] {
+        let response = router
+            .dispatch(request(Method::POST, "/v1/users", body)?)
+            .await;
+        assert_eq!(response.status(), StatusCode::CREATED, "{body}");
+    }
+    let response = router
+        .dispatch(request(
+            Method::POST,
+            "/v1/users",
+            r#"{"email":"a@b.c","password":"s","admin":true}"#,
+        )?)
+        .await;
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
     Ok(())
 }

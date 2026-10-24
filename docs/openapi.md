@@ -169,14 +169,23 @@ false` for every object:
 
 | Request | Answer |
 | --- | --- |
-| `Content-Type` other than `application/json` (case-insensitive; an optional `charset` must be UTF-8), absent, or repeated | `415`, `unsupported_media_type` |
+| `Content-Type` other than `application/json` (case-insensitive; empty parameters such as `application/json;` and a UTF-8 `charset` are fine, any other parameter is not), absent, or repeated | `415`, `unsupported_media_type` |
 | a body over `FORGE_MAX_BODY_BYTES` | `413` (text), before the handler runs |
 | not valid JSON for `T`, a wrong type, a missing member | `422`, `invalid_json` |
 | a member the schema of `T` does not list, at any depth | `422`, `invalid_json`, the member's path (`address.street`, `items[2].sku`) in `metadata.member` |
 
 Maps (`BTreeMap`, flattened maps) and `serde_json::Value` accept any member.
-A `#[serde(alias)]` is **not** a listed member, so a typed handler refuses
-it; decode by hand with `Request::json` when old names must keep working.
+Two kinds of names are accepted although the document does not list them,
+and are never published: a member with `#[serde(skip_serializing)]` (read but
+never written, such as a `password`), and `#[serde(alias = "...")]` names.
+Their values are not checked by the schema (serde still decodes them). A
+member with `skip`, or one the derive does not know, is refused as unknown.
+A schema written by hand with `OpenApiSchema` accepts such names with
+`ObjectSchema::accept` / `Field::alias`. For `anyOf`/`oneOf` a value is
+accepted when any branch of a matching `type` accepts it; `allOf` and other
+keywords are not interpreted. A type whose description cannot be built is
+answered with `500 json_description_invalid` (the same defect stops the
+document from building) rather than skipping the check.
 `#[serde(deny_unknown_fields)]` is no longer needed for typed handlers, but
 it still matters for `forge::web::decode_json` (below).
 
@@ -195,7 +204,12 @@ answers the `unsupported_media_type` code with `415`.
 
 Forge-Go answers `400 invalid_json` where this answers `422`: Forge-Rust maps
 a `Validation` error to `422` everywhere, and the documents declare what each
-framework answers.
+framework answers. The `Content-Type` rule is also stricter here: Go's
+`DecodeJSON` accepts any parameters and reads the first of several
+`Content-Type` headers, this refuses a repeated header or a parameter other
+than a UTF-8 `charset`. The strict path parses the body twice (once to look
+at its members, once into `T` from the original bytes), so number handling is
+exactly that of `Request::json`.
 
 An ordinary handler keeps working; `describe` attaches what it accepts and
 answers:

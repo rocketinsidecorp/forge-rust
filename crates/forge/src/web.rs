@@ -112,7 +112,10 @@ pub fn decode_json<T: DeserializeOwned>(request: &Request) -> Result<T, ForgeErr
 /// refused with `invalid_json` and the member's path (`address.street`,
 /// truncated to 64 characters) in the `member` metadata, so decoding accepts
 /// what the published document accepts (`additionalProperties: false`). A
-/// `#[serde(alias)]` is not a listed member.
+/// `skip_serializing` member and a `#[serde(alias)]` are accepted although
+/// the document does not list them. A type whose description cannot be built
+/// is refused with a `500` (`json_description_invalid`): nothing can be
+/// checked, so nothing is let through.
 pub fn decode_json_strict<T: DeserializeOwned + OpenApiSchema + 'static>(
     request: &Request,
 ) -> Result<T, ForgeError> {
@@ -132,6 +135,14 @@ fn json_failure(failure: JsonBodyError) -> ForgeError {
             "request body has a member this endpoint does not accept",
         )
         .with_metadata("member", member.chars().take(64).collect::<String>()),
+        // A request type whose description cannot be built is the
+        // application's bug: fail closed, with the reason in the logs only.
+        failure @ JsonBodyError::Description(_) => ForgeError::new(
+            ErrorCategory::Internal,
+            "json_description_invalid",
+            "the description of this endpoint's request is invalid",
+        )
+        .with_source(failure),
         other => ForgeError::new(
             ErrorCategory::Validation,
             "invalid_json",
