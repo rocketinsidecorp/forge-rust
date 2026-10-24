@@ -242,3 +242,71 @@ fn a_description_that_cannot_be_built_is_an_error_not_a_pass() {
     let error = unknown_member::<Broken>(&json!({"anything": 1})).expect_err("fails closed");
     assert!(error.contains("cannot be described"), "{error}");
 }
+
+#[derive(Deserialize, OpenApiSchema)]
+#[openapi(crate = "forge_openapi")]
+struct Aliased {
+    #[serde(alias = "addr", alias = "location")]
+    address: Address,
+    #[serde(alias = "all")]
+    visits: Vec<Address>,
+}
+
+#[test]
+fn a_value_under_an_alias_is_checked_like_its_member() {
+    let ok = json!({"addr": {"city": "x"}, "all": [{"city": "y"}]});
+    assert_eq!(check::<Aliased>(&ok), None);
+    assert_eq!(
+        check::<Aliased>(&json!({"addr": {"city": "x", "evil": 1}, "visits": []})).as_deref(),
+        Some("addr.evil")
+    );
+    assert_eq!(
+        check::<Aliased>(&json!({"location": {"evil": 1}, "visits": []})).as_deref(),
+        Some("location.evil")
+    );
+    assert_eq!(
+        check::<Aliased>(&json!({"address": {"city": "x"}, "all": [{"city": "y", "k": 1}]}))
+            .as_deref(),
+        Some("all[0].k")
+    );
+}
+
+/// Two object branches that share a recursive member: an `anyOf` walk that
+/// retried the whole subtree under each branch would take 2^depth steps.
+struct Expr;
+
+impl OpenApiSchema for Expr {
+    fn schema(generator: &mut forge_openapi::SchemaGenerator) -> forge_openapi::Schema {
+        generator.component::<Expr>(None, |generator| {
+            let inner = Expr::schema(generator);
+            json!({"anyOf": [
+                {"type": "object", "properties": {"l": inner.clone()}, "additionalProperties": false},
+                {"type": "object", "properties": {"l": inner, "r": {}}, "additionalProperties": false},
+            ]})
+        })
+    }
+}
+
+fn chain(depth: usize, leaf: Value) -> Value {
+    let mut value = leaf;
+    for _ in 0..depth {
+        value = json!({ "l": value });
+    }
+    value
+}
+
+#[test]
+fn any_of_branches_sharing_a_recursive_member_do_not_blow_up() {
+    let started = std::time::Instant::now();
+    // Valid: the first branch accepts at once.
+    assert_eq!(check::<Expr>(&chain(60, json!({}))), None);
+    // Invalid at the bottom: every branch fails, at every level. The budget
+    // ends the walk, closed (the body is refused), instead of 2^60 steps.
+    assert!(check::<Expr>(&chain(60, json!({"zz": 1}))).is_some());
+    assert!(check::<Expr>(&chain(40, json!({"zz": 1}))).is_some());
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "{:?}",
+        started.elapsed()
+    );
+}

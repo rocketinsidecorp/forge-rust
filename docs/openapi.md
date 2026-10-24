@@ -178,10 +178,15 @@ Maps (`BTreeMap`, flattened maps) and `serde_json::Value` accept any member.
 Two kinds of names are accepted although the document does not list them,
 and are never published: a member with `#[serde(skip_serializing)]` (read but
 never written, such as a `password`), and `#[serde(alias = "...")]` names.
-Their values are not checked by the schema (serde still decodes them). A
+The value of a `skip_serializing` member is not checked by the schema (serde
+still decodes it); the value under an alias is checked like the member it
+stands for. A
 member with `skip`, or one the derive does not know, is refused as unknown.
 A schema written by hand with `OpenApiSchema` accepts such names with
-`ObjectSchema::accept` / `Field::alias`. For `anyOf`/`oneOf` a value is
+`ObjectSchema::accept` / `Field::alias`. The check is bounded (at least 10,000
+steps, or four per value in the body): a body that exhausts it, as a
+pathological `anyOf` with branches sharing a recursive member could, is
+answered `422` rather than let through. For `anyOf`/`oneOf` a value is
 accepted when any branch of a matching `type` accepts it; `allOf` and other
 keywords are not interpreted. A type whose description cannot be built is
 answered with `500 json_description_invalid` (the same defect stops the

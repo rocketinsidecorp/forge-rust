@@ -11,7 +11,7 @@ use std::sync::{Arc, LazyLock, PoisonError, RwLock};
 
 use serde_json::Value;
 
-use crate::schema::{ACCEPTS_KEY, OpenApiSchema, REF_PLACEHOLDER, SchemaGenerator};
+use crate::schema::{ACCEPTS_KEY, ALIASES_KEY, OpenApiSchema, REF_PLACEHOLDER, SchemaGenerator};
 
 /// The schema of one type with the components it refers to, in the form the
 /// generator collects them (references still point at placeholders).
@@ -30,6 +30,21 @@ static SHAPES: LazyLock<RwLock<HashMap<TypeId, Arc<Shape>>>> =
 const MAX_DEPTH: usize = 160;
 /// Schema hops (`$ref`, `anyOf`) in a row without descending into the value.
 const MAX_HOPS: usize = 64;
+/// Steps the walk may take at least, however small the body: the work of a
+/// walk is otherwise bounded by the body only for simple schemas. `anyOf`
+/// tries one branch after another, and branches that share a recursive member
+/// would walk the same subtree again and again (exponentially in the depth),
+/// so the walk has a budget of `max(10_000, 4 x values in the body)` steps and
+/// is refused, not waved through, when it runs out.
+const MIN_BUDGET: usize = 10_000;
+
+fn count_values(value: &Value) -> usize {
+    match value {
+        Value::Object(members) => 1 + members.values().map(count_values).sum::<usize>(),
+        Value::Array(items) => 1 + items.iter().map(count_values).sum::<usize>(),
+        _ => 1,
+    }
+}
 
 fn shape_of<T: OpenApiSchema + ?Sized + 'static>() -> Arc<Shape> {
     let id = TypeId::of::<T>();
@@ -74,8 +89,10 @@ fn shape_of<T: OpenApiSchema + ?Sized + 'static>() -> Arc<Shape> {
 /// It follows what the document publishes: objects list their members and
 /// no others (`additionalProperties: false`), maps and `serde_json::Value`
 /// accept any. Besides the listed members, an object accepts the names its
-/// derive marked as read but never written (`skip_serializing`) and
-/// `serde(alias)`es; their values are not checked. Of the combinators,
+/// derive marked as read but never written (`skip_serializing`), whose values
+/// are not checked, and `serde(alias)`es, whose values are checked like the
+/// member they stand for. The work is bounded (see the budget below): a body
+/// that exhausts it is reported as unknown at the point it stopped. Of the combinators,
 /// `anyOf` and `oneOf` accept a value when any branch of a matching `type`
 /// does; `allOf` and the other keywords are not interpreted (nothing is
 /// refused because of them). A value nested deeper than 160 levels is
@@ -87,7 +104,8 @@ pub fn unknown_member<T: OpenApiSchema + ?Sized + 'static>(
     if let Some(error) = &shape.error {
         return Err(error.clone());
     }
-    Ok(walk(&shape, &shape.root, value, "", 0, 0))
+    let mut budget = MIN_BUDGET.max(4 * count_values(value));
+    Ok(walk(&shape, &shape.root, value, "", 0, 0, &mut budget))
 }
 
 fn resolve<'a>(shape: &'a Shape, schema: &'a Value) -> &'a Value {
@@ -121,7 +139,8 @@ fn kind_matches(shape: &Shape, schema: &Value, value: &Value) -> bool {
 }
 
 /// `path` of the first unknown member of `value` under `schema`; `depth`
-/// counts JSON levels, `hops` schema steps taken without descending.
+/// counts JSON levels, `hops` schema steps taken without descending, and
+/// `budget` the steps left (see [`MIN_BUDGET`]).
 fn walk(
     shape: &Shape,
     schema: &Value,
@@ -129,10 +148,12 @@ fn walk(
     at: &str,
     depth: usize,
     hops: usize,
+    budget: &mut usize,
 ) -> Option<String> {
-    if depth > MAX_DEPTH || hops > MAX_HOPS {
+    if depth > MAX_DEPTH || hops > MAX_HOPS || *budget == 0 {
         return Some(at.to_owned());
     }
+    *budget -= 1;
     let schema = resolve(shape, schema);
     for keyword in ["anyOf", "oneOf"] {
         let Some(branches) = schema.get(keyword).and_then(Value::as_array) else {
@@ -145,7 +166,7 @@ fn walk(
             return if value.is_null() {
                 None
             } else {
-                walk(shape, inner, value, at, depth, hops + 1)
+                walk(shape, inner, value, at, depth, hops + 1, budget)
             };
         }
         let mut first = None;
@@ -155,7 +176,7 @@ fn walk(
                 continue;
             }
             applicable = true;
-            match walk(shape, branch, value, at, depth, hops + 1) {
+            match walk(shape, branch, value, at, depth, hops + 1, budget) {
                 None => return None,
                 found => first = first.or(found),
             }
@@ -166,6 +187,7 @@ fn walk(
         Value::Object(members) => {
             let properties = schema.get("properties").and_then(Value::as_object);
             let accepted = schema.get(ACCEPTS_KEY).and_then(Value::as_array);
+            let aliases = schema.get(ALIASES_KEY).and_then(Value::as_object);
             let additional = schema.get("additionalProperties");
             for (name, member) in members {
                 let path = if at.is_empty() {
@@ -176,13 +198,20 @@ fn walk(
                 if accepted.is_some_and(|names| names.iter().any(|accepted| accepted == name)) {
                     continue;
                 }
-                let expected = match (properties.and_then(|listed| listed.get(name)), additional) {
+                // An alias is the member it stands for: its value is checked
+                // with that member's schema.
+                let canonical = aliases
+                    .and_then(|aliases| aliases.get(name))
+                    .and_then(Value::as_str)
+                    .and_then(|member| properties.and_then(|listed| listed.get(member)));
+                let listed = properties.and_then(|listed| listed.get(name)).or(canonical);
+                let expected = match (listed, additional) {
                     (Some(listed), _) => listed,
                     (None, Some(Value::Bool(false))) => return Some(path),
                     (None, Some(map @ Value::Object(_))) => map,
                     (None, _) => continue,
                 };
-                if let Some(found) = walk(shape, expected, member, &path, depth + 1, 0) {
+                if let Some(found) = walk(shape, expected, member, &path, depth + 1, 0, budget) {
                     return Some(found);
                 }
             }
@@ -198,6 +227,7 @@ fn walk(
                     &format!("{at}[{index}]"),
                     depth + 1,
                     0,
+                    budget,
                 )
             })
         }

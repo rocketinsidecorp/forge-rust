@@ -153,7 +153,12 @@ is created `0700`; an existing one that is group- or world-accessible is
 tightened to `0700` (with a warning), and one that cannot be tightened is an
 error. A sticky shared directory such as `/tmp`, and a symbolic link, are left
 alone with a warning; the check and the change use one open handle, so the
-path cannot be swapped in between.
+path cannot be swapped in between. Two residual risks remain, both limited to
+this development-only path and needing write access to the directory's
+parent: symbolic links in the parent components of the path are still
+followed, and replacing the directory with a FIFO between the check and the
+open can block start-up (std cannot open a directory with `O_NOFOLLOW |
+O_DIRECTORY` without a new dependency or unsafe code).
 
 For a browser preview with fixture data, register previews. They need
 `FORGE_ENV` development or test **and** `FORGE_MAIL_PREVIEW=true` (an unset

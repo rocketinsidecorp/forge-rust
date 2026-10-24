@@ -10,7 +10,8 @@ use serde_json::{Map, Value, json};
 use crate::json::to_canonical;
 use crate::operation::{Body, Operation, Param, ParamLocation};
 use crate::schema::{
-    ACCEPTS_KEY, Component, Field, OpenApiSchema, REF_PLACEHOLDER, SchemaGenerator, non_null,
+    ACCEPTS_KEY, ALIASES_KEY, Component, Field, OpenApiSchema, REF_PLACEHOLDER, SchemaGenerator,
+    non_null,
 };
 use crate::status;
 
@@ -751,8 +752,13 @@ fn resolve_references(value: &mut Value, names: &[String]) {
     match value {
         Value::Object(object) => {
             // Internal: the names typed decoding accepts, never published.
-            if object.contains_key("properties") {
+            // Only at an object schema node (`"type": "object"` as the
+            // derive writes it), never in a map of member names.
+            if object.get("type") == Some(&Value::from("object"))
+                && object.contains_key("properties")
+            {
                 object.remove(ACCEPTS_KEY);
+                object.remove(ALIASES_KEY);
             }
             for (key, member) in object.iter_mut() {
                 if key == "$ref"

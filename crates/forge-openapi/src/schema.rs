@@ -29,6 +29,11 @@ const MAX_NESTING: usize = 64;
 /// never published.
 pub(crate) const ACCEPTS_KEY: &str = "x-forge-accepts";
 
+/// Where an object schema maps each alias to the member it stands for
+/// (`{"addr": "address"}`), so a value under an alias is checked with the
+/// member's schema. Internal like [`ACCEPTS_KEY`].
+pub(crate) const ALIASES_KEY: &str = "x-forge-aliases";
+
 /// The `$ref` text of a component before names are assigned; rewritten when
 /// the document is built, so names do not depend on the order types are met.
 pub(crate) const REF_PLACEHOLDER: &str = "\u{0}forge-component:";
@@ -271,6 +276,7 @@ pub struct ObjectSchema {
     additional: Option<Value>,
     description: Option<String>,
     accepted: BTreeSet<String>,
+    aliases: BTreeMap<String, String>,
 }
 
 impl ObjectSchema {
@@ -297,14 +303,16 @@ impl ObjectSchema {
         if options.is_required() {
             self.required.insert(name.to_owned());
         }
-        self.accepted.extend(options.aliases);
+        for alias in options.aliases {
+            self.aliases.insert(alias, name.to_owned());
+        }
         self
     }
 
     /// Names a request may carry although the object does not describe them:
     /// members serde reads but never writes (`skip_serializing`, such as a
-    /// password) and aliases. Typed decoding accepts them (their values are
-    /// not checked); the document does not list them.
+    /// password), whose values are not checked; the document does not list
+    /// them. (A [`Field::alias`] is checked like its member.)
     pub fn accept<'a>(&mut self, names: impl IntoIterator<Item = &'a str>) -> &mut Self {
         self.accepted.extend(names.into_iter().map(str::to_owned));
         self
@@ -360,6 +368,7 @@ impl ObjectSchema {
         }
         self.required.extend(inner.required);
         self.accepted.extend(inner.accepted);
+        self.aliases.extend(inner.aliases);
         if let Some(additional) = inner.additional {
             if self.additional.is_some() {
                 generator.fail(format!(
@@ -404,6 +413,17 @@ impl ObjectSchema {
             object.insert(
                 ACCEPTS_KEY.to_owned(),
                 Value::Array(self.accepted.into_iter().map(Value::String).collect()),
+            );
+        }
+        if !self.aliases.is_empty() {
+            object.insert(
+                ALIASES_KEY.to_owned(),
+                Value::Object(
+                    self.aliases
+                        .into_iter()
+                        .map(|(alias, name)| (alias, Value::String(name)))
+                        .collect(),
+                ),
             );
         }
         Value::Object(object)
