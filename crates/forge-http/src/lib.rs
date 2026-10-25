@@ -19,7 +19,7 @@ use std::{
 use bytes::Bytes;
 use forge_config::ServerConfig;
 pub use http::{Extensions, HeaderMap, HeaderValue, Method, StatusCode, Uri, header};
-use http_body_util::{BodyExt, LengthLimitError, Limited};
+use http_body_util::BodyExt;
 use hyper::{
     body::{Body as _, Incoming},
     service::service_fn,
@@ -78,6 +78,9 @@ const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(50);
 /// for a fast API does not cut off clients that read a large download or an
 /// event stream slowly; those are only disconnected when they stop reading.
 const MIN_WRITE_STALL_TIMEOUT: Duration = Duration::from_secs(30);
+/// `Retry-After` of the `503` that refuses a body when the in-flight body
+/// budget is exhausted: uploads in progress end within the request timeout.
+const BODY_BUDGET_RETRY_AFTER_SECS: u32 = 5;
 
 type BoxHandlerFuture = Pin<Box<dyn Future<Output = Response> + Send + 'static>>;
 
@@ -828,6 +831,7 @@ impl Server {
                 router,
                 telemetry: None,
                 hsts: config.transport.is_https(),
+                body_budget: BodyBudget::new(config.max_in_flight_body_bytes),
             }),
             config,
             min_write_stall: MIN_WRITE_STALL_TIMEOUT,
@@ -1002,7 +1006,49 @@ struct ServedApp {
     /// Whether responses carry [`STRICT_TRANSPORT_SECURITY`]: clients use
     /// HTTPS (`FORGE_HTTP_TRANSPORT` is not `plain`).
     hsts: bool,
+    /// Request body bytes held at once (`FORGE_MAX_IN_FLIGHT_BODY_BYTES`).
+    body_budget: BodyBudget,
 }
+
+/// The bytes of request bodies all connections may hold in memory at once,
+/// a semaphore with one permit per byte. Bodies are buffered before
+/// dispatch, so without it `FORGE_MAX_BODY_BYTES` times
+/// `FORGE_MAX_CONNECTIONS` (about 10 GiB by default) could be resident.
+struct BodyBudget(Arc<Semaphore>);
+
+impl BodyBudget {
+    fn new(bytes: usize) -> Self {
+        Self(Arc::new(Semaphore::new(
+            bytes.clamp(1, Semaphore::MAX_PERMITS),
+        )))
+    }
+
+    /// Adds `bytes` to `held` without waiting; `false` when the budget has
+    /// no room left. What was added stays in `held` and is returned to the
+    /// budget when `held` is dropped, on every path.
+    fn charge(&self, held: &mut BodyCharge, mut bytes: usize) -> bool {
+        while bytes > 0 {
+            // Permits are acquired, and one permit holds, at most u32::MAX.
+            let step = u32::try_from(bytes).unwrap_or(u32::MAX);
+            let Ok(permit) = Arc::clone(&self.0).try_acquire_many_owned(step) else {
+                return false;
+            };
+            match held.0.last_mut() {
+                Some(last) if last.num_permits() <= (u32::MAX - step) as usize => {
+                    last.merge(permit);
+                }
+                _ => held.0.push(permit),
+            }
+            bytes -= step as usize;
+        }
+        true
+    }
+}
+
+/// The share of the [`BodyBudget`] one request body holds; dropping it
+/// returns the share. Usually one permit; one more per 4 GiB.
+#[derive(Default)]
+struct BodyCharge(Vec<OwnedSemaphorePermit>);
 
 async fn serve_connection(
     stream: tokio::net::TcpStream,
@@ -1072,8 +1118,12 @@ async fn handle_request(
         // The deadline covers reading the body as well as the handler, so a
         // client trickling body bytes cannot hold a connection indefinitely.
         let exchange = async {
-            let body = match collect_body(body, max_body_bytes).await {
-                Ok(body) => body,
+            // `charged` holds the body's share of the in-flight budget until
+            // the handler returned; dropping it on any other way out (a
+            // rejection, the timeout, a panic, the client leaving) releases
+            // it too.
+            let (body, charged) = match collect_body(body, max_body_bytes, &app.body_budget).await {
+                Ok(collected) => collected,
                 Err(rejection) => return rejection.into_response(),
             };
             let mut request = Request {
@@ -1094,7 +1144,9 @@ async fn handle_request(
             }
             // The client address is resolved once, outside every layer.
             app.trusted_proxies.apply(&mut request);
-            app.router.dispatch(request).await
+            let response = app.router.dispatch(request).await;
+            drop(charged);
+            response
         };
         let exchange = tokio::time::timeout(request_timeout, exchange);
         let response = match io::CatchUnwind::new(exchange).await {
@@ -1168,6 +1220,8 @@ enum BodyRejection {
     TooLarge,
     /// The body stream failed, e.g. malformed chunked encoding.
     Unreadable,
+    /// The in-flight body budget has no room for the body.
+    Busy,
 }
 
 impl BodyRejection {
@@ -1179,22 +1233,74 @@ impl BodyRejection {
             Self::Unreadable => {
                 Response::text(StatusCode::BAD_REQUEST, "request body could not be read")
             }
+            Self::Busy => {
+                let mut response =
+                    Response::text(StatusCode::SERVICE_UNAVAILABLE, "server busy, retry later");
+                response.headers.insert(
+                    header::RETRY_AFTER,
+                    HeaderValue::from(BODY_BUDGET_RETRY_AFTER_SECS),
+                );
+                response
+            }
         }
     }
 }
 
-/// Buffers a request body, enforcing the configured size limit.
-async fn collect_body(body: Incoming, max_body_bytes: usize) -> Result<Bytes, BodyRejection> {
+/// Buffers a request body, enforcing the configured size limit and charging
+/// it to the in-flight `budget`: a declared `Content-Length` up front, before
+/// a byte is read, and every byte beyond it as it arrives (chunked bodies).
+/// Returns the body and its charge, which the caller holds while the body is
+/// in use.
+async fn collect_body(
+    mut body: Incoming,
+    max_body_bytes: usize,
+    budget: &BodyBudget,
+) -> Result<(Bytes, BodyCharge), BodyRejection> {
     // Reject a declared Content-Length above the limit without reading it.
-    let limit = u64::try_from(max_body_bytes).unwrap_or(u64::MAX);
-    if body.size_hint().lower() > limit {
-        return Err(BodyRejection::TooLarge);
+    let declared = body.size_hint().lower();
+    let declared = match usize::try_from(declared) {
+        Ok(declared) if declared <= max_body_bytes => declared,
+        _ => return Err(BodyRejection::TooLarge),
+    };
+    let mut held = BodyCharge::default();
+    if !budget.charge(&mut held, declared) {
+        return Err(BodyRejection::Busy);
     }
-    match Limited::new(body, max_body_bytes).collect().await {
-        Ok(collected) => Ok(collected.to_bytes()),
-        Err(error) if error.is::<LengthLimitError>() => Err(BodyRejection::TooLarge),
-        Err(_) => Err(BodyRejection::Unreadable),
+    let mut charged = declared;
+    let mut received = 0_usize;
+    let mut chunks: Vec<Bytes> = Vec::new();
+    while let Some(frame) = body.frame().await {
+        let Ok(frame) = frame else {
+            return Err(BodyRejection::Unreadable);
+        };
+        // Trailers carry no body bytes.
+        let Ok(data) = frame.into_data() else {
+            continue;
+        };
+        received = received.saturating_add(data.len());
+        if received > max_body_bytes {
+            return Err(BodyRejection::TooLarge);
+        }
+        if received > charged {
+            if !budget.charge(&mut held, received - charged) {
+                return Err(BodyRejection::Busy);
+            }
+            charged = received;
+        }
+        if !data.is_empty() {
+            chunks.push(data);
+        }
     }
+    let body = if chunks.len() <= 1 {
+        chunks.pop().unwrap_or_default()
+    } else {
+        let mut joined = bytes::BytesMut::with_capacity(received);
+        for chunk in chunks {
+            joined.extend_from_slice(&chunk);
+        }
+        joined.freeze()
+    };
+    Ok((body, held))
 }
 
 /// The answer to a `HEAD` request: the headers of the response the route

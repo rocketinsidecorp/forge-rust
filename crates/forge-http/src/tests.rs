@@ -675,6 +675,7 @@ fn test_config(request_timeout: Duration) -> ServerConfig {
         shutdown_grace: Duration::from_secs(30),
         max_body_bytes: 64,
         max_connections: 16,
+        max_in_flight_body_bytes: 1024,
         trusted_proxies: Vec::new(),
         transport: forge_config::HttpTransport::Plain,
     }
@@ -1395,4 +1396,228 @@ async fn a_handler_panic_is_a_500_with_the_request_id_and_is_logged() {
     assert!(line.contains(&request_id), "{line}");
     assert!(line.contains("secret-detail 4242"), "{line}");
     assert!(line.contains("ERROR"), "{line}");
+}
+
+/// A server with a 64-byte body limit and a `budget`-byte in-flight body
+/// budget, and a handle on that budget.
+async fn budget_server(budget: usize, request_timeout: Duration) -> (TestServer, Arc<Semaphore>) {
+    let mut config = test_config(request_timeout);
+    config.max_in_flight_body_bytes = budget;
+    let server = Server::new(config, panicking_router());
+    let available = Arc::clone(&server.app.body_budget.0);
+    (TestServer::start_server(server).await, available)
+}
+
+/// Waits until the budget has exactly `bytes` free.
+async fn budget_reaches(budget: &Semaphore, bytes: usize) {
+    let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
+    while budget.available_permits() != bytes {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "budget stuck at {} free, expected {bytes}",
+            budget.available_permits()
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+async fn exchange_owned(addr: SocketAddr, raw: String) -> String {
+    tokio::task::spawn_blocking(move || exchange_blocking(addr, raw.as_bytes()))
+        .await
+        .expect("client task must not panic")
+}
+
+#[tokio::test]
+async fn a_declared_body_beyond_the_in_flight_budget_is_refused_with_503() {
+    let (server, budget) = budget_server(64, Duration::from_secs(10)).await;
+    let addr = server.addr;
+
+    // A trickling upload holds its whole Content-Length (40 of 64 bytes).
+    let mut holder = tokio::task::spawn_blocking(move || {
+        let mut stream = connect(addr);
+        stream
+            .write_all(
+                b"POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 40\r\n\
+                  Connection: close\r\n\r\nab",
+            )
+            .expect("partial body must be written");
+        stream
+    })
+    .await
+    .expect("client task must not panic");
+    budget_reaches(&budget, 24).await;
+
+    // 40 more do not fit: refused before a byte of the body is read.
+    let refused = exchange(
+        addr,
+        "POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 40\r\n\
+         Connection: close\r\n\r\n",
+    )
+    .await;
+    let lower = refused.to_ascii_lowercase();
+    assert!(refused.starts_with("HTTP/1.1 503 "), "{refused}");
+    assert!(lower.contains("retry-after: 5\r\n"), "{refused}");
+    assert!(lower.contains("x-request-id: "), "{refused}");
+    assert!(refused.ends_with("server busy, retry later"), "{refused}");
+    budget_reaches(&budget, 24).await;
+
+    // A body that fits is served meanwhile.
+    let fits = exchange_owned(
+        addr,
+        format!(
+            "POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 20\r\n\
+             Connection: close\r\n\r\n{}",
+            "x".repeat(20)
+        ),
+    )
+    .await;
+    assert!(fits.starts_with("HTTP/1.1 200 "), "{fits}");
+
+    // The first upload completes and returns its share.
+    let completed = tokio::task::spawn_blocking(move || {
+        holder
+            .write_all("c".repeat(38).as_bytes())
+            .expect("rest of the body must be written");
+        let mut response = Vec::new();
+        holder
+            .read_to_end(&mut response)
+            .expect("response must arrive");
+        String::from_utf8_lossy(&response).into_owned()
+    })
+    .await
+    .expect("client task must not panic");
+    assert!(completed.starts_with("HTTP/1.1 200 "), "{completed}");
+    assert!(
+        completed.ends_with(&format!("ab{}", "c".repeat(38))),
+        "{completed}"
+    );
+    budget_reaches(&budget, 64).await;
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn trickling_chunked_uploads_are_charged_as_they_arrive_and_released_on_disconnect() {
+    let (server, budget) = budget_server(64, Duration::from_secs(10)).await;
+    let addr = server.addr;
+
+    // A chunked upload sends 40 bytes and stalls without ending the body.
+    let holder = tokio::task::spawn_blocking(move || {
+        let mut stream = connect(addr);
+        stream
+            .write_all(
+                format!(
+                    "POST /echo HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\
+                     Connection: close\r\n\r\n28\r\n{}\r\n",
+                    "a".repeat(40)
+                )
+                .as_bytes(),
+            )
+            .expect("first chunk must be written");
+        stream
+    })
+    .await
+    .expect("client task must not panic");
+    budget_reaches(&budget, 24).await;
+
+    // A second chunked upload fits with its first 16 bytes, not its next 16
+    // (one write, so the server has read everything when it refuses).
+    let refused = exchange_owned(
+        addr,
+        format!(
+            "POST /echo HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\
+             Connection: close\r\n\r\n10\r\n{0}\r\n10\r\n{0}\r\n",
+            "b".repeat(16)
+        ),
+    )
+    .await;
+    assert!(refused.starts_with("HTTP/1.1 503 "), "{refused}");
+    assert!(
+        refused.to_ascii_lowercase().contains("retry-after: 5\r\n"),
+        "{refused}"
+    );
+    budget_reaches(&budget, 24).await;
+
+    // The stalled client leaves: its share comes back.
+    drop(holder);
+    budget_reaches(&budget, 64).await;
+    let served = exchange_owned(
+        addr,
+        format!(
+            "POST /echo HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\
+             Connection: close\r\n\r\n28\r\n{}\r\n0\r\n\r\n",
+            "d".repeat(40)
+        ),
+    )
+    .await;
+    assert!(served.starts_with("HTTP/1.1 200 "), "{served}");
+    assert!(served.ends_with(&"d".repeat(40)), "{served}");
+    budget_reaches(&budget, 64).await;
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn the_body_budget_is_returned_after_a_panic_a_timeout_and_a_rejection() {
+    let (server, budget) = budget_server(64, Duration::from_millis(300)).await;
+    let addr = server.addr;
+
+    let panicked = exchange(
+        addr,
+        "POST /panic HTTP/1.1\r\nHost: localhost\r\nContent-Length: 10\r\n\
+         Connection: close\r\n\r\n0123456789",
+    )
+    .await;
+    assert!(panicked.starts_with("HTTP/1.1 500 "), "{panicked}");
+    budget_reaches(&budget, 64).await;
+
+    // Declares 40 bytes, sends 2, stalls past the request timeout.
+    let timed_out = exchange(
+        addr,
+        "POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 40\r\n\
+         Connection: close\r\n\r\nab",
+    )
+    .await;
+    assert!(timed_out.starts_with("HTTP/1.1 504 "), "{timed_out}");
+    budget_reaches(&budget, 64).await;
+
+    // Over the body limit after 40 bytes were charged.
+    let too_large = exchange_owned(
+        addr,
+        format!(
+            "POST /echo HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\
+             Connection: close\r\n\r\n28\r\n{0}\r\n28\r\n{0}\r\n",
+            "e".repeat(40)
+        ),
+    )
+    .await;
+    assert!(too_large.starts_with("HTTP/1.1 413 "), "{too_large}");
+    budget_reaches(&budget, 64).await;
+    server.stop().await;
+}
+
+#[test]
+fn a_charge_larger_than_u32_is_taken_in_steps() {
+    let budget = BodyBudget::new(usize::MAX);
+    let mut held = BodyCharge::default();
+    let big = (u32::MAX as usize) * 2 + 7;
+    assert!(budget.charge(&mut held, big));
+    assert!(budget.charge(&mut held, 3));
+    assert_eq!(held.0.len(), 3);
+    assert_eq!(
+        budget.0.available_permits(),
+        Semaphore::MAX_PERMITS - big - 3
+    );
+    drop(held);
+    assert_eq!(budget.0.available_permits(), Semaphore::MAX_PERMITS);
+
+    let small = BodyBudget::new(10);
+    let mut held = BodyCharge::default();
+    assert!(small.charge(&mut held, 0));
+    assert!(held.0.is_empty());
+    assert!(small.charge(&mut held, 6));
+    assert!(small.charge(&mut held, 1));
+    assert_eq!(held.0.len(), 1, "small charges merge into one permit");
+    assert!(!small.charge(&mut held, 4));
+    assert_eq!(small.0.available_permits(), 3);
+    drop(held);
+    assert_eq!(small.0.available_permits(), 10);
 }

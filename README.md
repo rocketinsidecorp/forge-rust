@@ -596,7 +596,9 @@ Kubernetes and systemd deployment is covered in
 - Typed `FORGE_*` environment configuration. Database URLs are redacted from
   normal debug/serialization output, and unknown `FORGE_*` keys are
   rejected at startup.
-- HTTP defaults: request and header-read timeouts, a body size limit, bounded
+- HTTP defaults: request and header-read timeouts, a body size limit, a
+  256 MiB budget for all request bodies buffered at once
+  (`FORGE_MAX_IN_FLIGHT_BODY_BYTES`; `503` with `Retry-After` beyond it), bounded
   connections, `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`,
   UUIDv7 `x-request-id`, `Strict-Transport-Security` behind TLS termination
   (`FORGE_HTTP_TRANSPORT`), `HEAD` on every `GET` route, and a `500` with the
@@ -839,6 +841,7 @@ export FORGE_CACHE_DEFAULT_TTL_SECS=3600         # ttl of writes that pass none
 export FORGE_STORAGE_ROOT=/var/lib/shop/storage  # absolute in production
 export FORGE_STORAGE_SIGNING_KEY=$(openssl rand -base64 32 | tr '+/' '-_' | tr -d '=')
 export FORGE_STORAGE_MAX_UPLOAD_BYTES=524288     # must not exceed FORGE_MAX_BODY_BYTES
+export FORGE_MAX_IN_FLIGHT_BODY_BYTES=268435456  # all request bodies buffered at once; 503 + Retry-After beyond
 export FORGE_STORAGE_LINK_TTL_SECS=900           # default signed link lifetime
 ```
 

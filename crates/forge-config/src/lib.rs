@@ -41,6 +41,7 @@ const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_SHUTDOWN_GRACE_SECS: u64 = 15;
 const DEFAULT_MAX_BODY_BYTES: usize = 1_048_576;
 const DEFAULT_MAX_CONNECTIONS: usize = 10_000;
+const DEFAULT_MAX_IN_FLIGHT_BODY_BYTES: usize = 256 << 20;
 const DEFAULT_LOG_FILTER: &str = "info";
 const REDACTED: &str = "[REDACTED]";
 const DEFAULT_RATE_LIMIT_MAX_KEYS: usize = 100_000;
@@ -85,6 +86,7 @@ pub const KNOWN_KEYS: &[&str] = &[
     "FORGE_SHUTDOWN_GRACE_SECS",
     "FORGE_MAX_BODY_BYTES",
     "FORGE_MAX_CONNECTIONS",
+    MAX_IN_FLIGHT_BODY_BYTES_KEY,
     TRUSTED_PROXIES_KEY,
     TRANSPORT_KEY,
     "FORGE_LOG",
@@ -147,6 +149,12 @@ pub const I18N_DEFAULT_LOCALE_KEY: &str = "FORGE_I18N_DEFAULT_LOCALE";
 /// a comma-separated list of CIDR prefixes or bare addresses. Empty, the
 /// default, trusts nobody.
 pub const TRUSTED_PROXIES_KEY: &str = "FORGE_HTTP_TRUSTED_PROXIES";
+
+/// The request body bytes the server holds in memory at once, across all
+/// connections. Unset it is 256 MiB, or `FORGE_MAX_BODY_BYTES` when that is
+/// larger; a request whose body would exceed it gets `503` with
+/// `Retry-After`.
+pub const MAX_IN_FLIGHT_BODY_BYTES_KEY: &str = "FORGE_MAX_IN_FLIGHT_BODY_BYTES";
 
 /// How clients reach the server (Forge-Go's key): `plain` HTTP, or
 /// `trusted-proxy` when a reverse proxy or load balancer terminates TLS in
@@ -266,6 +274,14 @@ pub struct ServerConfig {
     pub max_body_bytes: usize,
     /// Maximum number of concurrently open client connections.
     pub max_connections: usize,
+    /// Request body bytes buffered at once across all connections
+    /// (`FORGE_MAX_IN_FLIGHT_BODY_BYTES`): a body is charged as it arrives
+    /// (its whole `Content-Length` up front) and released when the request
+    /// ends, however it ends. A body that does not fit is refused with
+    /// `503`. Should be at least `max_body_bytes`, or the largest bodies
+    /// are never admitted.
+    #[serde(default = "default_max_in_flight_body_bytes")]
+    pub max_in_flight_body_bytes: usize,
     /// Networks of the reverse proxies whose `X-Forwarded-For` header is
     /// believed when resolving the client address
     /// (`FORGE_HTTP_TRUSTED_PROXIES`, ADR 0032). Empty, the default, trusts
@@ -290,10 +306,15 @@ impl Default for ServerConfig {
             shutdown_grace: Duration::from_secs(DEFAULT_SHUTDOWN_GRACE_SECS),
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             max_connections: DEFAULT_MAX_CONNECTIONS,
+            max_in_flight_body_bytes: DEFAULT_MAX_IN_FLIGHT_BODY_BYTES,
             trusted_proxies: Vec::new(),
             transport: HttpTransport::Plain,
         }
     }
+}
+
+fn default_max_in_flight_body_bytes() -> usize {
+    DEFAULT_MAX_IN_FLIGHT_BODY_BYTES
 }
 
 /// Shortest IPv4 prefix a trusted proxy network may have. Shorter prefixes
@@ -987,6 +1008,20 @@ impl AppConfig {
         if let Some(value) = lookup("FORGE_MAX_CONNECTIONS") {
             config.server.max_connections = parse_positive("FORGE_MAX_CONNECTIONS", &value)?;
         }
+        config.server.max_in_flight_body_bytes = match lookup(MAX_IN_FLIGHT_BODY_BYTES_KEY) {
+            Some(value) => {
+                let budget: usize = parse_positive(MAX_IN_FLIGHT_BODY_BYTES_KEY, &value)?;
+                if budget < config.server.max_body_bytes {
+                    return Err(ConfigError::InvalidValue {
+                        key: MAX_IN_FLIGHT_BODY_BYTES_KEY,
+                        value,
+                        expected: "at least FORGE_MAX_BODY_BYTES",
+                    });
+                }
+                budget
+            }
+            None => DEFAULT_MAX_IN_FLIGHT_BODY_BYTES.max(config.server.max_body_bytes),
+        };
         if let Some(value) = lookup(TRUSTED_PROXIES_KEY) {
             config.server.trusted_proxies = parse_trusted_proxies(&value)?;
         }
@@ -1454,6 +1489,64 @@ mod tests {
     }
 
     #[test]
+    fn the_in_flight_body_budget_defaults_to_256_mib_and_covers_one_body() {
+        let load = |pairs: &[(&str, &str)]| {
+            let values: HashMap<&str, &str> = pairs.iter().copied().collect();
+            AppConfig::from_lookup(|key| values.get(key).map(ToString::to_string))
+        };
+        let budget = |pairs: &[(&str, &str)]| {
+            load(pairs)
+                .expect("valid budget")
+                .server
+                .max_in_flight_body_bytes
+        };
+        assert_eq!(budget(&[]), 268_435_456);
+        assert_eq!(
+            ServerConfig::default().max_in_flight_body_bytes,
+            268_435_456
+        );
+        assert_eq!(
+            budget(&[(MAX_IN_FLIGHT_BODY_BYTES_KEY, "2097152")]),
+            2_097_152
+        );
+        // Below the default 1 MiB body limit.
+        assert!(load(&[(MAX_IN_FLIGHT_BODY_BYTES_KEY, "4096")]).is_err());
+        // Unset, it grows to hold one maximum body.
+        assert_eq!(
+            budget(&[("FORGE_MAX_BODY_BYTES", "536870912")]),
+            536_870_912
+        );
+        assert_eq!(
+            budget(&[
+                ("FORGE_MAX_BODY_BYTES", "4096"),
+                (MAX_IN_FLIGHT_BODY_BYTES_KEY, "4096")
+            ]),
+            4096
+        );
+        for pairs in [
+            &[(MAX_IN_FLIGHT_BODY_BYTES_KEY, "0")][..],
+            &[(MAX_IN_FLIGHT_BODY_BYTES_KEY, "-1")][..],
+            &[(MAX_IN_FLIGHT_BODY_BYTES_KEY, "256MiB")][..],
+            &[
+                ("FORGE_MAX_BODY_BYTES", "4096"),
+                (MAX_IN_FLIGHT_BODY_BYTES_KEY, "4095"),
+            ][..],
+        ] {
+            let error = load(pairs).expect_err("refused budget");
+            assert!(
+                matches!(
+                    error,
+                    ConfigError::InvalidValue {
+                        key: MAX_IN_FLIGHT_BODY_BYTES_KEY,
+                        ..
+                    }
+                ),
+                "{pairs:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
     fn zero_limits_fail_closed() {
         let error =
             AppConfig::from_lookup(|key| (key == "FORGE_MAX_BODY_BYTES").then(|| "0".to_owned()))
@@ -1752,6 +1845,7 @@ mod tests {
             "5",
             "10",
             "10",
+            "100",
             "172.18.0.0/16, fd00:1::/64",
             "trusted-proxy",
             "debug",

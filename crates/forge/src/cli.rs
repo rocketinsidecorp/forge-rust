@@ -398,6 +398,9 @@ Environment:
   FORGE_SHUTDOWN_GRACE_SECS   connection drain period on shutdown in seconds (default: 15)
   FORGE_MAX_BODY_BYTES        maximum request body size in bytes (default: 1048576)
   FORGE_MAX_CONNECTIONS       maximum concurrent connections (default: 10000)
+  FORGE_MAX_IN_FLIGHT_BODY_BYTES request body bytes buffered at once across connections; a
+                              body that does not fit gets 503 (default: 268435456, at least
+                              FORGE_MAX_BODY_BYTES)
   FORGE_HTTP_TRUSTED_PROXIES  comma-separated CIDRs or addresses of reverse proxies whose
                               X-Forwarded-For is believed (default: empty, trust nobody)
   FORGE_HTTP_TRANSPORT        plain | trusted-proxy: trusted-proxy (TLS terminated in front)
