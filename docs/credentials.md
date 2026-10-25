@@ -21,7 +21,9 @@ forge credentials init --environment production
 ```
 
 `init` writes a random 256-bit key (operating-system CSPRNG) to
-`config/credentials/production.key` with mode 0600 in a 0700 directory, an
+`config/credentials/production.key` with mode 0600 (creating
+`config/credentials/` with mode 0700 when it is missing; an existing directory
+keeps its mode, and one that group or others can write is refused), an
 encrypted skeleton holding a data-encryption key ring, and adds
 `/config/credentials/*.key` to `.gitignore` and `config/credentials/*.key` to
 `.dockerignore` (creating either file when missing). It never overwrites a key
@@ -66,7 +68,12 @@ The document is one JSON object:
   what the name resolves to (`vi`, `editor`, `vim.basic`, `vim.nox`, `gvim`,
   `nvim`, `view`, symlinks to them) and started without swap, backup, undo and
   viminfo files. Other editors (a busybox `vi`, nano, Emacs, GUI editors) are
-  started unchanged and may keep their own copies; check their backup settings;
+  started unchanged and may keep their own copies; check their backup settings.
+  Those copies, and the plaintext file itself after `SIGQUIT` (`Ctrl-\`,
+  also when typed inside the editor; its default action ends the process,
+  with a core dump where enabled, without any cleanup), are outside Forge's
+  reach: after an abnormal exit look in `/dev/shm` (Linux) or your temporary
+  directory for `forge-credentials-*`, and in the editor's backup directory;
 - `SIGINT`, `SIGTERM` and `SIGHUP` are caught for the whole command and acted
   on at checkpoints, so the cleanup also covers validation and encryption. A
   Ctrl-C typed inside the editor belongs to the editor;
@@ -150,8 +157,17 @@ docker run --rm -p 3000:3000 \
 
 `FORGE_MASTER_KEY` is canonical unpadded base64url of 32 bytes, optionally
 several separated by commas or newlines (the first one is active). It wins
-over a key file. A key file must be a regular file (not a symbolic link) of
-mode 0600 or stricter; one that group or others can access is refused.
+over a key file. A key file must be a regular file (not a symbolic link, FIFO
+or device) of mode 0600 or stricter, in a directory that group and others
+cannot write; anything else is refused with the fix in the message:
+
+```sh
+chmod 700 config/credentials
+chmod 600 config/credentials/*.key
+```
+
+A fresh clone made with umask 002 has a group-writable `config/credentials/`;
+run the first command once.
 
 In CI, store the key as a secret and expose it only to the job that needs it
 (`FORGE_MASTER_KEY: ${{ secrets.FORGE_MASTER_KEY_PRODUCTION }}`). Tests and
@@ -183,6 +199,10 @@ instant. A safe sequence without downtime:
 3. When no deployment or branch uses the old file, drop the old key: set
    `FORGE_MASTER_KEY` to the new key alone and delete the second line of
    `production.key`.
+
+A key list holds at most 8 keys. With a full list, `--keep-old` is refused
+before anything is printed or written; drop old keys first. Without
+`--keep-old` a full list rotates normally.
 
 Without `--keep-old` the old key is discarded at once, which is right after a
 leak once the new file is deployed. Rotating the master key does not change
@@ -224,6 +244,8 @@ fields).
   key material and the decrypted document on drop, but copies made by the
   application (`String`s from `string`, exposed `SecretString`s, `ring`'s
   internal key schedules) are not wiped; core dumps and swap can contain them.
+  The same holds for `forge credentials edit`, whose memory holds the
+  plaintext while the editor runs.
 - Whoever can run the application with the key can read every credential.
 - An older but valid `production.json.enc` (for example from git history)
   decrypts under the same key. Rotate the key if you must invalidate it.

@@ -6,8 +6,9 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use forge_credentials::{
-    CredentialsError, DEFAULT_DIR, KeySource, file_name, indent, init, key_file_name, load_keys,
-    new_key, read_file, redact, seal, unseal, validate_environment, write_file, write_key_file,
+    CredentialsError, DEFAULT_DIR, KeySource, MAX_KEYS, file_name, indent, init, key_file_name,
+    key_id, load_keys, new_key, read_file, redact, seal, unseal, validate_environment, write_file,
+    write_key_file,
 };
 use forge_encryption::{Key, encode_key, generate_key};
 use zeroize::Zeroizing;
@@ -228,11 +229,29 @@ impl Context<'_> {
                  pass --print-key (to store the new key in your secret manager) or --write-key-file",
             ));
         }
+        // The key lists are checked before anything is printed or written:
+        // a list longer than MAX_KEYS could be neither stored nor parsed.
+        if keep_old && keys.len() + 1 > MAX_KEYS {
+            return Err(fail(format!(
+                "--keep-old would keep {} keys, and a key list holds at most {MAX_KEYS}: \
+                 drop old keys from the list first, or rotate without --keep-old; \
+                 nothing was changed",
+                keys.len() + 1
+            )));
+        }
         let fresh = generate_key()
             .map_err(fail)
             .and_then(|key| new_key(key).map_err(fail))?;
+        // During the swap the key file holds the new key and the keys that
+        // must stay readable: every old key with --keep-old, otherwise only
+        // the key that opens the file on disk, so a full list still rotates.
+        let file_key = key_id(&file).map_err(fail)?;
         let mut with_old = vec![fresh.clone()];
-        with_old.extend(keys.iter().cloned());
+        with_old.extend(
+            keys.iter()
+                .filter(|key| keep_old || key.id() == file_key)
+                .cloned(),
+        );
         let last = if keep_old {
             with_old.clone()
         } else {
@@ -262,9 +281,10 @@ impl Context<'_> {
             writeln!(self.stdout, "{}", list.as_str()).map_err(output)?;
         }
         // Crash safety: the key file first gains the new key while still
-        // holding the old ones, then the encrypted file changes, and only then
-        // are the old keys dropped. At every instant the file on disk is
-        // readable with the key file on disk.
+        // holding the key of the file on disk (all old keys with --keep-old),
+        // then the encrypted file changes, and only then are the old keys
+        // dropped. At every instant the file on disk is readable with the key
+        // file on disk.
         if to_file {
             write_key_file(&dir, environment, &with_old, true).map_err(fail)?;
         }

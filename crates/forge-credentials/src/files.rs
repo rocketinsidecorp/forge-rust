@@ -54,8 +54,9 @@ impl fmt::Display for KeySource {
 /// Reads the keys of `environment`: `FORGE_MASTER_KEY` when it is set and
 /// not blank (read through `lookup`), otherwise `<dir>/<environment>.key`.
 /// The first key is active; the others only decrypt. Key files that group or
-/// others can access, symbolic links and non-regular files are refused. With
-/// neither source the error is [`CredentialsError::KeyMissing`].
+/// others can access, key files in a directory that group or others can
+/// write, symbolic links and non-regular files (a FIFO, a device) are
+/// refused. With neither source the error is [`CredentialsError::KeyMissing`].
 pub fn load_keys(
     dir: &Path,
     environment: &str,
@@ -68,6 +69,13 @@ pub fn load_keys(
         let keys = parse_keys(&value).map_err(|error| prefixed(ENV_MASTER_KEY, error))?;
         return Ok((keys, KeySource::Environment));
     }
+    match fs::metadata(dir) {
+        Ok(metadata) => check_private_dir(dir, &metadata)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(CredentialsError::KeyMissing);
+        }
+        Err(error) => return Err(CredentialsError::io("inspect directory", dir, error)),
+    }
     let path = dir.join(key_file_name(environment));
     let mut file = match open_no_follow(&path) {
         Ok(file) => file,
@@ -76,15 +84,12 @@ pub fn load_keys(
         }
         Err(error) => return Err(CredentialsError::io("open key file", path, error)),
     };
-    let metadata = file
-        .metadata()
-        .map_err(|error| CredentialsError::io("inspect key file", &path, error))?;
-    if !metadata.is_file() {
+    let Some(metadata) = regular_file(&file, &path)? else {
         return Err(CredentialsError::InvalidKey(format!(
             "credentials: {} is not a regular file",
             path.display()
         )));
-    }
+    };
     check_private(&path, &metadata)?;
     let data = read_bounded(&mut file, MAX_KEY_FILE)
         .map_err(|error| CredentialsError::io("read key file", &path, error))?;
@@ -127,8 +132,43 @@ fn check_private(_path: &Path, _metadata: &fs::Metadata) -> Result<(), Credentia
     Ok(())
 }
 
+/// Refuses a credentials directory that group or others can write: they
+/// could replace the key file (and the encrypted file with one sealed under
+/// their key) even though the key file itself is 0600.
+#[cfg(unix)]
+fn check_private_dir(dir: &Path, metadata: &fs::Metadata) -> Result<(), CredentialsError> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let mode = metadata.permissions().mode() & 0o777;
+    if mode & 0o022 != 0 {
+        return Err(CredentialsError::DirectoryPermissions {
+            path: dir.to_path_buf(),
+            mode,
+        });
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn check_private_dir(_dir: &Path, _metadata: &fs::Metadata) -> Result<(), CredentialsError> {
+    Ok(())
+}
+
+/// The metadata of an opened file; `None` when it is not a regular file (a
+/// FIFO, a device or a directory), which is refused before any read.
+fn regular_file(file: &File, path: &Path) -> Result<Option<fs::Metadata>, CredentialsError> {
+    let metadata = file
+        .metadata()
+        .map_err(|error| CredentialsError::io("inspect", path, error))?;
+    Ok(metadata.is_file().then_some(metadata))
+}
+
 /// Opens `path` for reading without following a final symbolic link, so a
-/// link planted in the credentials directory cannot point elsewhere.
+/// link planted in the credentials directory cannot point elsewhere, and
+/// without blocking: opening a FIFO for reading waits for a writer unless
+/// `O_NONBLOCK` is set, which would hang the command before the
+/// regular-file check could refuse it. Reads of a regular file ignore the
+/// flag.
 fn open_no_follow(path: &Path) -> io::Result<File> {
     let mut options = OpenOptions::new();
     options.read(true);
@@ -136,8 +176,9 @@ fn open_no_follow(path: &Path) -> io::Result<File> {
     {
         use std::os::unix::fs::OpenOptionsExt as _;
 
-        let flags = i32::try_from(rustix::fs::OFlags::NOFOLLOW.bits())
-            .map_err(|_| io::Error::other("O_NOFOLLOW does not fit an open flag"))?;
+        let flags = rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK;
+        let flags = i32::try_from(flags.bits())
+            .map_err(|_| io::Error::other("O_NOFOLLOW | O_NONBLOCK does not fit an open flag"))?;
         options.custom_flags(flags);
     }
     let opened = options.open(path);
@@ -179,6 +220,10 @@ pub fn read_file(dir: &Path, environment: &str) -> Result<Vec<u8>, CredentialsEr
         }
         Err(error) => return Err(CredentialsError::io("open", path, error)),
     };
+    if regular_file(&file, &path)?.is_none() {
+        let error = io::Error::new(io::ErrorKind::InvalidInput, "not a regular file");
+        return Err(CredentialsError::io("open", path, error));
+    }
     let data = read_bounded(&mut file, MAX_FILE_BYTES)
         .map_err(|error| CredentialsError::io("read", &path, error))?;
     match data {
@@ -203,8 +248,10 @@ pub fn write_file(
 }
 
 /// Stores `keys` (active first) as `<dir>/<environment>.key` with mode 0600,
-/// one per line. Without `replace` it fails if the file exists, so a key is
-/// never overwritten by accident.
+/// one per line. `dir` is created with mode 0700 when missing; an existing
+/// directory that group or others can write is refused
+/// ([`CredentialsError::DirectoryPermissions`]). Without `replace` it fails
+/// if the file exists, so a key is never overwritten by accident.
 pub fn write_key_file(
     dir: &Path,
     environment: &str,
@@ -222,6 +269,10 @@ pub fn write_key_file(
         text.push_str(&encode_key(key.material()));
         text.push('\n');
     }
+    create_private_dir(dir)?;
+    let metadata =
+        fs::metadata(dir).map_err(|error| CredentialsError::io("inspect directory", dir, error))?;
+    check_private_dir(dir, &metadata)?;
     write_atomic(dir, &key_file_name(environment), text.as_bytes(), replace)
 }
 

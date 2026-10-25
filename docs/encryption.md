@@ -31,7 +31,10 @@ let cipher = std::sync::Arc::new(forge::encryption::Cipher::new(
 Without credentials, build a ring yourself (`generate_key`, `Key::new`,
 `KeyRing::new`, `KeyRing::parse`). Keys are 32 bytes; their identifiers are 1-32
 letters, digits, `_` or `-` and are stored in every ciphertext. Use names you
-can read in a year: `2026-10`, not `1`.
+can read in a year: `2026-10`, not `1`. Identifiers in one ring must differ in
+more than letter case: a ring with `K1` and `k1` is refused, because MySQL and
+MariaDB compare text ignoring case by default and could not tell their values
+apart.
 
 ## Encrypting a column
 
@@ -179,7 +182,12 @@ deterministic encryption mode.
    A role that bypasses row-level security (a superuser, a `BYPASSRLS` role,
    or the owner of a table without `FORCE`) may rotate the whole table
    unscoped. A tenant scope only narrows what the policies narrow: on a table
-   without row-level security it visits every row.
+   without row-level security it visits every row. The scope sets
+   `forge.tenant_id` and nothing else, and a scoped run skips the catalog
+   check: on a table whose policies read another setting (your own
+   `app.tenant`, say) it sees no row and reports `scanned == 0` as a success.
+   Rotate such a table as a role that bypasses its row-level security; the
+   completion count below catches the mistake.
 
    MySQL, MariaDB and SQLite have no row-level security. Their tenant
    isolation is the application's `TenantContext` predicates, which a rotation
@@ -210,6 +218,11 @@ deterministic encryption mode.
    count must be `0`. The rotation refuses views: point it at the table that
    stores the column. Compare a prefix rather than `NOT LIKE
    'fg1.2026_10.%'`: `_` is a `LIKE` wildcard and key ids may contain it.
+   MySQL and MariaDB compare with the column's collation, which ignores case
+   by default; the count is still exact because a key ring refuses identifiers
+   that differ only in letter case, so no other key's values share the
+   prefix. (`BINARY` or `COLLATE utf8mb4_bin` on the comparison makes it
+   byte-exact regardless.)
 
    A report never proves completion: `scanned == 0`, `rotated == 0` and
    `conflicts == 0` are exactly what a role that cannot see the rows reports.
@@ -231,6 +244,11 @@ Rotate before about 2^32 values have been encrypted under one key (random
   Use a version column and optimistic locking if that matters.
 - Whoever has both the database and the key reads everything. Keep the key out
   of the database host and its backups.
+- Decrypted values and the bytes `seal` encrypts are wiped when dropped,
+  including the buffers `Json<T>` outgrows while encoding. Not wiped: the
+  value you get back from `open` (a plain `String`, `Vec<u8>` or `T`), copies
+  your code makes, and the scratch buffer `serde_json` uses while decoding
+  `Json<T>` strings with escapes.
 - MFA seeds (`forge_auth::mfa`, [mfa](mfa.md)) keep their own single-key format
   under `FORGE_AUTH_MFA_KEY`, built on the same `ring` AES-256-GCM.
 
@@ -244,7 +262,6 @@ Rotate before about 2^32 values have been encrypted under one key (random
 - `reencrypt` takes a `forge_core::Cancellation` and returns the report inside
   the error (`ReencryptError::report`) instead of a context and a report beside
   the error.
-- The PostgreSQL rewriter has a tenant scope (`EncryptedColumn::tenant`) and
-  refuses an unscoped run on a table whose row-level security applies to the
-  connected role. Forge-Go's SQL rewriter has neither yet and adopts both, with
-  the same completion count, in a follow-up.
+- The PostgreSQL rewriter's tenant scope is `EncryptedColumn::tenant` here and
+  `postgres.WithTenant` there; both refuse an unscoped run on a table whose
+  row-level security applies to the connected role.

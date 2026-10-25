@@ -491,6 +491,78 @@ fn rotate_key_keep_old_reads_old_data_then_rewrites_it() {
     assert_eq!(app.plaintext(), content);
 }
 
+/// A key list already at `MAX_KEYS`, the key that sealed the file last.
+fn full_key_list(app: &App) -> Vec<forge_encryption::Key> {
+    let (current, _) = load_keys(&app.dir(), "development", &|_| None).expect("keys");
+    let mut keys: Vec<_> = (1..forge_credentials::MAX_KEYS)
+        .map(|_| {
+            forge_credentials::new_key(forge_encryption::generate_key().expect("random"))
+                .expect("key")
+        })
+        .collect();
+    keys.extend(current);
+    assert_eq!(keys.len(), forge_credentials::MAX_KEYS);
+    keys
+}
+
+#[test]
+fn rotate_key_with_a_full_key_list_rotates_and_keep_old_fails_cleanly() {
+    let mut app = initialized();
+    let content = app.plaintext();
+    let keys = full_key_list(&app);
+    forge_credentials::write_key_file(&app.dir(), "development", &keys, true).expect("full list");
+    let key_file = app.dir().join("development.key");
+    let (key_before, file_before) = (fs::read_to_string(&key_file).expect("key"), app.file());
+
+    // --keep-old would need MAX_KEYS + 1 keys: refused before any output or
+    // write, with or without --print-key.
+    for print_key in [false, true] {
+        let error = app
+            .run(rotate(true, print_key, false))
+            .expect_err("too many keys");
+        assert!(
+            error.to_string().contains("would keep 9 keys")
+                && error.to_string().contains("at most 8")
+                && error.to_string().contains("nothing was changed"),
+            "{error}"
+        );
+        assert!(app.stdout.is_empty(), "nothing printed");
+        assert_eq!(fs::read_to_string(&key_file).expect("key"), key_before);
+        assert_eq!(app.file(), file_before);
+    }
+
+    // Without --keep-old the full list rotates to the new key alone.
+    app.run(rotate(false, true, false)).expect("rotate");
+    let printed = parse_keys(app.stdout.trim()).expect("printed key list");
+    assert_eq!(printed.len(), 1);
+    let (stored, _) = load_keys(&app.dir(), "development", &|_| None).expect("keys");
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].id(), printed[0].id());
+    assert_eq!(app.plaintext(), content);
+    assert!(unseal("development", &app.file(), &keys).is_err());
+}
+
+#[test]
+fn rotate_key_keep_old_with_a_full_environment_list_prints_nothing() {
+    let mut app = initialized();
+    let keys = full_key_list(&app);
+    let list = keys
+        .iter()
+        .map(|key| forge_encryption::encode_key(key.material()).to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    fs::remove_file(app.dir().join("development.key")).expect("remove");
+    app.env.insert("FORGE_MASTER_KEY".to_owned(), list);
+    let before = app.file();
+    let error = app
+        .run(rotate(true, true, false))
+        .expect_err("too many keys");
+    assert!(error.to_string().contains("at most 8"), "{error}");
+    assert!(app.stdout.is_empty(), "nothing printed");
+    assert!(!app.dir().join("development.key").exists());
+    assert_eq!(app.file(), before);
+}
+
 #[test]
 fn rotate_key_from_the_environment_needs_a_destination_for_the_new_key() {
     let mut app = initialized();

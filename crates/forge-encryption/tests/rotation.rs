@@ -450,6 +450,118 @@ mod postgres_row_level_security {
         EncryptedColumn::new(database.clone(), spec).unwrap()
     }
 
+    /// Runs `statement` as the superuser.
+    async fn admin(db: &RlsTestDatabase, statement: String) {
+        sqlx::query(AssertSqlSafe(statement))
+            .execute(db.admin().pool())
+            .await
+            .expect("statement");
+    }
+
+    /// An unscoped rotation of `people` to `cipher`'s active key as
+    /// `database`.
+    async fn unscoped(
+        cipher: &Cipher,
+        database: &PgDatabase,
+    ) -> Result<forge_encryption::Report, forge_encryption::ReencryptError> {
+        cipher
+            .reencrypt(
+                &column(database),
+                RotateOptions::default(),
+                &Cancellation::new(),
+            )
+            .await
+    }
+
+    /// The roles row-level security does not bind (a superuser, a
+    /// `BYPASSRLS` role, the owner of a table without `FORCE`) rotate a
+    /// tenant table unscoped and see every row; the same roles without the
+    /// exemption are refused again.
+    #[tokio::test]
+    #[ignore = "needs FORGE_TEST_DATABASE_URL"]
+    async fn exempt_roles_rotate_tenant_tables_unscoped() {
+        let db = RlsTestDatabase::create(&[]).await.expect("database");
+        let runtime_role = db.runtime_role().to_owned();
+        for statement in [
+            "CREATE TABLE people (id uuid PRIMARY KEY, tenant_id uuid NOT NULL, \
+             ssn text, ssn_idx text)"
+                .to_owned(),
+            "ALTER TABLE people ENABLE ROW LEVEL SECURITY".to_owned(),
+            "ALTER TABLE people FORCE ROW LEVEL SECURITY".to_owned(),
+            "CREATE POLICY people_tenant_isolation ON people \
+             USING (tenant_id = NULLIF(current_setting('forge.tenant_id', true), '')::uuid)"
+                .to_owned(),
+            format!("GRANT SELECT, UPDATE ON people TO \"{runtime_role}\""),
+        ] {
+            sqlx::query(AssertSqlSafe(statement))
+                .execute(db.migrator().pool())
+                .await
+                .expect("schema");
+        }
+        let (first, second, third, fourth) = (key("k1"), key("k2"), key("k3"), key("k4"));
+        let old = Cipher::new(&KeyRing::new(first.clone(), []).unwrap()).unwrap();
+        for tenant in [TenantId::new(), TenantId::new()] {
+            for n in 0..ROWS_PER_TENANT {
+                let id = Uuid::now_v7();
+                let sealed = old
+                    .attribute(TABLE, COLUMN)
+                    .seal(&id.to_string(), &format!("ssn-{n}"))
+                    .unwrap();
+                sqlx::query("INSERT INTO people (id, tenant_id, ssn) VALUES ($1, $2, $3)")
+                    .bind(id)
+                    .bind(tenant.into_uuid())
+                    .bind(sealed)
+                    .execute(db.admin().pool())
+                    .await
+                    .expect("seed");
+            }
+        }
+        let all_rows = u64::from(2 * ROWS_PER_TENANT);
+        let previous = [first.clone(), second.clone(), third.clone(), fourth.clone()];
+        let ring = |active: &Key| {
+            let others = previous
+                .iter()
+                .filter(|key| key.id() != active.id())
+                .cloned();
+            Cipher::new(&KeyRing::new(active.clone(), others).unwrap()).unwrap()
+        };
+
+        // A superuser.
+        let to_second = ring(&second);
+        let report = unscoped(&to_second, db.admin()).await.expect("superuser");
+        assert_eq!((report.scanned, report.rotated), (all_rows, all_rows));
+        assert_eq!(stale(db.admin(), None, "k2").await, 0);
+
+        // A BYPASSRLS role; refused again once the attribute is gone.
+        let to_third = ring(&third);
+        assert!(unscoped(&to_third, db.runtime()).await.is_err());
+        admin(&db, format!("ALTER ROLE \"{runtime_role}\" BYPASSRLS")).await;
+        let report = unscoped(&to_third, db.runtime()).await.expect("BYPASSRLS");
+        assert_eq!((report.scanned, report.rotated), (all_rows, all_rows));
+        assert_eq!(stale(db.admin(), None, "k3").await, 0);
+        admin(&db, format!("ALTER ROLE \"{runtime_role}\" NOBYPASSRLS")).await;
+        let error = unscoped(&to_third, db.runtime())
+            .await
+            .expect_err("NOBYPASSRLS again");
+        assert!(error.to_string().contains("row-level security"), "{error}");
+
+        // The owner of a table without FORCE; other roles stay bound.
+        let to_fourth = ring(&fourth);
+        assert!(unscoped(&to_fourth, db.migrator()).await.is_err());
+        sqlx::query("ALTER TABLE people NO FORCE ROW LEVEL SECURITY")
+            .execute(db.migrator().pool())
+            .await
+            .expect("no force");
+        let error = unscoped(&to_fourth, db.runtime())
+            .await
+            .expect_err("ENABLE still binds a non-owner");
+        assert_eq!(error.report, Default::default());
+        let report = unscoped(&to_fourth, db.migrator()).await.expect("owner");
+        assert_eq!((report.scanned, report.rotated), (all_rows, all_rows));
+        assert_eq!(stale(db.admin(), None, "k4").await, 0);
+        db.cleanup().await.expect("cleanup");
+    }
+
     #[tokio::test]
     #[ignore = "needs FORGE_TEST_DATABASE_URL"]
     async fn tenant_tables_rotate_per_tenant_and_refuse_unscoped_runs() {

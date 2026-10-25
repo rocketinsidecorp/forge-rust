@@ -275,6 +275,82 @@ fn exposed_or_linked_key_files_are_refused() {
     assert!(load_keys(&dir, "production", &no_env).is_err());
 }
 
+#[cfg(unix)]
+#[test]
+fn writable_credentials_directories_are_refused() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("credentials");
+    init(&dir, "production").unwrap();
+    // Group or others could replace the 0600 key file in such a directory.
+    for writable in [0o770, 0o775, 0o707, 0o777, 0o1777] {
+        fs::set_permissions(&dir, fs::Permissions::from_mode(writable)).unwrap();
+        let error = load_keys(&dir, "production", &no_env).unwrap_err();
+        assert!(
+            matches!(&error, CredentialsError::DirectoryPermissions { mode, .. }
+                if *mode == writable & 0o777),
+            "{error}"
+        );
+        assert!(error.to_string().contains("chmod 700"), "{error}");
+        let key = new_key(generate_key().unwrap()).unwrap();
+        let error = write_key_file(&dir, "staging", &[key], false).unwrap_err();
+        assert!(
+            matches!(error, CredentialsError::DirectoryPermissions { .. }),
+            "{error}"
+        );
+        assert!(!dir.join("staging.key").exists());
+    }
+    // Readable by others is not writable: a checkout made with umask 022.
+    for private in [0o755, 0o750, 0o700, 0o500] {
+        fs::set_permissions(&dir, fs::Permissions::from_mode(private)).unwrap();
+        assert!(
+            load_keys(&dir, "production", &no_env).is_ok(),
+            "{private:o}"
+        );
+    }
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+/// A FIFO at a credentials path would block `open` until a writer appears;
+/// it must be refused at once. The calls run on a thread so that a
+/// regression fails this test instead of hanging the suite.
+#[cfg(unix)]
+#[test]
+fn fifos_at_credentials_paths_are_refused_without_blocking() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("credentials");
+    init(&dir, "production").unwrap();
+    for name in ["production.key", "production.json.enc"] {
+        let path = dir.join(name);
+        fs::remove_file(&path).unwrap();
+        let status = std::process::Command::new("mkfifo")
+            .arg("-m")
+            .arg("600")
+            .arg(&path)
+            .status()
+            .expect("mkfifo");
+        assert!(status.success());
+    }
+    let (sender, receiver) = mpsc::channel();
+    let target = dir.clone();
+    std::thread::spawn(move || {
+        let keys = load_keys(&target, "production", &no_env).map(|_| ());
+        let file = read_file(&target, "production").map(|_| ());
+        let _ = sender.send((keys, file));
+    });
+    let (keys, file) = receiver
+        .recv_timeout(Duration::from_secs(10))
+        .expect("opening a FIFO blocked");
+    let keys = keys.unwrap_err().to_string();
+    assert!(keys.contains("is not a regular file"), "{keys}");
+    let file = file.unwrap_err().to_string();
+    assert!(file.contains("not a regular file"), "{file}");
+}
+
 #[test]
 fn the_environment_variable_wins_over_the_key_file() {
     let root = tempfile::tempdir().unwrap();
