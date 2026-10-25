@@ -1410,10 +1410,57 @@ async fn a_handler_panic_is_a_500_with_the_request_id_and_is_logged() {
         .lines()
         .find(|line| line.contains("request handler panicked"))
         .unwrap_or_else(|| panic!("panic not logged: {logged}"));
-    // Logged with the request id, the message kept server-side.
+    // Logged with the request id, where it panicked and the payload type;
+    // the message, which may quote request data, is not logged at info.
     assert!(line.contains(&request_id), "{line}");
-    assert!(line.contains("secret-detail 4242"), "{line}");
     assert!(line.contains("ERROR"), "{line}");
+    assert!(
+        line.contains(r#"location="crates/forge-http/src/tests.rs:"#),
+        "{line}"
+    );
+    assert!(line.contains("payload=\"&str\""), "{line}");
+    assert!(!logged.contains("secret-detail"), "{logged}");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn the_panic_message_is_logged_only_at_debug() {
+    let log = CapturedLog::default();
+    let writer = log.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::DEBUG)
+        .with_writer(move || writer.clone())
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+    let server = TestServer::start(test_config(Duration::from_secs(10)), panicking_router()).await;
+
+    let response = exchange(
+        server.addr,
+        "GET /panic HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(response.starts_with("HTTP/1.1 500 "), "{response}");
+    assert!(!response.contains("secret-detail"), "{response}");
+    server.stop().await;
+
+    let logged = log.text();
+    let line = logged
+        .lines()
+        .find(|line| line.contains("request handler panic message"))
+        .unwrap_or_else(|| panic!("message not logged at debug: {logged}"));
+    assert!(line.contains("DEBUG"), "{line}");
+    assert!(line.contains("secret-detail 4242"), "{line}");
+}
+
+#[test]
+fn panic_payload_types_are_named_without_their_text() {
+    let literal: Box<dyn std::any::Any + Send> = Box::new("text");
+    let formatted: Box<dyn std::any::Any + Send> = Box::new(String::from("text"));
+    let other: Box<dyn std::any::Any + Send> = Box::new(7_u8);
+    assert_eq!(panics::payload_type(literal.as_ref()), "&str");
+    assert_eq!(panics::payload_type(formatted.as_ref()), "String");
+    assert_eq!(panics::payload_type(other.as_ref()), "other");
+    assert_eq!(panic_message(other.as_ref()), "non-string panic payload");
 }
 
 /// A server with a 64-byte body limit and a `budget`-byte in-flight body

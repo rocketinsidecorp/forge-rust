@@ -33,7 +33,7 @@ use tokio::{
     task::{JoinError, JoinSet},
 };
 use tokio_util::sync::CancellationToken;
-use tracing::{Instrument, Span, error, info_span, warn};
+use tracing::{Instrument, Span, debug, error, info_span, warn};
 use uuid::Uuid;
 
 use crate::body::{OutgoingBody, ResponseBody};
@@ -51,6 +51,7 @@ mod json;
 #[cfg(test)]
 mod media_type_tests;
 mod openapi;
+mod panics;
 mod query;
 #[cfg(test)]
 mod query_tests;
@@ -844,9 +845,14 @@ impl Server {
     ///
     /// Every request's [`Request::client_ip`] is resolved with
     /// [`ServerConfig::trusted_proxies`] before the first [`Middleware`]
-    /// runs.
+    /// runs. The first server installs, once per process, a panic hook that
+    /// keeps the message of a panic raised while handling a request off
+    /// stderr (the server logs its location at `error`, its message only at
+    /// `debug`) and passes every other panic to the hook it replaced.
     #[must_use]
     pub fn new(config: ServerConfig, router: Router) -> Self {
+        // Request panics are logged without their message (see `panics`).
+        panics::install();
         Self {
             app: Arc::new(ServedApp {
                 trusted_proxies: TrustedProxies::new(config.trusted_proxies.iter().copied()),
@@ -1171,17 +1177,25 @@ async fn handle_request(
             response
         };
         let exchange = tokio::time::timeout(request_timeout, exchange);
-        let response = match io::CatchUnwind::new(exchange).await {
+        let (outcome, site) = panics::scoped(io::CatchUnwind::new(exchange)).await;
+        let response = match outcome {
             Ok(Ok(response)) => response,
             Ok(Err(_elapsed)) => Response::new(StatusCode::GATEWAY_TIMEOUT, "request timed out"),
             Err(panic) => {
                 // Like Forge-Go's recoverer: logged here, in the request's
                 // span, and answered with a generic 500 that carries the
-                // request id; the panic message never reaches the client.
+                // request id. The message can quote request data, so it is
+                // logged only at debug and never reaches the client.
                 error!(
                     %request_id,
-                    panic = panic_message(panic.as_ref()),
+                    location = site.as_deref().unwrap_or("unknown"),
+                    payload = panics::payload_type(panic.as_ref()),
                     "request handler panicked"
+                );
+                debug!(
+                    %request_id,
+                    panic = panic_message(panic.as_ref()),
+                    "request handler panic message"
                 );
                 Response::text(StatusCode::INTERNAL_SERVER_ERROR, "internal server error")
             }

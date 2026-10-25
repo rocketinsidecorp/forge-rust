@@ -153,9 +153,11 @@ collects them. The HTTP layer also enforces a header-read timeout and adds
 `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, a UUIDv7
 `x-request-id` and, unless `FORGE_HTTP_TRANSPORT=plain`,
 `Strict-Transport-Security` to responses. A handler that panics gets a `500` with the body
-`internal server error` and its `x-request-id`; the panic message is logged
-(`request handler panicked`, with the request id) and never sent to the
-client, and the connection stays usable. `HEAD` is answered by the `GET`
+`internal server error` and its `x-request-id`; the log line
+(`request handler panicked`, at `error`) carries the request id, the source
+location and the payload type, and the message, which can quote request
+data, is logged only at `debug` (`FORGE_LOG=forge_http=debug`), never sent
+to the client and withheld from stderr. The connection stays usable. `HEAD` is answered by the `GET`
 route of the path without the body. Transient `accept` errors, such as
 running out of file descriptors, do not stop the server.
 
