@@ -200,9 +200,90 @@ does not match either form.
   always installs it, where the former `command -v tool || cargo install`
   kept whatever rust-cache restored. The release job installs without a
   cache.
+- Only allowlisted actions run (`ALLOWED_ACTIONS` in
+  `crates/forge/tests/gate/rules.rs`, compared without case):
+  `actions/checkout`, `actions/cache`, `actions/upload-artifact`,
+  `Swatinem/rust-cache`, `EmbarkStudios/cargo-deny-action`,
+  `docker/setup-buildx-action`, `docker/login-action`,
+  `docker/build-push-action`, `ossf/scorecard-action` and
+  `sigstore/cosign-installer`, plus local `./` actions. A SHA pin is not
+  enough: an installer action (`taiki-e/install-action`,
+  `baptiste0928/cargo-install`, ...) is refused however it is pinned, and
+  `docker://` actions are refused. To add an action, review its code (and
+  what it downloads), pin it by SHA with its version comment, and add it to
+  `ALLOWED_ACTIONS` and to the pin table below in the same reviewed change;
+  the gate also fails when an allowlisted action is no longer used. A
+  sub-path cannot leave the repository (no empty, `.` or `..` segment).
+- The generated application's workflows are gated as `forge new` writes
+  them, not as the template reads: `crates/forge-cli/src/generate/supply_chain.rs`
+  generates an application for every option (each `-d` backend and none,
+  with and without Docker, full-stack and `--api`, two names) and runs every
+  rule below on every file under its `.github/`. A `%%if%%` branch cannot hide
+  a step: a line that is `run: |` text in one render and a step in another is
+  read as both. The framework test also reads the template with its
+  `%%...%%` markers blanked line-aligned, all branches at once; that merged
+  reading is an extra check, not the guarantee, since no render produces it.
+- Gated files are written in a simple YAML subset. The gate reads the
+  workflows, local actions and rendered generated-app files line by line, and
+  refuses whatever such a reader could misread rather than guess:
+  - a carriage return not followed by a line feed, U+0085, U+2028 or U+2029,
+    and a byte-order mark anywhere but at the start;
+  - a YAML directive (`%YAML`), content after a document marker (`---`,
+    `...`), and a document root that does not start at column 0;
+  - outside block scalars (`run: |`), an anchor (`&`), alias (`*`), tag (`!`,
+    `!!`), explicit key (`?`) or merge key (`<<`) where any key or value
+    starts (`${{ !cancelled() }}`, quoted strings and `run: |` text stay
+    allowed);
+  - a plain scalar continued on a deeper line: write a multi-line expression
+    as a `>-` block scalar;
+  - a flow collection (`[...]`, `{...}`) or quoted scalar that does not close
+    on its line, a flow indicator or a `:` without a blank inside a flow
+    collection's plain scalar, a quoted key whose `:` is not followed by a
+    blank;
+  - a backslash in any double-quoted scalar, key or value: an escape spells
+    text the rules would not read (`"u\x73es"` is `uses`, `"c\x61rgo
+    install"` is `cargo install`, `"CARGO_\x48OME"` is `CARGO_HOME`). Plain
+    and single-quoted scalars and block text have no escapes, so the text
+    the rules read is the text YAML yields.
+  A `#` inside a quoted scalar is text, not a comment.
+- Every gated file is also parsed with a YAML parser (`yaml-rust2`, a
+  test-only dependency, docs/dependency-policy.md): the parser and the line
+  reader must find the same `uses` keys, the same values on the same lines
+  (block-scalar text is not read for keys, so a decoy there cannot stand in
+  for a key the reader misses), and the checkout (`with:
+  persist-credentials: false` in the step itself) and `permissions` rules
+  read the parsed tree, not the text. No mapping repeats a key, compared
+  without case (`persist-credentials` and `Persist-Credentials`, a second
+  `uses`): readers that keep the first and the last value would disagree.
+- Closed allowlists decide what a gated file may set, write, select and
+  pass (see Threat model and residual risk below). As a second, independent
+  check, no gated file names a variable that redirects where cargo or rustup
+  fetch from or what they run (`CARGO_HOME`, `CARGO_REGISTRIES_*`,
+  `CARGO_REGISTRY_*`, `CARGO_SOURCE*`, `CARGO_INSTALL_ROOT`, `CARGO_NET_*`,
+  `CARGO_CONFIG*`, `CARGO_HTTP_*`, `RUSTC_WRAPPER`,
+  `RUSTC_WORKSPACE_WRAPPER`, `RUSTUP_DIST_SERVER`, `RUSTUP_DIST_ROOT`,
+  `RUSTUP_UPDATE_ROOT`, `XDG_CONFIG_HOME`, `ACTIONS_ALLOW_UNSECURE_COMMANDS`)
+  anywhere, in any case; `HOME` and `RUSTC` are refused where set; and
+  `$GITHUB_ENV`, `::set-env`, `::add-path`, the runner's command-file paths
+  and cargo configuration file names (`.cargo/config`, `cargo/config.toml`)
+  are refused anywhere.
+- The install rule reads `run` text as text: with and without YAML comments
+  removed, continued lines joined with and without a space, quotes and
+  backslashes ignored. It refuses ANSI-C quoting (`$'...'`), any command
+  whose program is a variable (`c=cargo; $c install`) or a path to cargo
+  when it installs, and every `.cargo/config` or `.cargo/config.toml` in the
+  repository, symbolic links included (cargo reads them from every parent
+  directory; one could redirect crate sources or alias `install`).
+- What text scanning cannot see: the shell inside `run` is not parsed (a
+  script the workflow runs, `eval` of computed text, a command or variable
+  name assembled at run time), and an allowlisted action or a reviewed
+  script can still fetch a tool. Those are covered by review of every script
+  and allowlisted action, not by the gate (see Threat model and residual
+  risk below).
 - Cargo tools are installed only through that action, plus one reviewed
-  exception: the `Install cargo-auditable` step of `release.yml`. Both use
-  one exact `--version` and `--locked`, from crates.io. The gate refuses any
+  exception: the `Install cargo-auditable` step of `release.yml`, which
+  installs exactly `cargo-auditable`. Both use one exact `--version` and
+  `--locked`, from crates.io. The gate refuses any
   other install in a workflow or action, however it is spelled (a path to
   cargo, `$CARGO`, options before `install`, `binstall`, `cargo-binstall`,
   `CARGO_ALIAS_*`, continued or folded lines), and any probe that would skip
@@ -234,7 +315,8 @@ does not match either form.
   `SECRETS.X`, `secrets:  inherit`, `join(secrets, ...)`, comments after a
   tab. An `image:` is a container only under `services:` or `container:`; an
   action input under `with:` is not.
-- The generated application's CI (`templates/app/github/workflows/ci.yml.tmpl`),
+- The generated application's CI (`templates/app/github/workflows/ci.yml.tmpl`,
+  gated as rendered for every option),
   `Dockerfile.tmpl` (and `examples/hello-forge/Dockerfile`) and
   `compose.yaml.tmpl` follow the same rules: actions pinned by SHA,
   checkouts without credentials, both base images by the digests of
@@ -281,6 +363,76 @@ Dockerfile. It does not update the digests inside workflow `run:` steps or
 scripts (Syft), `sbom: generator=` (BuildKit's scanner) or the CI service
 image; refresh those by hand, all copies at once (the test requires the Syft
 copies to agree).
+
+## Threat model and residual risk
+
+Engineering decisions D6 and D8 (2026-10-25). The supply-chain gate is
+defense in depth against unreviewed drift and casual injection in the
+workflows, local actions and generated-app files. It is not a shell sandbox:
+review of every change is the primary control. Since D8 the gate's core is a
+set of closed allowlists in `crates/forge/tests/gate/rules.rs`, so it
+converges instead of chasing new redirects; growing a list is a reviewed
+change to that file.
+
+- Variables (`ALLOWED_VARIABLES`): a gated file sets only listed names, in an
+  `env:` key at any level (workflow, job, step, container, service; plain,
+  quoted or flow) or in `run` text (`NAME=`, `NAME+=`, `NAME[i]=`, `export`,
+  `env`, `sudo`, `declare`, `typeset`, `readonly`, `local`, `read`,
+  `mapfile`, `getopts`, `let`, `printf -v`, `for`/`select`/`coproc NAME`,
+  `${NAME:=...}`, `{NAME}>`, arithmetic). `run` text is read in every
+  reading bash could give it (`shell_lines`): physical lines, lines joined
+  as bash joins a backslash-newline continuation, joined with a space, each
+  with and without comments, so a target split from its `=` by a
+  continuation is still read. Names a tool reads as flags or a
+  program (`CARGO_INCREMENTAL`, `CARGO_TERM_COLOR`, `RUST_BACKTRACE`,
+  `FORGE_TEST_FAKE_DOCKER`, ...) take one exact value. `HOME`, `PATH`,
+  `BASH_ENV`, `LD_PRELOAD`, `RUSTUP_*`, `RUSTFLAGS` and every other unlisted
+  name are refused as assignment targets; reading `$HOME` stays allowed. An
+  `env:` or `with:` that is a whole expression is refused, and `shell:` is
+  bash only.
+- Runner files (`RUNNER_FILE_LINES`): `$GITHUB_ENV`, `$GITHUB_PATH` and
+  `$GITHUB_OUTPUT` are written only on the listed lines (the fuzz matrix and
+  release image name outputs, the cargo-tool action's `bin/` on `PATH`),
+  each a complete logical line: a listed line continued from or into
+  another is refused, and so is every other line that names a runner file,
+  in any reading, a heredoc or a `$( )` included;
+  `::set-env`, `::add-path`, `ACTIONS_ALLOW_UNSECURE_COMMANDS` and the
+  runner's command-file paths are refused.
+- Expressions (`EXPRESSION_LINES`): `format`, `fromJSON`, `join` and `toJSON`
+  appear only on the listed line (the fuzz matrix).
+- Toolchains and flags (`ALLOWED_TOOLCHAINS`, empty; `ALLOWED_RUSTUP`):
+  no `cargo`/`rustc`/`rustdoc +toolchain`, no cargo `--config`, no `-Z`
+  flag, rustup only as `toolchain install` and `component add`, and no
+  `linker`, `link-arg`, `codegen-backend` or `runtool` anywhere.
+- Action inputs: allowlisted actions get exact versions (`go-version` X.Y.Z
+  or `go-version-file: go.mod`, golangci-lint `version` vX.Y.Z,
+  `cosign-release` and setup-buildx `version` vX.Y.Z when set), no
+  `check-latest`, `driver-opts` images by digest, and no `latest` anywhere.
+- Job containers and services (`CONTAINER_KEYS`,
+  `ALLOWED_CONTAINER_OPTIONS`): only `image`, `env` (under
+  `ALLOWED_VARIABLES`), numeric `ports` and `options`; no `volumes`,
+  `credentials`, `entrypoint` or `command`. `options:` is exactly one of the
+  listed database health checks, and `-e`, `--env`, `--env-file`, `-v`,
+  `--volume`, `--mount`, `--entrypoint`, `--privileged`, `--network` and
+  `--cap-add` are refused in it.
+- Tool configuration files (`tool_configuration_files`): none anywhere in
+  the repository (templates included) or in any generated application, for
+  every `forge new` option: `.cargo/config` and `.cargo/config.toml`, a
+  `rust-toolchain` or `rust-toolchain.toml` whose content is not exactly
+  one of `ALLOWED_TOOLCHAIN_FILES` (rustup reads quoted and inline-table
+  `path` spellings and legacy plain-text names, so content is listed, not
+  parsed; a toolchain bump updates the list), `go.work`, `go.work.sum`, `go.env`,
+  `go/env`, `.bashrc`, `.profile`, `.bash_profile`, `.envrc`.
+- The YAML-level rules still apply underneath: the simple subset (no
+  escapes, anchors, tags, hidden line breaks), the parser cross-check,
+  duplicate keys, template branches gated as rendered, and the denylist of
+  redirecting variables as a second, independent check.
+
+Accepted residual risk, left to review: names the shell builds at run time
+(`eval`, a `printf`-built or `$(...)`-built name), the content of the scripts
+the workflows call (`scripts/*.sh`), and what an allowlisted action does
+internally with its pinned inputs. Reviews of the gate judge it against this
+model: a bypass inside the lists' scope is a defect to fix in the gate.
 
 ## Residual risks
 

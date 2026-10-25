@@ -33,7 +33,8 @@ const RESERVED: &[&str] = &[
 
 /// The message for a URL that is not well formed. It never contains the URL.
 pub const MALFORMED: &str = "the database URL is malformed: percent-encode `/`, `?`, `#` and `@` \
-     in the user name and password";
+     in the user name and password, and give a `host=` parameter a plain host name or an \
+     absolute socket directory (no `@`, `/`, `?`, `#`, `\\` or spaces in a host name)";
 
 /// Where a server URL points, after the driver's query overrides.
 #[derive(Debug, Eq, PartialEq)]

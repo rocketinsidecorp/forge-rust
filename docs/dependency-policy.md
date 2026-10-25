@@ -670,6 +670,40 @@ needs security-owner review (see Admission review): the pins, the permission
 rules and the tag-only trigger are checked by `crates/forge/tests/supply_chain.rs`,
 and [supply chain](supply-chain.md) lists every pin and how it was verified.
 
+## Test-only dependencies
+
+### YAML parser of the supply-chain gate
+
+`crates/forge/tests/supply_chain.rs` reads the workflows, local actions and
+generated-app CI template line by line. A line reader alone could be fooled by
+YAML spellings it does not model (hidden line breaks, quoted `#`, flow nesting,
+document markers), so the gate also parses every gated file with a real YAML
+parser and requires both to read the same `uses` keys (line and value); the
+checkout and `permissions` rules read the parsed tree. The same rules
+(`crates/forge/tests/gate/rules.rs`) also gate the workflows `forge new`
+renders, for every option, in forge-cli's unit tests
+(`crates/forge-cli/src/generate/supply_chain.rs`). The parser is a
+**dev-dependency of the `forge` and `forge-cli` crates only** (the same exact
+pin): it is compiled for those tests and never linked into a library, binary
+or released artifact.
+
+| Crate | Version | Role | Review |
+| --- | --- | --- | --- |
+| `yaml-rust2` | `=0.13.0`, `default-features = false` | YAML 1.2 event parser (`parser::Parser`, `MarkedEventReceiver`, line markers) | Pure Rust, no `unsafe` in its sources, no build script, no proc macro; MIT OR Apache-2.0; ~68M downloads, maintained (0.13.0 released 2026-09-11, six weeks before admission). Without the default `encoding` feature it does not pull `encoding_rs`. |
+| `arraydeque` | `0.5.1` | transitive: the scanner's bounded token buffer | MIT/Apache-2.0; `unsafe` in its ring-buffer internals (a long-standing, widely used crate, 2023 release); no build script, no proc macro. |
+| `hashlink` | `0.12.2` | transitive: `LinkedHashMap` for the loader | MIT OR Apache-2.0; `unsafe` in its linked-list internals; no build script, no proc macro; its `serde` feature is off. Pulls `hashbrown 0.17` (default hasher `foldhash`), both already in the lockfile. A second `hashlink` version next to SQLx's `0.11`. |
+
+Why `yaml-rust2` rather than `saphyr-parser` (the same maintainers'
+successor, one transitive crate fewer): `saphyr-parser` published five
+releases in the two weeks before admission (0.1.0 to 0.2.2), the newest ten
+days old, while `yaml-rust2` is the long-standing, far more widely used parser
+whose current release is six weeks old; for a gate that must not change under
+us, the settled release wins over one fewer dependency. `cargo deny check`
+(advisories, bans, licenses, sources) passes with it; the `Cargo.lock` change
+is exactly these three packages plus the `foldhash` edge of `hashbrown 0.17`.
+Adding it to forge-cli's dev-dependencies added only the `yaml-rust2` edge of
+`forge-cli` to `Cargo.lock`, no new package.
+
 ## Exceptions and removal
 
 Exceptions are checked-in records containing scope, reason, risk, compensating
