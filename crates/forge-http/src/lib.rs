@@ -734,11 +734,12 @@ impl Router {
     /// route is registered; the handler sees the `HEAD` method, and the
     /// [`Server`] sends the headers without the body (here the body is
     /// left in place). A matched path without a handler for the request
-    /// method answers `405` with an `Allow` header listing the served methods
-    /// in sorted order (`HEAD` included wherever `GET` is). A captured segment containing an encoded slash (`%2F`)
-    /// answers `400`, because it would let a client smuggle a path separator
-    /// past routing; other malformed escapes are reported by
-    /// [`Request::path_param_as`] when the handler reads the parameter.
+    /// method answers `405` with an `Allow` header listing the served
+    /// methods in sorted order (`HEAD` included wherever `GET` is). A
+    /// captured segment containing an encoded slash (`%2F`) answers `400`,
+    /// because it would let a client smuggle a path separator past routing;
+    /// other malformed escapes are reported by [`Request::path_param_as`]
+    /// when the handler reads the parameter.
     pub async fn dispatch(&self, mut request: Request) -> Response {
         for layer in &self.layers {
             layer.rewrite(&mut request);
@@ -1325,16 +1326,18 @@ async fn collect_body(
 }
 
 /// The answer to a `HEAD` request: the headers of the response the route
-/// produced, without its body (RFC 9110 §9.3.2). A buffered body becomes its
-/// `Content-Length` (unless the handler set one, or the status has no
-/// content); a streamed body is dropped without being polled and its length,
-/// unknown, is left out.
+/// produced, without its body (RFC 9110 §9.3.2). A non-empty buffered body
+/// becomes its `Content-Length` (unless the handler set one, or the status
+/// has no content); an empty one adds none, since an explicit `HEAD` route
+/// answers with an empty body; a streamed body is dropped without being
+/// polled and its length, unknown, is left out.
 fn without_body(mut response: Response) -> Response {
     let body = std::mem::replace(&mut response.body, ResponseBody::Full(Bytes::new()));
     let may_have_length = !(response.status.is_informational()
         || response.status == StatusCode::NO_CONTENT
         || response.status == StatusCode::NOT_MODIFIED);
     if let ResponseBody::Full(bytes) = body
+        && !bytes.is_empty()
         && may_have_length
         && !response.headers.contains_key(header::CONTENT_LENGTH)
     {

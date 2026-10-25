@@ -1213,7 +1213,11 @@ async fn head_answers_with_the_get_headers_and_no_body() {
         .route(Method::GET, "/ticks", |_| async {
             counting(3, Duration::from_millis(1))
         })
-        .expect("stream route must register");
+        .expect("stream route must register")
+        .route(Method::HEAD, "/empty", |_| async {
+            Response::empty(StatusCode::OK)
+        })
+        .expect("HEAD route must register");
     let server = TestServer::start(test_config(Duration::from_secs(10)), router).await;
 
     let response = exchange(
@@ -1237,6 +1241,20 @@ async fn head_answers_with_the_get_headers_and_no_body() {
     let response = exchange(
         server.addr,
         "HEAD /ticks HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    let (head, body) = split_head(&response);
+    assert!(head.starts_with("HTTP/1.1 200 "), "{response}");
+    assert!(
+        !head.to_ascii_lowercase().contains("content-length"),
+        "{response}"
+    );
+    assert_eq!(body, "", "{response}");
+
+    // An empty body adds no length (hyper adds none for HEAD either).
+    let response = exchange(
+        server.addr,
+        "HEAD /empty HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
     )
     .await;
     let (head, body) = split_head(&response);
