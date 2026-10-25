@@ -128,6 +128,7 @@ from env files, Kubernetes manifests and unit files.
 | `FORGE_MAX_BODY_BYTES` | `1048576` | Maximum request body size in bytes. |
 | `FORGE_MAX_CONNECTIONS` | `10000` | Maximum concurrent connections. Extra connections wait for a slot (backpressure) instead of being served without bound. |
 | `FORGE_HTTP_TRUSTED_PROXIES` | empty | Comma-separated CIDRs or addresses of reverse proxies whose `X-Forwarded-For` is believed; empty trusts nobody. Empty or malformed entries, `/0`, IPv4 prefixes shorter than `/8`, IPv6 prefixes shorter than `/16`, IPv4-mapped prefixes and zoned addresses stop startup; the error names the entry's position, never its text. See [client addresses behind a proxy](#client-addresses-behind-a-proxy). |
+| `FORGE_HTTP_TRANSPORT` | `trusted-proxy` in production, `plain` otherwise | How clients reach the server, Forge-Go's key: `plain` HTTP, or `trusted-proxy` when forge-proxy or a load balancer terminates TLS in front of it. With `trusted-proxy` every response carries `Strict-Transport-Security: max-age=31536000; includeSubDomains` (a handler that sets its own value, for example with `preload`, keeps it). Production refuses `plain`. Forge-Go's `tls` is refused: Forge-Rust does not terminate TLS itself. |
 | `FORGE_LOG` | `info` | `tracing` filter directive, for example `info,shop=debug`. |
 | `FORGE_LOG_FORMAT` | `json` in production, `text` otherwise | `json` or `text`. |
 | `FORGE_DATABASE_URL` | none | Least-privilege PostgreSQL runtime connection URL. Treated as a secret and redacted from ordinary diagnostics. |
@@ -148,8 +149,9 @@ from env files, Kubernetes manifests and unit files.
 
 Logs go to standard output, and the platform (Docker, Kubernetes, journald)
 collects them. The HTTP layer also enforces a header-read timeout and adds
-`X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY` and a UUIDv7
-`x-request-id` to responses. A handler that panics gets a `500` with the body
+`X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, a UUIDv7
+`x-request-id` and, unless `FORGE_HTTP_TRANSPORT=plain`,
+`Strict-Transport-Security` to responses. A handler that panics gets a `500` with the body
 `internal server error` and its `x-request-id`; the panic message is logged
 (`request handler panicked`, with the request id) and never sent to the
 client, and the connection stays usable. `HEAD` is answered by the `GET`

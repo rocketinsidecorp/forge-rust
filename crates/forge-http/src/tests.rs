@@ -517,11 +517,80 @@ fn routes_lists_every_registration_with_its_call_site() {
 
 #[test]
 fn security_headers_are_applied_at_transport_boundary() {
-    let outgoing = to_hyper_response(Response::empty(StatusCode::NO_CONTENT), Uuid::now_v7());
+    let outgoing = to_hyper_response(
+        Response::empty(StatusCode::NO_CONTENT),
+        Uuid::now_v7(),
+        false,
+    );
 
     assert_eq!(outgoing.headers()["x-content-type-options"], "nosniff");
     assert_eq!(outgoing.headers()["x-frame-options"], "DENY");
     assert!(outgoing.headers().contains_key("x-request-id"));
+    // Plain HTTP: no HSTS, which browsers would ignore anyway.
+    assert!(
+        !outgoing
+            .headers()
+            .contains_key(header::STRICT_TRANSPORT_SECURITY)
+    );
+}
+
+#[test]
+fn hsts_is_added_when_clients_use_https_and_a_handler_value_is_kept() {
+    let outgoing = to_hyper_response(Response::empty(StatusCode::OK), Uuid::now_v7(), true);
+    assert_eq!(
+        outgoing.headers()[header::STRICT_TRANSPORT_SECURITY],
+        "max-age=31536000; includeSubDomains"
+    );
+
+    let mut preload = Response::empty(StatusCode::OK);
+    preload.headers_mut().insert(
+        header::STRICT_TRANSPORT_SECURITY,
+        HeaderValue::from_static("max-age=63072000; includeSubDomains; preload"),
+    );
+    let outgoing = to_hyper_response(preload, Uuid::now_v7(), true);
+    let values: Vec<_> = outgoing
+        .headers()
+        .get_all(header::STRICT_TRANSPORT_SECURITY)
+        .iter()
+        .collect();
+    assert_eq!(values, ["max-age=63072000; includeSubDomains; preload"]);
+}
+
+#[tokio::test]
+async fn the_server_sends_hsts_only_behind_tls_termination() {
+    for (transport, expected) in [
+        (forge_config::HttpTransport::Plain, None),
+        (
+            forge_config::HttpTransport::TrustedProxy,
+            Some("strict-transport-security: max-age=31536000; includesubdomains"),
+        ),
+    ] {
+        let mut config = test_config(Duration::from_secs(10));
+        config.transport = transport;
+        let server = TestServer::start(config, panicking_router()).await;
+        // Every response, the routed one, a 404 and a recovered panic.
+        for target in ["/health", "/missing", "/panic"] {
+            let raw =
+                format!("GET {target} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            let addr = server.addr;
+            let response =
+                tokio::task::spawn_blocking(move || exchange_blocking(addr, raw.as_bytes()))
+                    .await
+                    .expect("client task must not panic")
+                    .to_ascii_lowercase();
+            match expected {
+                Some(line) => assert!(
+                    response.contains(line),
+                    "{transport:?} {target}: {response}"
+                ),
+                None => assert!(
+                    !response.contains("strict-transport-security"),
+                    "{transport:?} {target}: {response}"
+                ),
+            }
+        }
+        server.stop().await;
+    }
 }
 #[test]
 fn router_debug_lists_routes() {
@@ -607,6 +676,7 @@ fn test_config(request_timeout: Duration) -> ServerConfig {
         max_body_bytes: 64,
         max_connections: 16,
         trusted_proxies: Vec::new(),
+        transport: forge_config::HttpTransport::Plain,
     }
 }
 
@@ -1155,7 +1225,10 @@ async fn head_answers_with_the_get_headers_and_no_body() {
     assert!(head.starts_with("HTTP/1.1 200 "), "{response}");
     // The length of the GET body ({"status":"ok"}), which is not sent.
     assert!(lower.contains("content-length: 15"), "{response}");
-    assert!(lower.contains("content-type: application/json"), "{response}");
+    assert!(
+        lower.contains("content-type: application/json"),
+        "{response}"
+    );
     assert!(lower.contains("x-request-id: "), "{response}");
     assert_eq!(body, "", "{response}");
 
@@ -1167,7 +1240,10 @@ async fn head_answers_with_the_get_headers_and_no_body() {
     .await;
     let (head, body) = split_head(&response);
     assert!(head.starts_with("HTTP/1.1 200 "), "{response}");
-    assert!(!head.to_ascii_lowercase().contains("content-length"), "{response}");
+    assert!(
+        !head.to_ascii_lowercase().contains("content-length"),
+        "{response}"
+    );
     assert_eq!(body, "", "{response}");
 
     // A route without GET still refuses HEAD and lists what it serves.
@@ -1178,7 +1254,10 @@ async fn head_answers_with_the_get_headers_and_no_body() {
     .await;
     let (head, body) = split_head(&response);
     assert!(head.starts_with("HTTP/1.1 405 "), "{response}");
-    assert!(head.to_ascii_lowercase().contains("allow: post"), "{response}");
+    assert!(
+        head.to_ascii_lowercase().contains("allow: post"),
+        "{response}"
+    );
     assert_eq!(body, "", "{response}");
     server.stop().await;
 }
@@ -1288,10 +1367,16 @@ async fn a_handler_panic_is_a_500_with_the_request_id_and_is_logged() {
         .unwrap_or_else(|| panic!("no second response in {text:?}"));
     assert!(first.starts_with("HTTP/1.1 500 "), "{text}");
     let lower = first.to_ascii_lowercase();
-    assert!(lower.contains("content-type: text/plain; charset=utf-8"), "{text}");
+    assert!(
+        lower.contains("content-type: text/plain; charset=utf-8"),
+        "{text}"
+    );
     assert!(lower.contains("x-content-type-options: nosniff"), "{text}");
     assert!(first.ends_with("\r\n\r\ninternal server error"), "{text}");
-    assert!(!text.contains("secret-detail"), "the panic message leaked: {text}");
+    assert!(
+        !text.contains("secret-detail"),
+        "the panic message leaked: {text}"
+    );
     assert!(rest.ends_with(r#"{"status":"ok"}"#), "{text}");
     let request_id = lower
         .lines()

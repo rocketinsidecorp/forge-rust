@@ -338,6 +338,18 @@ docker run --rm --network edge -e FORGE_HTTP_TRUSTED_PROXIES=172.30.0.0/24 shop 
 FORGE_HTTP_TRUSTED_PROXIES=0.0.0.0/0 cargo run -- healthcheck   # refused: entry 1 is too broad
 ```
 
+Behind TLS termination the application sends
+`Strict-Transport-Security: max-age=31536000; includeSubDomains` on every
+response. `FORGE_HTTP_TRANSPORT` (Forge-Go's key) says how clients connect:
+`trusted-proxy` (the production default) or `plain` (the default elsewhere,
+refused in production):
+
+```sh
+FORGE_HTTP_TRANSPORT=trusted-proxy cargo run
+curl -sI http://127.0.0.1:3000/health | grep -i strict-transport-security
+FORGE_ENV=production FORGE_HTTP_TRANSPORT=plain cargo run -- healthcheck   # refused
+```
+
 List only proxy networks and keep the application port reachable only
 through them: anything inside a listed network can claim any client address.
 nginx, Traefik, Compose and Kubernetes setups are in the
@@ -586,7 +598,9 @@ Kubernetes and systemd deployment is covered in
   rejected at startup.
 - HTTP defaults: request and header-read timeouts, a body size limit, bounded
   connections, `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`,
-  and UUIDv7 `x-request-id`.
+  UUIDv7 `x-request-id`, `Strict-Transport-Security` behind TLS termination
+  (`FORGE_HTTP_TRANSPORT`), `HEAD` on every `GET` route, and a `500` with the
+  request id when a handler panics.
 - A multi-stage `Dockerfile`, `.dockerignore`, `compose.yaml`, the opt-in
   observability overlay (`compose.observability.yaml` and `observability/`:
   Collector, Prometheus, Tempo, Loki, Grafana) and a

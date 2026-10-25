@@ -131,6 +131,8 @@ pub(crate) fn metrics_server(telemetry: &Telemetry, bind: SocketAddr) -> Server 
         max_body_bytes: 1024,
         max_connections: METRICS_MAX_CONNECTIONS,
         trusted_proxies: Vec::new(),
+        // A private plain-HTTP listener scraped by Prometheus.
+        transport: forge_config::HttpTransport::Plain,
     };
     Server::new(config, router)
 }

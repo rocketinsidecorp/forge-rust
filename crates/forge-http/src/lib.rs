@@ -827,6 +827,7 @@ impl Server {
                 trusted_proxies: TrustedProxies::new(config.trusted_proxies.iter().copied()),
                 router,
                 telemetry: None,
+                hsts: config.transport.is_https(),
             }),
             config,
             min_write_stall: MIN_WRITE_STALL_TIMEOUT,
@@ -998,6 +999,9 @@ struct ServedApp {
     router: Router,
     trusted_proxies: TrustedProxies,
     telemetry: Option<ServerInstrumentation>,
+    /// Whether responses carry [`STRICT_TRANSPORT_SECURITY`]: clients use
+    /// HTTPS (`FORGE_HTTP_TRANSPORT` is not `plain`).
+    hsts: bool,
 }
 
 async fn serve_connection(
@@ -1061,6 +1065,7 @@ async fn handle_request(
         .map(forge_telemetry::http::RequestTelemetry::context);
     let span = request_span(request_id, &method, &path, remote_addr, trace.as_ref());
     let head = method == Method::HEAD;
+    let hsts = app.hsts;
     let response = async move {
         let matched = MatchedRoute::default();
         let (parts, body) = request.into_parts();
@@ -1115,7 +1120,7 @@ async fn handle_request(
         } else {
             response
         };
-        to_hyper_response(response, request_id)
+        to_hyper_response(response, request_id, hsts)
     }
     .instrument(span)
     .await;
@@ -1213,7 +1218,17 @@ fn without_body(mut response: Response) -> Response {
     response
 }
 
-fn to_hyper_response(response: Response, request_id: Uuid) -> hyper::Response<OutgoingBody> {
+/// The `Strict-Transport-Security` value the server adds when clients use
+/// HTTPS (`FORGE_HTTP_TRANSPORT` is not `plain`): one year, subdomains
+/// included, as Forge-Go sends it. A response that already carries the
+/// header (for example with `preload`) keeps its own.
+pub const STRICT_TRANSPORT_SECURITY: &str = "max-age=31536000; includeSubDomains";
+
+fn to_hyper_response(
+    response: Response,
+    request_id: Uuid,
+    hsts: bool,
+) -> hyper::Response<OutgoingBody> {
     let mut outgoing = hyper::Response::new(OutgoingBody::from(response.body));
     *outgoing.status_mut() = response.status;
     *outgoing.headers_mut() = response.headers;
@@ -1227,6 +1242,12 @@ fn to_hyper_response(response: Response, request_id: Uuid) -> hyper::Response<Ou
     outgoing
         .headers_mut()
         .insert("x-frame-options", HeaderValue::from_static("DENY"));
+    if hsts {
+        outgoing
+            .headers_mut()
+            .entry(header::STRICT_TRANSPORT_SECURITY)
+            .or_insert(HeaderValue::from_static(STRICT_TRANSPORT_SECURITY));
+    }
     outgoing
 }
 

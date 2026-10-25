@@ -86,6 +86,7 @@ pub const KNOWN_KEYS: &[&str] = &[
     "FORGE_MAX_BODY_BYTES",
     "FORGE_MAX_CONNECTIONS",
     TRUSTED_PROXIES_KEY,
+    TRANSPORT_KEY,
     "FORGE_LOG",
     "FORGE_LOG_FORMAT",
     "FORGE_DATABASE_URL",
@@ -147,6 +148,13 @@ pub const I18N_DEFAULT_LOCALE_KEY: &str = "FORGE_I18N_DEFAULT_LOCALE";
 /// default, trusts nobody.
 pub const TRUSTED_PROXIES_KEY: &str = "FORGE_HTTP_TRUSTED_PROXIES";
 
+/// How clients reach the server (Forge-Go's key): `plain` HTTP, or
+/// `trusted-proxy` when a reverse proxy or load balancer terminates TLS in
+/// front of it. Unset is `trusted-proxy` in production and `plain`
+/// elsewhere; production refuses `plain`. Anything but `plain` makes every
+/// response carry `Strict-Transport-Security`.
+pub const TRANSPORT_KEY: &str = "FORGE_HTTP_TRANSPORT";
+
 /// The owner password the `setup` command of generated applications reads
 /// when it is not typed at a terminal or piped with `--password-stdin`.
 ///
@@ -185,6 +193,64 @@ impl FromStr for Environment {
     }
 }
 
+/// How clients reach the HTTP server (`FORGE_HTTP_TRANSPORT`).
+///
+/// Forge-Go's third mode, `tls` (the server terminates TLS itself), does
+/// not exist here: Forge-Rust serves plain HTTP behind forge-proxy or a load
+/// balancer, and `tls` is refused with that explanation.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HttpTransport {
+    /// Clients connect over plain HTTP (development and test).
+    #[default]
+    Plain,
+    /// A reverse proxy or load balancer terminates TLS in front of the
+    /// server; clients use HTTPS.
+    TrustedProxy,
+}
+
+impl HttpTransport {
+    /// The transport when `FORGE_HTTP_TRANSPORT` is unset: `trusted-proxy`
+    /// in production (the generated image always runs behind TLS
+    /// termination), `plain` elsewhere.
+    #[must_use]
+    pub fn default_for(environment: Environment) -> Self {
+        match environment {
+            Environment::Production => Self::TrustedProxy,
+            Environment::Development | Environment::Test => Self::Plain,
+        }
+    }
+
+    /// Whether responses carry `Strict-Transport-Security`: whenever
+    /// clients use HTTPS, as in Forge-Go.
+    #[must_use]
+    pub fn is_https(self) -> bool {
+        self != Self::Plain
+    }
+}
+
+impl FromStr for HttpTransport {
+    type Err = ConfigError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim() {
+            "plain" => Ok(Self::Plain),
+            "trusted-proxy" => Ok(Self::TrustedProxy),
+            "tls" => Err(ConfigError::InvalidValue {
+                key: TRANSPORT_KEY,
+                value: value.to_owned(),
+                expected: "plain or trusted-proxy; Forge-Rust does not terminate TLS itself, \
+                     so run it behind forge-proxy or a load balancer with trusted-proxy",
+            }),
+            _ => Err(ConfigError::InvalidValue {
+                key: TRANSPORT_KEY,
+                value: value.to_owned(),
+                expected: "plain or trusted-proxy",
+            }),
+        }
+    }
+}
+
 /// HTTP server settings after validation.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ServerConfig {
@@ -207,6 +273,11 @@ pub struct ServerConfig {
     /// [`TrustedProxy::new`].
     #[serde(default)]
     pub trusted_proxies: Vec<TrustedProxy>,
+    /// How clients reach the server (`FORGE_HTTP_TRANSPORT`); anything but
+    /// [`HttpTransport::Plain`] adds `Strict-Transport-Security` to every
+    /// response.
+    #[serde(default)]
+    pub transport: HttpTransport,
 }
 
 impl Default for ServerConfig {
@@ -220,6 +291,7 @@ impl Default for ServerConfig {
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             max_connections: DEFAULT_MAX_CONNECTIONS,
             trusted_proxies: Vec::new(),
+            transport: HttpTransport::Plain,
         }
     }
 }
@@ -918,6 +990,21 @@ impl AppConfig {
         if let Some(value) = lookup(TRUSTED_PROXIES_KEY) {
             config.server.trusted_proxies = parse_trusted_proxies(&value)?;
         }
+        config.server.transport = match lookup(TRANSPORT_KEY) {
+            Some(value) => value.parse()?,
+            None => HttpTransport::default_for(config.environment),
+        };
+        if config.environment == Environment::Production
+            && config.server.transport == HttpTransport::Plain
+        {
+            // Forge-Go's rule: production clients use HTTPS.
+            return Err(ConfigError::InvalidValue {
+                key: TRANSPORT_KEY,
+                value: "plain".to_owned(),
+                expected: "trusted-proxy in production, where a reverse proxy or load \
+                     balancer terminates TLS",
+            });
+        }
         if let Some(value) = lookup("FORGE_LOG") {
             let filter = value.trim();
             if filter.is_empty() {
@@ -1312,6 +1399,61 @@ mod tests {
     }
 
     #[test]
+    fn the_transport_follows_the_environment_and_production_refuses_plain() {
+        let load = |pairs: &[(&str, &str)]| {
+            let values: HashMap<&str, &str> = pairs.iter().copied().collect();
+            AppConfig::from_lookup(|key| values.get(key).map(ToString::to_string))
+        };
+        for (pairs, transport) in [
+            (&[][..], HttpTransport::Plain),
+            (&[("FORGE_ENV", "test")][..], HttpTransport::Plain),
+            (
+                &[("FORGE_ENV", "production")][..],
+                HttpTransport::TrustedProxy,
+            ),
+            (
+                &[(TRANSPORT_KEY, "trusted-proxy")][..],
+                HttpTransport::TrustedProxy,
+            ),
+            (
+                &[
+                    ("FORGE_ENV", "production"),
+                    (TRANSPORT_KEY, "trusted-proxy"),
+                ][..],
+                HttpTransport::TrustedProxy,
+            ),
+        ] {
+            let config = load(pairs).expect("valid transport");
+            assert_eq!(config.server.transport, transport, "{pairs:?}");
+            assert_eq!(
+                config.server.transport.is_https(),
+                transport == HttpTransport::TrustedProxy
+            );
+        }
+        for pairs in [
+            &[("FORGE_ENV", "production"), (TRANSPORT_KEY, "plain")][..],
+            &[(TRANSPORT_KEY, "tls")][..],
+            &[(TRANSPORT_KEY, "https")][..],
+            &[(TRANSPORT_KEY, "Plain")][..],
+            &[(TRANSPORT_KEY, "")][..],
+        ] {
+            let error = load(pairs).expect_err("refused transport");
+            assert!(
+                matches!(
+                    error,
+                    ConfigError::InvalidValue {
+                        key: TRANSPORT_KEY,
+                        ..
+                    }
+                ),
+                "{pairs:?}: {error}"
+            );
+        }
+        let tls = load(&[(TRANSPORT_KEY, "tls")]).expect_err("tls is not served");
+        assert!(tls.to_string().contains("forge-proxy"), "{tls}");
+    }
+
+    #[test]
     fn zero_limits_fail_closed() {
         let error =
             AppConfig::from_lookup(|key| (key == "FORGE_MAX_BODY_BYTES").then(|| "0".to_owned()))
@@ -1611,6 +1753,7 @@ mod tests {
             "10",
             "10",
             "172.18.0.0/16, fd00:1::/64",
+            "trusted-proxy",
             "debug",
             "json",
             "postgres://runtime:secret@localhost/app",

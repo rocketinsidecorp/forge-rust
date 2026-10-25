@@ -400,6 +400,9 @@ Environment:
   FORGE_MAX_CONNECTIONS       maximum concurrent connections (default: 10000)
   FORGE_HTTP_TRUSTED_PROXIES  comma-separated CIDRs or addresses of reverse proxies whose
                               X-Forwarded-For is believed (default: empty, trust nobody)
+  FORGE_HTTP_TRANSPORT        plain | trusted-proxy: trusted-proxy (TLS terminated in front)
+                              adds Strict-Transport-Security; production refuses plain
+                              (default: trusted-proxy in production, plain otherwise)
   FORGE_LOG                   log filter directives (default: info)
   FORGE_LOG_FORMAT            json | text (default: json in production, text otherwise)
   FORGE_DATABASE_URL           least-privilege runtime URL: postgres://, mysql://, mariadb:// or sqlite:
