@@ -15,6 +15,8 @@ mod destroy;
 mod dev;
 mod doctor;
 mod error;
+#[cfg(test)]
+mod error_tests;
 mod generate;
 #[cfg(test)]
 mod generator_tests;
