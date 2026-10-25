@@ -6,7 +6,10 @@
 //! stream cancellation — runs over real SSH. No Docker daemon is involved.
 //!
 //! Skipped (with a notice) without sshd, ssh, ssh-keygen or the stand-in;
-//! `FORGE_TEST_REQUIRE_SSHD=true` turns the skip into a failure.
+//! `FORGE_TEST_REQUIRE_SSHD=true` turns the skip into a failure. The
+//! stand-in is `cargo build -p forge-cli --example fake_docker` (`cargo test`
+//! leaves examples under hashed names only); `FORGE_TEST_FAKE_DOCKER` names
+//! it when the tests run from another target directory (cargo llvm-cov).
 
 use std::collections::BTreeMap;
 use std::io::Read as _;
@@ -186,17 +189,19 @@ fn start_cluster(names: &[&str]) -> Option<Cluster> {
     if rustix::process::geteuid().is_root() && !Path::new("/run/sshd").is_dir() {
         return unavailable("sshd running as root needs /run/sshd (mkdir -m 0755 /run/sshd)");
     }
-    let fake_docker = std::env::current_exe()
-        .ok()
-        .and_then(|exe| {
+    let fake_docker = match std::env::var_os("FORGE_TEST_FAKE_DOCKER") {
+        Some(path) => Some(PathBuf::from(path)),
+        None => std::env::current_exe().ok().and_then(|exe| {
             exe.parent()
                 .and_then(Path::parent)
                 .map(|dir| dir.join("examples/fake_docker"))
-        })
-        .filter(|path| path.is_file());
+        }),
+    }
+    .filter(|path| path.is_file());
     let Some(fake_docker) = fake_docker else {
         return unavailable(
-            "the fake_docker example is not built (run cargo test with --all-targets)",
+            "the fake_docker stand-in is not built \
+             (cargo build -p forge-cli --example fake_docker, or set FORGE_TEST_FAKE_DOCKER)",
         );
     };
     // Short: ControlPath sockets are limited to about 100 bytes.

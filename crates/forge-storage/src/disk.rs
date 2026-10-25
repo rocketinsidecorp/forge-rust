@@ -25,12 +25,20 @@
 //! tmp/               uploads in progress
 //! ```
 //!
-//! The metadata is renamed into place before the content, so a blob is never
-//! visible with metadata of a different upload except in the instant between
-//! two overwrites of one key; keys of user content are unique (UUIDv7), so
-//! overwrites are the exception. A blob whose metadata is missing or does not
-//! match its size is served as `application/octet-stream`, which the handler
-//! downloads.
+//! The metadata records the inode of the blob file it was written for (the
+//! temporary file keeps its inode through the rename). A record that names
+//! another inode (the instant between the two renames of an overwrite, a
+//! restored backup) or none (written before inodes were recorded) is trusted
+//! only when the content matches its SHA-256, so the new metadata is never
+//! served with the old blob or the reverse. A blob whose metadata is missing,
+//! does not match its size or fails that check is served as
+//! `application/octet-stream`, which the handler downloads. Keys of user
+//! content are unique (UUIDv7), so overwrites are the exception.
+//!
+//! An overwrite keeps the previous blob and metadata as second hard links in
+//! `tmp/` until the write is complete: a failed publish, or a failed
+//! [`Storage::put_all`] batch, puts the previous version back instead of
+//! deleting the key.
 //!
 //! Disk storage suits one application host (or hosts sharing a volume with
 //! working `rename` and `fsync` semantics, not NFS). Blocking file-system work
@@ -41,7 +49,7 @@
 use std::{
     fs::File,
     io::{self, Read, Write},
-    os::fd::OwnedFd,
+    os::{fd::OwnedFd, unix::fs::MetadataExt},
     path::Path,
     sync::{
         Arc,
@@ -53,7 +61,7 @@ use std::{
 use async_trait::async_trait;
 use bytes::Bytes;
 use rustix::{
-    fs::{AtFlags, Dir, Mode, OFlags, mkdirat, openat, renameat, statat, unlinkat},
+    fs::{AtFlags, Dir, Mode, OFlags, linkat, mkdirat, openat, renameat, statat, unlinkat},
     io::Errno,
 };
 use serde::{Deserialize, Serialize};
@@ -91,6 +99,10 @@ struct Metadata {
     filename: Option<String>,
     sha256: String,
     size: u64,
+    /// The inode of the blob file this record describes; absent in records
+    /// written before it existed, which are trusted on their size alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    inode: Option<u64>,
 }
 
 fn io_error(error: impl Into<io::Error>) -> StorageError {
@@ -226,14 +238,6 @@ impl Dirs {
             .map(sanitize_filename)
             .filter(|name| !name.is_empty());
         let digest = hex(&Sha256::digest(body));
-        let metadata = Metadata {
-            content_type: content_type.clone(),
-            filename: filename.clone(),
-            sha256: digest.clone(),
-            size: body.len() as u64,
-        };
-        let encoded = serde_json::to_vec(&metadata)
-            .map_err(|error| StorageError::Io(io::Error::other(error)))?;
 
         let temp = uuid::Uuid::now_v7().simple().to_string();
         // Whatever a failure leaves behind goes (the guard unlinks on drop).
@@ -241,77 +245,131 @@ impl Dirs {
             dirs: self,
             key: key.clone(),
             temp_meta: format!("{temp}.meta"),
-            backup: format!("{temp}.old"),
             temp,
             info: Info {
                 key: key.clone(),
                 size: body.len() as u64,
                 content_type,
                 filename,
-                sha256: Some(digest),
+                sha256: Some(digest.clone()),
                 modified: SystemTime::now(),
             },
         };
-        self.write_temp(&staged.temp, body)?;
+        let inode = self.write_temp(&staged.temp, body)?;
+        let metadata = Metadata {
+            content_type: staged.info.content_type.clone(),
+            filename: staged.info.filename.clone(),
+            sha256: digest,
+            size: body.len() as u64,
+            inode: Some(inode),
+        };
+        let encoded = serde_json::to_vec(&metadata)
+            .map_err(|error| StorageError::Io(io::Error::other(error)))?;
         self.write_temp(&staged.temp_meta, &encoded)?;
         Ok(staged)
     }
 
-    /// Publishes a staged blob: the metadata first, the blob is the commit
-    /// point. The previous metadata is kept aside, so a failed overwrite puts it
-    /// back instead of losing it.
-    fn promote(&self, staged: &Staged<'_>) -> Result<(), StorageError> {
+    /// Publishes a staged blob: the metadata, then the blob. The previous
+    /// blob and metadata, if any, stay reachable as second hard links in
+    /// `tmp/` (no instant without a file under the key), so a failure here,
+    /// or the rollback of a batch, puts them back with [`Dirs::revert`].
+    fn promote(&self, staged: &Staged<'_>) -> Result<Promoted<'_>, StorageError> {
         let key = &staged.key;
         let blob_dir = self.parent(&self.blobs, key, true).map_err(io_error)?;
         let meta_dir = self.parent(&self.meta, key, true).map_err(io_error)?;
         let meta_leaf = Self::meta_leaf(key);
-        let had_old = match renameat(
-            &meta_dir,
-            meta_leaf.as_str(),
-            &self.tmp,
-            staged.backup.as_str(),
-        ) {
-            Ok(()) => true,
-            Err(Errno::NOENT) => false,
-            Err(error) => return Err(io_error(error)),
-        };
-        let restore = || {
-            if had_old {
-                let _ = renameat(
-                    &self.tmp,
-                    staged.backup.as_str(),
-                    &meta_dir,
-                    meta_leaf.as_str(),
-                );
+        let old_blob = self.keep(&blob_dir, Self::leaf(key), "oldblob")?;
+        let old_meta = match self.keep(&meta_dir, &meta_leaf, "old") {
+            Ok(old_meta) => old_meta,
+            Err(error) => {
+                if let Some(backup) = old_blob {
+                    let _ = unlinkat(&self.tmp, backup.as_str(), AtFlags::empty());
+                }
+                return Err(error);
             }
         };
-        if let Err(error) = renameat(
+        let promoted = Promoted {
+            dirs: self,
+            blob_dir,
+            meta_dir,
+            old_blob,
+            old_meta,
+        };
+        let published = renameat(
             &self.tmp,
             staged.temp_meta.as_str(),
-            &meta_dir,
+            &promoted.meta_dir,
             meta_leaf.as_str(),
-        ) {
-            restore();
+        )
+        .and_then(|()| {
+            renameat(
+                &self.tmp,
+                staged.temp.as_str(),
+                &promoted.blob_dir,
+                Self::leaf(key),
+            )
+        });
+        if let Err(error) = published {
+            self.revert(staged, &promoted);
             return Err(io_error(error));
         }
-        if let Err(error) = renameat(&self.tmp, staged.temp.as_str(), &blob_dir, Self::leaf(key)) {
-            // The new metadata describes a blob that never arrived: drop it and
-            // bring the previous record back.
-            let _ = unlinkat(&meta_dir, meta_leaf.as_str(), AtFlags::empty());
-            restore();
-            return Err(io_error(error));
-        }
-        for directory in [&blob_dir, &meta_dir] {
+        for directory in [&promoted.blob_dir, &promoted.meta_dir] {
             // Best effort: the rename is already atomic; this makes it durable.
             let _ = rustix::fs::fsync(directory);
         }
-        Ok(())
+        Ok(promoted)
     }
 
-    /// Removes a blob and its metadata that were just published (rollback of a
-    /// multi-file commit; the keys are fresh).
-    fn unpublish(&self, key: &StorageKey) {
-        let _ = self.delete(key);
+    /// Links the current `leaf` of `directory` into `tmp/` as
+    /// `<fresh UUIDv7>.<suffix>` and returns that name; `None` when there is
+    /// no such leaf. The name is made now, not when the batch was staged, so
+    /// `prune_temp` sees the backup as young however long the batch took.
+    fn keep(
+        &self,
+        directory: &OwnedFd,
+        leaf: &str,
+        suffix: &str,
+    ) -> Result<Option<String>, StorageError> {
+        let backup = format!("{}.{suffix}", uuid::Uuid::now_v7().simple());
+        match linkat(
+            directory,
+            leaf,
+            &self.tmp,
+            backup.as_str(),
+            AtFlags::empty(),
+        ) {
+            Ok(()) => Ok(Some(backup)),
+            Err(Errno::NOENT) => Ok(None),
+            Err(error) => Err(io_error(error)),
+        }
+    }
+
+    /// Undoes a (partial) publish: the previous blob and metadata go back
+    /// under the key, or the key is removed when it had none.
+    fn revert(&self, staged: &Staged<'_>, promoted: &Promoted<'_>) {
+        let meta_leaf = Self::meta_leaf(&staged.key);
+        for (directory, leaf, backup) in [
+            (
+                &promoted.blob_dir,
+                Self::leaf(&staged.key),
+                promoted.old_blob.as_deref(),
+            ),
+            (
+                &promoted.meta_dir,
+                meta_leaf.as_str(),
+                promoted.old_meta.as_deref(),
+            ),
+        ] {
+            // Best effort: there is nothing better to do with a failure here.
+            match backup {
+                Some(backup) => {
+                    let _ = renameat(&self.tmp, backup, directory, leaf);
+                }
+                None => {
+                    let _ = unlinkat(directory, leaf, AtFlags::empty());
+                }
+            }
+        }
     }
 
     fn put(
@@ -321,14 +379,15 @@ impl Dirs {
         options: &PutOptions,
     ) -> Result<Info, StorageError> {
         let staged = self.stage(key, body, options)?;
-        self.promote(&staged)?;
+        drop(self.promote(&staged)?);
         Ok(staged.info.clone())
     }
 
-    /// Stages every file, then publishes them all, or none: a failure removes
-    /// what was published, and a cancelled request (`cancelled`, set when the
-    /// awaiting future is dropped) discards the staged files before anything is
-    /// published. `before_promote` runs between the two phases.
+    /// Stages every file, then publishes them all, or none: a failure puts
+    /// back the previous version of every key already published (or removes
+    /// the key when it was new), and a cancelled request (`cancelled`, set
+    /// when the awaiting future is dropped) discards the staged files before
+    /// anything is published. `before_promote` runs between the two phases.
     fn put_all(
         &self,
         items: &[(StorageKey, Bytes, PutOptions)],
@@ -347,18 +406,24 @@ impl Dirs {
         if cancelled.load(Ordering::SeqCst) {
             return Err(abandoned());
         }
-        for (index, file) in staged.iter().enumerate() {
-            if let Err(error) = self.promote(file) {
-                for published in &staged[..index] {
-                    self.unpublish(&published.key);
+        let mut promoted = Vec::with_capacity(staged.len());
+        for file in &staged {
+            match self.promote(file) {
+                Ok(done) => promoted.push(done),
+                Err(error) => {
+                    // Newest first, so a key listed twice ends at its oldest.
+                    for (file, done) in staged.iter().zip(&promoted).rev() {
+                        self.revert(file, done);
+                    }
+                    return Err(error);
                 }
-                return Err(error);
             }
         }
         Ok(staged.iter().map(|file| file.info.clone()).collect())
     }
 
-    fn write_temp(&self, name: &str, content: &[u8]) -> Result<(), StorageError> {
+    /// Writes and flushes `tmp/<name>`; returns its inode.
+    fn write_temp(&self, name: &str, content: &[u8]) -> Result<u64, StorageError> {
         let descriptor = openat(
             &self.tmp,
             name,
@@ -368,7 +433,8 @@ impl Dirs {
         .map_err(io_error)?;
         let mut file = File::from(descriptor);
         file.write_all(content).map_err(io_error)?;
-        file.sync_all().map_err(io_error)
+        file.sync_all().map_err(io_error)?;
+        Ok(file.metadata().map_err(io_error)?.ino())
     }
 
     fn open_leaf(
@@ -396,7 +462,16 @@ impl Dirs {
         Ok(File::from(descriptor))
     }
 
-    fn describe(&self, key: &StorageKey, file: &File) -> Result<Info, StorageError> {
+    /// The blob's info, with its metadata when the record belongs to this
+    /// file. The second value is the SHA-256 the content must have before the
+    /// metadata may be trusted: set when the record names another inode (the
+    /// instant between the two renames of an overwrite, or a restored backup)
+    /// or no inode (a record from before inodes were recorded).
+    fn describe(
+        &self,
+        key: &StorageKey,
+        file: &File,
+    ) -> Result<(Info, Option<String>), StorageError> {
         let stat = file.metadata().map_err(io_error)?;
         if !stat.is_file() {
             return Err(StorageError::NotFound);
@@ -411,7 +486,7 @@ impl Dirs {
         };
         // Metadata is trusted only while its recorded size equals the file's.
         let Ok(meta_file) = self.open_leaf(&self.meta, key, &Self::meta_leaf(key)) else {
-            return Ok(info);
+            return Ok((info, None));
         };
         let mut raw = Vec::new();
         if meta_file
@@ -419,14 +494,15 @@ impl Dirs {
             .read_to_end(&mut raw)
             .is_err()
         {
-            return Ok(info);
+            return Ok((info, None));
         }
         let Ok(meta) = serde_json::from_slice::<Metadata>(&raw) else {
-            return Ok(info);
+            return Ok((info, None));
         };
         if meta.size != stat.len() {
-            return Ok(info);
+            return Ok((info, None));
         }
+        let pending = (meta.inode != Some(stat.ino())).then(|| meta.sha256.clone());
         if let Ok(content_type) = normalize_content_type(&meta.content_type) {
             info.content_type = content_type;
         }
@@ -435,24 +511,28 @@ impl Dirs {
             .map(|name| sanitize_filename(&name))
             .filter(|name| !name.is_empty());
         info.sha256 = Some(meta.sha256);
-        Ok(info)
+        Ok((info, pending))
     }
 
     fn open(&self, key: &StorageKey, max_bytes: u64) -> Result<Blob, StorageError> {
         let file = self.open_leaf(&self.blobs, key, Self::leaf(key))?;
-        let info = self.describe(key, &file)?;
+        let (mut info, pending) = self.describe(key, &file)?;
         if info.size > max_bytes {
             return Err(StorageError::TooLarge);
         }
         let mut body = Vec::with_capacity(usize::try_from(info.size).unwrap_or(0));
         // One byte past the size: a file that grew since `stat` is refused, not truncated.
-        file.take(info.size + 1)
+        (&file)
+            .take(info.size + 1)
             .read_to_end(&mut body)
             .map_err(io_error)?;
         if body.len() as u64 != info.size {
             return Err(StorageError::Io(io::Error::other(
                 "file changed while it was read",
             )));
+        }
+        if pending.is_some_and(|digest| hex(&Sha256::digest(&body)) != digest) {
+            info = untrusted(info);
         }
         Ok(Blob {
             info,
@@ -462,7 +542,25 @@ impl Dirs {
 
     fn stat(&self, key: &StorageKey) -> Result<Info, StorageError> {
         let file = self.open_leaf(&self.blobs, key, Self::leaf(key))?;
-        self.describe(key, &file)
+        let (info, pending) = self.describe(key, &file)?;
+        let Some(digest) = pending else {
+            return Ok(info);
+        };
+        let mut hasher = Sha256::new();
+        let mut buffer = vec![0_u8; 64 << 10];
+        let mut content = (&file).take(info.size);
+        loop {
+            let read = content.read(&mut buffer).map_err(io_error)?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+        }
+        Ok(if hex(&hasher.finalize()) == digest {
+            info
+        } else {
+            untrusted(info)
+        })
     }
 
     fn delete(&self, key: &StorageKey) -> Result<(), StorageError> {
@@ -487,10 +585,13 @@ impl Dirs {
 
     fn prune_temp(&self, older_than: Duration) -> Result<usize, StorageError> {
         let directory = Dir::read_from(&self.tmp).map_err(io_error)?;
-        let cutoff = SystemTime::now()
-            .checked_sub(older_than)
-            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
             .map_or(0, |elapsed| elapsed.as_secs());
+        let cutoff = now.saturating_sub(older_than.as_secs());
+        // A name dated further ahead than `older_than` is not a write in
+        // progress (a clock jump, a planted file): its mtime decides.
+        let horizon = now.saturating_add(older_than.as_secs());
         let mut removed = 0;
         for entry in directory {
             let entry = entry.map_err(io_error)?;
@@ -503,7 +604,13 @@ impl Dirs {
             };
             let regular = rustix::fs::FileType::from_raw_mode(stat.st_mode)
                 == rustix::fs::FileType::RegularFile;
-            let modified = u64::try_from(stat.st_mtime).unwrap_or(u64::MAX);
+            // A hard-linked backup keeps the old file's mtime, which can be
+            // months old: the UUIDv7 in the name says when it was linked,
+            // and the later of the two counts.
+            let named = staged_at(name).filter(|at| *at <= horizon);
+            let modified = u64::try_from(stat.st_mtime)
+                .unwrap_or(u64::MAX)
+                .max(named.unwrap_or(0));
             if regular && modified <= cutoff && unlinkat(&self.tmp, name, AtFlags::empty()).is_ok()
             {
                 removed += 1;
@@ -514,19 +621,37 @@ impl Dirs {
 }
 
 /// A blob written to `tmp/` and not yet published. Dropping it removes whatever
-/// is left of its temporary files (after a publish only the backup, if any).
+/// is left of its temporary files (nothing after a publish).
 struct Staged<'a> {
     dirs: &'a Dirs,
     key: StorageKey,
     temp: String,
     temp_meta: String,
-    backup: String,
     info: Info,
+}
+
+/// A published blob's directories and the `tmp/` names of the blob and
+/// metadata it replaced, if any. Dropping it (the publish is final) removes
+/// those backups; [`Dirs::revert`] puts them back first.
+struct Promoted<'a> {
+    dirs: &'a Dirs,
+    blob_dir: OwnedFd,
+    meta_dir: OwnedFd,
+    old_blob: Option<String>,
+    old_meta: Option<String>,
 }
 
 impl Drop for Staged<'_> {
     fn drop(&mut self) {
-        for name in [&self.temp, &self.temp_meta, &self.backup] {
+        for name in [&self.temp, &self.temp_meta] {
+            let _ = unlinkat(&self.dirs.tmp, name.as_str(), AtFlags::empty());
+        }
+    }
+}
+
+impl Drop for Promoted<'_> {
+    fn drop(&mut self) {
+        for name in [&self.old_blob, &self.old_meta].into_iter().flatten() {
             let _ = unlinkat(&self.dirs.tmp, name.as_str(), AtFlags::empty());
         }
     }
@@ -544,6 +669,25 @@ impl Drop for CancelOnDrop {
             self.flag.store(true, Ordering::SeqCst);
         }
     }
+}
+
+/// When the write that created a `tmp/` file began, from the UUIDv7 its name
+/// starts with (`<uuid>`, `<uuid>.meta`, `<uuid>.old`, `<uuid>.oldblob`), in
+/// seconds since the epoch.
+fn staged_at(name: &std::ffi::CStr) -> Option<u64> {
+    let id = uuid::Uuid::try_parse(name.to_str().ok()?.get(..32)?).ok()?;
+    if id.get_version_num() != 7 {
+        return None;
+    }
+    Some(id.get_timestamp()?.to_unix().0)
+}
+
+/// `info` without what only its metadata could tell.
+fn untrusted(mut info: Info) -> Info {
+    info.content_type = OCTET_STREAM.to_owned();
+    info.filename = None;
+    info.sha256 = None;
+    info
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -706,5 +850,263 @@ mod tests {
             "unrelated blobs are untouched"
         );
         assert_eq!(file_count(&root, "tmp"), 0);
+    }
+
+    fn typed(
+        text: &str,
+        body: &'static [u8],
+        content_type: &str,
+    ) -> (StorageKey, Bytes, PutOptions) {
+        (
+            key(text),
+            Bytes::from_static(body),
+            PutOptions::new(100)
+                .expect("options")
+                .content_type(content_type),
+        )
+    }
+
+    #[test]
+    fn a_failed_batch_puts_back_the_blobs_it_overwrote() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = DiskStorage::open(dir.path().join("root")).expect("open");
+        let (old, body, options) = typed("kept", b"old content", "text/plain");
+        storage.inner.put(&old, &body, &options).expect("put");
+        storage
+            .inner
+            .put_all(&items(&["d/x"]), &AtomicBool::new(false), &|| {})
+            .expect("setup");
+        // "kept" is overwritten first, then "d" (a directory) fails the batch.
+        let result = storage.inner.put_all(
+            &[
+                typed("kept", b"replacement", "image/png"),
+                typed("fresh", b"new", "text/plain"),
+                typed("d", b"x", "text/plain"),
+            ],
+            &AtomicBool::new(false),
+            &|| {},
+        );
+        assert!(result.is_err());
+        let blob = storage.inner.open(&old, 100).expect("the old blob is back");
+        assert_eq!(&blob.body[..], b"old content");
+        assert_eq!(blob.info.content_type, "text/plain");
+        assert!(blob.info.sha256.is_some(), "its metadata is back too");
+        assert!(matches!(
+            storage.inner.stat(&key("fresh")),
+            Err(StorageError::NotFound)
+        ));
+        let root = dir.path().join("root");
+        assert!(!root.join("meta/fresh.json").exists());
+        assert_eq!(file_count(&root, "tmp"), 0, "backups were left behind");
+    }
+
+    #[test]
+    fn a_successful_overwrite_leaves_no_backup() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = DiskStorage::open(dir.path().join("root")).expect("open");
+        let (target, body, options) = typed("k", b"one", "text/plain");
+        storage.inner.put(&target, &body, &options).expect("put");
+        let (_, body, options) = typed("k", b"two!", "image/png");
+        storage
+            .inner
+            .put(&target, &body, &options)
+            .expect("overwrite");
+        let blob = storage.inner.open(&target, 100).expect("open");
+        assert_eq!(&blob.body[..], b"two!");
+        assert_eq!(blob.info.content_type, "image/png");
+        assert_eq!(file_count(&dir.path().join("root"), "tmp"), 0);
+    }
+
+    #[test]
+    fn metadata_is_trusted_only_for_the_blob_it_was_written_for() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = DiskStorage::open(dir.path().join("root")).expect("open");
+        for (text, body, content_type) in [
+            ("x", b"same size", "text/plain"),
+            ("y", b"SAME SIZE", "image/png"),
+        ] {
+            let (target, body, options) = typed(text, body, content_type);
+            storage.inner.put(&target, &body, &options).expect("put");
+        }
+        let meta = dir.path().join("root/meta");
+        // y's record next to x's blob (same size): what a reader sees between
+        // the two renames of an overwrite. It is ignored.
+        std::fs::copy(meta.join("y.json"), meta.join("x.json")).expect("copy");
+        let info = storage.inner.stat(&key("x")).expect("stat");
+        assert_eq!(info.content_type, OCTET_STREAM);
+        assert_eq!(info.sha256, None);
+        let blob = storage.inner.open(&key("x"), 100).expect("open");
+        assert_eq!(blob.info.content_type, OCTET_STREAM);
+        // A restored backup (new inodes) or a record without an inode is
+        // trusted once the content matches its digest.
+        let blobs = dir.path().join("root/blobs");
+        std::fs::copy(blobs.join("y"), blobs.join("y.copy")).expect("copy");
+        std::fs::rename(blobs.join("y.copy"), blobs.join("y")).expect("rename");
+        assert_eq!(
+            storage.inner.stat(&key("y")).expect("stat").content_type,
+            "image/png"
+        );
+        assert_eq!(
+            storage
+                .inner
+                .open(&key("y"), 100)
+                .expect("open")
+                .info
+                .content_type,
+            "image/png"
+        );
+        let raw = std::fs::read_to_string(meta.join("y.json")).expect("read");
+        let mut legacy: serde_json::Value = serde_json::from_str(&raw).expect("json");
+        legacy.as_object_mut().expect("object").remove("inode");
+        std::fs::write(meta.join("y.json"), legacy.to_string()).expect("write");
+        assert_eq!(
+            storage.inner.stat(&key("y")).expect("stat").content_type,
+            "image/png"
+        );
+        // ...and not when it does not.
+        std::fs::write(meta.join("x.json"), legacy.to_string()).expect("write");
+        assert_eq!(
+            storage.inner.stat(&key("x")).expect("stat").content_type,
+            OCTET_STREAM
+        );
+    }
+
+    #[test]
+    fn a_backup_linked_from_an_old_file_survives_pruning() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = DiskStorage::open(dir.path().join("root")).expect("open");
+        let root = dir.path().join("root");
+        // A blob written a year ago, then linked as the backup of a write that
+        // begins now: the link keeps the year-old mtime.
+        let old = root.join("blobs/old");
+        std::fs::write(&old, b"previous").expect("write");
+        let year_ago = SystemTime::now() - Duration::from_secs(365 * 86_400);
+        std::fs::File::options()
+            .write(true)
+            .open(&old)
+            .and_then(|file| file.set_modified(year_ago))
+            .expect("back-date");
+        let backup = root.join(format!("tmp/{}.oldblob", uuid::Uuid::now_v7().simple()));
+        std::fs::hard_link(&old, &backup).expect("link");
+        // A staged file whose write began two hours ago is stale.
+        let two_hours_ago = uuid::Timestamp::from_unix(
+            uuid::NoContext,
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_secs()
+                - 7_200,
+            0,
+        );
+        let stale = root.join(format!(
+            "tmp/{}.meta",
+            uuid::Uuid::new_v7(two_hours_ago).simple()
+        ));
+        std::fs::write(&stale, b"{}").expect("write");
+        std::fs::File::options()
+            .write(true)
+            .open(&stale)
+            .and_then(|file| file.set_modified(year_ago))
+            .expect("back-date");
+
+        let removed = storage
+            .inner
+            .prune_temp(Duration::from_secs(3_600))
+            .expect("prune");
+        assert_eq!(removed, 1);
+        assert!(
+            backup.exists(),
+            "the backup of a write in progress was pruned"
+        );
+        assert!(!stale.exists());
+
+        // A name dated far in the future does not pin a file forever.
+        let next_year = uuid::Timestamp::from_unix(
+            uuid::NoContext,
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_secs()
+                + 365 * 86_400,
+            0,
+        );
+        let planted = root.join(format!(
+            "tmp/{}.old",
+            uuid::Uuid::new_v7(next_year).simple()
+        ));
+        std::fs::write(&planted, b"x").expect("write");
+        std::fs::File::options()
+            .write(true)
+            .open(&planted)
+            .and_then(|file| file.set_modified(year_ago))
+            .expect("back-date");
+        storage
+            .inner
+            .prune_temp(Duration::from_secs(3_600))
+            .expect("prune");
+        assert!(!planted.exists(), "a future-dated name kept a stale file");
+        assert!(backup.exists());
+    }
+
+    #[test]
+    fn a_legacy_record_reads_correctly_and_is_left_untouched() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = DiskStorage::open(dir.path().join("root")).expect("open");
+        let (target, body, options) = typed("legacy", b"content", "text/plain");
+        storage.inner.put(&target, &body, &options).expect("put");
+        let record = dir.path().join("root/meta/legacy.json");
+        let raw = std::fs::read_to_string(&record).expect("read");
+        let mut legacy: serde_json::Value = serde_json::from_str(&raw).expect("json");
+        legacy.as_object_mut().expect("object").remove("inode");
+        let legacy = legacy.to_string();
+        std::fs::write(&record, &legacy).expect("write");
+
+        // Verified by its digest on every read; reads never write.
+        assert_eq!(
+            storage.inner.stat(&target).expect("stat").content_type,
+            "text/plain"
+        );
+        assert_eq!(
+            storage
+                .inner
+                .open(&target, 100)
+                .expect("open")
+                .info
+                .content_type,
+            "text/plain"
+        );
+        assert_eq!(std::fs::read_to_string(&record).expect("read"), legacy);
+        // The next put records the inode.
+        storage.inner.put(&target, &body, &options).expect("put");
+        let rewritten: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&record).expect("read")).expect("json");
+        assert!(rewritten.get("inode").is_some());
+    }
+
+    #[test]
+    fn a_backup_is_named_when_it_is_linked() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = DiskStorage::open(dir.path().join("root")).expect("open");
+        std::fs::write(dir.path().join("root/blobs/x"), b"x").expect("write");
+        let backup = storage
+            .inner
+            .keep(&storage.inner.blobs, "x", "oldblob")
+            .expect("keep")
+            .expect("a backup");
+        let name = std::ffi::CString::new(backup.clone()).expect("name");
+        let linked_at = staged_at(&name).expect("a UUIDv7 name");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_secs();
+        assert!(now.abs_diff(linked_at) <= 1, "{backup}");
+        assert!(backup.ends_with(".oldblob"));
+        assert_eq!(
+            storage
+                .inner
+                .keep(&storage.inner.blobs, "missing", "old")
+                .expect("keep"),
+            None
+        );
     }
 }

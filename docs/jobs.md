@@ -299,10 +299,21 @@ composition.events()?.publish_to(subscribers);
 
 The dispatcher publishes committed events in id order (best effort; retries
 and concurrent dispatchers can reorder), with a per-event timeout, retries
-with backoff (default 20 attempts) and a dead state. `Subscribers` delivers an
-event to all subscribers of its type and retries all of them if one fails, so
-every consumer must use the inbox. Any broker adapter can implement
-`EventPublisher` instead.
+with backoff (default 20 attempts) and a dead state. Any broker adapter can
+implement `EventPublisher` instead. Two consequences of `Subscribers` that a
+consumer must design for:
+
+- **A retry re-runs every subscriber.** Delivery state is tracked per event,
+  not per subscriber: when one subscriber of a type fails, the whole event is
+  retried and the subscribers that already succeeded run again. Every
+  consumer must therefore be idempotent through the inbox
+  (`record_delivery`, as above), never through "it ran once".
+- **An event type without a subscriber is published, not kept.** `Subscribers`
+  succeeds for a type nobody subscribed to, so the dispatcher marks the event
+  published and it is never delivered later, even if a subscriber for that
+  type is added in a later release. Subscribe before you append a new type,
+  or keep the events in your own table. Per-subscriber delivery tracking would
+  need a schema change; it is tracked in forge-rust#10.
 
 ## Database, roles and RLS
 
@@ -325,18 +336,40 @@ in a transaction that carries `forge.tenant_id` (a request-serving scope),
 and a separate worker role keeps them away from the serving process
 entirely:
 
-```sql
--- as the migration role, before `migrate`
-ALTER DATABASE shop SET forge.runtime_role = 'shop_runtime'; -- default app_runtime
-ALTER DATABASE shop SET forge.worker_role  = 'shop_worker';  -- default: the runtime role
--- the worker role usually also needs the application's own table grants:
--- GRANT shop_runtime TO shop_worker;
+The migration reads both names from session settings of the migration
+role's connection. Pass them with `PGOPTIONS`, which every libpq-based client
+and SQLx honour; `ALTER DATABASE ... SET forge.runtime_role` fails for a
+migration role that is not a superuser ("permission denied to set parameter"
+on PostgreSQL 16 and 18):
+
+```sh
+# as the migration role; forge.runtime_role defaults to app_runtime,
+# forge.worker_role to the runtime role
+PGOPTIONS='-c forge.runtime_role=shop_runtime -c forge.worker_role=shop_worker' forge migrate
 ```
 
-Then run `serve` with `App::jobs(WorkerMode::Dedicated)` and the runtime
-role's `FORGE_DATABASE_URL`, and `jobs work` / the operator commands with
-the worker role's `FORGE_DATABASE_URL`. Both settings must name existing
-roles, or the migration fails.
+The worker role usually also needs the application's own table grants
+(`GRANT shop_runtime TO shop_worker;`). Then run `serve` with
+`App::jobs(WorkerMode::Dedicated)` and the runtime role's
+`FORGE_DATABASE_URL`, and `jobs work` / the operator commands with the worker
+role's `FORGE_DATABASE_URL`. Both settings must name existing roles, or the
+migration fails.
+
+Before its first claim, the job runtime (`serve` with embedded workers, and
+`jobs work`) checks that its role can run the `forge_jobs_*` functions and
+stops with an error instead of retrying every poll interval:
+
+```text
+database role "shop_web" cannot claim jobs: it lacks EXECUTE on forge_jobs_claim(text,text[],integer,uuid,bigint), ...; as the migration role run `GRANT EXECUTE ON FUNCTION forge_jobs_claim(text,text[],integer,uuid,bigint), ... TO shop_web;`, or run the workers as the role that has them (...)
+```
+
+Run the `GRANT` the message names, as the migration role (it lists every
+missing function with its signature), or point the workers at the role that
+holds the grants. Re-running `forge migrate` with other `PGOPTIONS` grants
+nothing on an already migrated database: the grants are made only when the
+job schema's migration first runs. An unmigrated database reports `the job
+schema is not migrated (forge_jobs_claim does not exist); run `forge
+migrate``.
 
 ## Tests
 

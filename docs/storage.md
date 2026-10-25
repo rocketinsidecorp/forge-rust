@@ -124,7 +124,10 @@ Files are written from the buffered body without an extra copy; text fields
 A multi-file upload is stored as one unit (`Storage::put_all`): if a store
 failure interrupts it, or the request is cancelled (for example by the request
 timeout) before publishing starts, no file of the request is kept; staged files
-in `tmp/` are removed by the job or by `prune_temp`.
+in `tmp/` are removed by the job or by `prune_temp`. A key the batch had
+already overwritten gets its previous blob and metadata back (the disk adapter
+keeps them as hard links in `tmp/` until the batch commits), so a failed batch
+never deletes data that existed before it.
 
 ### How the content type is decided
 
@@ -188,6 +191,17 @@ depth, not a substitute.
   periodically (for example from a scheduled job).
 - Metadata that is missing, unreadable or disagrees with the file's size is
   ignored and the blob is served as `application/octet-stream` (a download).
+  Each record names the inode of its blob; a record for another inode (the
+  instant between the two renames of an overwrite, or a restored backup) is
+  trusted only when the content matches its SHA-256, which reads the blob once
+  more. Reads never write: such a record (from before inodes were recorded,
+  or a restored backup) is checked this way on every read and records the
+  inode again on the key's next put.
+- `prune_temp` ages a temporary file by the later of its modification time and
+  the UUIDv7 its name starts with (made when the file was created or linked;
+  a name dated further ahead than the age limit is ignored): an overwrite's
+  backup (a hard link that keeps the old blob's modification time) is never
+  pruned while the write is in progress.
 - Back up `blobs/` and `meta/` together. Disk storage is for one host, or hosts
   sharing a volume with working `rename` and `fsync` (not NFS). The disk adapter
   is Unix only.

@@ -1051,6 +1051,13 @@ cargo test --workspace --doc --locked
 # PostgreSQL integration suites for jobs, the outbox and the facade (ignored without a server)
 FORGE_TEST_DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5432/postgres \
   cargo test -p forge-jobs -p forge-events -p forge --all-features -- --include-ignored
+# Every ignored database test, as CI's database job runs them (also needs
+# FORGE_TEST_MYSQL_URL and FORGE_TEST_MARIADB_URL; docs/test-strategy.md)
+scripts/test-databases.sh
+
+# Coverage: cargo-llvm-cov 0.9.1 over the same set, gated by .coverage-floor
+# (a second build in target/llvm-cov-target; docs/test-strategy.md#coverage)
+scripts/coverage.sh
 
 # Generated-app end-to-end test (requires bash, curl and Docker)
 bash scripts/e2e-generated-app.sh

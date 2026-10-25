@@ -69,6 +69,20 @@ pub enum JobsError {
     /// A supervised background loop panicked.
     #[error("background task {0} failed")]
     TaskFailed(&'static str),
+    /// The connected database role cannot run the job workers: the job
+    /// schema is not migrated, or the role was not `forge.runtime_role` (or
+    /// `forge.worker_role`) when it was, so it lacks `EXECUTE` on the
+    /// `forge_jobs_*` functions. Checked once before the workers start, so
+    /// `serve` and `jobs work` stop instead of failing every claim.
+    #[error(
+        "database role {role:?} cannot claim jobs: {detail} (docs/jobs.md, \"Database, roles and RLS\")"
+    )]
+    WorkerNotGranted {
+        /// The connected role (`current_user`).
+        role: String,
+        /// What is missing and how to grant it.
+        detail: String,
+    },
 }
 
 impl From<forge_db::sqlx::Error> for JobsError {

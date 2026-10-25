@@ -56,8 +56,10 @@ allow = ["CDLA-Permissive-2.0"]
 # into a released artifact, so this exception is only evaluated by
 # `cargo deny --manifest-path fuzz/Cargo.toml` (the workspace run reports it as
 # not encountered). Owner: the maintainers (CODEOWNERS). Reviewed 2026-10-20;
-# expires 2027-10-20, when it is re-reviewed or removed.
-crate = "libfuzzer-sys"
+# expires 2027-10-20, when it is re-reviewed or removed; the gate in
+# crates/forge/tests/supply_chain.rs fails `cargo test` the day after. Pinned to
+# the version of fuzz/Cargo.lock: an update is re-reviewed, not inherited.
+crate = "libfuzzer-sys@0.4.13"
 allow = ["NCSA"]
 
 [bans]

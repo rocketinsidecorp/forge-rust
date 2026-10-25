@@ -164,7 +164,9 @@ SQL
 migration_url="postgres://${migrator}:${migrator_password}@${authority}/${database}"
 runtime_url="postgres://${runtime}:${runtime_password}@${authority}/${database}"
 
-FORGE_MIGRATION_DATABASE_URL="$migration_url" "$server" migrate >"$work/migrate.log" 2>&1 || { cat "$work/migrate.log" >&2; exit 1; }
+# The job schema grants its functions to the role forge.runtime_role names
+# (docs/jobs.md); without it the server refuses to start its workers.
+PGOPTIONS="-c forge.runtime_role=${runtime}" FORGE_MIGRATION_DATABASE_URL="$migration_url" "$server" migrate >"$work/migrate.log" 2>&1 || { cat "$work/migrate.log" >&2; exit 1; }
 # `setup` reads the owner's password from standard input, never an argument.
 printf '%s\n' "$owner_password" |
 	FORGE_MIGRATION_DATABASE_URL="$migration_url" "$server" setup --tenant bench --email bench@example.com --organization "Bench" --password-stdin >"$work/setup.log" 2>&1 || { cat "$work/setup.log" >&2; exit 1; }

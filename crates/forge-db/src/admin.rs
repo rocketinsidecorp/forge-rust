@@ -215,12 +215,10 @@ mod tests {
             ] {
                 assert!(target::<Pg>(&secret(url)).expect(url).is_local(), "{url}");
             }
-            // A host that merely looks like a path is not a socket.
-            assert!(
-                !target::<Pg>(&secret("postgres://m:pw@localhost/shop?host=var/run"))
-                    .expect("parses")
-                    .is_local()
-            );
+            // A host that merely looks like a path is not a socket: a host=
+            // value with a `/` that is not an absolute socket directory is
+            // no host name either, so the URL is refused, never local.
+            assert!(target::<Pg>(&secret("postgres://m:pw@localhost/shop?host=var/run")).is_err());
         }
 
         #[test]

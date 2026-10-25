@@ -269,6 +269,9 @@ fn logs_are_exported_with_trace_context_and_redacted_values() {
     let layer = telemetry.log_layer().expect("log exporter configured");
     let subscriber = tracing_subscriber::registry().with(layer);
     tracing::subscriber::with_default(subscriber, || {
+        // Callsite interest is cached process-wide (see forge-i18n's
+        // translator tests): rebuild it now that this subscriber is set.
+        tracing::callsite::rebuild_interest_cache();
         let span = tracing::info_span!(
             "http.request",
             trace_id = %"4bf92f3577b34da6a3ce929d0e0e4736",

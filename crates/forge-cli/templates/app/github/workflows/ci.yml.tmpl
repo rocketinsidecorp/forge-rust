@@ -15,40 +15,71 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
 
-# Pin actions to full commit SHAs before deploying to production.
+# Every action is pinned to a full commit SHA with its version in a comment
+# and every container to a digest, the pins Forge itself uses; Dependabot
+# (.github/dependabot.yml) proposes updates. A checkout keeps no credentials.
 jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Install pinned toolchain
         run: cargo --version
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets --all-features --locked -- -D warnings
 
   test:
     runs-on: ubuntu-latest
+%%if postgresql%%
+    # The PostgreSQL tests (RLS, authentication) are #[ignore]d without a
+    # server; here they run.
+    services:
+      postgres:
+        image: postgres:18.6-trixie@sha256:74935e72241653ca55e0414067e6d8763aceb8a810eb51b452253ec3dcfc4336
+        env:
+          POSTGRES_PASSWORD: forge
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      FORGE_TEST_DATABASE_URL: postgres://postgres:forge@127.0.0.1:5432/postgres
+%%end%%
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Install pinned toolchain
         run: cargo --version
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+%%if postgresql%%
+      - run: cargo test --all-targets --locked -- --include-ignored
+%%end%%
+%%if !postgresql%%
       - run: cargo test --all-targets --locked
+%%end%%
 %%if docker%%
 
   docker:
     runs-on: ubuntu-latest
     needs: [lint, test]
     steps:
-      - uses: actions/checkout@v5
-      - uses: docker/setup-buildx-action@v3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - name: Validate the observability overlay
         env:
           GRAFANA_ADMIN_PASSWORD: ci-only-not-a-secret
         run: docker compose -f compose.yaml -f compose.observability.yaml config --quiet
       - name: Build image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           load: true

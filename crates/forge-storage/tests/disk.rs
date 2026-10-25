@@ -400,7 +400,9 @@ async fn metadata_cannot_inject_headers_through_a_filename_or_type() {
         .expect("put");
     fs::write(
         fixture.root.join("meta/blob.json"),
-        r#"{"content_type":"text/html\r\nSet-Cookie: a=b","filename":"a\r\nSet-Cookie: x=y.txt","sha256":"00","size":1}"#,
+        // The digest of "x": the record is trusted (it matches the content),
+        // so only sanitizing stands between it and the response headers.
+        r#"{"content_type":"text/html\r\nSet-Cookie: a=b","filename":"a\r\nSet-Cookie: x=y.txt","sha256":"2d711642b726b04401627ca9fbac32f5c8530fb1903cc4db02258717921a4881","size":1}"#,
     )
     .expect("write");
     let info = fixture.store.stat(&k).await.expect("stat");

@@ -1581,7 +1581,8 @@ mod tests {
         let dockerfile = read(&root, "Dockerfile");
         assert!(dockerfile.contains(&format!("ARG RUST_VERSION={RUST_VERSION}")));
         assert!(dockerfile.contains("cargo build --release --locked --bin sample-app"));
-        assert!(dockerfile.contains("FROM gcr.io/distroless/cc-debian13:nonroot AS runtime"));
+        assert!(dockerfile.contains("FROM gcr.io/distroless/cc-debian13:nonroot@sha256:"));
+        assert!(dockerfile.contains("FROM rust:${RUST_VERSION}-slim-trixie@sha256:"));
         assert!(dockerfile.contains("USER 65532:65532"));
         assert!(dockerfile.contains("CMD [\"/usr/local/bin/sample-app\", \"healthcheck\"]"));
         assert!(dockerfile.contains("ENTRYPOINT [\"/usr/local/bin/sample-app\"]"));
