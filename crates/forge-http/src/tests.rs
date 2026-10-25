@@ -1621,3 +1621,61 @@ fn a_charge_larger_than_u32_is_taken_in_steps() {
     drop(held);
     assert_eq!(small.0.available_permits(), 10);
 }
+
+/// Moves `/v2/...` to `/...` in its rewrite step and records it.
+struct RewriteV2;
+
+impl Middleware for RewriteV2 {
+    fn handle<'a>(&'a self, request: Request, next: Next<'a>) -> BoxResponseFuture<'a> {
+        next.run(request)
+    }
+
+    fn rewrite(&self, request: &mut Request) {
+        if let Some(rest) = request.uri().path().strip_prefix("/v2/") {
+            let uri = format!("/{rest}").parse().expect("valid rewritten URI");
+            request.set_uri(uri);
+            request.extensions_mut().insert("rewritten");
+        }
+    }
+}
+
+/// A path guard: refuses `/admin` and everything under it.
+struct DenyAdmin;
+
+impl Middleware for DenyAdmin {
+    fn handle<'a>(&'a self, request: Request, next: Next<'a>) -> BoxResponseFuture<'a> {
+        let path = request.uri().path();
+        if path == "/admin" || path.starts_with("/admin/") {
+            return Box::pin(async { Response::empty(StatusCode::FORBIDDEN) });
+        }
+        next.run(request)
+    }
+}
+
+#[tokio::test]
+async fn rewrites_run_before_every_layer_wherever_they_are_registered() {
+    let mut router = Router::new();
+    router
+        .route(Method::GET, "/admin", |_| async {
+            Response::new(StatusCode::OK, "admin")
+        })
+        .expect("admin route must register")
+        .route(Method::GET, "/posts", |request: Request| async move {
+            let rewritten = request.extensions().get::<&str>().copied();
+            Response::new(StatusCode::OK, rewritten.unwrap_or("as sent"))
+        })
+        .expect("posts route must register");
+    // The guard comes first; the rewriting layer after it.
+    router.layer(DenyAdmin).layer(RewriteV2);
+
+    for (target, status, body) in [
+        ("/admin", StatusCode::FORBIDDEN, ""),
+        ("/v2/admin", StatusCode::FORBIDDEN, ""),
+        ("/v2/posts", StatusCode::OK, "rewritten"),
+        ("/posts", StatusCode::OK, "as sent"),
+    ] {
+        let response = router.dispatch(request(Method::GET, target)).await;
+        assert_eq!(response.status, status, "{target}");
+        assert_eq!(response.body(), body, "{target}");
+    }
+}

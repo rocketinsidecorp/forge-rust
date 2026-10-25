@@ -206,8 +206,10 @@ impl Request {
     ///
     /// This exists for [`Middleware`] that rewrites the path the route table
     /// sees, such as the locale prefix `forge_views::LocaleNegotiation`
-    /// removes (`/pt-BR/posts` is routed as `/posts`). Layers registered
-    /// before it, and the server's own request telemetry, keep seeing the
+    /// removes (`/pt-BR/posts` is routed as `/posts`). Done in
+    /// [`Middleware::rewrite`], every layer sees the new URI; done in
+    /// [`Middleware::handle`], layers registered before it keep seeing the
+    /// original one. The server's own request telemetry always logs the
     /// original URI.
     pub fn set_uri(&mut self, uri: Uri) {
         self.uri = uri;
@@ -527,10 +529,24 @@ where
 /// first registered layer is the outermost), and may change it (for example
 /// its method), attach [`Request::extensions`], answer without calling the
 /// rest of the chain, or adjust the response that [`Next::run`] returns.
+///
+/// Before the first layer's `handle`, [`Router::dispatch`] calls every
+/// layer's [`Middleware::rewrite`], in registration order, so a layer that
+/// canonicalizes the request (such as removing a locale path prefix) does it
+/// for every layer, wherever it was registered: a path guard can never see a
+/// different path than the route table.
 pub trait Middleware: Send + Sync + 'static {
     /// Handles `request`; call `next.run(request)` to continue to the
     /// remaining layers and then the route table.
     fn handle<'a>(&'a self, request: Request, next: Next<'a>) -> BoxResponseFuture<'a>;
+
+    /// Canonicalizes `request` before any layer handles it (the default
+    /// does nothing). Every layer, the first registered included, and the
+    /// route table then see the rewritten request. It cannot answer, and it
+    /// runs before every guard, so it must only normalize (for example
+    /// remove a prefix and record it in [`Request::extensions`]); decisions
+    /// belong in [`Middleware::handle`].
+    fn rewrite(&self, _request: &mut Request) {}
 }
 
 /// The rest of the layer chain, ending with route matching.
@@ -667,7 +683,8 @@ impl Router {
 
     /// Adds a [`Middleware`] layer that runs before routing for every request,
     /// including requests that match no route. Layers run in registration
-    /// order: the first one added is the outermost.
+    /// order: the first one added is the outermost. Their
+    /// [`Middleware::rewrite`] steps all run before the first layer.
     pub fn layer(&mut self, middleware: impl Middleware) -> &mut Self {
         self.layers.push(Arc::new(middleware));
         self
@@ -709,7 +726,8 @@ impl Router {
     /// Runs one request through the layers and the route table without a
     /// network connection.
     ///
-    /// Layers added with [`Router::layer`] run first, in registration order;
+    /// Every layer's [`Middleware::rewrite`] runs first, then the layers
+    /// added with [`Router::layer`] handle the request in registration order;
     /// then the request is routed. The raw (still percent-encoded) path is matched segment by segment;
     /// static segments win over `{name}` captures. Unmatched paths answer
     /// `404`. `HEAD` is served by the path's `GET` route unless a `HEAD`
@@ -721,7 +739,10 @@ impl Router {
     /// answers `400`, because it would let a client smuggle a path separator
     /// past routing; other malformed escapes are reported by
     /// [`Request::path_param_as`] when the handler reads the parameter.
-    pub async fn dispatch(&self, request: Request) -> Response {
+    pub async fn dispatch(&self, mut request: Request) -> Response {
+        for layer in &self.layers {
+            layer.rewrite(&mut request);
+        }
         Next {
             layers: &self.layers,
             router: self,

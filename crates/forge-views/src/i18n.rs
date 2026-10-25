@@ -238,10 +238,11 @@ impl askama::filters::HtmlSafe for Translation<'_> {}
 /// Names that are not available locales are ignored, so no request input
 /// ever names a file. After the handler, a response that used the
 /// binding gets `Content-Language` and `Vary: Accept-Language, Cookie`.
-/// Register it before the other HTML layers so the prefix is removed for
-/// all of them; with the path prefix, a layer that decides by path (an
-/// `/admin` guard, an allow-list) must be registered after it, because
-/// layers before it see `/pt-BR/admin`.
+/// The path prefix is removed in the router's rewrite step
+/// ([`Middleware::rewrite`]), before any layer handles the request, so
+/// every layer sees `/admin` for `/pt-BR/admin` wherever it is registered:
+/// a path guard (an `/admin` guard, an allow-list) cannot be bypassed with
+/// a locale prefix, whatever the layer order.
 ///
 /// [`LocaleNegotiation::negotiate`] only answers the question and cannot
 /// mark a response. A response that depends on its result (a redirect to
@@ -280,8 +281,9 @@ impl LocaleNegotiation {
     }
 
     /// Lets the first path segment choose the locale and removes it before
-    /// routing. Layers registered before this one (and the server's request
-    /// telemetry) see the prefixed path.
+    /// any layer runs, so every layer and the route table see the path
+    /// without it (the server's request telemetry logs the path as sent).
+    /// [`path_prefix`] gives the removed prefix.
     #[must_use]
     pub fn with_path_prefix(mut self) -> Self {
         self.path_prefix = true;
@@ -320,30 +322,52 @@ impl LocaleNegotiation {
     /// yourself.
     #[must_use]
     pub fn negotiate(&self, request: &Request) -> String {
-        self.choose(request).0.to_owned()
+        self.choose(request).to_owned()
     }
 
-    /// The locale and the length of the path prefix to remove, if any.
-    fn choose(&self, request: &Request) -> (&str, Option<usize>) {
+    /// The available locale the first path segment of `request` names, and
+    /// the length of `/` and that segment.
+    fn prefix_locale<'s>(&'s self, request: &Request) -> Option<(&'s str, usize)> {
+        let path = request.uri().path();
+        let rest = path.strip_prefix('/').unwrap_or(path);
+        let segment = rest.split('/').next().unwrap_or_default();
+        self.translator
+            .exact_locale(segment)
+            .map(|locale| (locale, 1 + segment.len()))
+    }
+
+    /// The locale of `request`.
+    fn choose(&self, request: &Request) -> &str {
         let translator = &self.translator;
         if self.path_prefix {
-            let path = request.uri().path();
-            let rest = path.strip_prefix('/').unwrap_or(path);
-            let segment = rest.split('/').next().unwrap_or_default();
-            if let Some(locale) = translator.exact_locale(segment) {
-                return (locale, Some(1 + segment.len()));
+            match request.extensions().get::<PathPrefix>() {
+                // Removed by the rewrite step.
+                Some(PathPrefix(prefix)) => {
+                    let name = prefix.strip_prefix('/').unwrap_or(prefix);
+                    if let Some(locale) = translator.exact_locale(name) {
+                        return locale;
+                    }
+                }
+                // A request that did not pass the rewrite step (`negotiate`
+                // on a request the router has not seen): read the path.
+                None if request.extensions().get::<PrefixChecked>().is_none() => {
+                    if let Some((locale, _)) = self.prefix_locale(request) {
+                        return locale;
+                    }
+                }
+                None => {}
             }
         }
         if let Some(param) = &self.param
             && let Some(value) = query_value(request.uri().query(), param)
             && let Some(locale) = translator.find_locale(&value)
         {
-            return (locale, None);
+            return locale;
         }
         if let Some(value) = cookie_value(request, &self.cookie)
             && let Some(locale) = translator.find_locale(&value)
         {
-            return (locale, None);
+            return locale;
         }
         let accept = request
             .headers()
@@ -352,28 +376,41 @@ impl LocaleNegotiation {
         if let Some(header) = accept
             && let Some(locale) = translator.match_accept_language(header)
         {
-            return (locale, None);
+            return locale;
         }
-        (translator.default_locale(), None)
+        translator.default_locale()
     }
 }
 
 impl Middleware for LocaleNegotiation {
-    fn handle<'a>(&'a self, mut request: Request, next: Next<'a>) -> BoxResponseFuture<'a> {
-        let (locale, prefix) = self.choose(&request);
-        let i18n = I18n::new(Arc::clone(&self.translator), locale);
-        if let Some(prefix) = prefix {
-            // Only a prefix that was really removed is reported: were the
-            // rewrite refused, the request would still carry it and a return
-            // path built from `path_prefix` would read `/pt-BR/pt-BR/...`.
-            if strip_prefix(&mut request, prefix) {
-                // The locale's canonical name, not the request's spelling of
-                // it ("/PT-br" is stored as "/pt-BR").
-                request
-                    .extensions_mut()
-                    .insert(PathPrefix(format!("/{}", i18n.locale)));
-            }
+    /// Removes the locale path prefix, once per request, before any layer
+    /// runs (the router calls it; `handle` calls it too for a request that
+    /// did not come through a router).
+    fn rewrite(&self, request: &mut Request) {
+        if !self.path_prefix || request.extensions().get::<PrefixChecked>().is_some() {
+            return;
         }
+        // Checked once: a second negotiation layer, or `handle` after this
+        // step, must not strip `/en` from `/pt-BR/en/...` again.
+        request.extensions_mut().insert(PrefixChecked);
+        let Some((locale, length)) = self.prefix_locale(request) else {
+            return;
+        };
+        // The locale's canonical name, not the request's spelling of it
+        // ("/PT-br" is stored as "/pt-BR").
+        let prefix = PathPrefix(format!("/{locale}"));
+        // Only a prefix that was really removed is reported: were the
+        // rewrite refused, the request would still carry it and a return
+        // path built from `path_prefix` would read `/pt-BR/pt-BR/...`.
+        if strip_prefix(request, length) {
+            request.extensions_mut().insert(prefix);
+        }
+    }
+
+    fn handle<'a>(&'a self, mut request: Request, next: Next<'a>) -> BoxResponseFuture<'a> {
+        self.rewrite(&mut request);
+        let locale = self.choose(&request);
+        let i18n = I18n::new(Arc::clone(&self.translator), locale);
         request.extensions_mut().insert(i18n.clone());
         Box::pin(async move {
             let mut response = next.run(request).await;
@@ -388,6 +425,11 @@ impl Middleware for LocaleNegotiation {
 /// The locale path segment [`LocaleNegotiation`] removed from the request.
 #[derive(Clone, Debug)]
 struct PathPrefix(String);
+
+/// Set once a negotiation layer looked for a locale path prefix, so it is
+/// removed at most once per request.
+#[derive(Clone, Copy, Debug)]
+struct PrefixChecked;
 
 /// The locale path segment [`LocaleNegotiation::with_path_prefix`] removed
 /// from `request` (`"/pt-BR"`), or `None` when the request had none (or did
@@ -737,6 +779,83 @@ mod tests {
             "prefix off"
         );
         assert_eq!(path_prefix(&request("/pt-BR/posts", "", "")), None);
+    }
+
+    /// A path guard: refuses `/admin` and everything under it.
+    struct DenyAdmin;
+
+    impl Middleware for DenyAdmin {
+        fn handle<'a>(&'a self, request: Request, next: Next<'a>) -> BoxResponseFuture<'a> {
+            let path = request.uri().path();
+            if path == "/admin" || path.starts_with("/admin/") {
+                return Box::pin(async { Response::new(StatusCode::FORBIDDEN, "denied") });
+            }
+            next.run(request)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_locale_prefix_cannot_bypass_a_path_guard_registered_before_the_negotiation() {
+        for guard_first in [true, false] {
+            let mut router = Router::new();
+            for path in ["/admin", "/admin/users", "/posts"] {
+                router
+                    .route(Method::GET, path, |request: Request| async move {
+                        let locale = I18n::from_request(&request)
+                            .map(|i18n| i18n.locale().to_owned())
+                            .unwrap_or_default();
+                        Response::new(StatusCode::OK, format!("{}|{locale}", request.uri().path()))
+                    })
+                    .expect("route registers");
+            }
+            let negotiation = LocaleNegotiation::new(translator()).with_path_prefix();
+            if guard_first {
+                router.layer(DenyAdmin).layer(negotiation);
+            } else {
+                router.layer(negotiation).layer(DenyAdmin);
+            }
+            for (target, status, want) in [
+                ("/admin", StatusCode::FORBIDDEN, "denied"),
+                ("/pt-BR/admin", StatusCode::FORBIDDEN, "denied"),
+                ("/PT-br/admin/users", StatusCode::FORBIDDEN, "denied"),
+                ("/pt/admin?x=1", StatusCode::FORBIDDEN, "denied"),
+                ("/en/admin/", StatusCode::FORBIDDEN, "denied"),
+                // The prefix is removed once: `/en` after it is a path.
+                ("/pt-BR/en/admin", StatusCode::NOT_FOUND, "not found"),
+                ("/pt-BR/posts", StatusCode::OK, "/posts|pt-BR"),
+                ("/posts", StatusCode::OK, "/posts|en"),
+            ] {
+                let response = router.dispatch(request(target, "", "")).await;
+                assert_eq!(
+                    response.status(),
+                    status,
+                    "guard first: {guard_first}, {target}"
+                );
+                assert_eq!(
+                    text(&response),
+                    want,
+                    "guard first: {guard_first}, {target}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn negotiate_in_a_handler_still_sees_the_removed_prefix() {
+        let negotiation = LocaleNegotiation::new(translator()).with_path_prefix();
+        let mut router = Router::new();
+        router
+            .route(Method::GET, "/posts", {
+                let negotiation = negotiation.clone();
+                move |request: Request| {
+                    let locale = negotiation.negotiate(&request);
+                    async move { Response::new(StatusCode::OK, locale) }
+                }
+            })
+            .expect("route registers");
+        router.layer(negotiation);
+        let response = router.dispatch(request("/pt-BR/posts", "", "en")).await;
+        assert_eq!(text(&response), "pt-BR");
     }
 
     #[test]

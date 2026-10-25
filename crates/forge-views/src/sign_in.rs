@@ -536,25 +536,22 @@ mod tests {
             ),
         ] {
             assert_eq!(location_for(prefix_on, true, target).await, want, "{name}");
-            // A redirect layer registered before the locale layer sees the
-            // prefixed path as sent: it returns it, if it is local.
+            // The prefix is removed before any layer runs, so a redirect
+            // layer registered before the locale layer behaves the same.
             assert_eq!(
                 location_for(prefix_on, false, target).await,
-                to(target),
+                want,
                 "{name}, redirect layer first"
             );
         }
         // The stored prefix is the locale's canonical name, not the request's
-        // spelling of it. (A redirect layer registered before the locale
-        // layer never sees the stripped path and keeps the spelling.)
-        assert_eq!(
-            location_for(true, true, "/PT-br/products").await,
-            to("/pt-BR/products")
-        );
-        assert_eq!(
-            location_for(true, false, "/PT-br/products").await,
-            to("/PT-br/products")
-        );
+        // spelling of it, in either layer order.
+        for negotiation_first in [true, false] {
+            assert_eq!(
+                location_for(true, negotiation_first, "/PT-br/products").await,
+                to("/pt-BR/products")
+            );
+        }
         // The bare prefix is routed as "/": the visitor returns to "/pt-BR/".
         assert_eq!(location_for(true, true, "/pt-BR").await, to("/pt-BR/"));
         assert_eq!(
