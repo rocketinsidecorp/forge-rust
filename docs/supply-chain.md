@@ -212,7 +212,16 @@ does not match either form.
   `docker://` actions are refused. To add an action, review its code (and
   what it downloads), pin it by SHA with its version comment, and add it to
   `ALLOWED_ACTIONS` and to the pin table below in the same reviewed change;
-  the gate also fails when an allowlisted action is no longer used.
+  the gate also fails when an allowlisted action is no longer used. A
+  sub-path cannot leave the repository (no empty, `.` or `..` segment).
+- The gate reads workflows line by line, so it refuses what a line scanner
+  could misread: outside block scalars, a key written as an explicit key
+  (`? uses`), with an anchor (`&k uses`), as an alias (`*k :`), with a tag
+  (`!!str uses`) or as a double-quoted key with an escape (`"u\x73es"`).
+  Write keys plainly. It reads `run` text both with and without YAML
+  comments removed and continued lines joined both ways, so a `#` inside
+  shell quotes or a `\` inside a word hides no install, and it refuses a
+  `.cargo/config.toml` that redirects crate sources or aliases `install`.
 - Cargo tools are installed only through that action, plus one reviewed
   exception: the `Install cargo-auditable` step of `release.yml`, which
   installs exactly `cargo-auditable`. Both use one exact `--version` and

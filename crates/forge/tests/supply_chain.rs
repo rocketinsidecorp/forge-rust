@@ -173,9 +173,9 @@ fn key_values<'a>(code: &'a str, key: &str) -> Vec<&'a str> {
     let mut found = Vec::new();
     for (start, _) in code.match_indices(key) {
         // What precedes the key, past an opening quote and blanks: the start
-        // of the line, a list dash, or a flow mapping's `{` or `,`.
+        // of the line, a list dash, or a flow collection's `{`, `[` or `,`.
         let before = code[..start].trim_end_matches(['"', '\'']).trim_end();
-        if !(before.is_empty() || before.ends_with(['-', '{', ','])) {
+        if !(before.is_empty() || before.ends_with(['-', '{', '[', ','])) {
             continue;
         }
         let after = code[start + key.len()..]
@@ -184,7 +184,7 @@ fn key_values<'a>(code: &'a str, key: &str) -> Vec<&'a str> {
         let Some(value) = after.strip_prefix(':') else {
             continue;
         };
-        let value = value.split([',', '}']).next().unwrap_or_default();
+        let value = value.split([',', '}', ']']).next().unwrap_or_default();
         found.push(value.trim().trim_matches(['"', '\'']));
     }
     found
@@ -259,17 +259,109 @@ fn allowlist_violations(name: &str, text: &str) -> Vec<String> {
             let action = reference
                 .split_once('@')
                 .map_or(reference, |(action, _)| action);
-            let repository: Vec<&str> = action.splitn(3, '/').take(2).collect();
-            let allowed = repository.len() == 2
-                && ALLOWED_ACTIONS
-                    .iter()
-                    .any(|allowed| allowed.eq_ignore_ascii_case(&repository.join("/")));
+            // owner/repo[/sub/path]: no empty, `.` or `..` segment can walk
+            // from an allowlisted repository into another one.
+            let plain_path = action
+                .split('/')
+                .all(|segment| !matches!(segment, "" | "." | ".."));
+            let allowed = plain_path
+                && action_repository(reference)
+                    .is_some_and(|repository| ALLOWED_ACTIONS.contains(&repository.as_str()));
             if !allowed {
                 violations.push(format!(
                     "{name}:{}: `{reference}` is not an allowlisted action (ALLOWED_ACTIONS, docs/supply-chain.md)",
                     number + 1
                 ));
             }
+        }
+    }
+    violations
+}
+
+/// The `owner/repo` of a `uses:` reference, lower case (GitHub resolves both
+/// without case); `None` when it names none (`docker://...` included).
+fn action_repository(reference: &str) -> Option<String> {
+    let action = reference
+        .split_once('@')
+        .map_or(reference, |(action, _)| action);
+    let mut parts = action.splitn(3, '/');
+    let (owner, repository) = (parts.next()?, parts.next()?);
+    (!owner.is_empty() && !repository.is_empty() && !owner.contains(':'))
+        .then(|| format!("{owner}/{repository}").to_ascii_lowercase())
+}
+
+/// Lines a line scanner cannot read reliably are refused rather than read
+/// wrong, outside block scalars (`run: |`): a key position (after the
+/// indentation, `- `, or the `[`, `{`, `,` of a flow collection) that starts
+/// with `?` (explicit key), `&` (anchor), `*` (alias) or `!` (tag), or a
+/// double-quoted key with an escape (`"u\x73es"`). Each would let a `uses:`
+/// key slip past the pin and allowlist rules.
+fn key_position_violations(name: &str, text: &str) -> Vec<String> {
+    let mut violations = Vec::new();
+    // The indentation of the key whose block scalar is being skipped.
+    let mut block: Option<usize> = None;
+    for (number, line) in text.lines().enumerate() {
+        let code = split_comment(line).0;
+        if code.trim().is_empty() {
+            continue;
+        }
+        let indent = indentation(code);
+        if let Some(opened) = block {
+            if indent > opened {
+                continue;
+            }
+            block = None;
+        }
+        let mut content = code.trim_start();
+        while let Some(rest) = content
+            .strip_prefix('-')
+            .filter(|rest| rest.is_empty() || rest.starts_with([' ', '\t']))
+        {
+            content = rest.trim_start();
+        }
+        let mut positions = vec![content];
+        let value = mapping_entry(content).map_or("", |(_, value)| value);
+        // Inside a flow collection, what follows `[`, `{` or `,` (outside
+        // quotes) is a key position too.
+        for flow in [content, value] {
+            if !flow.starts_with(['[', '{']) {
+                continue;
+            }
+            let mut quote = None;
+            for (at, character) in flow.char_indices() {
+                match (quote, character) {
+                    (Some(open), _) if character == open => quote = None,
+                    (Some(_), _) => {}
+                    (None, '"' | '\'') => quote = Some(character),
+                    (None, '[' | '{' | ',') => positions.push(flow[at + 1..].trim_start()),
+                    _ => {}
+                }
+            }
+        }
+        let refused = positions.iter().any(|position| {
+            position.starts_with(['?', '&', '*', '!'])
+                || position
+                    .strip_prefix('"')
+                    .and_then(|key| key.split_once('"'))
+                    .map_or(position.starts_with('"'), |(key, _)| key.contains('\\'))
+        });
+        if refused {
+            violations.push(format!(
+                "{name}:{}: `{}`: explicit, anchored, aliased, tagged or escaped keys are not read by the gate; write the key plainly",
+                number + 1,
+                line.trim()
+            ));
+        }
+        let opens_block = value.starts_with(['|', '>'])
+            && value[1..]
+                .chars()
+                .all(|character| matches!(character, '-' | '+') || character.is_ascii_digit());
+        if opens_block {
+            // The column of the key (past any `- `): the block's lines are
+            // indented deeper than it, its siblings are not.
+            block = Some(
+                code.len() - code.trim_start().len() + (code.trim_start().len() - content.len()),
+            );
         }
     }
     violations
@@ -523,21 +615,33 @@ fn secret_violations(name: &str, text: &str, release: bool) -> Vec<String> {
 const RELEASE_INSTALL: (&str, &str) = (".github/workflows/release.yml", "Install cargo-auditable");
 const TOOL_ACTION: &str = ".github/actions/cargo-tool/action.yml";
 
-/// The logical lines of a file: comments removed and `\`-continued lines
-/// joined, each with the index of its first physical line.
-fn logical_lines(text: &str) -> Vec<(usize, String)> {
+/// The logical lines of a file, each with the index of its first physical
+/// line: `\`-continued lines joined with `glue`, and YAML comments removed
+/// when `strip_comments`. The install rule reads every combination: a `#`
+/// inside shell quotes is no comment, and a continuation inside a word
+/// (`c\` + `argo`) joins without a space.
+fn logical_lines(text: &str, strip_comments: bool, glue: &str) -> Vec<(usize, String)> {
     let mut lines: Vec<(usize, String)> = Vec::new();
     let mut continued = false;
     for (index, line) in text.lines().enumerate() {
-        let code = split_comment(line).0.trim_end();
+        let code = if strip_comments {
+            split_comment(line).0
+        } else {
+            line
+        }
+        .trim_end();
         let (code, continues) = match code.strip_suffix('\\') {
             Some(code) => (code, true),
             None => (code, false),
         };
         match lines.last_mut() {
             Some((_, joined)) if continued => {
-                joined.push(' ');
-                joined.push_str(code);
+                joined.push_str(glue);
+                joined.push_str(if glue.is_empty() {
+                    code.trim_start()
+                } else {
+                    code
+                });
             }
             _ => lines.push((index, code.to_owned())),
         }
@@ -606,6 +710,8 @@ struct CargoInstall {
     words: Vec<String>,
     /// Whether the logical line holds nothing but `run:` and this command.
     alone: bool,
+    /// The logical line as written, quotes included.
+    raw: String,
 }
 
 /// Every cargo command of a file that installs: a word `install` or
@@ -613,7 +719,21 @@ struct CargoInstall {
 /// the subcommand included). A cargo command that ends its line is read on
 /// into the next line, as a YAML-folded scalar would be.
 fn cargo_installs(text: &str) -> Vec<CargoInstall> {
-    let lines = logical_lines(text);
+    let mut found: Vec<CargoInstall> = Vec::new();
+    for (strip_comments, glue) in [(true, " "), (false, " "), (true, ""), (false, "")] {
+        for install in cargo_installs_in(&logical_lines(text, strip_comments, glue)) {
+            let known = found
+                .iter()
+                .any(|seen| seen.line == install.line && seen.words == install.words);
+            if !known {
+                found.push(install);
+            }
+        }
+    }
+    found
+}
+
+fn cargo_installs_in(lines: &[(usize, String)]) -> Vec<CargoInstall> {
     let mut found = Vec::new();
     for (at, (line, code)) in lines.iter().enumerate() {
         let words = shell_words(code);
@@ -660,6 +780,7 @@ fn cargo_installs(text: &str) -> Vec<CargoInstall> {
                     line: *line,
                     words: command,
                     alone,
+                    raw: code.clone(),
                 });
             }
         }
@@ -688,8 +809,17 @@ fn allowed_install_problems(install: &CargoInstall, in_tool_action: bool) -> Opt
                 _ if matches!(*argument, "--version" | "--vers") => arguments.get(at + 1).copied(),
                 _ => None,
             });
-    let exact = version
-        .is_some_and(|value| is_exact_version(value) || (in_tool_action && value == "$VERSION"));
+    // The action passes its caller's checked version exactly as
+    // `--version "$VERSION"`; no other spelling of it.
+    let raw_version = install
+        .raw
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .windows(2)
+        .any(|pair| pair == ["--version", "\"$VERSION\""]);
+    let exact = version.is_some_and(|value| {
+        is_exact_version(value) || (in_tool_action && value == "$VERSION" && raw_version)
+    });
     let source = arguments.iter().any(|argument| {
         let flag = argument.split_once('=').map_or(*argument, |(flag, _)| flag);
         matches!(
@@ -947,15 +1077,17 @@ fn actions_are_pinned_by_commit_with_their_version_in_a_comment() {
 
 #[test]
 fn only_allowlisted_actions_are_used() {
+    let mut files = workflows_and_local_actions();
+    let template = "crates/forge-cli/templates/app/github/workflows/ci.yml.tmpl";
+    files.push((template.to_owned(), template.to_owned()));
     let mut used = BTreeSet::new();
-    for (name, relative) in workflows_and_local_actions() {
+    for (name, relative) in files {
         let text = read(&relative);
         assert_clean(&allowlist_violations(&name, &text));
+        assert_clean(&key_position_violations(&name, &text));
         for line in text.lines() {
             for reference in key_values(split_comment(line).0, "uses") {
-                if let Some((action, _)) = reference.split_once('@') {
-                    used.insert(action.to_ascii_lowercase());
-                }
+                used.extend(action_repository(reference));
             }
         }
     }
@@ -968,6 +1100,14 @@ fn only_allowlisted_actions_are_used() {
     }
 }
 
+/// What the gate refuses about a `uses:` line: an unlisted action, or a key
+/// it cannot read.
+fn uses_violations(text: &str) -> Vec<String> {
+    let mut violations = allowlist_violations("t.yml", text);
+    violations.extend(key_position_violations("t.yml", text));
+    violations
+}
+
 #[test]
 fn the_allowlist_rejects_unlisted_actions_however_pinned() {
     for rejected in [
@@ -978,12 +1118,21 @@ fn the_allowlist_rejects_unlisted_actions_however_pinned() {
         "      - uses: actions/checkout-evil@SHA # v7.0.1",
         "      - uses: docker://alpine@sha256:DIGEST",
         "      - uses: checkout@SHA # v7",
+        "      - uses: actions/checkout/../../taiki-e/install-action@SHA # v2",
+        "      - uses: actions/checkout/./x@SHA # v7",
+        "      - uses: actions/checkout//x@SHA # v7",
+        // YAML spellings of the key that a line scanner would not see.
+        "      - \"u\\x73es\": taiki-e/install-action@SHA # v2",
+        "      - \"use\\s\": taiki-e/install-action@SHA # v2",
+        "      - ? uses\n        : taiki-e/install-action@SHA # v2",
+        "    steps: [uses: taiki-e/install-action@SHA] # v2",
+        "      - &k uses: taiki-e/install-action@SHA # v2",
+        "      - *k : taiki-e/install-action@SHA # v2",
+        "      - !!str uses: taiki-e/install-action@SHA # v2",
+        "    steps: [{name: x, !!str uses: taiki-e/install-action@SHA}] # v2",
     ] {
         let text = snippet(rejected);
-        assert!(
-            !allowlist_violations("t.yml", &text).is_empty(),
-            "accepted: {text}"
-        );
+        assert!(!uses_violations(&text).is_empty(), "accepted: {text}");
     }
     for accepted in [
         "      - uses: actions/checkout@SHA # v7.0.1",
@@ -991,8 +1140,12 @@ fn the_allowlist_rejects_unlisted_actions_however_pinned() {
         "      - uses: swatinem/RUST-CACHE@SHA # v2.9.2",
         "      - uses: docker/build-push-action/subdir@SHA # v7",
         "      - uses: ./.github/actions/cargo-tool",
+        "    steps: [uses: actions/checkout@SHA] # v7.0.1",
+        // Inside a block scalar, `*`, `&` and `!` are shell, not YAML.
+        "      - run: |\n          case \"$x\" in\n            *) echo \"!\" & wait ;;\n          esac\n      - uses: actions/checkout@SHA # v7.0.1",
+        "    branches: [main]\n    tags: [\"v*\"]",
     ] {
-        assert_clean(&allowlist_violations("t.yml", &snippet(accepted)));
+        assert_clean(&uses_violations(&snippet(accepted)));
     }
 }
 
@@ -1394,6 +1547,12 @@ fn the_tool_rule_rejects_installs_that_ignore_a_version_bump() {
         "        run: $CARGO install x --version 1.2.3 --locked\n",
         "        run: ${CARGO:-cargo} install x --version 1.2.3 --locked\n",
         "        run: CARGO_ALIAS_I=install cargo i x\n",
+        // A `#` inside shell quotes is no comment; a continuation inside a
+        // word joins without a space.
+        "        run: |\n          echo \" #\"; cargo install evil\n",
+        "        run: echo \"a #\" && cargo install evil\n",
+        "        run: |\n          c\\\n          argo install evil\n",
+        "        run: |\n          cargo inst\\\n          all evil\n",
         "        run: ca\"rgo\" install x --version 1.2.3 --locked\n",
         "        run: c\\\\argo inst\\\\all x --version 1.2.3 --locked\n",
         "        run: cargo 'bin'stall x\n",
@@ -1453,6 +1612,17 @@ fn the_tool_rule_rejects_installs_that_ignore_a_version_bump() {
     // checked $VERSION.
     let action = "      run: cargo install \"$TOOL\" --version \"$VERSION\" --locked --root \"$HOME/.forge-tools/$TOOL-$VERSION\"\n";
     assert_clean(&tool_install_violations(TOOL_ACTION, action));
+    // ... spelled exactly so: unquoted or partly quoted is refused.
+    for spelled in [
+        "      run: cargo install \"$TOOL\" --version $VERSION --locked\n",
+        "      run: cargo install \"$TOOL\" --version $VER\"SION\" --locked\n",
+        "      run: cargo install \"$TOOL\" --version=\"$VERSION\" --locked\n",
+    ] {
+        assert!(
+            !tool_install_violations(TOOL_ACTION, spelled).is_empty(),
+            "accepted: {spelled}"
+        );
+    }
     for elsewhere in [
         ".github/workflows/ci.yml",
         "evil/.github/actions/cargo-tool/action.yml",
@@ -1463,6 +1633,74 @@ fn the_tool_rule_rejects_installs_that_ignore_a_version_bump() {
             "{elsewhere}"
         );
     }
+}
+
+/// A cargo configuration may not redirect crates.io (`[source.*]`,
+/// `replace-with`) or alias a command to `install`: either would bypass the
+/// locked, crates.io-only installs the rules above check.
+fn cargo_config_violations(name: &str, text: &str) -> Vec<String> {
+    let mut violations = Vec::new();
+    let mut in_alias = false;
+    for (number, line) in text.lines().enumerate() {
+        let code = line.split_once('#').map_or(line, |(code, _)| code).trim();
+        if code.starts_with('[') {
+            let table = code.trim_matches(['[', ']', ' ']);
+            in_alias = table == "alias";
+            if table == "source" || table.starts_with("source.") || table.starts_with("registries")
+            {
+                violations.push(format!(
+                    "{name}:{}: `{code}` redirects crate sources",
+                    number + 1
+                ));
+            }
+            continue;
+        }
+        let words: Vec<String> = shell_words(code);
+        let installs = words
+            .iter()
+            .any(|word| matches!(word.as_str(), "install" | "binstall"))
+            || code.contains("\"install\"")
+            || code.contains("'install'");
+        if code.contains("replace-with") || code.starts_with("source.") {
+            violations.push(format!(
+                "{name}:{}: `{code}` redirects crate sources",
+                number + 1
+            ));
+        }
+        if (in_alias || code.starts_with("alias.")) && installs {
+            violations.push(format!("{name}:{}: `{code}` aliases install", number + 1));
+        }
+    }
+    violations
+}
+
+#[test]
+fn no_cargo_configuration_redirects_sources_or_aliases_install() {
+    for directory in [".", "fuzz", "examples/hello-forge"] {
+        for file in [".cargo/config.toml", ".cargo/config"] {
+            let relative = format!("{directory}/{file}");
+            if root().join(&relative).is_file() {
+                assert_clean(&cargo_config_violations(&relative, &read(&relative)));
+            }
+        }
+    }
+    for rejected in [
+        "[source.crates-io]\nreplace-with = \"mirror\"\n",
+        "[source.mirror]\nregistry = \"https://example.com/index\"\n",
+        "[alias]\ni = \"install\"\n",
+        "[alias]\nget = [\"install\", \"--git\", \"https://example.com/x\"]\n",
+        "alias.i = \"install\"\n",
+        "[registries.mirror]\nindex = \"https://example.com/index\"\n",
+    ] {
+        assert!(
+            !cargo_config_violations("config.toml", rejected).is_empty(),
+            "accepted: {rejected}"
+        );
+    }
+    assert_clean(&cargo_config_violations(
+        "config.toml",
+        "[alias]\nxtask = \"run --package xtask --\"\n[build]\nrustflags = []\n",
+    ));
 }
 
 #[test]
