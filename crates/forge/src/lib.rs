@@ -36,6 +36,8 @@ mod operator;
 mod probe;
 mod routes;
 mod signal;
+#[cfg(test)]
+mod test_support;
 pub mod web;
 mod worker;
 

@@ -12,14 +12,20 @@
 pub(crate) mod cli;
 pub(crate) mod commands;
 pub(crate) mod config;
+#[cfg(test)]
+mod config_tests;
 pub(crate) mod deployer;
 pub(crate) mod errors;
 pub(crate) mod init;
 #[cfg(all(test, unix))]
 mod lock_tests;
 pub(crate) mod operations;
+#[cfg(all(test, unix))]
+mod operations_tests;
 pub(crate) mod remote;
 pub(crate) mod runner;
+#[cfg(all(test, unix))]
+mod runner_tests;
 pub(crate) mod secrets;
 #[cfg(all(test, unix))]
 mod ssh_tests;

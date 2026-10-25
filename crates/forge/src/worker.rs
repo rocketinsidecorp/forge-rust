@@ -185,6 +185,9 @@ where
 }
 
 #[cfg(test)]
+mod worker_tests;
+
+#[cfg(test)]
 mod tests {
     use std::sync::{
         Arc,

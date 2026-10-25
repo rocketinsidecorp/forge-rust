@@ -69,3 +69,6 @@ pub(crate) fn text(status: u16) -> Option<&'static str> {
         _ => return None,
     })
 }
+
+#[cfg(test)]
+mod status_tests;

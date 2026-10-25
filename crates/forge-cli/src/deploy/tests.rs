@@ -612,22 +612,22 @@ fn command_text_is_exact() {
 
 /// Records commands and answers read-only queries from fixtures.
 #[derive(Clone, Default)]
-struct FakeRunner {
+pub(super) struct FakeRunner {
     calls: Arc<Mutex<Vec<String>>>,
-    inventory: Arc<Mutex<HashMap<String, String>>>,
-    images: Arc<Mutex<HashMap<String, String>>>,
+    pub(super) inventory: Arc<Mutex<HashMap<String, String>>>,
+    pub(super) images: Arc<Mutex<HashMap<String, String>>>,
     /// Scripts starting with a prefix answer with this stdout.
-    answers: Arc<Mutex<Vec<(String, String)>>>,
+    pub(super) answers: Arc<Mutex<Vec<(String, String)>>>,
     #[allow(clippy::type_complexity)]
     fail: Arc<Mutex<Option<Box<dyn Fn(&str, &RemoteCommand) -> Option<RunError> + Send + Sync>>>>,
 }
 
 impl FakeRunner {
-    fn calls(&self) -> Vec<String> {
+    pub(super) fn calls(&self) -> Vec<String> {
         self.calls.lock().expect("lock").clone()
     }
 
-    fn fail_with(
+    pub(super) fn fail_with(
         &self,
         fail: impl Fn(&str, &RemoteCommand) -> Option<RunError> + Send + Sync + 'static,
     ) {
@@ -707,8 +707,8 @@ impl Runner for FakeRunner {
 
 /// Records local commands instead of running them.
 #[derive(Clone, Default)]
-struct RecordingLocal {
-    calls: Arc<Mutex<Vec<Vec<String>>>>,
+pub(super) struct RecordingLocal {
+    pub(super) calls: Arc<Mutex<Vec<Vec<String>>>>,
 }
 
 impl LocalRunner for RecordingLocal {
@@ -761,7 +761,13 @@ pub(super) fn plan_epoch() -> Timestamp {
     }
 }
 
-fn ps_json(name: &str, role: &str, version: &str, state: &str, created: Timestamp) -> String {
+pub(super) fn ps_json(
+    name: &str,
+    role: &str,
+    version: &str,
+    state: &str,
+    created: Timestamp,
+) -> String {
     let line = serde_json::json!({
         "Names": name, "State": state, "Image": format!("registry.example.com/acme/shop:{version}"),
         "Labels": format!("forge.role={role},forge.service=shop,forge.version={version}"),
@@ -770,7 +776,7 @@ fn ps_json(name: &str, role: &str, version: &str, state: &str, created: Timestam
     format!("{line}\n")
 }
 
-fn image_json(tag: &str) -> String {
+pub(super) fn image_json(tag: &str) -> String {
     format!("{{\"Repository\":\"registry.example.com/acme/shop\",\"Tag\":{tag:?}}}\n")
 }
 
@@ -780,17 +786,17 @@ pub(super) const PLAN_SECRETS: [(&str, &str); 3] = [
     ("POSTGRES_PASSWORD", "pg-secret-3"),
 ];
 
-struct Fixture {
-    deployer: Deployer,
-    runner: FakeRunner,
-    local: RecordingLocal,
-    log: Buffer,
-    _root: tempfile::TempDir,
+pub(super) struct Fixture {
+    pub(super) deployer: Deployer,
+    pub(super) runner: FakeRunner,
+    pub(super) local: RecordingLocal,
+    pub(super) log: Buffer,
+    pub(super) _root: tempfile::TempDir,
 }
 
 /// Forge-Go's `planFixture`: web on .10 and .11, jobs on .11; v2 is live,
 /// v1 and v0 are retained; retain is 2.
-fn plan_fixture(dry_run: bool) -> Fixture {
+pub(super) fn plan_fixture(dry_run: bool) -> Fixture {
     let config = parse(&VALID_CONFIG.replacen("retain: 3", "retain: 2", 1));
     let hour = Duration::from_secs(3600);
     let at = |hours_ago: u32| {
@@ -1105,7 +1111,7 @@ fn failing_hook_aborts_before_remote_changes() {
     assert!(error.message.contains("not executable"), "{error}");
 }
 
-fn remote(host: &str, code: i32, stderr: &str) -> RunError {
+pub(super) fn remote(host: &str, code: i32, stderr: &str) -> RunError {
     RunError::Remote(RemoteError {
         host: host.to_owned(),
         exit_code: code,
@@ -1685,7 +1691,7 @@ fn logs_respect_parallelism_unless_following() {
     }
 }
 
-fn common(_root: &Path) -> Common {
+pub(super) fn common(_root: &Path) -> Common {
     Common {
         config: PathBuf::from(DEFAULT_CONFIG_PATH),
         secrets: PathBuf::from(".forge/secrets"),
@@ -1694,7 +1700,7 @@ fn common(_root: &Path) -> Common {
     }
 }
 
-fn io() -> (Io, Buffer, Buffer) {
+pub(super) fn io() -> (Io, Buffer, Buffer) {
     let (out, err) = (Buffer::default(), Buffer::default());
     (
         Io {

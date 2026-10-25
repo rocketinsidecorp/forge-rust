@@ -811,3 +811,162 @@ fn environments_are_validated_and_default_to_forge_env() {
     app.run(Action::Init).expect("init");
     assert!(app.dir().join("staging.json.enc").exists());
 }
+
+/// Replaces `path` with a directory that cannot be replaced by a rename.
+fn block(path: &Path) {
+    let _ = fs::remove_file(path);
+    fs::create_dir(path).expect("directory");
+    fs::write(path.join("blocker"), b"x").expect("blocker");
+}
+
+#[test]
+fn a_restore_that_fails_too_adds_to_the_error_instead_of_replacing_it() {
+    let mut app = initialized();
+    let _ = environment_key_beside_a_key_file(&mut app);
+    let encrypted = app.dir().join("development.json.enc");
+    let key_file = app.dir().join("development.key");
+    app.after_write = Some(Box::new(move |step: &str| {
+        if step == "key file with the new key" {
+            block(&encrypted);
+            block(&key_file);
+        }
+    }));
+    let error = app
+        .run(rotate(false, false, true))
+        .expect_err("neither file can be written");
+    let message = error.to_string();
+    assert!(
+        message.contains("\ncould not restore the previous key file: "),
+        "{message}"
+    );
+}
+
+#[test]
+fn old_keys_that_cannot_be_dropped_after_the_rewrite_are_reported() {
+    let mut app = initialized();
+    let key_file = app.dir().join("development.key");
+    app.after_write = Some(Box::new(move |step: &str| {
+        if step == "credentials file" {
+            block(&key_file);
+        }
+    }));
+    let error = app
+        .run(rotate(false, false, true))
+        .expect_err("the key file cannot be rewritten");
+    assert!(
+        error
+            .to_string()
+            .starts_with("re-encrypted, but could not drop the old keys from the key file: "),
+        "{error}"
+    );
+}
+
+#[test]
+fn init_names_the_ignore_file_it_could_not_update() {
+    for ignored in [".gitignore", ".dockerignore"] {
+        let mut app = App::new();
+        fs::create_dir(app.root.path().join(ignored)).expect("directory");
+        let error = app.run(Action::Init).expect_err("unreadable ignore file");
+        let message = error.to_string();
+        assert!(
+            message.starts_with(&format!("update {ignored} (add ")),
+            "{message}"
+        );
+        assert!(
+            app.dir().join("development.json.enc").is_file(),
+            "the credentials were created before the ignore file failed"
+        );
+    }
+}
+
+#[test]
+fn init_reports_a_credentials_directory_it_cannot_use() {
+    // The encrypted file's name is taken by a directory: neither missing nor
+    // readable.
+    let mut app = App::new();
+    fs::create_dir_all(app.dir().join("development.json.enc")).expect("directory");
+    assert!(app.run(Action::Init).is_err());
+
+    // The key file's name is taken: init fails after finding nothing, and
+    // says what it created.
+    let mut app = App::new();
+    fs::create_dir_all(app.dir().join("development.key")).expect("directory");
+    assert!(app.run(Action::Init).is_err());
+}
+
+#[test]
+fn ignore_entries_are_appended_only_where_missing() {
+    use crate::credentials::ensure_line;
+
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let path = directory.path().join(".gitignore");
+    // Not created unless asked.
+    ensure_line(&path, "/config/credentials/*.key", false).expect("nothing to do");
+    assert!(!path.exists());
+    // An empty file takes the entry without a leading blank line.
+    fs::write(&path, "").expect("empty file");
+    ensure_line(&path, "/config/credentials/*.key", false).expect("append");
+    assert_eq!(
+        fs::read_to_string(&path).expect("read"),
+        "# Credential keys: never commit.\n/config/credentials/*.key\n"
+    );
+    // Present: untouched. A broader rule counts too.
+    let before = fs::read_to_string(&path).expect("read");
+    ensure_line(&path, "/config/credentials/*.key", false).expect("present");
+    assert_eq!(fs::read_to_string(&path).expect("read"), before);
+    fs::write(&path, "*.key").expect("broad rule");
+    ensure_line(&path, "/config/credentials/*.key", false).expect("covered");
+    assert_eq!(fs::read_to_string(&path).expect("read"), "*.key");
+    // A directory is no ignore file.
+    let folder = directory.path().join("folder");
+    fs::create_dir(&folder).expect("directory");
+    assert!(ensure_line(&folder, "x", true).is_err());
+}
+
+#[test]
+fn the_editor_process_reports_how_it_failed() {
+    use crate::credentials_edit::run_editor_process;
+
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let file = directory.path().join("document.json");
+    fs::write(&file, "{}").expect("document");
+    let none = Interrupts::none();
+    assert_eq!(
+        run_editor_process(&[], &file, &none).expect_err("no editor"),
+        "no editor"
+    );
+    let failing = [
+        "sh".to_owned(),
+        "-c".to_owned(),
+        "exit 3".to_owned(),
+        "--".to_owned(),
+    ];
+    let error = run_editor_process(&failing, &file, &none).expect_err("exit 3");
+    assert!(error.starts_with("sh exited with "), "{error}");
+    let error = run_editor_process(&["/no/such/editor".to_owned()], &file, &none)
+        .expect_err("cannot start");
+    assert!(error.starts_with("start /no/such/editor: "), "{error}");
+    let working = [
+        "sh".to_owned(),
+        "-c".to_owned(),
+        "exit 0".to_owned(),
+        "--".to_owned(),
+    ];
+    run_editor_process(&working, &file, &none).expect("success");
+}
+
+#[test]
+fn an_edited_document_over_the_size_limit_is_refused_and_wiped() {
+    let mut app = initialized();
+    let mut seen = None;
+    let huge = format!(
+        "{{\"a\": \"{}\"}}",
+        "x".repeat(forge_credentials::MAX_PLAINTEXT_BYTES)
+    );
+    let error = app.edit(writing(&huge, &mut seen)).expect_err("too large");
+    assert!(
+        error.to_string().contains("edited document exceeds "),
+        "{error}"
+    );
+    gone(seen);
+}

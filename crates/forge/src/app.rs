@@ -1573,6 +1573,13 @@ impl fmt::Display for ErrorChain<'_> {
 }
 
 #[cfg(test)]
+mod lifecycle_tests;
+#[cfg(all(test, feature = "mysql"))]
+mod mysql_tests;
+#[cfg(all(test, feature = "postgres"))]
+mod postgres_tests;
+
+#[cfg(test)]
 mod tests {
     use forge_http::{Method, Response, StatusCode};
 

@@ -456,6 +456,9 @@ impl ComposeError {
 }
 
 #[cfg(test)]
+mod compose_tests;
+
+#[cfg(test)]
 mod tests {
     use std::io;
 

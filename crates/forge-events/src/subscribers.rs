@@ -120,3 +120,6 @@ impl EventPublisher for Subscribers {
         first_failure.map_or(Ok(()), Err)
     }
 }
+
+#[cfg(test)]
+mod subscribers_tests;

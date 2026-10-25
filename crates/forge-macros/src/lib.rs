@@ -834,3 +834,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod expansion_tests;

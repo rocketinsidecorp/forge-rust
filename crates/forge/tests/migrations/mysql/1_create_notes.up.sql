@@ -1,0 +1,4 @@
+CREATE TABLE notes (
+    id BINARY(16) PRIMARY KEY NOT NULL,
+    title VARCHAR(255) NOT NULL
+);

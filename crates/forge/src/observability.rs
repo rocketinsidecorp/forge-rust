@@ -144,3 +144,6 @@ pub(crate) async fn shutdown(telemetry: Option<Telemetry>, deadline: Instant) {
         warn!(%error, "telemetry was not fully exported before the shutdown deadline");
     }
 }
+
+#[cfg(test)]
+mod observability_tests;

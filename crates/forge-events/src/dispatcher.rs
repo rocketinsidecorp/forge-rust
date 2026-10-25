@@ -352,3 +352,6 @@ mod tests {
         assert!(sanitize(&"x".repeat(5000)).len() <= 1024);
     }
 }
+
+#[cfg(test)]
+mod dispatcher_tests;

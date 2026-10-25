@@ -106,6 +106,9 @@ fn read_hidden_line(input: &mut impl Read) -> io::Result<String> {
 }
 
 #[cfg(test)]
+mod console_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

@@ -416,3 +416,67 @@ fn new_refuses_unknown_locales_and_api_applications_with_a_locale() {
     assert!(!api.status.success());
     assert!(!directory.path().join("shop").exists());
 }
+
+#[test]
+fn i18n_check_skips_sources_it_cannot_read_and_defaults_to_an_available_locale() {
+    let directory = tempfile::tempdir().expect("temporary directory should be available");
+    let created = forge(
+        directory.path(),
+        &[
+            "new",
+            "shop",
+            "-d",
+            "none",
+            "--locale",
+            "es",
+            "--skip-lockfile",
+        ],
+    );
+    assert!(created.status.success(), "{created:?}");
+    let root = directory.path().join("shop");
+    // Without an English file the first available locale is the default.
+    for entry in std::fs::read_dir(root.join("config/locales")).expect("locales") {
+        let path = entry.expect("entry").path();
+        if path
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().contains("en.json"))
+        {
+            std::fs::remove_file(path).expect("remove English");
+        }
+    }
+    // A source that is not UTF-8 and one over the size limit are skipped,
+    // not fatal.
+    std::fs::write(root.join("src/binary.rs"), [0xff_u8, 0xfe, 0x00]).expect("binary source");
+    std::fs::write(root.join("src/huge.rs"), vec![b'x'; 3 << 20]).expect("huge source");
+
+    let checked = forge(&root, &["i18n", "check"]);
+    let report = String::from_utf8_lossy(&checked.stdout);
+    assert!(
+        report.starts_with("config/locales: es; "),
+        "{report}{:?}",
+        checked.stderr
+    );
+}
+
+#[test]
+fn i18n_check_refuses_a_tree_with_too_many_sources() {
+    let directory = tempfile::tempdir().expect("temporary directory should be available");
+    let created = forge(
+        directory.path(),
+        &["new", "shop", "-d", "none", "--skip-lockfile"],
+    );
+    assert!(created.status.success(), "{created:?}");
+    let root = directory.path().join("shop");
+    let many = root.join("src/generated");
+    std::fs::create_dir_all(&many).expect("directory");
+    for index in 0..20_001 {
+        std::fs::write(many.join(format!("file{index}.rs")), "").expect("source");
+    }
+    let checked = forge(&root, &["i18n", "check"]);
+    assert_eq!(checked.status.code(), Some(1), "{checked:?}");
+    assert!(
+        String::from_utf8_lossy(&checked.stderr).contains("more than 20000 source files to scan"),
+        "{}",
+        String::from_utf8_lossy(&checked.stderr)
+    );
+}

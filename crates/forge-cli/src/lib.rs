@@ -13,9 +13,15 @@ mod dbclient;
 mod deploy;
 mod destroy;
 mod dev;
+#[cfg(test)]
+mod dev_tests;
 mod doctor;
 mod error;
+#[cfg(test)]
+mod error_tests;
 mod generate;
+#[cfg(test)]
+mod generate_error_tests;
 #[cfg(test)]
 mod generator_tests;
 mod generators;

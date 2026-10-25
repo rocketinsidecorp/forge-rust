@@ -643,3 +643,483 @@ fn mailers_and_jobs_round_trip_through_destroy() {
         .unwrap_or_default();
     assert!(refusal.contains("testing"), "{refusal}");
 }
+
+// --- refusals and rarely taken branches ---------------------------------------
+
+use crate::CliError;
+use crate::authentication;
+use crate::generators::{self, Planned, Role};
+
+/// Rewrites a file of the application.
+fn edit(root: &Path, path: &str, change: impl FnOnce(&str) -> String) {
+    let full = root.join(path);
+    let source = fs::read_to_string(&full).unwrap_or_else(|error| panic!("{path}: {error}"));
+    fs::write(&full, change(&source)).unwrap_or_else(|error| panic!("{path}: {error}"));
+}
+
+/// The text of a refusal; fails the test when the generator accepted.
+fn refused<T>(result: Result<T, CliError>) -> String {
+    match result {
+        Ok(_) => panic!("the generator accepted the request"),
+        Err(error) => error.to_string(),
+    }
+}
+
+#[test]
+fn a_scaffold_refuses_an_application_it_cannot_wire() {
+    let scaffold_post = |root: &Path, scope: Scope| {
+        scaffold::generate(
+            root,
+            &resource("post", &["title:string"], scope, Layers::Scaffold),
+            VERSION,
+        )
+    };
+
+    let (_parent, root) = application(Database::Postgresql, true, Locale::En);
+    edit(&root, "Cargo.toml", |manifest| {
+        manifest
+            .lines()
+            .map(|line| {
+                if line.starts_with("sqlx =") {
+                    line.replace("\"postgres\"", "\"odbc\"")
+                } else {
+                    line.to_owned()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    });
+    assert!(
+        refused(scaffold_post(&root, Scope::Global))
+            .contains("could not tell the database backend"),
+        "an sqlx dependency without a known backend"
+    );
+
+    let (_parent, root) = application(Database::Postgresql, true, Locale::En);
+    edit(&root, "src/bootstrap/mod.rs", |source| {
+        source.replace(
+            "crate::adapters::http::site(",
+            "crate::adapters::http::elsewhere(",
+        )
+    });
+    assert!(refused(scaffold_post(&root, Scope::Global)).contains("has no `compose` function"));
+
+    let (_parent, root) = application(Database::Postgresql, true, Locale::En);
+    fs::remove_file(root.join("src/application/use_cases/mod.rs")).expect("remove");
+    assert!(
+        refused(scaffold_post(&root, Scope::Global))
+            .contains("src/application/use_cases/mod.rs is missing")
+    );
+
+    let (_parent, root) = application(Database::Postgresql, true, Locale::En);
+    edit(&root, "src/infrastructure/database/mod.rs", |source| {
+        source.replace(
+            "pub async fn begin_tenant_transaction",
+            "pub async fn begin_other",
+        )
+    });
+    assert!(
+        refused(scaffold_post(&root, Scope::Tenant)).contains("has no begin_tenant_transaction"),
+        "a tenant-scoped PostgreSQL repository runs in the tenant transaction"
+    );
+    // The same application serves a global scaffold.
+    scaffold_post(&root, Scope::Global).unwrap_or_else(|error| panic!("{error}"));
+}
+
+#[test]
+fn a_model_for_mysql_prints_the_mysql_repository() {
+    let (_parent, root) = application(Database::Mysql, true, Locale::En);
+    let outcome = scaffold::generate(
+        &root,
+        &resource("post", &["title:string"], Scope::Global, Layers::Model),
+        VERSION,
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
+    assert!(
+        outcome.wiring.contains("MySqlPostRepository"),
+        "{}",
+        outcome.wiring
+    );
+    assert!(!outcome.wiring.contains("PgPostRepository"));
+}
+
+/// Generates a scaffold with `fields` and returns everything it wrote.
+fn scaffolded(fields: &[&str]) -> String {
+    let (_parent, root) = application(Database::Postgresql, true, Locale::En);
+    let before = tree(&root);
+    scaffold::generate(
+        &root,
+        &resource("item", fields, Scope::Global, Layers::Scaffold),
+        VERSION,
+    )
+    .unwrap_or_else(|error| panic!("{fields:?}: {error}"));
+    tree(&root)
+        .into_iter()
+        .filter(|(path, content)| before.get(path) != Some(content))
+        .map(|(_, content)| content)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn the_generated_form_tests_break_the_first_field_that_can_be_broken() {
+    // A required text field is broken by leaving it blank (covered by the
+    // goldens); without one, the first typed field gets a value of the wrong
+    // type.
+    for (fields, broken, message) in [
+        (
+            &["count:integer"][..],
+            "count=abc",
+            "must be a whole number",
+        ),
+        (
+            &["at:timestamp"],
+            "at=not-a-time",
+            "must be a date and time",
+        ),
+        (&["owner:uuid"], "owner=nope", "must be a UUID"),
+        (&["done:boolean?"], "done=maybe", "must be yes, no or blank"),
+    ] {
+        let written = scaffolded(fields);
+        assert!(
+            written.contains(broken),
+            "{fields:?}: {broken} not in the generated tests"
+        );
+        assert!(
+            written.contains(message),
+            "{fields:?}: {message} not in the generated tests"
+        );
+    }
+    // Only optional text left: an over-long value, with the other fields
+    // valid.
+    let written = scaffolded(&["done:boolean", "note:string?"]);
+    assert!(written.contains("is too long"), "{written}");
+    assert!(
+        written.contains("\"done=true&note={}\", \"x\".repeat(256)"),
+        "{written}"
+    );
+    let written = scaffolded(&["note:text?"]);
+    assert!(
+        written.contains("\"note={}\", \"x\".repeat(65536)"),
+        "{written}"
+    );
+    // Nothing breakable but a required checkbox: an unexpected field.
+    let written = scaffolded(&["done:boolean"]);
+    assert!(written.contains("unknown form field"), "{written}");
+    // The show page names the first field's value in the form's own type.
+    for (fields, shown) in [
+        (&["count:integer"][..], "42"),
+        (&["done:boolean"], "Yes"),
+        (&["at:timestamp"], "2026-01-02T03:04:05Z"),
+    ] {
+        assert!(
+            scaffolded(fields).contains(&format!("\"{shown}\"")),
+            "{fields:?}"
+        );
+    }
+}
+
+#[test]
+fn a_controller_can_be_planned_without_writing_and_serves_public_json() {
+    let (_parent, root) = application(Database::Postgresql, true, Locale::En);
+    let before = tree(&root);
+    let mut dry = controller("pages", &["index", "about"]);
+    dry.dry_run = true;
+    let outcome = controller::generate(&root, &dry).unwrap_or_else(|error| panic!("{error}"));
+    assert!(!outcome.files.is_empty());
+    assert_eq!(tree(&root), before, "a dry run writes nothing");
+
+    let mut api = controller("status", &["index", "details"]);
+    api.api = true;
+    api.public = true;
+    let outcome = controller::generate(&root, &api).unwrap_or_else(|error| panic!("{error}"));
+    let source =
+        fs::read_to_string(root.join("src/adapters/http/status_controller.rs")).unwrap_or_default();
+    assert!(
+        source.contains("describe(index, operation(\"index\"))"),
+        "{source}"
+    );
+    assert!(source.contains("\"/v1/status/details\""), "{source}");
+    assert!(
+        !source.contains("authorize("),
+        "a public controller asks nobody"
+    );
+    assert!(!outcome.reused_access);
+}
+
+#[test]
+fn controllers_refuse_what_they_cannot_guard_or_place() {
+    let too_many: Vec<String> = (0..21).map(|index| format!("action{index}")).collect();
+    let (_parent, root) = application(Database::Postgresql, true, Locale::En);
+    let options = ControllerOptions {
+        name: "pages".to_owned(),
+        actions: too_many,
+        api: false,
+        public: false,
+        dry_run: false,
+    };
+    assert!(refused(controller::generate(&root, &options)).contains("at most 20 actions"));
+
+    let empty = tempfile::tempdir().expect("temporary directory");
+    assert!(
+        refused(controller::generate(
+            empty.path(),
+            &controller("pages", &["index"])
+        ))
+        .contains("no Cargo.toml in ")
+    );
+
+    let access = root.join(scaffold::ACCESS_PATH);
+    fs::create_dir_all(access.parent().expect("parent")).expect("directory");
+    fs::write(&access, "pub struct Unrelated;\n").expect("access module");
+    assert!(
+        refused(controller::generate(
+            &root,
+            &controller("pages", &["index"])
+        ))
+        .contains("has no `GlobalAccess` or `DenyAll`")
+    );
+    fs::write(
+        &access,
+        "pub trait GlobalAccess {\n    fn authorize(&self) -> Result<(), AccessDenied>;\n}\npub struct DenyAll;\n",
+    )
+    .expect("old access module");
+    assert!(
+        refused(controller::generate(
+            &root,
+            &controller("pages", &["index"])
+        ))
+        .contains("returns `Result<(), AccessDenied>`")
+    );
+    fs::remove_file(&access).expect("remove");
+    fs::create_dir(&access).expect("a directory in its place");
+    assert!(
+        refused(controller::generate(
+            &root,
+            &controller("pages", &["index"])
+        ))
+        .contains("is not a readable file")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_source_tree_the_permission_scan_cannot_vouch_for_fails_closed_but_not_destroy() {
+    let (_parent, root) = application(Database::Postgresql, true, Locale::En);
+    // A link to code under src/ could declare any permission.
+    std::os::unix::fs::symlink(root.join("src/domain"), root.join("src/linked")).expect("symlink");
+    let reason = refused(controller::generate(
+        &root,
+        &controller("pages", &["index"]),
+    ));
+    assert!(
+        reason.contains("src/linked is a symbolic link under src/"),
+        "{reason}"
+    );
+    // Destroy renders what the controller would have declared itself.
+    controller::plan_destroy(&root, &controller("pages", &["index"]))
+        .unwrap_or_else(|error| panic!("{error}"));
+
+    // Another module declaring the permission: generation refuses, destroy
+    // still plans the controller's own files.
+    let (_parent, root) = application(Database::Postgresql, true, Locale::En);
+    fs::write(
+        root.join("src/adapters/other.rs"),
+        "const P: &str = \"pages:read\";\n",
+    )
+    .expect("other module");
+    assert!(
+        refused(controller::generate(
+            &root,
+            &controller("pages", &["index"])
+        ))
+        .contains("already declares the permission `pages:read`")
+    );
+    controller::plan_destroy(&root, &controller("pages", &["index"]))
+        .unwrap_or_else(|error| panic!("{error}"));
+}
+
+#[test]
+fn mailers_refuse_requests_and_applications_they_cannot_serve() {
+    let (_parent, root) = application(Database::Postgresql, true, Locale::En);
+    let mailer = |name: &str, methods: &[String]| MailerOptions {
+        name: name.to_owned(),
+        methods: methods.to_vec(),
+        dry_run: false,
+    };
+    let many: Vec<String> = (0..21).map(|index| format!("email{index}")).collect();
+    assert!(refused(mailer::generate(&root, &mailer("user", &many))).contains("at most 20 emails"));
+    let fields: Vec<String> = (0..21).map(|index| format!("f{index}")).collect();
+    let declaration = format!("welcome:{}", fields.join(","));
+    assert!(
+        refused(mailer::generate(&root, &mailer("user", &[declaration])))
+            .contains("email `welcome` has more than 20 fields")
+    );
+    // `subject` and `welcome` both generate the type `WelcomeSubject` in the
+    // mailer `welcome`.
+    let reason = refused(mailer::generate(
+        &root,
+        &mailer("welcome", &["subject".to_owned(), "welcome".to_owned()]),
+    ));
+    assert!(
+        reason.contains("generates the type `WelcomeSubject`, which email `subject`"),
+        "{reason}"
+    );
+
+    let mut dry = mailer("user", &["welcome:name".to_owned()]);
+    dry.dry_run = true;
+    let before = tree(&root);
+    mailer::generate(&root, &dry).unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(tree(&root), before, "a dry run writes nothing");
+
+    let empty = tempfile::tempdir().expect("temporary directory");
+    assert!(
+        refused(mailer::generate(
+            empty.path(),
+            &mailer("user", &["welcome".to_owned()])
+        ))
+        .contains("no Cargo.toml in ")
+    );
+    let send = |root: &Path| mailer::generate(root, &mailer("user", &["welcome".to_owned()]));
+
+    let (_parent, no_askama) = application(Database::Postgresql, true, Locale::En);
+    edit(&no_askama, "Cargo.toml", |manifest| {
+        manifest
+            .lines()
+            .filter(|line| !line.starts_with("askama ="))
+            .collect::<Vec<_>>()
+            .join("\n")
+    });
+    assert!(refused(send(&no_askama)).contains("mailers render askama templates"));
+
+    let (_parent, no_testing) = application(Database::Postgresql, true, Locale::En);
+    edit(&no_testing, "Cargo.toml", |manifest| {
+        manifest.replace("\"testing\"", "\"other\"")
+    });
+    assert!(refused(send(&no_testing)).contains("forge::mail::testing"));
+
+    let (_parent, no_module) = application(Database::Postgresql, true, Locale::En);
+    fs::remove_file(no_module.join("src/adapters/email/mod.rs")).expect("remove");
+    assert!(refused(send(&no_module)).contains("src/adapters/email/mod.rs is missing"));
+}
+
+#[test]
+fn jobs_refuse_requests_and_applications_they_cannot_serve() {
+    let (_parent, root) = application(Database::Postgresql, true, Locale::En);
+    let job = |name: &str, fields: &[&str]| JobOptions {
+        name: name.to_owned(),
+        fields: fields.iter().map(|field| (*field).to_owned()).collect(),
+        queue: true,
+        dry_run: false,
+    };
+    assert!(refused(job::generate(&root, &job("mod", &[]))).contains("`mod` is a Rust keyword"));
+    let many: Vec<String> = (0..21).map(|index| format!("f{index}:integer")).collect();
+    let many: Vec<&str> = many.iter().map(String::as_str).collect();
+    assert!(refused(job::generate(&root, &job("report", &many))).contains("at most 20 fields"));
+
+    // A timestamp payload field has a sample the test can serialize.
+    let outcome = job::generate(&root, &job("stamp", &["at:timestamp"]))
+        .unwrap_or_else(|error| panic!("{error}"));
+    assert!(!outcome.files.is_empty());
+    let source = fs::read_to_string(root.join("src/adapters/jobs/stamp.rs")).unwrap_or_default();
+    assert!(
+        source.contains("pub at: forge::core::Timestamp,"),
+        "{source}"
+    );
+
+    let before = tree(&root);
+    let mut dry = job("other", &["note:string"]);
+    dry.dry_run = true;
+    job::generate(&root, &dry).unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(tree(&root), before, "a dry run writes nothing");
+
+    let empty = tempfile::tempdir().expect("temporary directory");
+    assert!(
+        refused(job::generate(empty.path(), &job("report", &[]))).contains("no Cargo.toml in ")
+    );
+}
+
+#[test]
+fn authentication_refuses_applications_without_what_its_pages_need() {
+    let (_parent, no_testing) = application(Database::Postgresql, true, Locale::En);
+    edit(&no_testing, "Cargo.toml", |manifest| {
+        manifest.replace("\"testing\"", "\"other\"")
+    });
+    assert!(refused(authentication::generate(&no_testing, true)).contains("forge::db::testing"));
+
+    let (_parent, no_compose) = application(Database::Postgresql, true, Locale::En);
+    edit(&no_compose, "src/bootstrap/mod.rs", |source| {
+        source.replace(
+            "crate::adapters::http::site(",
+            "crate::adapters::http::elsewhere(",
+        )
+    });
+    assert!(
+        refused(authentication::generate(&no_compose, true)).contains("has no `compose` function")
+    );
+
+    let (_parent, no_locales) = application(Database::Postgresql, true, Locale::En);
+    fs::remove_file(no_locales.join("src/adapters/http/views/locales.rs")).expect("remove");
+    assert!(refused(authentication::generate(&no_locales, true)).contains("locales.rs is missing"));
+}
+
+#[test]
+fn the_shared_helpers_tell_apart_what_they_scan() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let root = directory.path();
+
+    // A path below a regular file is neither missing nor a plain path.
+    fs::write(root.join("file"), "x").expect("file");
+    let reason = generators::refuse_symlinks(root, ["file/inside"]).expect_err("not a directory");
+    assert!(reason.starts_with("file/inside: "), "{reason}");
+    assert!(generators::refuse_symlinks(root, ["missing/inside"]).is_ok());
+
+    // Migrations: only `<digits>_<name>.up|down.sql` count.
+    fs::create_dir(root.join("migrations")).expect("migrations");
+    for name in [
+        "1_post.up.sql",
+        "2_post.down.sql",
+        "abc_post.up.sql",
+        "_post.up.sql",
+        "nounderscore.sql",
+        "3_other.up.sql",
+    ] {
+        fs::write(root.join("migrations").join(name), "").expect("migration");
+    }
+    let (up, down) = generators::existing_migrations(root, "post");
+    assert_eq!(up, ["migrations/1_post.up.sql"]);
+    assert_eq!(down, ["migrations/2_post.down.sql"]);
+
+    // The permission scan: `src` that is a file cannot be listed; a name
+    // without a namespace is only found as a whole literal.
+    fs::write(root.join("src"), "x").expect("src as a file");
+    let reason = generators::permission_owner(root, &["posts:read".to_owned()], &[])
+        .expect_err("src is a file");
+    assert!(
+        reason.starts_with("could not read src to look for permissions: "),
+        "{reason}"
+    );
+    let (_parent, app) = application(Database::Disabled, true, Locale::En);
+    fs::write(
+        app.join("src/extra.rs"),
+        "const A: &str = concat!(left, right);\n",
+    )
+    .expect("source");
+    assert_eq!(
+        generators::permission_owner(&app, &["plain".to_owned()], &[]).expect("scan"),
+        None
+    );
+
+    // The file list printed by every generator.
+    let files = [
+        Planned::new("src/a.rs", "", Role::Owned),
+        Planned::new("src/b.rs", "", Role::Shared),
+    ];
+    let mut output = Vec::new();
+    generators::report(&mut output, false, &files).expect("report");
+    generators::report(&mut output, true, &files[..1]).expect("dry report");
+    assert_eq!(
+        String::from_utf8_lossy(&output),
+        "  create       src/a.rs\n  create       src/b.rs\n  would create src/a.rs\n"
+    );
+}

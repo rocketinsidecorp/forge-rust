@@ -428,6 +428,9 @@ impl CommandError {
 }
 
 #[cfg(test)]
+mod command_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
