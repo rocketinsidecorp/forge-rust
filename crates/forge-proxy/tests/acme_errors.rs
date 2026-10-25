@@ -1,0 +1,640 @@
+//! The ACME client against scripted certificate authorities that fail in
+//! every way a real one can: problem documents, a missing nonce or
+//! `Location`, `badNonce`, a challenge nobody can answer, invalid orders,
+//! oversized and malformed answers, and connections that fail or close.
+//! Every failure must surface as an error that names what went wrong and
+//! never leaves a challenge published.
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use bytes::Bytes;
+use forge_proxy::acme::{Challenges, Client};
+use forge_proxy::der::generate_p256;
+use http::{Request, Response, StatusCode};
+use http_body_util::Full;
+use hyper_util::rt::TokioIo;
+use serde_json::{Value, json};
+use tokio::net::TcpListener;
+use tokio_util::sync::CancellationToken;
+
+const HOST: &str = "app.example.com";
+
+/// What the scripted CA is asked.
+struct Ask<'a> {
+    base: &'a str,
+    method: &'a str,
+    path: &'a str,
+    /// How many requests with this method and path came before.
+    nth: usize,
+}
+
+struct Reply {
+    status: u16,
+    headers: Vec<(&'static str, String)>,
+    body: Vec<u8>,
+}
+
+fn reply(status: u16, body: &Value) -> Reply {
+    Reply {
+        status,
+        headers: Vec::new(),
+        body: body.to_string().into_bytes(),
+    }
+}
+
+fn raw(status: u16, body: impl Into<Vec<u8>>) -> Reply {
+    Reply {
+        status,
+        headers: Vec::new(),
+        body: body.into(),
+    }
+}
+
+impl Reply {
+    fn with(mut self, name: &'static str, value: impl Into<String>) -> Self {
+        self.headers.push((name, value.into()));
+        self
+    }
+}
+
+fn problem(kind: &str, detail: &str) -> Value {
+    json!({"type": kind, "detail": detail})
+}
+
+/// A CA that does everything right; tests override single steps.
+fn happy(ask: &Ask<'_>) -> Reply {
+    let base = ask.base;
+    match (ask.method, ask.path) {
+        ("GET", "/directory") => reply(
+            200,
+            &json!({"newNonce": format!("{base}/nonce"), "newAccount": format!("{base}/account"), "newOrder": format!("{base}/order")}),
+        ),
+        ("HEAD", "/nonce") => raw(200, ""),
+        ("POST", "/account") => reply(201, &json!({"status": "valid"})).with("location", format!("{base}/acct/1")),
+        ("POST", "/order") => reply(
+            201,
+            &json!({"status": "pending", "authorizations": [format!("{base}/authz")], "finalize": format!("{base}/finalize")}),
+        )
+        .with("location", format!("{base}/order/1")),
+        ("POST", "/authz") => reply(200, &json!({"status": "valid"})),
+        ("POST", "/finalize") => reply(200, &json!({"status": "processing"})),
+        ("POST", "/order/1") => {
+            reply(200, &json!({"status": "valid", "certificate": format!("{base}/cert")}))
+        }
+        ("POST", "/cert") => raw(200, "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n"),
+        _ => reply(404, &problem("urn:ietf:params:acme:error:malformed", "unknown")),
+    }
+}
+
+/// A pending authorization offering one challenge.
+fn pending(base: &str, token: &str) -> Reply {
+    reply(
+        200,
+        &json!({"status": "pending", "challenges": [{"type": "http-01", "token": token, "url": format!("{base}/chall")}]}),
+    )
+}
+
+type Script = dyn Fn(&Ask<'_>) -> Reply + Send + Sync;
+
+/// A scripted CA on a loopback port; stops when dropped. Every response
+/// carries a fresh `Replay-Nonce` unless the script removed it.
+struct Ca {
+    base: String,
+    stop: CancellationToken,
+}
+
+impl Drop for Ca {
+    fn drop(&mut self) {
+        self.stop.cancel();
+    }
+}
+
+async fn ca(script: impl Fn(&Ask<'_>) -> Reply + Send + Sync + 'static) -> Ca {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let base = format!("http://{}", listener.local_addr().expect("addr"));
+    let stop = CancellationToken::new();
+    let script: Arc<Script> = Arc::new(script);
+    let counts: Arc<Mutex<HashMap<String, usize>>> = Arc::default();
+    let nonces = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    tokio::spawn({
+        let (base, stop) = (base.clone(), stop.clone());
+        async move {
+            loop {
+                let accepted = tokio::select! {
+                    accepted = listener.accept() => accepted,
+                    () = stop.cancelled() => return,
+                };
+                let Ok((stream, _)) = accepted else { continue };
+                let (script, counts, nonces, base) = (
+                    Arc::clone(&script),
+                    Arc::clone(&counts),
+                    Arc::clone(&nonces),
+                    base.clone(),
+                );
+                tokio::spawn(async move {
+                    let service = hyper::service::service_fn(
+                        move |request: Request<hyper::body::Incoming>| {
+                            let (script, counts, nonces, base) = (
+                                Arc::clone(&script),
+                                Arc::clone(&counts),
+                                Arc::clone(&nonces),
+                                base.clone(),
+                            );
+                            async move {
+                                let method = request.method().as_str().to_owned();
+                                let path = request.uri().path().to_owned();
+                                let nth = {
+                                    let mut counts = counts.lock().expect("counts");
+                                    let seen =
+                                        counts.entry(format!("{method} {path}")).or_default();
+                                    let nth = *seen;
+                                    *seen += 1;
+                                    nth
+                                };
+                                let reply = script(&Ask {
+                                    base: &base,
+                                    method: &method,
+                                    path: &path,
+                                    nth,
+                                });
+                                let mut response =
+                                    Response::new(Full::new(Bytes::from(reply.body)));
+                                *response.status_mut() =
+                                    StatusCode::from_u16(reply.status).expect("status");
+                                let serial =
+                                    nonces.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                                response.headers_mut().insert(
+                                    "replay-nonce",
+                                    format!("nonce-{serial}").parse().expect("nonce"),
+                                );
+                                for (name, value) in reply.headers {
+                                    if value.is_empty() {
+                                        response.headers_mut().remove(name);
+                                    } else {
+                                        response
+                                            .headers_mut()
+                                            .insert(name, value.parse().expect("header"));
+                                    }
+                                }
+                                Ok::<_, std::convert::Infallible>(response)
+                            }
+                        },
+                    );
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        }
+    });
+    Ca { base, stop }
+}
+
+fn client(base: &str) -> Client {
+    Client::new(
+        &format!("{base}/directory"),
+        &generate_p256().expect("key"),
+        "ops@example.com",
+    )
+    .expect("client")
+}
+
+/// Issues for `HOST` and returns the error text, asserting no challenge stays published.
+async fn failure(ca: &Ca) -> String {
+    let challenges = Challenges::default();
+    let key = generate_p256().expect("key");
+    let error = client(&ca.base)
+        .issue(HOST, &key, &challenges)
+        .await
+        .expect_err("the issuance must fail");
+    assert!(
+        challenges.lock().expect("challenges").is_empty(),
+        "a challenge is still published after: {error}"
+    );
+    error
+}
+
+/// A script that is `happy` except for the steps `change` answers.
+fn except(
+    change: impl Fn(&Ask<'_>) -> Option<Reply> + Send + Sync + 'static,
+) -> impl Fn(&Ask<'_>) -> Reply + Send + Sync + 'static {
+    move |ask| change(ask).unwrap_or_else(|| happy(ask))
+}
+
+#[tokio::test]
+async fn a_scripted_ca_that_does_everything_right_issues_the_chain() {
+    let ca = ca(happy).await;
+    let challenges = Challenges::default();
+    let chain = client(&ca.base)
+        .issue(HOST, &generate_p256().expect("key"), &challenges)
+        .await
+        .expect("issues");
+    assert!(chain.starts_with("-----BEGIN CERTIFICATE-----"), "{chain}");
+}
+
+#[tokio::test]
+async fn the_directory_must_answer_with_a_usable_document() {
+    let down = ca(except(|ask| {
+        (ask.path == "/directory")
+            .then(|| reply(503, &problem("urn:test:unavailable", "come back later")))
+    }))
+    .await;
+    assert_eq!(
+        failure(&down).await,
+        "acme: urn:test:unavailable (503): come back later"
+    );
+
+    let plain = ca(except(|ask| {
+        (ask.path == "/directory").then(|| raw(500, "oops"))
+    }))
+    .await;
+    assert_eq!(failure(&plain).await, "acme: HTTP 500");
+
+    let typeless = ca(except(|ask| {
+        (ask.path == "/directory").then(|| reply(400, &json!({})))
+    }))
+    .await;
+    assert_eq!(failure(&typeless).await, "acme: error (400): no detail");
+
+    let garbage = ca(except(|ask| {
+        (ask.path == "/directory").then(|| raw(200, "not json"))
+    }))
+    .await;
+    assert!(
+        failure(&garbage)
+            .await
+            .starts_with("acme: malformed response: ")
+    );
+
+    for missing in ["newNonce", "newAccount", "newOrder"] {
+        let incomplete = ca(except(move |ask| {
+            (ask.path == "/directory").then(|| {
+                let mut directory = json!({"newNonce": "http://127.0.0.1/n", "newAccount": "http://127.0.0.1/a", "newOrder": "http://127.0.0.1/o"});
+                directory.as_object_mut().expect("object").remove(missing);
+                reply(200, &directory)
+            })
+        }))
+        .await;
+        assert_eq!(
+            failure(&incomplete).await,
+            format!("acme: directory lacks {missing}")
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_ca_that_gives_no_nonce_or_no_location_is_refused() {
+    let no_nonce = ca(except(|ask| {
+        (ask.method == "HEAD" && ask.path == "/nonce")
+            .then(|| raw(200, "").with("replay-nonce", ""))
+    }))
+    .await;
+    assert_eq!(failure(&no_nonce).await, "acme: no Replay-Nonce");
+
+    let no_account_location = ca(except(|ask| {
+        (ask.path == "/account").then(|| reply(201, &json!({"status": "valid"})))
+    }))
+    .await;
+    assert_eq!(
+        failure(&no_account_location).await,
+        "acme: account without Location"
+    );
+
+    let no_order_location = ca(except(|ask| {
+        (ask.path == "/order").then(|| {
+            reply(
+                201,
+                &json!({"authorizations": [], "finalize": format!("{}/finalize", ask.base)}),
+            )
+        })
+    }))
+    .await;
+    assert_eq!(
+        failure(&no_order_location).await,
+        "acme: order without Location"
+    );
+
+    let no_finalize = ca(except(|ask| {
+        (ask.path == "/order").then(|| {
+            reply(201, &json!({"authorizations": []}))
+                .with("location", format!("{}/order/1", ask.base))
+        })
+    }))
+    .await;
+    assert_eq!(
+        failure(&no_finalize).await,
+        "acme: order without finalize URL"
+    );
+}
+
+#[tokio::test]
+async fn bad_nonce_is_retried_a_bounded_number_of_times() {
+    let bad_nonce = || {
+        reply(
+            400,
+            &problem("urn:ietf:params:acme:error:badNonce", "stale"),
+        )
+    };
+    // Two stale nonces, then the account is created: the issuance succeeds.
+    let recovers = ca(except(move |ask| {
+        (ask.path == "/account" && ask.nth < 2).then(bad_nonce)
+    }))
+    .await;
+    let challenges = Challenges::default();
+    client(&recovers.base)
+        .issue(HOST, &generate_p256().expect("key"), &challenges)
+        .await
+        .expect("recovers from two stale nonces");
+
+    // A CA that never accepts a nonce is given up on after three attempts.
+    let never = ca(except(move |ask| (ask.path == "/account").then(bad_nonce))).await;
+    assert_eq!(
+        failure(&never).await,
+        "acme: urn:ietf:params:acme:error:badNonce (400): stale"
+    );
+}
+
+#[tokio::test]
+async fn a_problem_document_names_its_type_and_detail() {
+    let refused = ca(except(|ask| {
+        (ask.path == "/account").then(|| {
+            reply(
+                403,
+                &problem(
+                    "urn:ietf:params:acme:error:unauthorized",
+                    "no account for you",
+                ),
+            )
+        })
+    }))
+    .await;
+    assert_eq!(
+        failure(&refused).await,
+        "acme: urn:ietf:params:acme:error:unauthorized (403): no account for you"
+    );
+    let rate_limited = ca(except(|ask| {
+        (ask.path == "/order").then(|| {
+            reply(
+                429,
+                &problem("urn:ietf:params:acme:error:rateLimited", "too many orders"),
+            )
+        })
+    }))
+    .await;
+    assert!(
+        failure(&rate_limited)
+            .await
+            .contains("(429): too many orders")
+    );
+}
+
+#[tokio::test]
+async fn authorizations_without_a_usable_http_challenge_are_refused() {
+    let dns_only = ca(except(|ask| {
+        (ask.path == "/authz").then(|| {
+            reply(200, &json!({"status": "pending", "challenges": [{"type": "dns-01", "token": "t", "url": "http://127.0.0.1/c"}]}))
+        })
+    }))
+    .await;
+    assert_eq!(
+        failure(&dns_only).await,
+        "acme: no http-01 challenge offered"
+    );
+
+    let none = ca(except(|ask| {
+        (ask.path == "/authz").then(|| reply(200, &json!({"status": "pending"})))
+    }))
+    .await;
+    assert_eq!(failure(&none).await, "acme: no http-01 challenge offered");
+
+    for token in ["", "../etc/passwd", "a b", "tok/en"] {
+        let hostile = ca(except(move |ask| {
+            (ask.path == "/authz").then(|| pending(ask.base, token))
+        }))
+        .await;
+        assert_eq!(
+            failure(&hostile).await,
+            "acme: invalid challenge token",
+            "token {token:?}"
+        );
+    }
+    let tokenless = ca(except(|ask| {
+        (ask.path == "/authz").then(|| {
+            reply(200, &json!({"status": "pending", "challenges": [{"type": "http-01", "url": format!("{}/chall", ask.base)}]}))
+        })
+    }))
+    .await;
+    assert_eq!(failure(&tokenless).await, "acme: invalid challenge token");
+
+    let urlless = ca(except(|ask| {
+        (ask.path == "/authz").then(|| {
+            reply(200, &json!({"status": "pending", "challenges": [{"type": "http-01", "token": "tok-1"}]}))
+        })
+    }))
+    .await;
+    assert_eq!(failure(&urlless).await, "acme: challenge without URL");
+}
+
+#[tokio::test]
+async fn a_challenge_the_ca_rejects_ends_the_issuance_with_the_cas_reason() {
+    let rejected = ca(except(|ask| match (ask.path, ask.nth) {
+        ("/authz", 0) => Some(pending(ask.base, "tok-1")),
+        ("/chall", _) => Some(reply(200, &json!({"status": "pending"}))),
+        ("/authz", _) => Some(reply(
+            200,
+            &json!({"status": "invalid", "challenges": [{"type": "dns-01"}, {"type": "http-01", "error": {"detail": "connection refused"}}]}),
+        )),
+        _ => None,
+    }))
+    .await;
+    assert_eq!(
+        failure(&rejected).await,
+        "acme: authorization is invalid: connection refused"
+    );
+
+    let unexplained = ca(except(|ask| match (ask.path, ask.nth) {
+        ("/authz", 0) => Some(pending(ask.base, "tok-1")),
+        ("/chall", _) => Some(reply(200, &json!({}))),
+        ("/authz", _) => Some(reply(200, &json!({"status": "invalid"}))),
+        _ => None,
+    }))
+    .await;
+    assert_eq!(
+        failure(&unexplained).await,
+        "acme: authorization is invalid: no detail"
+    );
+
+    let challenge_refused = ca(except(|ask| match (ask.path, ask.nth) {
+        ("/authz", _) => Some(pending(ask.base, "tok-1")),
+        ("/chall", _) => Some(reply(
+            400,
+            &problem("urn:ietf:params:acme:error:malformed", "bad challenge"),
+        )),
+        _ => None,
+    }))
+    .await;
+    assert!(
+        failure(&challenge_refused)
+            .await
+            .ends_with("(400): bad challenge")
+    );
+}
+
+#[tokio::test]
+async fn an_order_that_ends_invalid_or_without_a_certificate_is_an_error() {
+    let invalid = ca(except(|ask| {
+        (ask.path == "/order/1").then(|| {
+            reply(
+                200,
+                &json!({"status": "invalid", "error": {"detail": "CSR rejected"}}),
+            )
+        })
+    }))
+    .await;
+    assert_eq!(
+        failure(&invalid).await,
+        "acme: order is invalid: CSR rejected"
+    );
+
+    let unexplained = ca(except(|ask| {
+        (ask.path == "/order/1").then(|| reply(200, &json!({"status": "invalid"})))
+    }))
+    .await;
+    assert_eq!(
+        failure(&unexplained).await,
+        "acme: order is invalid: no detail"
+    );
+
+    let no_certificate = ca(except(|ask| {
+        (ask.path == "/order/1").then(|| reply(200, &json!({"status": "valid"})))
+    }))
+    .await;
+    assert_eq!(
+        failure(&no_certificate).await,
+        "acme: valid order without certificate URL"
+    );
+
+    let not_pem = ca(except(|ask| {
+        (ask.path == "/cert").then(|| raw(200, vec![0xff, 0xfe, 0x00]))
+    }))
+    .await;
+    assert_eq!(failure(&not_pem).await, "acme: certificate is not PEM");
+
+    let finalize_refused = ca(except(|ask| {
+        (ask.path == "/finalize").then(|| {
+            reply(
+                403,
+                &problem("urn:ietf:params:acme:error:orderNotReady", "not ready"),
+            )
+        })
+    }))
+    .await;
+    assert!(
+        failure(&finalize_refused)
+            .await
+            .ends_with("(403): not ready")
+    );
+}
+
+#[tokio::test]
+async fn polling_honors_retry_after_and_falls_back_when_it_is_not_a_number() {
+    let slow = ca(except(|ask| match (ask.path, ask.nth) {
+        ("/order/1", 0) => {
+            Some(reply(200, &json!({"status": "processing"})).with("retry-after", "1"))
+        }
+        ("/order/1", 1) => {
+            Some(reply(200, &json!({"status": "processing"})).with("retry-after", "soon"))
+        }
+        _ => None,
+    }))
+    .await;
+    let started = std::time::Instant::now();
+    let chain = client(&slow.base)
+        .issue(HOST, &generate_p256().expect("key"), &Challenges::default())
+        .await
+        .expect("issues after two polls");
+    assert!(chain.contains("BEGIN CERTIFICATE"));
+    // Two waits of one second: the header's value and the default.
+    assert!(
+        started.elapsed() >= Duration::from_secs(2),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn a_certificate_key_that_is_not_p256_is_refused_before_a_csr_is_made() {
+    let ca = ca(happy).await;
+    let error = client(&ca.base)
+        .issue(HOST, b"not a key", &Challenges::default())
+        .await
+        .expect_err("refused");
+    assert_eq!(error, "acme: the certificate key is not a P-256 key");
+}
+
+#[tokio::test]
+async fn clients_refuse_unusable_keys_urls_and_trust_anchors() {
+    let key = generate_p256().expect("key");
+    let error = Client::new("http://127.0.0.1:1/dir", b"not a key", "").expect_err("key");
+    assert_eq!(error, "acme: the account key is not a P-256 key");
+    for url in [
+        "not a url",
+        "ftp://127.0.0.1/dir",
+        "http://acme.example.com/dir",
+    ] {
+        assert!(Client::new(url, &key, "").is_err(), "{url}");
+    }
+    let bad_root = rustls::pki_types::CertificateDer::from(b"not a certificate".to_vec());
+    let error =
+        Client::with_roots("http://127.0.0.1:1/dir", &key, "", &[bad_root]).expect_err("root");
+    assert!(error.starts_with("acme: trust anchor: "), "{error}");
+}
+
+#[tokio::test]
+async fn network_failures_are_reported_by_stage() {
+    // Nothing listens.
+    let closed = {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        format!("http://{}", listener.local_addr().expect("addr"))
+    };
+    let error = client(&closed)
+        .issue(HOST, &generate_p256().expect("key"), &Challenges::default())
+        .await
+        .expect_err("refused");
+    assert!(error.starts_with("acme: connect 127.0.0.1:"), "{error}");
+
+    // A server that hangs up without answering.
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let base = format!("http://{}", listener.local_addr().expect("addr"));
+    let hangup = tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            drop(stream);
+        }
+    });
+    let error = client(&base)
+        .issue(HOST, &generate_p256().expect("key"), &Challenges::default())
+        .await
+        .expect_err("hung up");
+    assert!(error.starts_with("acme: http: "), "{error}");
+    hangup.abort();
+
+    // An https directory served as plain HTTP fails the handshake.
+    let plain = ca(happy).await;
+    let https = plain.base.replacen("http://", "https://", 1);
+    let error = client(&https)
+        .issue(HOST, &generate_p256().expect("key"), &Challenges::default())
+        .await
+        .expect_err("handshake");
+    assert!(error.starts_with("acme: tls 127.0.0.1:"), "{error}");
+}
+
+#[tokio::test]
+async fn an_oversized_answer_is_cut_off() {
+    let huge = ca(except(|ask| {
+        (ask.path == "/directory").then(|| raw(200, vec![b' '; (1 << 20) + 10]))
+    }))
+    .await;
+    assert_eq!(failure(&huge).await, "acme: response too large");
+}
