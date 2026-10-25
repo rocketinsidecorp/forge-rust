@@ -174,9 +174,12 @@ anything is wrong; `FORGE_ALLOW_DESTRUCTIVE` is not treated as an unknown key.
   (`Router::routes()` plus a built-in `routes`, which composes the application
   without listening, like `openapi`); `inspect` is tracked in
   [Rails parity](../rails-parity.md#parity-follow-ups).
-- `db schema:dump|schema:load|console`: they run `pg_dump`, `psql` and friends
-  with the credential. They need application subcommands that pass it through
-  the child's environment; tracked with the above.
+- `db schema:dump|schema:load`: they run `pg_dump`, `psql` and friends with the
+  credential. They need application subcommands that pass it through the
+  child's environment; tracked with the above. `db console` was ported later
+  (2026-10-25, [CLI](../cli.md#application-lifecycle-commands)): the CLI runs
+  the client itself, with the URL's credentials in the child's environment or
+  a private option file, never in an argument.
 - `destroy`, `deploy`, `logs`, `app`, `credentials`, `i18n`: outside this change.
 
 ### Dependencies

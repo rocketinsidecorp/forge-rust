@@ -37,9 +37,10 @@ pub(crate) const INIT_SCRIPT: &str = "docker/postgres/init.sql";
 /// How long a client gets to exit after it was asked to.
 const CLIENT_GRACE: Duration = Duration::from_secs(5);
 
-/// The variables that name the database; the application's own settings must
-/// not reach a client (its environment is the user's to inspect with `\!`).
-const DATABASE_URL_VARIABLES: [&str; 2] = ["FORGE_DATABASE_URL", "FORGE_MIGRATION_DATABASE_URL"];
+/// The application's own settings (`FORGE_*`: its database URLs, keys and
+/// passwords) do not reach a client: its environment is the user's to inspect
+/// (`\!` in psql, `system` in mysql).
+const APPLICATION_PREFIX: &str = "FORGE_";
 
 /// The database name of the URL, and the credentials of the role that
 /// administers it.
@@ -260,9 +261,19 @@ fn connection(sources: &Sources<'_>, migration_required: bool) -> Result<Connect
             sources.root.join(path)
         }));
     }
-    let nothing = |_: &str| None;
-    let app = database_url::client_target(&url, &nothing)
-        .ok_or_else(|| usage(database_url::MALFORMED))?;
+    // Where the application's own SQLx connects: what the URL leaves out
+    // (host, port, user, password, TLS mode) comes from the PG* variables.
+    let process = |name: &str| (sources.environment)(name);
+    let target = |url: &SecretString| {
+        database_url::client_target(url, &process).map(|target| {
+            if scheme == DatabaseScheme::Postgres {
+                with_pg_defaults(target, &process)
+            } else {
+                target
+            }
+        })
+    };
+    let app = target(&url).ok_or_else(|| usage(database_url::MALFORMED))?;
     let database = app
         .database
         .clone()
@@ -276,7 +287,7 @@ fn connection(sources: &Sources<'_>, migration_required: bool) -> Result<Connect
                     "FORGE_MIGRATION_DATABASE_URL selects another engine than FORGE_DATABASE_URL",
                 ));
             }
-            database_url::client_target(&privileged, &nothing).ok_or_else(|| {
+            target(&privileged).ok_or_else(|| {
                 usage(format!(
                     "FORGE_MIGRATION_DATABASE_URL: {}",
                     database_url::MALFORMED
@@ -289,13 +300,52 @@ fn connection(sources: &Sources<'_>, migration_required: bool) -> Result<Connect
                  migration role",
             ));
         }
-        None => app,
+        None => app.clone(),
+    };
+    let database = if migration_required {
+        // The application's `db create` and `db drop` act on the database of
+        // the migration URL: that is the one whose privileges are restored,
+        // and it must be the one the application runs on.
+        let created = admin
+            .database
+            .clone()
+            .ok_or_else(|| usage("FORGE_MIGRATION_DATABASE_URL does not name a database"))?;
+        database_url::validate_name(&created).map_err(usage)?;
+        if created != database {
+            return Err(usage(
+                "FORGE_DATABASE_URL and FORGE_MIGRATION_DATABASE_URL name different databases; \
+                 `forge db reset` would restore the privileges of the wrong one",
+            ));
+        }
+        created
+    } else {
+        database
     };
     Ok(Connection::Server {
         scheme,
         database,
         admin: Box::new(admin),
     })
+}
+
+/// What a PostgreSQL URL leaves out comes from `PGUSER`, `PGPASSWORD` and
+/// `PGSSLMODE`, as SQLx reads them (host and port are resolved by
+/// [`database_url::server`] already).
+fn with_pg_defaults(
+    mut target: ClientTarget,
+    environment: &dyn Fn(&str) -> Option<String>,
+) -> ClientTarget {
+    let read = |name: &str| environment(name).filter(|value| !value.is_empty());
+    if target.user.is_none() {
+        target.user = read("PGUSER");
+    }
+    if target.password.is_none() {
+        target.password = read("PGPASSWORD").map(SecretString::new);
+    }
+    if target.tls.mode.is_none() {
+        target.tls.mode = read("PGSSLMODE");
+    }
+    target
 }
 
 fn missing_tool(tool: &str, engine: &str) -> CliError {
@@ -322,8 +372,8 @@ pub(crate) fn console(sources: &Sources<'_>, extra: &[String]) -> Result<Invocat
                 program,
                 args,
                 directory: sources.root.to_owned(),
-                dropped_prefixes: &[],
-                dropped: database_url_variables(),
+                dropped_prefixes: &[APPLICATION_PREFIX],
+                dropped: Vec::new(),
                 set: Vec::new(),
                 _files: None,
             })
@@ -362,21 +412,16 @@ pub(crate) fn console(sources: &Sources<'_>, extra: &[String]) -> Result<Invocat
                 program,
                 args,
                 directory: sources.root.to_owned(),
-                dropped_prefixes: &[],
-                dropped: {
-                    // MySQL's clients read ~/.mylogin.cnf even with
-                    // --defaults-file; a name that never exists keeps it out.
-                    let mut dropped = database_url_variables();
-                    dropped.extend(
-                        [
-                            "MYSQL_PWD",
-                            "MYSQL_TEST_LOGIN_FILE",
-                            "LIBMYSQL_ENABLE_CLEARTEXT_PLUGIN",
-                        ]
-                        .map(str::to_owned),
-                    );
-                    dropped
-                },
+                dropped_prefixes: &[APPLICATION_PREFIX],
+                // MySQL's clients read ~/.mylogin.cnf even with
+                // --defaults-file; a name that never exists keeps it out.
+                dropped: [
+                    "MYSQL_PWD",
+                    "MYSQL_TEST_LOGIN_FILE",
+                    "LIBMYSQL_ENABLE_CLEARTEXT_PLUGIN",
+                ]
+                .map(str::to_owned)
+                .to_vec(),
                 set: vec![(
                     "MYSQL_TEST_LOGIN_FILE".to_owned(),
                     no_login_path.to_string_lossy().into_owned(),
@@ -401,15 +446,12 @@ pub(crate) fn psql_script(sources: &Sources<'_>) -> Result<(Invocation, String),
         return Err(usage("the privilege bootstrap is for PostgreSQL databases"));
     };
     let program = (sources.locate)("psql").ok_or_else(|| missing_tool("psql", "postgres"))?;
-    let args = ["-X", "-q", "-v", "ON_ERROR_STOP=1", "-1", "-f", "-"]
+    // `-w`: never prompt for a password, which would hang a reset.
+    let args = ["-X", "-q", "-w", "-v", "ON_ERROR_STOP=1", "-1", "-f", "-"]
         .map(OsString::from)
         .to_vec();
     let invocation = postgres(sources, program, args, &database, &admin)?;
     Ok((invocation, database))
-}
-
-fn database_url_variables() -> Vec<String> {
-    DATABASE_URL_VARIABLES.map(str::to_owned).to_vec()
 }
 
 fn postgres(
@@ -464,8 +506,8 @@ fn postgres(
         program,
         args,
         directory: sources.root.to_owned(),
-        dropped_prefixes: &["PG"],
-        dropped: database_url_variables(),
+        dropped_prefixes: &["PG", APPLICATION_PREFIX],
+        dropped: Vec::new(),
         set,
         _files: None,
     })
@@ -628,8 +670,11 @@ impl Client for System {
 /// # Errors
 ///
 /// A reason (never SQL or a URL) when the file names another database than
-/// `database`, has no `\connect` line, or uses a psql meta-command after it:
-/// only SQL is sent to the server.
+/// `database`, has no `\connect` line, or the part after it contains a
+/// backslash or a colon that is not half of a `::` cast. `psql` runs a
+/// backslash command anywhere on a line (`SELECT 1; \! cmd`, `\o FILE`,
+/// `\gexec`, `\copy`) and interpolates `:name`, `:'name'` and `:"name"`, and
+/// only plain SQL is meant to reach it. The shipped script has neither.
 pub(crate) fn bootstrap_sql(init: &str, database: &str) -> Result<String, String> {
     let mut lines = init.lines();
     let connected = lines.by_ref().find_map(|line| {
@@ -650,15 +695,40 @@ pub(crate) fn bootstrap_sql(init: &str, database: &str) -> Result<String, String
     }
     let mut sql = String::new();
     for line in lines {
-        if line.trim_start().starts_with('\\') {
+        if line.contains('\\') {
             return Err(
-                "it uses a psql meta-command after \\connect; only SQL is applied".to_owned(),
+                "it has a backslash after \\connect (a psql command); only plain SQL is applied"
+                    .to_owned(),
+            );
+        }
+        if has_variable_reference(line) {
+            return Err(
+                "it has a colon after \\connect that is not part of `::` (a psql variable); \
+                 only plain SQL is applied"
+                    .to_owned(),
             );
         }
         sql.push_str(line);
         sql.push('\n');
     }
     Ok(sql)
+}
+
+/// Whether a line has a `:` that is not one half of a `::` pair, which psql
+/// may read as a variable reference. Quotes are not parsed: a colon in a
+/// string literal is refused too.
+fn has_variable_reference(line: &str) -> bool {
+    let mut characters = line.chars().peekable();
+    while let Some(character) = characters.next() {
+        if character == ':' {
+            if characters.peek() == Some(&':') {
+                characters.next();
+            } else {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -741,6 +811,7 @@ mod tests {
             ("FORGE_DATABASE_URL", "postgres://u:inherited@h/d"),
             ("FORGE_MIGRATION_DATABASE_URL", "postgres://u:inherited@h/d"),
             ("FORGE_ENV", "development"),
+            ("FORGE_SECRET_KEY", "application-secret"),
         ]
         .map(|(name, value)| (OsString::from(name), OsString::from(value)))
         .to_vec()
@@ -801,7 +872,10 @@ mod tests {
         for name in ["FORGE_DATABASE_URL", "FORGE_MIGRATION_DATABASE_URL"] {
             assert!(!env.contains_key(name), "{name}");
         }
-        assert_eq!(env["FORGE_ENV"], "development");
+        assert!(
+            !env.keys().any(|name| name.starts_with("FORGE_")),
+            "no application setting reaches the client: {env:?}"
+        );
     }
 
     #[test]
@@ -1006,7 +1080,7 @@ mod tests {
         let invocation = machine.script().expect("script");
         assert_eq!(
             args(&invocation),
-            ["-X", "-q", "-v", "ON_ERROR_STOP=1", "-1", "-f", "-"]
+            ["-X", "-q", "-w", "-v", "ON_ERROR_STOP=1", "-1", "-f", "-"]
         );
         let env = env_of(&invocation);
         assert_eq!(env["PGUSER"], "app_migrator");
@@ -1045,8 +1119,8 @@ mod tests {
         for (init, database, expected) in [
             (init, "other", "is for the database \"shop\""),
             ("CREATE ROLE a;\n", "shop", "no \\connect line"),
-            ("\\connect shop\n\\! rm -rf x\n", "shop", "meta-command"),
-            ("\\connect shop\n  \\i other.sql\n", "shop", "meta-command"),
+            ("\\connect shop\n\\! rm -rf x\n", "shop", "backslash"),
+            ("\\connect shop\n  \\i other.sql\n", "shop", "backslash"),
         ] {
             let error = bootstrap_sql(init, database).expect_err(expected);
             assert!(error.contains(expected), "{expected}: {error}");
@@ -1054,6 +1128,139 @@ mod tests {
         assert_eq!(
             bootstrap_sql("\\connect \"shop\"\nSELECT 1;\n", "shop").expect("quoted"),
             "SELECT 1;\n"
+        );
+    }
+
+    #[test]
+    fn plain_sql_passes_and_every_psql_escape_is_refused_wherever_it_stands() {
+        let accepted =
+            "\\connect shop\nSELECT 1::int, '{}'::jsonb;\nGRANT ALL ON SCHEMA public TO a;\n";
+        assert!(bootstrap_sql(accepted, "shop").is_ok());
+        for hostile in [
+            // A backslash command after SQL on the same line, in each spelling.
+            "SELECT 1; \\! touch /tmp/pwned",
+            "SELECT $$x$$ \\o /tmp/out",
+            "SELECT 1 \\gexec",
+            "GRANT CONNECT ON DATABASE shop TO a; \\o /tmp/out",
+            "SELECT 1; \\copy t to '/tmp/f'",
+            "\\! touch /tmp/pwned",
+            "-- a comment \\! touch /tmp/pwned",
+            "SELECT 'a\\b';",
+            // psql variable references.
+            "SELECT :name;",
+            "SELECT :'name';",
+            "SELECT :\"name\";",
+            "SELECT 1 :x",
+            "SELECT 1:int;",
+            "SELECT ':name';",
+            "SELECT 1:::int;",
+        ] {
+            let init = format!("\\connect shop\n{hostile}\n");
+            let error = bootstrap_sql(&init, "shop").expect_err(hostile);
+            assert!(
+                error.contains("backslash") || error.contains("colon"),
+                "{hostile}: {error}"
+            );
+            assert!(
+                !error.contains("pwned"),
+                "the reason never quotes the SQL: {error}"
+            );
+        }
+        // The text before \connect is never sent, so it is not inspected.
+        assert!(bootstrap_sql("\\! echo hi\n\\connect shop\nSELECT 1;\n", "shop").is_ok());
+    }
+
+    #[test]
+    fn the_restore_connects_where_the_application_does_and_to_one_database() {
+        // The URL leaves the port out: SQLx takes PGPORT, and so does psql.
+        let machine = Machine::new("postgres://app_runtime:rt@127.0.0.1/shop")
+            .with(
+                "FORGE_MIGRATION_DATABASE_URL",
+                "postgres://app_migrator:mg@127.0.0.1/shop",
+            )
+            .with("PGPORT", "5433");
+        let env = env_of(&machine.script().expect("script"));
+        assert_eq!(
+            (env["PGHOST"].as_str(), env["PGPORT"].as_str()),
+            ("127.0.0.1", "5433")
+        );
+        // No host in the URL: PGHOSTADDR, then PGHOST (a directory is a socket).
+        let machine = Machine::new("postgres:///shop")
+            .with("FORGE_MIGRATION_DATABASE_URL", "postgres:///shop")
+            .with("PGHOST", "/var/run/postgresql")
+            .with("PGUSER", "app_migrator")
+            .with("PGPASSWORD", "from-env");
+        let invocation = machine.script().expect("script");
+        let env = env_of(&invocation);
+        assert_eq!(env["PGHOST"], "/var/run/postgresql");
+        assert_eq!(env["PGUSER"], "app_migrator");
+        assert_eq!(env["PGPASSWORD"], "from-env");
+        assert!(
+            args(&invocation)
+                .iter()
+                .all(|argument| !argument.contains("from-env"))
+        );
+        let machine = Machine::new("postgres:///shop")
+            .with("FORGE_MIGRATION_DATABASE_URL", "postgres:///shop")
+            .with("PGHOST", "db.internal")
+            .with("PGHOSTADDR", "10.0.0.5");
+        assert_eq!(
+            env_of(&machine.script().expect("script"))["PGHOST"],
+            "10.0.0.5"
+        );
+        // The URL's own values beat the environment.
+        let machine = Machine::new("postgres://u:p@own.host:7000/shop")
+            .with(
+                "FORGE_MIGRATION_DATABASE_URL",
+                "postgres://m:p@own.host:7000/shop",
+            )
+            .with("PGHOST", "elsewhere")
+            .with("PGPORT", "1");
+        let env = env_of(&machine.script().expect("script"));
+        assert_eq!(
+            (env["PGHOST"].as_str(), env["PGPORT"].as_str()),
+            ("own.host", "7000")
+        );
+        assert_eq!(env["PGUSER"], "m");
+
+        // The console resolves the server the same way.
+        let machine = Machine::new("postgres://u:p@127.0.0.1/shop").with("PGPORT", "5433");
+        assert_eq!(
+            env_of(&machine.console(&[]).expect("console"))["PGPORT"],
+            "5433"
+        );
+
+        // The application's `db create` and `db drop` use the migration URL's
+        // database: a different one than FORGE_DATABASE_URL's is refused.
+        let machine = Machine::new("postgres://u:p@127.0.0.1/shop").with(
+            "FORGE_MIGRATION_DATABASE_URL",
+            "postgres://m:p@127.0.0.1/shop_admin",
+        );
+        let error = machine
+            .script()
+            .expect_err("different databases")
+            .to_string();
+        assert!(error.contains("name different databases"), "{error}");
+        assert!(!error.contains("shop_admin"), "{error}");
+        let machine = Machine::new("postgres://u:p@127.0.0.1/shop").with(
+            "FORGE_MIGRATION_DATABASE_URL",
+            "postgres://m:p@127.0.0.1/postgres",
+        );
+        assert!(
+            machine
+                .script()
+                .expect_err("system database")
+                .to_string()
+                .contains("system database")
+        );
+        let machine = Machine::new("postgres://u:p@127.0.0.1/shop")
+            .with("FORGE_MIGRATION_DATABASE_URL", "postgres://m:p@127.0.0.1");
+        assert!(
+            machine
+                .script()
+                .expect_err("no database")
+                .to_string()
+                .contains("does not name a database")
         );
     }
 

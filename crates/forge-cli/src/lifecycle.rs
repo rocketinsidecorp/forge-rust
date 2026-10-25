@@ -946,7 +946,7 @@ mod tests {
             ),
             (
                 postgres_harness().init_script("\\connect shop\n\\! touch /tmp/pwned\n"),
-                "meta-command",
+                "backslash",
             ),
             (
                 postgres_harness().init_script("CREATE ROLE a;\n"),

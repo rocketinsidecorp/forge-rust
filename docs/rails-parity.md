@@ -41,6 +41,15 @@ the work is finished and waiting for its review; **Planned** means not started.
 
 ## Parity follow-ups
 
+- Database URLs without a host (tracked 2026-10-25, forge-rust#24): the Rust
+  production guard of `db drop` treats `postgres:///shop` as a local socket
+  (what SQLx resolves it to: `PGHOST=/dir`, or the first default socket
+  directory with a server, else `localhost`). Forge-Go's `forge db` refuses
+  such a URL as ambiguous, because its checks need an explicit host. Both fail
+  closed for a remote host; the difference is that Rust accepts the URL. Decide
+  once whether Go should resolve the same way or Rust should refuse it, and
+  change the other framework to match.
+
 - TOTP MFA ([ADR 0040](adr/0040-totp-multi-factor-authentication.md)): the
   primitives, storage format, key, throttle limits, audit names (including
   `auth.mfa.backup_codes_regenerated`) and the HTML enrollment, rotation,

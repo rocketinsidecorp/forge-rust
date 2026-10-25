@@ -370,7 +370,7 @@ fn db_reset_restores_the_init_script_privileges_after_creating_the_database() {
         [
             "app db drop",
             "app db create",
-            "psql -X -q -v ON_ERROR_STOP=1 -1 -f -",
+            "psql -X -q -w -v ON_ERROR_STOP=1 -1 -f -",
             "app migrate",
             "app seed",
         ]
