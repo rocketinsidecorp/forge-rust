@@ -480,7 +480,8 @@ impl Aes256GcmSecretCipher {
     /// 32 bytes, the format of `FORGE_AUTH_MFA_KEY`. The error never echoes
     /// the value.
     pub fn from_base64url(encoded: &str) -> Result<Self, SecretCipherError> {
-        Self::new(&parse_mfa_key(encoded)?)
+        let key = Zeroizing::new(parse_mfa_key(encoded)?);
+        Self::new(key.as_slice())
     }
 }
 
@@ -492,11 +493,15 @@ impl std::fmt::Debug for Aes256GcmSecretCipher {
 
 /// Decodes `FORGE_AUTH_MFA_KEY`: canonical unpadded base64url (no padding,
 /// no trailing bits, the URL-safe alphabet) of exactly 32 bytes.
+/// The decoded bytes and the canonical re-encoding it is compared with are
+/// wiped; the returned key is the caller's to wipe.
 pub fn parse_mfa_key(encoded: &str) -> Result<[u8; MFA_KEY_BYTES], SecretCipherError> {
-    let decoded = URL_SAFE_NO_PAD
-        .decode(encoded)
-        .map_err(|_| SecretCipherError::InvalidKey)?;
-    if URL_SAFE_NO_PAD.encode(&decoded) != encoded {
+    let decoded = Zeroizing::new(
+        URL_SAFE_NO_PAD
+            .decode(encoded)
+            .map_err(|_| SecretCipherError::InvalidKey)?,
+    );
+    if *Zeroizing::new(URL_SAFE_NO_PAD.encode(decoded.as_slice())) != encoded {
         return Err(SecretCipherError::InvalidKey);
     }
     <[u8; MFA_KEY_BYTES]>::try_from(decoded.as_slice()).map_err(|_| SecretCipherError::InvalidKey)

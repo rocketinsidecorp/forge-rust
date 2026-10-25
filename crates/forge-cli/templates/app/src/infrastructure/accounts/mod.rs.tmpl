@@ -13,9 +13,11 @@
 //! of a factor, a backup code or a challenge is one transaction that locks
 //! the rows it reads, so a code is accepted once even under concurrency.
 //!
-//! Lock order: every MFA transaction locks the account's `forge_principals`
-//! row first and only then its enrollment, factor, backup code, session and
-//! challenge rows. Factor changes take it `FOR UPDATE` ([`lock_account`]);
+//! Lock order: every transaction that changes an account's MFA rows, sessions
+//! or reset tokens locks the account's `forge_principals` row first and only
+//! then its enrollment, factor, backup code, session, challenge and reset
+//! rows (redeeming a reset token too; `PostgresSessionStore::rotate` takes
+//! the row `FOR KEY SHARE` before the session row). Factor changes take it `FOR UPDATE` ([`lock_account`]);
 //! issuing and completing a sign-in challenge take it `FOR NO KEY UPDATE`
 //! ([`lock_sign_in`]). The two modes conflict with each other and with
 //! themselves, so the MFA transactions of one account run one at a time and
@@ -31,8 +33,9 @@
 use async_trait::async_trait;
 use forge::audit::{AuditAction, AuditActor, AuditEvent, AuditOutcome};
 use forge::auth::{
-    CanonicalLogin, MfaBackupCodeDigest, MfaChallengeBinding, MfaChallengeDigest, PasswordHash,
-    PasswordResetTokenDigest, SealedTotpSecret, TotpSecretDigest, UnixTimestamp,
+    CanonicalLogin, MfaBackupCodeDigest, MfaChallengeBinding, MfaChallengeDigest,
+    PasswordCredentialVersion, PasswordHash, PasswordResetTokenDigest, SealedTotpSecret,
+    TotpSecretDigest, UnixTimestamp,
 };
 use forge::core::Id;
 use forge::security::PrincipalId;
@@ -147,6 +150,31 @@ impl PasswordResetStore for PgPasswordResetStore {
     ) -> Result<Option<RedeemedPasswordReset>, AccountStoreError> {
         let now = seconds(now)?;
         let mut transaction = self.pool.begin().await.map_err(classify)?;
+
+        // The account row first (see the module's lock order), as Forge-Go's
+        // ConsumeRecovery: the token is looked up without a lock, then the
+        // account row is locked `FOR UPDATE` before the token row. Locking
+        // the token first deadlocked two redemptions of different links of
+        // one account (each held its token, one waited for the account row,
+        // the other for the first's token). `FOR UPDATE` also makes a
+        // session insert of the account wait for the reset, so a sign-in
+        // finishing meanwhile sees the new credential version.
+        let Some(principal) = sqlx::query_scalar::<_, Uuid>(
+            "SELECT principal_id FROM forge_password_resets WHERE token_digest = $1",
+        )
+        .bind(digest.as_bytes().as_slice())
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(classify)?
+        else {
+            transaction.rollback().await.map_err(classify)?;
+            return Ok(None);
+        };
+        sqlx::query("SELECT 1 FROM forge_principals WHERE id = $1 FOR UPDATE")
+            .bind(principal)
+            .execute(&mut *transaction)
+            .await
+            .map_err(classify)?;
 
         // Locks the token row, so a concurrent redemption waits and then sees
         // it used. The account must still be enabled and an active member of
@@ -669,9 +697,10 @@ impl MfaStore for PgMfaStore {
         digest: &MfaChallengeDigest,
         now: UnixTimestamp,
     ) -> Result<Option<MfaChallengeRecord>, AccountStoreError> {
-        type Row = (Uuid, Uuid, Vec<u8>, Vec<u8>, Vec<u8>, i64, i64, i64);
+        type Row = (Uuid, Uuid, i64, Vec<u8>, Vec<u8>, Vec<u8>, i64, i64, i64);
         let row = sqlx::query_as::<_, Row>(concat!(
-            "SELECT challenge.principal_id, challenge.tenant_id, challenge.binding_digest,
+            "SELECT challenge.principal_id, challenge.tenant_id, challenge.credential_version,
+                    challenge.binding_digest,
                     factor.secret_digest, factor.secret_ciphertext, factor.last_counter,
                     EXTRACT(EPOCH FROM challenge.expires_at)::bigint,
                     EXTRACT(EPOCH FROM challenge.session_expires_at)::bigint",
@@ -684,12 +713,16 @@ impl MfaStore for PgMfaStore {
         .await
         .map_err(classify)?;
         row.map(
-            |(principal, tenant, binding, factor, ciphertext, last, expires, session)| {
+            |(principal, tenant, version, binding, factor, ciphertext, last, expires, session)| {
                 Ok(MfaChallengeRecord {
                     principal_id: PrincipalId::from_uuid(principal)
                         .map_err(|_| AccountStoreError::Corrupt)?,
                     tenant_id: TenantId::from_uuid(tenant)
                         .map_err(|_| AccountStoreError::Corrupt)?,
+                    credential_version: u64::try_from(version)
+                        .ok()
+                        .and_then(PasswordCredentialVersion::new)
+                        .ok_or(AccountStoreError::Corrupt)?,
                     binding: MfaChallengeBinding::from_bytes(digest32(binding)?),
                     factor: ActiveTotp {
                         sealed: sealed(ciphertext, factor)?,
