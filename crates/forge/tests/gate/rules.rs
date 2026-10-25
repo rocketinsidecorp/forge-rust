@@ -242,7 +242,7 @@ pub(crate) fn action_repository(reference: &str) -> Option<String> {
 /// - a flow collection or quoted scalar that does not close on its line, a
 ///   flow indicator or a `:` without a blank inside a flow collection's
 ///   plain scalar, a quoted key whose `:` is not followed by a blank, and a
-///   double-quoted key with an escape.
+///   double-quoted scalar (key or value) with an escape.
 pub(crate) fn yaml_subset(text: &str) -> (Vec<bool>, Vec<(usize, &'static str)>) {
     let mut problems = Vec::new();
     let mut line = 0;
@@ -377,18 +377,22 @@ pub(crate) fn yaml_subset(text: &str) -> (Vec<bool>, Vec<(usize, &'static str)>)
                                 .push((number, "a quoted scalar that does not close on its line"));
                             break;
                         };
+                        // An escape spells any text (`"c\x61rgo"` is
+                        // `cargo`, `"u\x73es"` is `uses`) where the text
+                        // rules would not read it: no double-quoted scalar,
+                        // key or value, holds a backslash.
+                        if character == '"' && content[at..characters[end].0].contains('\\') {
+                            problems.push((number, "a double-quoted scalar with an escape"));
+                        }
                         let after = &content[characters[end].0 + 1..];
                         let trimmed = after.trim_start_matches([' ', '\t']);
-                        if let Some(value) = trimmed.strip_prefix(':') {
-                            if character == '"' && content[at..characters[end].0].contains('\\') {
-                                problems.push((number, "a double-quoted key with an escape"));
-                            }
-                            if !(value.is_empty() || value.starts_with([' ', '\t'])) {
-                                problems.push((
-                                    number,
-                                    "a quoted key whose `:` is not followed by a blank",
-                                ));
-                            }
+                        if let Some(value) = trimmed.strip_prefix(':')
+                            && !(value.is_empty() || value.starts_with([' ', '\t']))
+                        {
+                            problems.push((
+                                number,
+                                "a quoted key whose `:` is not followed by a blank",
+                            ));
                         }
                         index = end + 1;
                         continue;
@@ -1350,11 +1354,15 @@ pub(crate) fn tool_install_violations(relative: &str, text: &str) -> Vec<String>
 }
 
 /// Environment variables that redirect where cargo, rustup and their tools
-/// come from: a crate registry or source replacement (`CARGO_HOME` points
-/// cargo at another `config.toml`), the install root, the network settings
-/// and the toolchain download servers. A prefix ends in `_`;
+/// come from or what they run: a crate registry or source replacement
+/// (`CARGO_HOME` points cargo at another `config.toml`), the install root,
+/// the network and HTTP settings (a proxy, a CA bundle), the build and
+/// target settings (`CARGO_BUILD_RUSTC_WRAPPER`, `CARGO_TARGET_*_RUNNER`),
+/// the compiler wrappers, the toolchain download servers, the configuration
+/// directory (`XDG_CONFIG_HOME`), and the runner switch that re-enables the
+/// deprecated `::set-env` and `::add-path` commands. A prefix ends in `_`;
 /// `CARGO_SOURCE` and `CARGO_CONFIG` are prefixes too.
-pub(crate) const REDIRECTING_VARIABLES: [&str; 9] = [
+pub(crate) const REDIRECTING_VARIABLES: [&str; 17] = [
     "CARGO_HOME",
     "CARGO_REGISTRIES_",
     "CARGO_REGISTRY_",
@@ -1362,39 +1370,98 @@ pub(crate) const REDIRECTING_VARIABLES: [&str; 9] = [
     "CARGO_INSTALL_ROOT",
     "CARGO_NET_",
     "CARGO_CONFIG",
+    "CARGO_HTTP_",
+    "CARGO_BUILD_",
+    "CARGO_TARGET_",
+    "RUSTC_WRAPPER",
+    "RUSTC_WORKSPACE_WRAPPER",
     "RUSTUP_DIST_SERVER",
+    "RUSTUP_DIST_ROOT",
     "RUSTUP_UPDATE_ROOT",
+    "XDG_CONFIG_HOME",
+    "ACTIONS_ALLOW_UNSECURE_COMMANDS",
 ];
 
+/// Variables a gated file may read (`$HOME`, a `rustc` command) but never
+/// set: `HOME` moves `~/.cargo` (cargo's default `CARGO_HOME`) and `RUSTC`
+/// replaces the compiler.
+pub(crate) const ASSIGNED_ONLY_VARIABLES: [&str; 2] = ["HOME", "RUSTC"];
+
+/// Text refused anywhere in a gated file, compared without case: a
+/// `$GITHUB_ENV` write (it sets variables for every later step under a name
+/// the shell may build at run time), the deprecated `::set-env` and
+/// `::add-path` workflow commands, a cargo configuration file
+/// (`.cargo/config`, `cargo/config.toml`, any extension) and cargo's
+/// `--config` flag, which sets any configuration value on the command line.
+pub(crate) const REFUSED_TEXT: [(&str, &str); 5] = [
+    (
+        "GITHUB_ENV",
+        "gated files do not write `$GITHUB_ENV`; set variables in an env: block",
+    ),
+    ("::SET-ENV", "the `::set-env` workflow command is refused"),
+    ("::ADD-PATH", "the `::add-path` workflow command is refused"),
+    (
+        "CARGO/CONFIG",
+        "a cargo configuration file can redirect crate sources",
+    ),
+    (
+        "--CONFIG",
+        "a `--config` flag can set any cargo configuration value",
+    ),
+];
+
+fn is_name_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
 /// No gated file names a variable of `REDIRECTING_VARIABLES` anywhere: not
-/// in an `env:` block (workflow, job or step), not in `run` text. Compared
-/// without case. No gated file writes `$GITHUB_ENV` either: a write there
-/// sets variables for every later step under a name the shell may build at
-/// run time, where no text rule can read it.
+/// in an `env:` block (workflow, job or step), not in `run` text. A variable
+/// of `ASSIGNED_ONLY_VARIABLES` is refused where it is set: an `env:` key
+/// (`HOME:`, `"HOME":`) or a shell assignment (`HOME=`), but not read
+/// (`$HOME`, `${HOME}`). `REFUSED_TEXT` is refused anywhere. All compared
+/// without case. The subset refuses escapes in double-quoted scalars, so
+/// the text read here is the text YAML yields; a name the shell assembles
+/// at run time is the accepted residual risk (docs/supply-chain.md).
 pub(crate) fn environment_violations(name: &str, text: &str) -> Vec<String> {
     let upper = text.to_ascii_uppercase();
     let bytes = upper.as_bytes();
+    let line = |position: usize| upper[..position].matches('\n').count() + 1;
+    let starts_word = |position: usize| position == 0 || !is_name_byte(bytes[position - 1]);
     let mut violations = Vec::new();
-    for (position, _) in upper.match_indices("GITHUB_ENV") {
-        let line = upper[..position].matches('\n').count() + 1;
-        violations.push(format!(
-            "{name}:{line}: gated files do not write `$GITHUB_ENV`; set variables in an env: block"
-        ));
+    for (refused, reason) in REFUSED_TEXT {
+        for (position, _) in upper.match_indices(refused) {
+            violations.push(format!("{name}:{}: {reason}", line(position)));
+        }
     }
     for variable in REDIRECTING_VARIABLES {
         for (position, _) in upper.match_indices(variable) {
-            let starts_word = position == 0
-                || !(bytes[position - 1].is_ascii_alphanumeric() || bytes[position - 1] == b'_');
             let end = position + variable.len();
             let ends_word = variable.ends_with('_')
                 || matches!(variable, "CARGO_SOURCE" | "CARGO_CONFIG")
-                || bytes
-                    .get(end)
-                    .is_none_or(|byte| !(byte.is_ascii_alphanumeric() || *byte == b'_'));
-            if starts_word && ends_word {
-                let line = upper[..position].matches('\n').count() + 1;
+                || bytes.get(end).is_none_or(|byte| !is_name_byte(*byte));
+            if starts_word(position) && ends_word {
                 violations.push(format!(
-                    "{name}:{line}: `{variable}` redirects where cargo or rustup fetch from"
+                    "{name}:{}: `{variable}` redirects where cargo or rustup fetch from or what they run",
+                    line(position)
+                ));
+            }
+        }
+    }
+    for variable in ASSIGNED_ONLY_VARIABLES {
+        for (position, _) in upper.match_indices(variable) {
+            let end = position + variable.len();
+            let read = position > 0 && matches!(bytes[position - 1], b'$' | b'{');
+            if !starts_word(position)
+                || read
+                || bytes.get(end).is_some_and(|byte| is_name_byte(*byte))
+            {
+                continue;
+            }
+            let rest = upper[end..].trim_start_matches(['"', '\'', ' ', '\t']);
+            if rest.starts_with([':', '=']) {
+                violations.push(format!(
+                    "{name}:{}: gated files do not set `{variable}`",
+                    line(position)
                 ));
             }
         }

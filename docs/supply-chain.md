@@ -239,7 +239,12 @@ does not match either form.
   - a flow collection (`[...]`, `{...}`) or quoted scalar that does not close
     on its line, a flow indicator or a `:` without a blank inside a flow
     collection's plain scalar, a quoted key whose `:` is not followed by a
-    blank, and a double-quoted key with an escape (`"u\x73es"`).
+    blank;
+  - a backslash in any double-quoted scalar, key or value: an escape spells
+    text the rules would not read (`"u\x73es"` is `uses`, `"c\x61rgo
+    install"` is `cargo install`, `"CARGO_\x48OME"` is `CARGO_HOME`). Plain
+    and single-quoted scalars and block text have no escapes, so the text
+    the rules read is the text YAML yields.
   A `#` inside a quoted scalar is text, not a comment.
 - Every gated file is also parsed with a YAML parser (`yaml-rust2`, a
   test-only dependency, docs/dependency-policy.md): the parser and the line
@@ -251,12 +256,20 @@ does not match either form.
   without case (`persist-credentials` and `Persist-Credentials`, a second
   `uses`): readers that keep the first and the last value would disagree.
 - No gated file names a variable that redirects where cargo or rustup fetch
-  from (`CARGO_HOME`, `CARGO_REGISTRIES_*`, `CARGO_REGISTRY_*`,
-  `CARGO_SOURCE*`, `CARGO_INSTALL_ROOT`, `CARGO_NET_*`, `CARGO_CONFIG*`,
-  `RUSTUP_DIST_SERVER`, `RUSTUP_UPDATE_ROOT`), in any case, in an `env:` block
-  at any level or in `run` text, and none writes `$GITHUB_ENV`, whatever it
-  sets: a variable for later steps goes in an `env:` block, where the gate
-  reads its name.
+  from or what they run (`CARGO_HOME`, `CARGO_REGISTRIES_*`,
+  `CARGO_REGISTRY_*`, `CARGO_SOURCE*`, `CARGO_INSTALL_ROOT`, `CARGO_NET_*`,
+  `CARGO_CONFIG*`, `CARGO_HTTP_*`, `CARGO_BUILD_*`, `CARGO_TARGET_*`,
+  `RUSTC_WRAPPER`, `RUSTC_WORKSPACE_WRAPPER`, `RUSTUP_DIST_SERVER`,
+  `RUSTUP_DIST_ROOT`, `RUSTUP_UPDATE_ROOT`, `XDG_CONFIG_HOME`,
+  `ACTIONS_ALLOW_UNSECURE_COMMANDS`), in any case, in an `env:` block at any
+  level or in `run` text. `HOME` (cargo's default `CARGO_HOME` is
+  `$HOME/.cargo`) and `RUSTC` are refused where they are set, as an `env:`
+  key or a `NAME=` assignment; reading `$HOME` or running `rustc` stays
+  allowed. No gated file writes `$GITHUB_ENV`, whatever it sets (a variable
+  for later steps goes in an `env:` block, where the gate reads its name),
+  uses the deprecated `::set-env` or `::add-path` commands, names a cargo
+  configuration file (`.cargo/config`, `cargo/config.toml`, any extension)
+  or passes cargo's `--config` flag.
 - The install rule reads `run` text as text: with and without YAML comments
   removed, continued lines joined with and without a space, quotes and
   backslashes ignored. It refuses ANSI-C quoting (`$'...'`), any command
@@ -267,8 +280,9 @@ does not match either form.
 - What text scanning cannot see: the shell inside `run` is not parsed (a
   script the workflow runs, `eval` of computed text, a command or variable
   name assembled at run time), and an allowlisted action or a reviewed
-  script can still fetch a tool. Those are covered by review of every script and allowlisted action,
-  not by the gate.
+  script can still fetch a tool. Those are covered by review of every script
+  and allowlisted action, not by the gate (see Threat model and residual
+  risk below).
 - Cargo tools are installed only through that action, plus one reviewed
   exception: the `Install cargo-auditable` step of `release.yml`, which
   installs exactly `cargo-auditable`. Both use one exact `--version` and
@@ -352,6 +366,30 @@ Dockerfile. It does not update the digests inside workflow `run:` steps or
 scripts (Syft), `sbom: generator=` (BuildKit's scanner) or the CI service
 image; refresh those by hand, all copies at once (the test requires the Syft
 copies to agree).
+
+## Threat model and residual risk
+
+Engineering decision D6 (2026-10-25). The supply-chain gate is defense in
+depth against unreviewed drift and casual injection in the workflows, local
+actions and generated-app workflows. It is not a shell sandbox, and review is
+the primary control.
+
+- In scope, refused by the gate: every YAML-level and plain-text spelling of
+  a refused action, install, permission, secret, variable or configuration
+  file (YAML escapes, quoting, case, flow style, anchors, aliases, tags,
+  merge and duplicate keys, hidden line breaks, template branches and every
+  rendered variant of the generated application's workflows), and every
+  documented tool or configuration redirect (cargo, rustup and their
+  configuration files and flags, `HOME` and `XDG_CONFIG_HOME`, the runner's
+  `$GITHUB_ENV`, `::set-env` and `::add-path`).
+- Accepted residual risk, left to mandatory review of every change to a
+  workflow, action, script or template: names and commands the shell
+  assembles at run time (`CARGO_""HOME=...`, `eval`, a name built with
+  `printf`, a script the workflow calls), and what an allowlisted action or a
+  reviewed script downloads.
+- Reviews of the gate judge it against this model: a bypass inside the scope
+  above is a defect to fix in the gate; a run-time-assembled name is the
+  accepted residual risk.
 
 ## Residual risks
 

@@ -2322,6 +2322,8 @@ mod tests {
                     })?;
                 Ok(())
             });
+            // Without `jobs` the slot is `()`, as in `serve`.
+            #[cfg_attr(not(feature = "jobs"), allow(clippy::unit_arg))]
             let Built {
                 router, database, ..
             } = compose(
@@ -2345,6 +2347,7 @@ mod tests {
                     composition.postgres()?;
                     Ok(())
                 });
+                #[cfg_attr(not(feature = "jobs"), allow(clippy::unit_arg))]
                 let outcome = compose(
                     "demo",
                     &config,

