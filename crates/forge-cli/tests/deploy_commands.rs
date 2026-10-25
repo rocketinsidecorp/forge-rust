@@ -397,3 +397,20 @@ fn logs_and_app_commands_print_the_remote_command_in_a_dry_run() {
         stderr(&invalid)
     );
 }
+
+#[test]
+fn an_unusable_temporary_directory_fails_before_any_ssh_runs() {
+    let project = Project::new();
+    let output = project
+        .command(&["deploy", "lock", "status"])
+        .env("TMPDIR", project.root().join("no-such-directory"))
+        .output()
+        .expect("forge runs");
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        stderr(&output).contains("create ssh control directory: "),
+        "{}",
+        stderr(&output)
+    );
+    assert!(project.ssh_calls().is_empty(), "ssh never started");
+}

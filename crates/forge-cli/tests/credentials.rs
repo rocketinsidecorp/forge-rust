@@ -149,6 +149,59 @@ fn sigterm_during_the_edit_wipes_the_plaintext_and_keeps_the_credentials() {
 }
 
 #[test]
+fn sighup_during_the_edit_wipes_the_plaintext_and_keeps_the_credentials() {
+    let app = tempfile::tempdir().expect("app");
+    let scratch = tempfile::tempdir().expect("scratch");
+    let root = app.path();
+    assert!(forge(root, &["credentials", "init"], &[]).status.success());
+    let encrypted = root.join("config/credentials/development.json.enc");
+    let before = fs::read(&encrypted).expect("file");
+    let seen = scratch.path().join("seen");
+    let script = editor(
+        scratch.path(),
+        &format!(
+            "printf '{{\"changed\": true}}' > \"$1\"\necho \"$1\" > '{}'\nexec sleep 30",
+            seen.display()
+        ),
+    );
+    let mut child = Command::new(env!("CARGO_BIN_EXE_forge"))
+        .args(["credentials", "edit"])
+        .current_dir(root)
+        .env("EDITOR", &script)
+        .env_remove("VISUAL")
+        .env_remove("FORGE_MASTER_KEY")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("forge");
+    let edited = PathBuf::from(wait_for(&seen));
+    assert!(
+        edited.exists(),
+        "the plaintext exists while the editor runs"
+    );
+    let pid = rustix::process::Pid::from_raw(i32::try_from(child.id()).expect("pid")).expect("pid");
+    rustix::process::kill_process(pid, rustix::process::Signal::HUP).expect("SIGHUP");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("wait") {
+            break status;
+        }
+        assert!(Instant::now() < deadline, "forge did not stop");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let output = child.wait_with_output().expect("output");
+    assert!(!status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("interrupted by SIGHUP"), "{stderr}");
+    assert!(
+        !edited.parent().expect("dir").exists(),
+        "the private directory was left behind"
+    );
+    assert_eq!(fs::read(&encrypted).expect("file"), before);
+}
+
+#[test]
 fn rotate_key_replaces_the_key_and_prints_it_only_when_asked() {
     let app = tempfile::tempdir().expect("app");
     let root = app.path();
