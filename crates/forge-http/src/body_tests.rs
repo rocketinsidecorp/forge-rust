@@ -7,9 +7,19 @@ use hyper::body::Body as _;
 
 use crate::body::{ChunkSource, OutgoingBody, ResponseBody, Unfold};
 
+/// One step function exercises every state of the body, because coverage
+/// counts a generic function by its best single instantiation.
 #[test]
-fn a_step_that_only_yields_empty_chunks_gives_way_to_the_scheduler_and_resumes() {
+fn a_streamed_body_waits_skips_empty_chunks_yields_and_ends() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("runtime");
     let mut source = Unfold::new(0_u32, |count: u32| async move {
+        if count == 0 {
+            // Not ready on the first poll: the state is kept until the
+            // next one.
+            tokio::task::yield_now().await;
+        }
         match count {
             0..=39 => Some((Bytes::new(), count + 1)),
             40 => Some((Bytes::from_static(b"data"), 41)),
@@ -17,32 +27,20 @@ fn a_step_that_only_yields_empty_chunks_gives_way_to_the_scheduler_and_resumes()
         }
     });
     let mut context = Context::from_waker(Waker::noop());
-    // 32 empty chunks in a row: the body yields instead of holding the thread.
-    assert_eq!(source.poll_chunk(&mut context), Poll::Pending);
-    // The remaining empty chunks are skipped and the first data comes out.
-    assert_eq!(
-        source.poll_chunk(&mut context),
-        Poll::Ready(Some(Bytes::from_static(b"data")))
-    );
-    assert_eq!(source.poll_chunk(&mut context), Poll::Ready(None));
-    // A finished body stays finished.
-    assert_eq!(source.poll_chunk(&mut context), Poll::Ready(None));
-}
-
-#[tokio::test]
-async fn a_step_that_is_not_ready_keeps_its_state_until_polled_again() {
-    let mut source = Unfold::new(false, |ready: bool| async move {
-        if !ready {
-            tokio::task::yield_now().await;
-        }
-        Some((Bytes::from_static(b"late"), true))
+    runtime.block_on(async {
+        assert_eq!(source.poll_chunk(&mut context), Poll::Pending);
+        // 32 empty chunks in a row: the body yields instead of holding the
+        // thread.
+        assert_eq!(source.poll_chunk(&mut context), Poll::Pending);
+        // The remaining empty chunks are skipped and the first data comes out.
+        assert_eq!(
+            source.poll_chunk(&mut context),
+            Poll::Ready(Some(Bytes::from_static(b"data")))
+        );
+        assert_eq!(source.poll_chunk(&mut context), Poll::Ready(None));
+        // A finished body stays finished.
+        assert_eq!(source.poll_chunk(&mut context), Poll::Ready(None));
     });
-    let mut context = Context::from_waker(Waker::noop());
-    assert_eq!(source.poll_chunk(&mut context), Poll::Pending);
-    assert_eq!(
-        source.poll_chunk(&mut context),
-        Poll::Ready(Some(Bytes::from_static(b"late")))
-    );
 }
 
 #[test]

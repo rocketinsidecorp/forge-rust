@@ -509,6 +509,8 @@ impl<'de> SeqAccess<'de> for Values<'_, '_> {
 }
 
 #[cfg(test)]
+mod display_tests;
+#[cfg(test)]
 mod tests {
     use std::collections::HashMap;
 

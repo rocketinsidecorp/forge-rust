@@ -48,6 +48,8 @@ mod io;
 #[cfg(test)]
 mod io_tests;
 mod json;
+#[cfg(test)]
+mod media_type_tests;
 mod openapi;
 mod query;
 #[cfg(test)]
