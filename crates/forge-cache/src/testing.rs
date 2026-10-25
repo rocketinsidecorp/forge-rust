@@ -15,7 +15,7 @@ use std::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use crate::{Cache, CacheError, FetchError, MAX_KEY_LENGTH, Options, Pruner, fetch};
@@ -139,12 +139,21 @@ async fn overwrite_replaces_value_and_ttl(subject: Subject) {
     );
 }
 
+/// Asserts that `key`, stored at `stored` with [`SHORT_TTL`], is readable
+/// while that ttl runs. A store that took the whole ttl to answer (a loaded
+/// CI runner) may rightly have expired the entry already, so the read only
+/// counts when it finished inside the ttl.
+async fn readable_before_short_ttl(subject: &Subject, key: &str, stored: Instant) {
+    let found = get(subject, key).await.is_some();
+    if stored.elapsed() < SHORT_TTL {
+        assert!(found, "readable before it expires");
+    }
+}
+
 async fn values_expire(subject: Subject) {
+    let stored = Instant::now();
     set(&subject, "k", b"v", Some(SHORT_TTL)).await;
-    assert!(
-        get(&subject, "k").await.is_some(),
-        "readable before it expires"
-    );
+    readable_before_short_ttl(&subject, "k", stored).await;
     tokio::time::sleep(SHORT_TTL + Duration::from_millis(150)).await;
     assert!(
         get(&subject, "k").await.is_none(),
@@ -153,8 +162,9 @@ async fn values_expire(subject: Subject) {
 }
 
 async fn default_ttl_applies(subject: Subject) {
+    let stored = Instant::now();
     set(&subject, "k", b"v", None).await;
-    assert!(get(&subject, "k").await.is_some());
+    readable_before_short_ttl(&subject, "k", stored).await;
     tokio::time::sleep(SHORT_TTL + Duration::from_millis(150)).await;
     assert!(
         get(&subject, "k").await.is_none(),
