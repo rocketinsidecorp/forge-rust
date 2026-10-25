@@ -71,7 +71,13 @@ fn logs_of(run: impl FnOnce()) -> String {
         .with_ansi(false)
         .without_time()
         .finish();
-    tracing::subscriber::with_default(subscriber, run);
+    tracing::subscriber::with_default(subscriber, || {
+        // Callsite interest is cached process-wide; a callsite first seen by
+        // a parallel test while no capturing subscriber existed may be
+        // cached as uninteresting. Rebuild it now that this one is set.
+        tracing::callsite::rebuild_interest_cache();
+        run();
+    });
     let bytes = buffer
         .0
         .lock()
