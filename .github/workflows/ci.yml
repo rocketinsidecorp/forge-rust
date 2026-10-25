@@ -64,8 +64,10 @@ jobs:
     timeout-minutes: 30
     env:
       # forge deploy's SSH tests (crates/forge-cli/src/deploy/ssh_tests.rs)
-      # fail instead of skipping when sshd, ssh or ssh-keygen is missing.
+      # fail instead of skipping when sshd, ssh, ssh-keygen or the docker
+      # stand-in (built below) is missing.
       FORGE_TEST_REQUIRE_SSHD: "true"
+      FORGE_TEST_FAKE_DOCKER: ${{ github.workspace }}/target/debug/examples/fake_docker
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -85,6 +87,10 @@ jobs:
           workspaces: |
             .
             examples/hello-forge
+      - name: Docker stand-in for the deploy SSH tests
+        # cargo test leaves examples under hashed names; cargo build writes
+        # target/debug/examples/fake_docker, which FORGE_TEST_FAKE_DOCKER names.
+        run: cargo build --locked -p forge-cli --example fake_docker
       - name: Unit, integration and golden tests
         run: cargo test --workspace --all-targets --locked
       - name: Doctests
@@ -203,6 +209,7 @@ jobs:
       FORGE_TEST_MYSQL_URL: mysql://root:forge@127.0.0.1:3306/mysql
       FORGE_TEST_MARIADB_URL: mariadb://root:forge@127.0.0.1:3307/mysql
       FORGE_TEST_REQUIRE_SSHD: "true"
+      FORGE_TEST_FAKE_DOCKER: ${{ github.workspace }}/target/debug/examples/fake_docker
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -216,6 +223,10 @@ jobs:
           sudo apt-get install -y -q --no-install-recommends openssh-server openssh-client
           # The tests start their own sshd; the system service is not needed.
           sudo systemctl disable --now ssh.service ssh.socket || true
+      - name: Docker stand-in for the deploy SSH tests
+        # cargo test leaves examples under hashed names; cargo build writes
+        # target/debug/examples/fake_docker, which FORGE_TEST_FAKE_DOCKER names.
+        run: cargo build --locked -p forge-cli --example fake_docker
       - name: Every test, the database ones included (PostgreSQL 18)
         run: scripts/test-databases.sh
       - name: Every test, the database ones included (PostgreSQL 16)
@@ -272,6 +283,7 @@ jobs:
       FORGE_TEST_MYSQL_URL: mysql://root:forge@127.0.0.1:3306/mysql
       FORGE_TEST_MARIADB_URL: mariadb://root:forge@127.0.0.1:3307/mysql
       FORGE_TEST_REQUIRE_SSHD: "true"
+      FORGE_TEST_FAKE_DOCKER: ${{ github.workspace }}/target/debug/examples/fake_docker
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -291,6 +303,10 @@ jobs:
           sudo apt-get install -y -q --no-install-recommends openssh-server openssh-client
           # The tests start their own sshd; the system service is not needed.
           sudo systemctl disable --now ssh.service ssh.socket || true
+      - name: Docker stand-in for the deploy SSH tests
+        # cargo test leaves examples under hashed names; cargo build writes
+        # target/debug/examples/fake_docker, which FORGE_TEST_FAKE_DOCKER names.
+        run: cargo build --locked -p forge-cli --example fake_docker
       - name: Coverage
         run: scripts/coverage.sh
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
