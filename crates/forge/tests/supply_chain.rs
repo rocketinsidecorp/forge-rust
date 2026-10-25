@@ -290,81 +290,195 @@ fn action_repository(reference: &str) -> Option<String> {
         .then(|| format!("{owner}/{repository}").to_ascii_lowercase())
 }
 
-/// Lines a line scanner cannot read reliably are refused rather than read
-/// wrong, outside block scalars (`run: |`): a key position (after the
-/// indentation, `- `, or the `[`, `{`, `,` of a flow collection) that starts
-/// with `?` (explicit key), `&` (anchor), `*` (alias) or `!` (tag), or a
-/// double-quoted key with an escape (`"u\x73es"`). Each would let a `uses:`
-/// key slip past the pin and allowlist rules.
-fn key_position_violations(name: &str, text: &str) -> Vec<String> {
-    let mut violations = Vec::new();
-    // The indentation of the key whose block scalar is being skipped.
-    let mut block: Option<usize> = None;
-    for (number, line) in text.lines().enumerate() {
-        let code = split_comment(line).0;
-        if code.trim().is_empty() {
+/// What makes a gated file leave the simple YAML subset the gate can read exactly (docs/supply-chain.md,
+/// "Gated files are written in a simple YAML subset"):
+/// - a `\r` not followed by `\n`, U+0085, U+2028 or U+2029 (hidden line
+///   breaks), or U+FEFF anywhere but at the start;
+/// - outside block scalars and plain-scalar continuations, an anchor (`&`),
+///   alias (`*`), tag (`!`), explicit key (`?`) or merge key (`<<`) where a
+///   key or value starts (after the indentation, `- `, `: `, or a flow
+///   collection's `[`, `{`, `,`);
+/// - a flow collection that does not close on its line, a quoted scalar that
+///   does not close on its line, and a double-quoted key with an escape.
+fn yaml_subset(text: &str) -> Vec<(usize, &'static str)> {
+    let mut problems = Vec::new();
+    let mut line = 0;
+    for (offset, character) in text.char_indices() {
+        if character == '\n' {
+            line += 1;
+        }
+        let hidden_break = matches!(character, '\u{85}' | '\u{2028}' | '\u{2029}')
+            || (character == '\r' && !text[offset + 1..].starts_with('\n'))
+            || (character == '\u{feff}' && offset > 0);
+        if hidden_break {
+            problems.push((
+                line,
+                "a hidden line break (lone CR, NEL, LS, PS) or a byte-order mark",
+            ));
+        }
+    }
+    // Column of the key whose block scalar, or of the node whose plain
+    // scalar, the following deeper lines continue.
+    let mut text_under: Option<usize> = None;
+    for (number, raw) in text.split('\n').enumerate() {
+        let line = raw.strip_suffix('\r').unwrap_or(raw);
+        let content = line.trim_start_matches([' ', '\t']);
+        let indent = line.len() - content.len();
+        if content.is_empty() || content.starts_with('#') {
+            // A comment no deeper than the scalar's node ends that scalar.
+            if content.starts_with('#') && text_under.is_some_and(|column| indent <= column) {
+                text_under = None;
+            }
             continue;
         }
-        let indent = indentation(code);
-        if let Some(opened) = block {
-            if indent > opened {
+        if let Some(column) = text_under {
+            if indent > column {
                 continue;
             }
-            block = None;
+            text_under = None;
         }
-        let mut content = code.trim_start();
+        let mut content = content;
         while let Some(rest) = content
             .strip_prefix('-')
             .filter(|rest| rest.is_empty() || rest.starts_with([' ', '\t']))
         {
-            content = rest.trim_start();
+            content = rest.trim_start_matches([' ', '\t']);
         }
-        let mut positions = vec![content];
-        let value = mapping_entry(content).map_or("", |(_, value)| value);
-        // Inside a flow collection, what follows `[`, `{` or `,` (outside
-        // quotes) is a key position too.
-        for flow in [content, value] {
-            if !flow.starts_with(['[', '{']) {
+        let column = line.len() - content.len();
+        let characters: Vec<(usize, char)> = content.char_indices().collect();
+        let mut index = 0;
+        let mut depth = 0_usize;
+        let mut at_node = true;
+        // Whether the last node started on this line is a plain scalar,
+        // and whether it is a block scalar indicator.
+        let mut last_plain = false;
+        let mut last_block = false;
+        while index < characters.len() {
+            let (at, character) = characters[index];
+            if at_node {
+                if matches!(character, ' ' | '\t') {
+                    index += 1;
+                    continue;
+                }
+                at_node = false;
+                last_plain = false;
+                last_block = false;
+                let rest = &content[at..];
+                if matches!(character, '&' | '*' | '!' | '?') || rest.starts_with("<<") {
+                    problems.push((number, "an anchor, alias, tag, explicit key or merge key"));
+                }
+                match character {
+                    '"' | '\'' => {
+                        // A quoted scalar closes on this line.
+                        let mut end = None;
+                        let mut escaped = false;
+                        let mut scan = index + 1;
+                        while scan < characters.len() {
+                            let (_, inner) = characters[scan];
+                            if character == '"' && inner == '\\' && !escaped {
+                                escaped = true;
+                                scan += 1;
+                                continue;
+                            }
+                            if inner == character && !escaped {
+                                if character == '\''
+                                    && characters
+                                        .get(scan + 1)
+                                        .is_some_and(|(_, next)| *next == '\'')
+                                {
+                                    scan += 2;
+                                    continue;
+                                }
+                                end = Some(scan);
+                                break;
+                            }
+                            escaped = false;
+                            scan += 1;
+                        }
+                        let Some(end) = end else {
+                            problems
+                                .push((number, "a quoted scalar that does not close on its line"));
+                            break;
+                        };
+                        let quoted = &content[at..characters[end].0];
+                        let is_key = content[characters[end].0 + 1..]
+                            .trim_start()
+                            .starts_with(':');
+                        if character == '"' && quoted.contains('\\') && is_key {
+                            problems.push((number, "a double-quoted key with an escape"));
+                        }
+                        index = end + 1;
+                        continue;
+                    }
+                    '[' | '{' => {
+                        depth += 1;
+                        at_node = true;
+                        index += 1;
+                        continue;
+                    }
+                    ']' | '}' if depth > 0 => {
+                        // An empty collection, or a trailing comma.
+                        depth -= 1;
+                        index += 1;
+                        continue;
+                    }
+                    '|' | '>' => last_block = depth == 0,
+                    '#' => break,
+                    // Only a plain scalar outside a flow collection may go on,
+                    // more indented, on the next lines.
+                    _ => last_plain = depth == 0,
+                }
+                index += 1;
                 continue;
             }
-            let mut quote = None;
-            for (at, character) in flow.char_indices() {
-                match (quote, character) {
-                    (Some(open), _) if character == open => quote = None,
-                    (Some(_), _) => {}
-                    (None, '"' | '\'') => quote = Some(character),
-                    (None, '[' | '{' | ',') => positions.push(flow[at + 1..].trim_start()),
-                    _ => {}
+            match character {
+                '#' if characters
+                    .get(index.wrapping_sub(1))
+                    .is_some_and(|(_, previous)| matches!(previous, ' ' | '\t')) =>
+                {
+                    break;
                 }
+                ':' if characters
+                    .get(index + 1)
+                    .is_none_or(|(_, next)| matches!(next, ' ' | '\t' | ',' | ']' | '}')) =>
+                {
+                    // A key ends: what follows is its value, not the key.
+                    at_node = true;
+                    last_plain = false;
+                    last_block = false;
+                }
+                ',' if depth > 0 => at_node = true,
+                ']' | '}' if depth > 0 => depth -= 1,
+                _ => {}
             }
+            index += 1;
         }
-        let refused = positions.iter().any(|position| {
-            position.starts_with(['?', '&', '*', '!'])
-                || position
-                    .strip_prefix('"')
-                    .and_then(|key| key.split_once('"'))
-                    .map_or(position.starts_with('"'), |(key, _)| key.contains('\\'))
-        });
-        if refused {
-            violations.push(format!(
-                "{name}:{}: `{}`: explicit, anchored, aliased, tagged or escaped keys are not read by the gate; write the key plainly",
-                number + 1,
-                line.trim()
-            ));
+        if depth > 0 {
+            problems.push((number, "a flow collection that spans lines"));
         }
-        let opens_block = value.starts_with(['|', '>'])
-            && value[1..]
-                .chars()
-                .all(|character| matches!(character, '-' | '+') || character.is_ascii_digit());
-        if opens_block {
-            // The column of the key (past any `- `): the block's lines are
-            // indented deeper than it, its siblings are not.
-            block = Some(
-                code.len() - code.trim_start().len() + (code.trim_start().len() - content.len()),
-            );
+        if depth == 0 && last_block {
+            text_under = Some(column);
+        } else if depth == 0 && last_plain {
+            // A plain scalar may go on, more indented, on the next lines.
+            text_under = Some(column);
         }
     }
-    violations
+    problems
+}
+
+/// The YAML subset rule as violations.
+fn yaml_subset_violations(name: &str, text: &str) -> Vec<String> {
+    let lines: Vec<&str> = text.split('\n').collect();
+    yaml_subset(text)
+        .into_iter()
+        .map(|(number, problem)| {
+            format!(
+                "{name}:{}: `{}`: {problem}: gated files are written in a simple YAML subset (docs/supply-chain.md); write a multi-line expression as a `>-` block scalar",
+                number + 1,
+                lines.get(number).map_or("", |line| line.trim())
+            )
+        })
+        .collect()
 }
 
 /// The lines of the step (list item) that line `index` belongs to: from its
@@ -688,10 +802,14 @@ fn is_separator(word: &str) -> bool {
 /// `${CARGO...}`, quoted or not.
 fn is_cargo_program(word: &str) -> bool {
     let word = word.trim_matches(['"', '\'']);
-    word == "cargo"
-        || word.ends_with("/cargo")
-        || word.starts_with("$CARGO")
-        || word.starts_with("${CARGO")
+    // A variable can hold `cargo` (`c=cargo; $c install x`): a command whose
+    // program is any variable counts as cargo, so it may not install either.
+    let variable = word.strip_prefix('$').is_some_and(|name| {
+        name.starts_with(|character: char| {
+            character.is_ascii_alphanumeric() || matches!(character, '_' | '{')
+        })
+    });
+    word == "cargo" || word.ends_with("/cargo") || variable
 }
 
 /// Whether a `cargo install --version` value is one exact `X.Y.Z` (an `=`
@@ -916,6 +1034,9 @@ fn tool_install_violations(relative: &str, text: &str) -> Vec<String> {
         if code.contains("CARGO_ALIAS_") {
             refuse("a CARGO_ALIAS_* can rename install");
         }
+        if line.contains("$'") {
+            refuse("ANSI-C quoting ($'...') can spell any word; quote plainly");
+        }
         let flat = words.join(" ");
         let probes = [
             "command -v cargo-",
@@ -1084,7 +1205,7 @@ fn only_allowlisted_actions_are_used() {
     for (name, relative) in files {
         let text = read(&relative);
         assert_clean(&allowlist_violations(&name, &text));
-        assert_clean(&key_position_violations(&name, &text));
+        assert_clean(&yaml_subset_violations(&name, &text));
         for line in text.lines() {
             for reference in key_values(split_comment(line).0, "uses") {
                 used.extend(action_repository(reference));
@@ -1104,7 +1225,7 @@ fn only_allowlisted_actions_are_used() {
 /// it cannot read.
 fn uses_violations(text: &str) -> Vec<String> {
     let mut violations = allowlist_violations("t.yml", text);
-    violations.extend(key_position_violations("t.yml", text));
+    violations.extend(yaml_subset_violations("t.yml", text));
     violations
 }
 
@@ -1146,6 +1267,67 @@ fn the_allowlist_rejects_unlisted_actions_however_pinned() {
         "    branches: [main]\n    tags: [\"v*\"]",
     ] {
         assert_clean(&uses_violations(&snippet(accepted)));
+    }
+}
+
+#[test]
+fn the_yaml_subset_refuses_what_a_line_scanner_could_misread() {
+    let decoy = "      - uses: actions/checkout@SHA # v7.0.1";
+    for rejected in [
+        // Hidden line breaks: one line here, two for a YAML parser.
+        format!("{decoy}\r      - uses: evil/tool@main\n"),
+        format!("{decoy}\u{85}      - uses: evil/tool@main\n"),
+        format!("{decoy}\u{2028}      - uses: evil/tool@main\n"),
+        format!("{decoy}\u{2029}      - uses: evil/tool@main\n"),
+        format!("{decoy}\n\u{feff}      - uses: evil/tool@main\n"),
+        // Anchors, aliases, tags, explicit and merge keys anywhere.
+        "    steps: !!seq [ {\"u\\x73es\": evil/tool@main} ]\n".to_owned(),
+        "    steps: &s [ {uses: actions/checkout@SHA} ]\n".to_owned(),
+        "    steps: *s\n".to_owned(),
+        "      - <<: *base\n".to_owned(),
+        "      - name: x\n        with: !!map {a: b}\n".to_owned(),
+        "      - with: {a: &x b}\n".to_owned(),
+        "      - ? uses\n        : evil/tool@main\n".to_owned(),
+        // Flow collections that span lines, unclosed quotes.
+        "    steps: [\n      {uses: evil/tool@main} ]\n".to_owned(),
+        "    steps: [ {name: x},\n      uses: evil/tool@main ]\n".to_owned(),
+        "      - name: \"x\n        uses: evil/tool@main\"\n".to_owned(),
+        "      - \"u\\x73es\": evil/tool@main\n".to_owned(),
+    ] {
+        let text = snippet(&rejected);
+        assert!(
+            !yaml_subset_violations("t.yml", &text).is_empty(),
+            "accepted: {text:?}"
+        );
+    }
+    for accepted in [
+        "\u{feff}name: CI\non:\n  push:\n    branches: [main]\n    tags: [\"v*\"]\n",
+        "jobs:\n  x:\n    if: ${{ !cancelled() }}\n    steps:\n      - run: |\n          case \"$x\" in\n            *) echo \"!\" & wait ;;\n          esac\n          # deeper comment\n      - uses: actions/checkout@SHA # v7.0.1\n",
+        // A plain scalar continued on deeper lines is text, `&&` and `!` too.
+        "    if: github.event_name == 'push'\n      && !cancelled()\n    runs-on: ubuntu-latest\n",
+        "      - run: echo \"a #b\" && echo it's\n      - name: 'it''s'\n        with: {a: b, c: [d, e]}\n",
+        "    if: >-\n      github.event_name == 'push'\n      && !cancelled()\n",
+        "on:\r\n  push:\r\n",
+    ] {
+        assert_clean(&yaml_subset_violations("t.yml", &snippet(accepted)));
+    }
+    // The scanner reads every node of the real files, deep ones included:
+    // an anchor or a tag anywhere in them is found.
+    let ci = read(".github/workflows/ci.yml");
+    for (from, to) in [
+        (
+            "persist-credentials: false",
+            "persist-credentials: !!bool false",
+        ),
+        ("runs-on: ubuntu-latest", "runs-on: &runner ubuntu-latest"),
+        ("timeout-minutes: 60", "timeout-minutes: *minutes"),
+    ] {
+        let last = ci.rfind(from).expect("present");
+        let changed = format!("{}{to}{}", &ci[..last], &ci[last + from.len()..]);
+        assert!(
+            !yaml_subset_violations("ci.yml", &changed).is_empty(),
+            "the last `{from}` of ci.yml was not read"
+        );
     }
 }
 
@@ -1547,6 +1729,10 @@ fn the_tool_rule_rejects_installs_that_ignore_a_version_bump() {
         "        run: $CARGO install x --version 1.2.3 --locked\n",
         "        run: ${CARGO:-cargo} install x --version 1.2.3 --locked\n",
         "        run: CARGO_ALIAS_I=install cargo i x\n",
+        "        run: c=cargo; $c install x --version 1.2.3 --locked\n",
+        "        run: ${c} install x\n",
+        "        run: \"$c\" install x\n",
+        "        run: cargo $'\\x69nstall' x\n",
         // A `#` inside shell quotes is no comment; a continuation inside a
         // word joins without a space.
         "        run: |\n          echo \" #\"; cargo install evil\n",
@@ -1635,72 +1821,68 @@ fn the_tool_rule_rejects_installs_that_ignore_a_version_bump() {
     }
 }
 
-/// A cargo configuration may not redirect crates.io (`[source.*]`,
-/// `replace-with`) or alias a command to `install`: either would bypass the
-/// locked, crates.io-only installs the rules above check.
-fn cargo_config_violations(name: &str, text: &str) -> Vec<String> {
-    let mut violations = Vec::new();
-    let mut in_alias = false;
-    for (number, line) in text.lines().enumerate() {
-        let code = line.split_once('#').map_or(line, |(code, _)| code).trim();
-        if code.starts_with('[') {
-            let table = code.trim_matches(['[', ']', ' ']);
-            in_alias = table == "alias";
-            if table == "source" || table.starts_with("source.") || table.starts_with("registries")
-            {
-                violations.push(format!(
-                    "{name}:{}: `{code}` redirects crate sources",
-                    number + 1
-                ));
-            }
+/// Every `.cargo/config` or `.cargo/config.toml` below `directory` (build
+/// output and git metadata aside).
+fn cargo_configs(directory: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let Ok(entries) = fs::read_dir(directory) else {
+        return found;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        let name = entry.file_name();
+        let Ok(kind) = entry.file_type() else {
             continue;
-        }
-        let words: Vec<String> = shell_words(code);
-        let installs = words
-            .iter()
-            .any(|word| matches!(word.as_str(), "install" | "binstall"))
-            || code.contains("\"install\"")
-            || code.contains("'install'");
-        if code.contains("replace-with") || code.starts_with("source.") {
-            violations.push(format!(
-                "{name}:{}: `{code}` redirects crate sources",
-                number + 1
-            ));
-        }
-        if (in_alias || code.starts_with("alias.")) && installs {
-            violations.push(format!("{name}:{}: `{code}` aliases install", number + 1));
+        };
+        if kind.is_dir() {
+            if name == ".git" || name == "target" {
+                continue;
+            }
+            if name == ".cargo" {
+                for file in ["config", "config.toml"] {
+                    if path.join(file).exists() {
+                        found.push(path.join(file));
+                    }
+                }
+            }
+            found.extend(cargo_configs(&path));
         }
     }
-    violations
+    found
 }
 
+/// No cargo configuration exists anywhere in the repository: cargo reads
+/// every parent directory's `.cargo/config*`, and one could redirect crate
+/// sources (`[source]`, `replace-with`, `[registries]`) or alias `install`
+/// past the locked, crates.io-only installs the rules check. A future need
+/// goes through review and changes this test.
 #[test]
-fn no_cargo_configuration_redirects_sources_or_aliases_install() {
-    for directory in [".", "fuzz", "examples/hello-forge"] {
-        for file in [".cargo/config.toml", ".cargo/config"] {
-            let relative = format!("{directory}/{file}");
-            if root().join(&relative).is_file() {
-                assert_clean(&cargo_config_violations(&relative, &read(&relative)));
-            }
-        }
-    }
-    for rejected in [
-        "[source.crates-io]\nreplace-with = \"mirror\"\n",
-        "[source.mirror]\nregistry = \"https://example.com/index\"\n",
-        "[alias]\ni = \"install\"\n",
-        "[alias]\nget = [\"install\", \"--git\", \"https://example.com/x\"]\n",
-        "alias.i = \"install\"\n",
-        "[registries.mirror]\nindex = \"https://example.com/index\"\n",
+fn no_cargo_configuration_exists_in_the_repository() {
+    let found = cargo_configs(&root());
+    assert!(found.is_empty(), "cargo configuration found: {found:?}");
+    let scratch = tempfile::tempdir().expect("tempdir");
+    for (relative, content) in [
+        ("a/.cargo/config.toml", "alias = { i = \"install\" }\n"),
+        (
+            "b/c/.cargo/config",
+            "[source.crates-io]\nreplace-with = \"m\"\n",
+        ),
     ] {
-        assert!(
-            !cargo_config_violations("config.toml", rejected).is_empty(),
-            "accepted: {rejected}"
-        );
+        let path = scratch.path().join(relative);
+        fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        fs::write(&path, content).expect("write");
     }
-    assert_clean(&cargo_config_violations(
-        "config.toml",
-        "[alias]\nxtask = \"run --package xtask --\"\n[build]\nrustflags = []\n",
-    ));
+    fs::create_dir_all(scratch.path().join("target/.cargo")).expect("mkdir");
+    fs::write(scratch.path().join("target/.cargo/config.toml"), "").expect("write");
+    let mut found = cargo_configs(scratch.path());
+    found.sort();
+    assert_eq!(
+        found,
+        vec![
+            scratch.path().join("a/.cargo/config.toml"),
+            scratch.path().join("b/c/.cargo/config"),
+        ]
+    );
 }
 
 #[test]

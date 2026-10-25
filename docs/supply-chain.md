@@ -214,14 +214,30 @@ does not match either form.
   `ALLOWED_ACTIONS` and to the pin table below in the same reviewed change;
   the gate also fails when an allowlisted action is no longer used. A
   sub-path cannot leave the repository (no empty, `.` or `..` segment).
-- The gate reads workflows line by line, so it refuses what a line scanner
-  could misread: outside block scalars, a key written as an explicit key
-  (`? uses`), with an anchor (`&k uses`), as an alias (`*k :`), with a tag
-  (`!!str uses`) or as a double-quoted key with an escape (`"u\x73es"`).
-  Write keys plainly. It reads `run` text both with and without YAML
-  comments removed and continued lines joined both ways, so a `#` inside
-  shell quotes or a `\` inside a word hides no install, and it refuses a
-  `.cargo/config.toml` that redirects crate sources or aliases `install`.
+- Gated files are written in a simple YAML subset. The gate reads the
+  workflows, local actions and generated-app CI templates line by line, and
+  refuses whatever such a reader could misread rather than guess:
+  - a carriage return not followed by a line feed, U+0085, U+2028 or U+2029
+    (line breaks a YAML parser sees and a line reader does not), and a
+    byte-order mark anywhere but at the start;
+  - outside block scalars (`run: |`) and plain scalars continued on deeper
+    lines, an anchor (`&`), alias (`*`), tag (`!`, `!!`), explicit key (`?`)
+    or merge key (`<<`) where any key or value starts (`${{ !cancelled() }}`,
+    quoted strings and `run: |` text stay allowed);
+  - a flow collection (`[...]`, `{...}`) that does not close on its line, a
+    quoted scalar that does not close on its line, and a double-quoted key
+    with an escape (`"u\x73es"`).
+  Write a multi-line expression as a `>-` block scalar.
+- The install rule reads `run` text as text: with and without YAML comments
+  removed, continued lines joined with and without a space, quotes and
+  backslashes ignored. It refuses ANSI-C quoting (`$'...'`), any command
+  whose program is a variable (`c=cargo; $c install`) or a path to cargo
+  when it installs, and every `.cargo/config` or `.cargo/config.toml` in the
+  repository (cargo reads them from every parent directory; one could
+  redirect crate sources or alias `install`). What remains beyond a text
+  scanner (a script the workflow runs, `eval` of computed text, a tool
+  downloaded by an allowlisted action) is covered by review and by the rule
+  that only the reviewed scripts and actions run.
 - Cargo tools are installed only through that action, plus one reviewed
   exception: the `Install cargo-auditable` step of `release.yml`, which
   installs exactly `cargo-auditable`. Both use one exact `--version` and
