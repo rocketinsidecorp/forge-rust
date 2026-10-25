@@ -291,7 +291,9 @@ COVERAGE_JSON=summary.json scripts/coverage.sh       # report and gate an existi
   (`scripts/test-databases.sh llvm-cov --no-report`, the ignored database
   tests included) against PostgreSQL 18, MySQL and MariaDB, then
   `cargo llvm-cov report`. The job writes the total and a per-crate table to
-  the run's summary and uploads `target/coverage/summary.json`.
+  the run's summary and uploads `target/coverage/summary.json` and the
+  line-level `target/coverage/lcov.info` (`DA:<line>,<hits>` per line of each
+  file; a line with `0` hits is what no test reaches).
   cargo-llvm-cov builds into its own `target/llvm-cov-target`, a second full
   build: run it locally only with the disk to spare.
 - **Pinned tools.** cargo-llvm-cov 0.9.1 (2026-09-06, MSRV 1.87, not

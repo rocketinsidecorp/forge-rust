@@ -26,8 +26,10 @@
 #   - test code: tests/ directories (cargo-llvm-cov's default) and the
 #     #[cfg(test)] modules kept in their own files (tests.rs, *_tests.rs,
 #     test_support.rs).
-# Writes target/coverage/summary.json, prints the total and a per-crate
-# table (also to $GITHUB_STEP_SUMMARY when set), and exits 1 below the floor.
+# Writes target/coverage/summary.json and, when it measures, the line-level
+# target/coverage/lcov.info (one DA:<line>,<hits> record per line of each
+# file), prints the total and a per-crate table (also to $GITHUB_STEP_SUMMARY
+# when set), and exits 1 below the floor.
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
@@ -41,9 +43,14 @@ if [ -z "$summary" ]; then
 	summary="$out/summary.json"
 	cargo llvm-cov clean --workspace
 	scripts/test-databases.sh llvm-cov --no-report
+	ignored='(^|/)crates/(forge-bench|forge-loadgen|forge-cli/templates)/|(^|/)(tests|[a-z0-9_]+_tests|test_support)\.rs$'
 	cargo llvm-cov report \
-		--ignore-filename-regex '(^|/)crates/(forge-bench|forge-loadgen|forge-cli/templates)/|(^|/)(tests|[a-z0-9_]+_tests|test_support)\.rs$' \
+		--ignore-filename-regex "$ignored" \
 		--json --summary-only --output-path "$summary"
+	# The same measurement line by line, for finding what no test reaches.
+	cargo llvm-cov report \
+		--ignore-filename-regex "$ignored" \
+		--lcov --output-path "$out/lcov.info"
 fi
 
 # One row per crate: lines covered, lines, percent; then the total.
