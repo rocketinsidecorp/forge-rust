@@ -211,6 +211,9 @@ async fn serve_connection<S>(
     }
 }
 
+#[cfg(test)]
+mod keep_alive_tests;
+
 /// Reading a request head ([`KeepAlive`]).
 const HEAD: u8 = 0;
 /// Serving a request: no read limit here (the body timeouts apply).

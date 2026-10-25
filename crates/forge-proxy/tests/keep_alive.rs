@@ -3,6 +3,11 @@
 //! connection may wait the idle timeout for its next request, whose headers
 //! then have the header timeout; the first request has the header timeout
 //! from the start of the connection.
+//!
+//! These run over real sockets, so their bounds are wide: a timer never
+//! fires early, so lower bounds are exact, and upper bounds only need to stay
+//! below the other limit. The exact limits are checked in virtual time by
+//! the unit tests in `src/listen/keep_alive_tests.rs`.
 
 mod support;
 
@@ -84,36 +89,37 @@ async fn closed_after(stream: &mut TcpStream, wait: Duration) -> Option<Duration
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_keep_alive_connection_waits_the_idle_timeout_not_the_header_timeout() {
     let (front, _app) = proxy(
-        limits(Duration::from_millis(200), Duration::from_millis(1500)),
+        limits(Duration::from_millis(200), Duration::from_secs(3)),
         None,
     )
     .await;
     let mut stream = TcpStream::connect(front.addr).await.expect("connect");
     request(&mut stream).await;
 
-    // Idle for three header timeouts: still open (before the fix the
-    // shorter header timeout closed it).
-    tokio::time::sleep(Duration::from_millis(600)).await;
+    // Idle for five header timeouts: still open (before the fix the
+    // shorter header timeout closed it). A slow runner only stretches the
+    // pause, and only past the 3 s idle limit would it fail.
+    tokio::time::sleep(Duration::from_secs(1)).await;
     request(&mut stream).await;
 
-    // Then closed once idle for the idle timeout.
-    let closed = closed_after(&mut stream, Duration::from_secs(10))
+    // Then closed once idle for the idle timeout (measured from after the
+    // response was read, so a little less than the limit at the earliest).
+    let closed = closed_after(&mut stream, Duration::from_secs(60))
         .await
         .expect("an idle connection is closed");
-    assert!(closed >= Duration::from_millis(1400), "{closed:?}");
-    assert!(closed < Duration::from_secs(5), "{closed:?}");
+    assert!(closed >= Duration::from_millis(2500), "{closed:?}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_next_request_head_has_the_header_timeout_from_its_first_byte() {
     let (front, _app) = proxy(
-        limits(Duration::from_millis(300), Duration::from_secs(3)),
+        limits(Duration::from_millis(300), Duration::from_secs(30)),
         None,
     )
     .await;
     let mut stream = TcpStream::connect(front.addr).await.expect("connect");
     request(&mut stream).await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
 
     // A head that starts and never ends is cut at the header timeout, not
     // after the (longer) idle timeout.
@@ -121,25 +127,25 @@ async fn the_next_request_head_has_the_header_timeout_from_its_first_byte() {
         .write_all(format!("GET / HTTP/1.1\r\nHost: {TEST_HOST}\r\n").as_bytes())
         .await
         .expect("partial head");
-    let closed = closed_after(&mut stream, Duration::from_secs(10))
+    // Well before the 30 s idle limit.
+    let closed = closed_after(&mut stream, Duration::from_secs(20))
         .await
-        .expect("a stalled head is cut off");
+        .expect("a stalled head is cut off before the idle limit");
     assert!(closed >= Duration::from_millis(250), "{closed:?}");
-    assert!(closed < Duration::from_millis(2500), "{closed:?}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_first_request_has_the_header_timeout_from_the_connection_start() {
     let (front, _app) = proxy(
-        limits(Duration::from_millis(300), Duration::from_secs(3)),
+        limits(Duration::from_millis(300), Duration::from_secs(30)),
         None,
     )
     .await;
     let mut stream = TcpStream::connect(front.addr).await.expect("connect");
-    let closed = closed_after(&mut stream, Duration::from_secs(10))
+    // Well before the 30 s idle limit.
+    closed_after(&mut stream, Duration::from_secs(20))
         .await
-        .expect("a silent client is cut off");
-    assert!(closed < Duration::from_millis(2500), "{closed:?}");
+        .expect("a silent client is cut off before the idle limit");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
