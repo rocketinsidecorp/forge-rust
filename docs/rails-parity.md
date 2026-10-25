@@ -60,7 +60,8 @@ the work is finished and waiting for its review; **Planned** means not started.
   locale prefix in Forge-Rust (the prefix is removed in a rewrite step
   before every layer); Forge-Go still relies on registering path-sensitive
   middleware after its i18n middleware, and should strip the prefix before
-  the application middleware the same way. (5) forge-proxy `-idle-timeout`
+  the application middleware the same way (tracked in
+  [forge-go#56](https://github.com/rocketinsidecorp/forge-go/issues/56)). (5) forge-proxy `-idle-timeout`
   now means what it means in Forge-Go: the wait between requests.
 
 - Database URLs without a host (tracked 2026-10-25, forge-rust#24): the Rust

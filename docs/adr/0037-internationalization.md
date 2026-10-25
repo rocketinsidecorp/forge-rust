@@ -181,6 +181,7 @@ middleware trait, without tower.
   prefix); `forge destroy` (with the generators,
   [forge-rust#15](https://github.com/rocketinsidecorp/forge-rust/issues/15)).
 - Resolved 2026-10-25 for Forge-Rust by the rewrite step above; Forge-Go
-  still relies on the registration order of path-sensitive middleware.
+  still relies on the registration order of path-sensitive middleware
+  ([forge-go#56](https://github.com/rocketinsidecorp/forge-go/issues/56)).
 - Broadcast fragments render in the default locale for every subscriber, as
   in Forge-Go and Rails.
