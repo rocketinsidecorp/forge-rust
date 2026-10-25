@@ -39,13 +39,19 @@ use uuid::Uuid;
 use crate::body::{OutgoingBody, ResponseBody};
 
 mod body;
+#[cfg(test)]
+mod body_tests;
 mod client_ip;
 mod encoding;
 mod form;
 mod io;
+#[cfg(test)]
+mod io_tests;
 mod json;
 mod openapi;
 mod query;
+#[cfg(test)]
+mod query_tests;
 mod routing;
 
 pub use client_ip::{MAX_FORWARDED_HOPS, TrustedProxies, X_FORWARDED_FOR};
