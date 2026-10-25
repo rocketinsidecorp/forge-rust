@@ -227,6 +227,54 @@ fn pin_violations(name: &str, text: &str) -> Vec<String> {
     violations
 }
 
+/// The action repositories a workflow may use, compared without case
+/// (GitHub resolves owner and name case-insensitively). Adding one is a
+/// supply-chain decision: review the action's code, pin it by SHA, and add it
+/// here and to the table of docs/supply-chain.md in the same change. Local
+/// `./` actions are checked as files of their own; `docker://` actions are not
+/// allowed.
+const ALLOWED_ACTIONS: [&str; 10] = [
+    "actions/cache",
+    "actions/checkout",
+    "actions/upload-artifact",
+    "docker/build-push-action",
+    "docker/login-action",
+    "docker/setup-buildx-action",
+    "embarkstudios/cargo-deny-action",
+    "ossf/scorecard-action",
+    "sigstore/cosign-installer",
+    "swatinem/rust-cache",
+];
+
+/// Every `uses:` names an allowlisted repository (or a local `./` action),
+/// whatever its pin: an installer action such as taiki-e/install-action
+/// would otherwise put any tool on PATH, pinned or not.
+fn allowlist_violations(name: &str, text: &str) -> Vec<String> {
+    let mut violations = Vec::new();
+    for (number, line) in text.lines().enumerate() {
+        for reference in key_values(split_comment(line).0, "uses") {
+            if reference.starts_with("./") {
+                continue;
+            }
+            let action = reference
+                .split_once('@')
+                .map_or(reference, |(action, _)| action);
+            let repository: Vec<&str> = action.splitn(3, '/').take(2).collect();
+            let allowed = repository.len() == 2
+                && ALLOWED_ACTIONS
+                    .iter()
+                    .any(|allowed| allowed.eq_ignore_ascii_case(&repository.join("/")));
+            if !allowed {
+                violations.push(format!(
+                    "{name}:{}: `{reference}` is not an allowlisted action (ALLOWED_ACTIONS, docs/supply-chain.md)",
+                    number + 1
+                ));
+            }
+        }
+    }
+    violations
+}
+
 /// The lines of the step (list item) that line `index` belongs to: from its
 /// `- ` to the next line indented no deeper than that dash.
 fn step_lines<'a, 'b>(lines: &'b [&'a str], index: usize) -> &'b [&'a str] {
@@ -519,7 +567,13 @@ fn shell_words(code: &str) -> Vec<String> {
             }
         }
     }
-    spaced.split_whitespace().map(str::to_owned).collect()
+    // Quotes and backslashes change nothing a shell runs here: `ca"rgo"`,
+    // `'install'` and `--g\it` are cargo, install and --git.
+    spaced
+        .split_whitespace()
+        .map(|word| word.replace(['\'', '"', '\\'], ""))
+        .filter(|word| !word.is_empty())
+        .collect()
 }
 
 fn is_separator(word: &str) -> bool {
@@ -634,9 +688,8 @@ fn allowed_install_problems(install: &CargoInstall, in_tool_action: bool) -> Opt
                 _ if matches!(*argument, "--version" | "--vers") => arguments.get(at + 1).copied(),
                 _ => None,
             });
-    let exact = version.is_some_and(|value| {
-        is_exact_version(value) || (in_tool_action && value == "\"$VERSION\"")
-    });
+    let exact = version
+        .is_some_and(|value| is_exact_version(value) || (in_tool_action && value == "$VERSION"));
     let source = arguments.iter().any(|argument| {
         let flag = argument.split_once('=').map_or(*argument, |(flag, _)| flag);
         matches!(
@@ -644,8 +697,29 @@ fn allowed_install_problems(install: &CargoInstall, in_tool_action: bool) -> Opt
             "--git" | "--path" | "--registry" | "--index" | "--config" | "-Z"
         )
     });
-    (!exact || !arguments.contains(&"--locked") || source)
-        .then_some("needs one exact --version X.Y.Z and --locked, from crates.io")
+    if !exact || !arguments.contains(&"--locked") || source {
+        return Some("needs one exact --version X.Y.Z and --locked, from crates.io");
+    }
+    // The release step installs cargo-auditable and nothing else: once the
+    // version and --locked are set aside, that is the whole command.
+    if !in_tool_action {
+        let mut rest = Vec::new();
+        let mut words = arguments.iter();
+        while let Some(word) = words.next() {
+            match *word {
+                "--locked" => {}
+                "--version" | "--vers" => {
+                    words.next();
+                }
+                word if word.starts_with("--version=") || word.starts_with("--vers=") => {}
+                word => rest.push(word),
+            }
+        }
+        if rest != ["cargo-auditable"] {
+            return Some("the release step installs exactly `cargo-auditable`");
+        }
+    }
+    None
 }
 
 /// Cargo tools are installed only through the local cargo-tool action
@@ -872,6 +946,57 @@ fn actions_are_pinned_by_commit_with_their_version_in_a_comment() {
 }
 
 #[test]
+fn only_allowlisted_actions_are_used() {
+    let mut used = BTreeSet::new();
+    for (name, relative) in workflows_and_local_actions() {
+        let text = read(&relative);
+        assert_clean(&allowlist_violations(&name, &text));
+        for line in text.lines() {
+            for reference in key_values(split_comment(line).0, "uses") {
+                if let Some((action, _)) = reference.split_once('@') {
+                    used.insert(action.to_ascii_lowercase());
+                }
+            }
+        }
+    }
+    // The list holds what is in use, nothing more.
+    for allowed in ALLOWED_ACTIONS {
+        assert!(
+            used.contains(allowed),
+            "{allowed} is allowlisted but unused"
+        );
+    }
+}
+
+#[test]
+fn the_allowlist_rejects_unlisted_actions_however_pinned() {
+    for rejected in [
+        "      - uses: taiki-e/install-action@SHA # v2.62.1",
+        "      - uses: baptiste0928/cargo-install@SHA # v3.3.2",
+        "      - { uses: dtolnay/rust-toolchain@SHA } # v1",
+        "      - uses: actions-rs/cargo@SHA # v1.0.3",
+        "      - uses: actions/checkout-evil@SHA # v7.0.1",
+        "      - uses: docker://alpine@sha256:DIGEST",
+        "      - uses: checkout@SHA # v7",
+    ] {
+        let text = snippet(rejected);
+        assert!(
+            !allowlist_violations("t.yml", &text).is_empty(),
+            "accepted: {text}"
+        );
+    }
+    for accepted in [
+        "      - uses: actions/checkout@SHA # v7.0.1",
+        "      - uses: Actions/Checkout@SHA # v7.0.1",
+        "      - uses: swatinem/RUST-CACHE@SHA # v2.9.2",
+        "      - uses: docker/build-push-action/subdir@SHA # v7",
+        "      - uses: ./.github/actions/cargo-tool",
+    ] {
+        assert_clean(&allowlist_violations("t.yml", &snippet(accepted)));
+    }
+}
+
+#[test]
 fn workflow_containers_are_pinned_by_digest() {
     for (name, relative) in workflows_and_local_actions() {
         assert_clean(&container_violations(&name, &read(&relative)));
@@ -962,6 +1087,8 @@ fn generated_application_ci_and_dockerfile_are_pinned() {
     assert_clean(&container_violations(name, &ci));
     assert_clean(&permission_violations(name, &ci, false));
     assert_clean(&secret_violations(name, &ci, false));
+    assert_clean(&allowlist_violations(name, &ci));
+    assert_clean(&tool_install_violations(name, &ci));
     assert!(
         ci.contains("FORGE_TEST_DATABASE_URL") && ci.contains("--include-ignored"),
         "{name}: a PostgreSQL application's CI runs its database tests"
@@ -1267,6 +1394,9 @@ fn the_tool_rule_rejects_installs_that_ignore_a_version_bump() {
         "        run: $CARGO install x --version 1.2.3 --locked\n",
         "        run: ${CARGO:-cargo} install x --version 1.2.3 --locked\n",
         "        run: CARGO_ALIAS_I=install cargo i x\n",
+        "        run: ca\"rgo\" install x --version 1.2.3 --locked\n",
+        "        run: c\\\\argo inst\\\\all x --version 1.2.3 --locked\n",
+        "        run: cargo 'bin'stall x\n",
         "        env:\n          CARGO_ALIAS_GET: install\n",
     ] {
         assert!(
@@ -1304,6 +1434,11 @@ fn the_tool_rule_rejects_installs_that_ignore_a_version_bump() {
         "cargo -q install cargo-auditable --version 0.7.7 --locked",
         "true || cargo install cargo-auditable --version 0.7.7 --locked",
         "cargo install cargo-auditable --version 0.7.7 --locked --git https://example.com/a",
+        "cargo install cargo-auditable --version 0.7.7 --locked --g\\\\it https://example.com/a",
+        "cargo install cargo-auditable --version 0.7.7 --locked \\\"--registry\\\" mirror",
+        "cargo install cargo-auditable cargo-fuzz --version 0.7.7 --locked",
+        "cargo install cargo-fuzz --version 0.13.2 --locked",
+        "cargo install --version 0.7.7 --locked",
     ] {
         assert!(
             !tool_install_violations(release, &step(run)).is_empty(),

@@ -162,7 +162,7 @@ pub(crate) fn run(
                         diagnostics.push(Diagnostic::error(
                             "database.url_malformed",
                             "FORGE_DATABASE_URL is malformed.",
-                            "Percent-encode `/`, `?`, `#` and `@` in the user name and password (for example `/` as %2F); the URL is not shown because it holds credentials.",
+                            "Percent-encode `/`, `?`, `#` and `@` in the user name and password (for example `/` as %2F), and give a `host=` parameter a plain host name or an absolute socket directory; the URL is not shown because it holds credentials.",
                         ));
                         lines.push(
                             "database reachability: not checked (the URL is malformed)".to_owned(),

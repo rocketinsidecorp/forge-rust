@@ -200,9 +200,23 @@ does not match either form.
   always installs it, where the former `command -v tool || cargo install`
   kept whatever rust-cache restored. The release job installs without a
   cache.
+- Only allowlisted actions run (`ALLOWED_ACTIONS` in
+  `crates/forge/tests/supply_chain.rs`, compared without case):
+  `actions/checkout`, `actions/cache`, `actions/upload-artifact`,
+  `Swatinem/rust-cache`, `EmbarkStudios/cargo-deny-action`,
+  `docker/setup-buildx-action`, `docker/login-action`,
+  `docker/build-push-action`, `ossf/scorecard-action` and
+  `sigstore/cosign-installer`, plus local `./` actions. A SHA pin is not
+  enough: an installer action (`taiki-e/install-action`,
+  `baptiste0928/cargo-install`, ...) is refused however it is pinned, and
+  `docker://` actions are refused. To add an action, review its code (and
+  what it downloads), pin it by SHA with its version comment, and add it to
+  `ALLOWED_ACTIONS` and to the pin table below in the same reviewed change;
+  the gate also fails when an allowlisted action is no longer used.
 - Cargo tools are installed only through that action, plus one reviewed
-  exception: the `Install cargo-auditable` step of `release.yml`. Both use
-  one exact `--version` and `--locked`, from crates.io. The gate refuses any
+  exception: the `Install cargo-auditable` step of `release.yml`, which
+  installs exactly `cargo-auditable`. Both use one exact `--version` and
+  `--locked`, from crates.io. The gate refuses any
   other install in a workflow or action, however it is spelled (a path to
   cargo, `$CARGO`, options before `install`, `binstall`, `cargo-binstall`,
   `CARGO_ALIAS_*`, continued or folded lines), and any probe that would skip
