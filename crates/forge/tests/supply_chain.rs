@@ -638,6 +638,40 @@ fn the_closed_allowlists_refuse_every_redirect() {
         "steps:\n  - uses: sigstore/cosign-installer@SHA # v4.1.2\n    with:\n      cosign-release: latest\n",
         "steps:\n  - uses: docker/setup-buildx-action@SHA # v4.4.1\n    with:\n      version: latest\n",
         "steps:\n  - uses: docker/setup-buildx-action@SHA # v4.4.1\n    with:\n      driver-opts: image=moby/buildkit:master\n",
+        // Round 8, lead 1: continuations. An assignment target split from
+        // its `=`, a runner-file write split across lines, a listed line
+        // continued into more.
+        "steps:\n  - run: |\n      HOME\\\n      =/tmp/h cargo build\n",
+        "steps:\n  - run: |\n      export HO\\\n      ME=/tmp/h\n",
+        "steps:\n  - run: |\n      echo /tmp/evil >> \"$GITHUB_\\\n      PATH\"\n",
+        "steps:\n  - run: |\n      echo \"$HOME/.forge-tools/$TOOL-$VERSION/bin\" >> \"$GITHUB_PATH\" \\\n        && export HOME=/tmp/h\n",
+        "steps:\n  - run: |\n      true \\\n      echo \"$HOME/.forge-tools/$TOOL-$VERSION/bin\" >> \"$GITHUB_PATH\"\n",
+        // Lead 2: runner files named in a heredoc or a `$( )`.
+        "steps:\n  - run: |\n      cat <<EOF >> \"$GITHUB_ENV\"\n      A=1\n      EOF\n",
+        "steps:\n  - run: |\n      cat <<EOF\n      $GITHUB_OUTPUT\n      EOF\n",
+        "steps:\n  - run: |\n      f=\"$(\n      echo $GITHUB_PATH)\"\n",
+        // Lead 3: container and service options, keys and ports.
+        "jobs:\n  a:\n    services:\n      db:\n        image: x@sha256:DIGEST\n        options: -e CARGO_HOME=/tmp/h\n",
+        "jobs:\n  a:\n    services:\n      db:\n        image: x@sha256:DIGEST\n        options: --env=A=1\n",
+        "jobs:\n  a:\n    services:\n      db:\n        image: x@sha256:DIGEST\n        options: --env-file /tmp/e\n",
+        "jobs:\n  a:\n    services:\n      db:\n        image: x@sha256:DIGEST\n        options: -v /:/host\n",
+        "jobs:\n  a:\n    services:\n      db:\n        image: x@sha256:DIGEST\n        options: --volume=/:/host\n",
+        "jobs:\n  a:\n    services:\n      db:\n        image: x@sha256:DIGEST\n        options: --mount type=bind,src=/,dst=/h\n",
+        "jobs:\n  a:\n    services:\n      db:\n        image: x@sha256:DIGEST\n        options: --entrypoint /bin/sh\n",
+        "jobs:\n  a:\n    services:\n      db:\n        image: x@sha256:DIGEST\n        options: --privileged\n",
+        "jobs:\n  a:\n    services:\n      db:\n        image: x@sha256:DIGEST\n        options: --network host\n",
+        "jobs:\n  a:\n    container:\n      image: x@sha256:DIGEST\n      options: --cap-add SYS_ADMIN\n",
+        "jobs:\n  a:\n    services:\n      db:\n        image: x@sha256:DIGEST\n        options: --health-cmd \"true\"\n",
+        "jobs:\n  a:\n    services:\n      db:\n        image: x@sha256:DIGEST\n        volumes:\n          - /:/host\n",
+        "jobs:\n  a:\n    container:\n      image: x@sha256:DIGEST\n      credentials:\n        username: u\n",
+        "jobs:\n  a:\n    services:\n      db:\n        image: x@sha256:DIGEST\n        entrypoint: /bin/sh\n",
+        "jobs:\n  a:\n    services:\n      db:\n        image: x@sha256:DIGEST\n        ports:\n          - 0.0.0.0:5432:5432\n",
+        "jobs:\n  a:\n    container:\n      image: x@sha256:DIGEST\n      env:\n        HOME: /tmp/h\n",
+        // Git configuration from the environment.
+        "env:\n  GIT_CONFIG_COUNT: \"1\"\n",
+        "env:\n  GIT_CONFIG_KEY_0: url.https://evil.example/.insteadOf\n",
+        "env:\n  GIT_CONFIG_VALUE_0: https://github.com/\n",
+        "steps:\n  - run: GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.sshCommand GIT_CONFIG_VALUE_0=/tmp/evil git fetch\n",
     ] {
         let text = snippet(rejected);
         assert!(parse_yaml(&text).is_ok(), "the snippet must parse: {text}");
@@ -645,6 +679,23 @@ fn the_closed_allowlists_refuse_every_redirect() {
             !closed_list_violations("t.yml", &text).is_empty(),
             "accepted: {text}"
         );
+    }
+}
+
+/// Round 8: a listed runner-file line passes only as a complete logical
+/// line, and the listed container options pass.
+#[test]
+fn listed_lines_and_options_pass_only_whole() {
+    let action = ".github/actions/cargo-tool/action.yml";
+    let listed = "runs:\n  steps:\n    - shell: bash\n      run: echo \"$HOME/.forge-tools/$TOOL-$VERSION/bin\" >> \"$GITHUB_PATH\"\n      env:\n        TOOL: t\n        VERSION: v\n";
+    assert_clean(&closed_list_violations(action, listed));
+    let continued = "runs:\n  steps:\n    - shell: bash\n      run: >-\n        echo \"$HOME/.forge-tools/$TOOL-$VERSION/bin\" >> \"$GITHUB_PATH\"\n        \\\n        /tmp/evil\n";
+    assert!(!closed_list_violations(action, continued).is_empty());
+    for options in ALLOWED_CONTAINER_OPTIONS {
+        let text = format!(
+            "jobs:\n  a:\n    services:\n      db:\n        image: x@sha256:{DIGEST}\n        env:\n          POSTGRES_PASSWORD: forge\n        ports:\n          - 5432:5432\n        options: >-\n          {options}\n"
+        );
+        assert_clean(&closed_list_violations("ci.yml", &text));
     }
 }
 
@@ -725,10 +776,23 @@ fn no_tool_configuration_exists_in_the_repository() {
             "[toolchain]\npath = \"/opt/evil\"\n",
         ),
         ("c2/rust-toolchain", "[toolchain]\n  path= \"/opt/evil\"\n"),
+        // Round 8, lead 4: every other spelling rustup reads, and any
+        // content that is not listed.
         (
-            "ok/rust-toolchain.toml",
+            "c3/rust-toolchain.toml",
+            "[toolchain]\n\"path\" = '/opt/evil'\n",
+        ),
+        (
+            "c4/rust-toolchain.toml",
+            "toolchain = { path = \"/opt/evil\" }\n",
+        ),
+        ("c5/rust-toolchain", "/opt/evil\n"),
+        ("c6/rust-toolchain", "nightly-2026-01-01\n"),
+        (
+            "c7/rust-toolchain.toml",
             "[toolchain]\nchannel = \"1.98.1\"\n",
         ),
+        ("ok/rust-toolchain.toml", ALLOWED_TOOLCHAIN_FILES[1]),
         ("d/go.work", "go 1.25\n"),
         ("d/go.work.sum", ""),
         ("e/go.env", ""),
@@ -762,6 +826,11 @@ fn no_tool_configuration_exists_in_the_repository() {
             "b/.cargo/config",
             "c/rust-toolchain.toml",
             "c2/rust-toolchain",
+            "c3/rust-toolchain.toml",
+            "c4/rust-toolchain.toml",
+            "c5/rust-toolchain",
+            "c6/rust-toolchain",
+            "c7/rust-toolchain.toml",
             "d/go.work",
             "d/go.work.sum",
             "e/go.env",

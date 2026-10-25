@@ -379,7 +379,11 @@ change to that file.
   quoted or flow) or in `run` text (`NAME=`, `NAME+=`, `NAME[i]=`, `export`,
   `env`, `sudo`, `declare`, `typeset`, `readonly`, `local`, `read`,
   `mapfile`, `getopts`, `let`, `printf -v`, `for`/`select`/`coproc NAME`,
-  `${NAME:=...}`, `{NAME}>`, arithmetic). Names a tool reads as flags or a
+  `${NAME:=...}`, `{NAME}>`, arithmetic). `run` text is read in every
+  reading bash could give it (`shell_lines`): physical lines, lines joined
+  as bash joins a backslash-newline continuation, joined with a space, each
+  with and without comments, so a target split from its `=` by a
+  continuation is still read. Names a tool reads as flags or a
   program (`CARGO_INCREMENTAL`, `CARGO_TERM_COLOR`, `RUST_BACKTRACE`,
   `FORGE_TEST_FAKE_DOCKER`, ...) take one exact value. `HOME`, `PATH`,
   `BASH_ENV`, `LD_PRELOAD`, `RUSTUP_*`, `RUSTFLAGS` and every other unlisted
@@ -388,7 +392,10 @@ change to that file.
   bash only.
 - Runner files (`RUNNER_FILE_LINES`): `$GITHUB_ENV`, `$GITHUB_PATH` and
   `$GITHUB_OUTPUT` are written only on the listed lines (the fuzz matrix and
-  release image name outputs, the cargo-tool action's `bin/` on `PATH`);
+  release image name outputs, the cargo-tool action's `bin/` on `PATH`),
+  each a complete logical line: a listed line continued from or into
+  another is refused, and so is every other line that names a runner file,
+  in any reading, a heredoc or a `$( )` included;
   `::set-env`, `::add-path`, `ACTIONS_ALLOW_UNSECURE_COMMANDS` and the
   runner's command-file paths are refused.
 - Expressions (`EXPRESSION_LINES`): `format`, `fromJSON`, `join` and `toJSON`
@@ -401,10 +408,20 @@ change to that file.
   or `go-version-file: go.mod`, golangci-lint `version` vX.Y.Z,
   `cosign-release` and setup-buildx `version` vX.Y.Z when set), no
   `check-latest`, `driver-opts` images by digest, and no `latest` anywhere.
+- Job containers and services (`CONTAINER_KEYS`,
+  `ALLOWED_CONTAINER_OPTIONS`): only `image`, `env` (under
+  `ALLOWED_VARIABLES`), numeric `ports` and `options`; no `volumes`,
+  `credentials`, `entrypoint` or `command`. `options:` is exactly one of the
+  listed database health checks, and `-e`, `--env`, `--env-file`, `-v`,
+  `--volume`, `--mount`, `--entrypoint`, `--privileged`, `--network` and
+  `--cap-add` are refused in it.
 - Tool configuration files (`tool_configuration_files`): none anywhere in
   the repository (templates included) or in any generated application, for
   every `forge new` option: `.cargo/config` and `.cargo/config.toml`, a
-  `rust-toolchain` file with a `path`, `go.work`, `go.work.sum`, `go.env`,
+  `rust-toolchain` or `rust-toolchain.toml` whose content is not exactly
+  one of `ALLOWED_TOOLCHAIN_FILES` (rustup reads quoted and inline-table
+  `path` spellings and legacy plain-text names, so content is listed, not
+  parsed; a toolchain bump updates the list), `go.work`, `go.work.sum`, `go.env`,
   `go/env`, `.bashrc`, `.profile`, `.bash_profile`, `.envrc`.
 - The YAML-level rules still apply underneath: the simple subset (no
   escapes, anchors, tags, hidden line breaks), the parser cross-check,

@@ -1587,6 +1587,55 @@ fn leading_identifier(word: &str) -> Option<&str> {
     Some(&word[..end]).filter(|name| is_identifier(name))
 }
 
+/// Every reading of a script's lines the gate analyses, each with whether
+/// it spans more than one physical line: the physical lines, the lines
+/// joined as bash joins them (backslash-newline removed), and joined with a
+/// space, each with and without comments stripped. A continuation or a
+/// comment the gate would misread cannot hide text from every reading.
+pub(crate) fn shell_lines(script: &str) -> Vec<(String, bool)> {
+    let mut found = Vec::new();
+    for strip in [true, false] {
+        for glue in [None, Some(""), Some(" ")] {
+            let mut current: Option<(String, bool)> = None;
+            let mut previous_continues = false;
+            for line in script.lines() {
+                let line = if strip { split_comment(line).0 } else { line };
+                let (code, continues) = match line.trim_end().strip_suffix('\\') {
+                    Some(code) => (code, true),
+                    None => (line, false),
+                };
+                match glue {
+                    None => found.push((code.to_owned(), continues || previous_continues)),
+                    Some(glue) => match current.as_mut() {
+                        Some((text, continued)) if previous_continues => {
+                            text.push_str(glue);
+                            text.push_str(code);
+                            *continued = true;
+                        }
+                        _ => {
+                            found.extend(current.take());
+                            current = Some((code.to_owned(), false));
+                        }
+                    },
+                }
+                previous_continues = continues;
+            }
+            found.extend(current);
+        }
+    }
+    found.sort();
+    found.dedup();
+    found
+}
+
+/// Does a line name one of the runner's files, in any case?
+fn names_runner_file(line: &str) -> bool {
+    let upper = line.to_ascii_uppercase();
+    ["GITHUB_ENV", "GITHUB_PATH", "GITHUB_OUTPUT"]
+        .iter()
+        .any(|file| upper.contains(file))
+}
+
 /// A variable a `run` script sets: its name and, for `NAME=value`, the value.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Assignment {
@@ -1610,7 +1659,7 @@ pub(crate) fn assignments(script: &str) -> Vec<Assignment> {
             value,
         });
     };
-    for (_, line) in logical_lines(script, true, " ") {
+    for (line, _) in shell_lines(script) {
         let bytes = line.as_bytes();
         // `${NAME:=...}`, `${NAME=...}` and `{NAME}>` redirections.
         for (position, _) in line.match_indices('{') {
@@ -1766,12 +1815,34 @@ fn variable_problems(file: &str, documents: &[YamlNode]) -> Vec<(usize, String)>
                     }
                 }
                 ("run", YamlNode::Scalar(script, script_line)) => {
-                    // A listed runner-file line is reviewed as a whole.
-                    let script: String = script
-                        .lines()
-                        .filter(|line| {
-                            !listed_line(&RUNNER_FILE_LINES, file, &format!("run: {line}"))
-                        })
+                    // A listed runner-file line is reviewed as a whole: it
+                    // must be a complete logical line, and every other line
+                    // that names a runner file is refused, in every reading
+                    // (continued, in a heredoc or a `$( )`).
+                    let listed = |line: &str| {
+                        listed_line(&RUNNER_FILE_LINES, file, line)
+                            || listed_line(
+                                &RUNNER_FILE_LINES,
+                                file,
+                                &format!("run: {}", line.trim()),
+                            )
+                    };
+                    let readings = shell_lines(script);
+                    for (line, continued) in &readings {
+                        if names_runner_file(line) && (*continued || !listed(line)) {
+                            problems.push((
+                                *script_line,
+                                format!(
+                                    "a runner file (GITHUB_ENV, GITHUB_PATH, GITHUB_OUTPUT) is written only on a complete listed line (RUNNER_FILE_LINES): `{}`",
+                                    line.trim()
+                                ),
+                            ));
+                        }
+                    }
+                    let script: String = readings
+                        .iter()
+                        .filter(|(line, continued)| *continued || !listed(line))
+                        .map(|(line, _)| line.as_str())
                         .collect::<Vec<_>>()
                         .join("\n");
                     for assignment in assignments(&script) {
@@ -1803,7 +1874,7 @@ fn variable_problems(file: &str, documents: &[YamlNode]) -> Vec<(usize, String)>
 /// `--config`, any `-Z` flag, and rustup commands outside `ALLOWED_RUSTUP`.
 fn toolchain_problems(script: &str) -> Vec<String> {
     let mut problems = Vec::new();
-    for (_, line) in logical_lines(script, true, " ") {
+    for (line, _) in shell_lines(script) {
         let words = shell_words(&line);
         for (index, word) in words.iter().enumerate() {
             if word.starts_with("-Z") {
@@ -1862,7 +1933,10 @@ pub(crate) fn closed_list_violations(name: &str, text: &str) -> Vec<String> {
         Ok(documents) => documents,
         Err(error) => return vec![format!("{name}: {error}")],
     };
-    for (line, problem) in variable_problems(name, &documents) {
+    for (line, problem) in variable_problems(name, &documents)
+        .into_iter()
+        .chain(container_problems(&documents))
+    {
         violations.push(format!("{name}:{line}: {problem}"));
     }
     violations.extend(action_input_violations(name, &documents));
@@ -1904,7 +1978,126 @@ pub(crate) fn closed_list_violations(name: &str, text: &str) -> Vec<String> {
             }
         }
     }
+    violations.sort();
+    violations.dedup();
     violations
+}
+
+/// The `options:` a job container or service may take, exactly (a folded
+/// `>-` value, as the parser reads it): the database health checks.
+pub(crate) const ALLOWED_CONTAINER_OPTIONS: [&str; 3] = [
+    r#"--health-cmd "pg_isready -U postgres" --health-interval 2s --health-timeout 5s --health-retries 30"#,
+    r#"--health-cmd "mysqladmin ping -h 127.0.0.1 -uroot -pforge" --health-interval 2s --health-timeout 3s --health-retries 30"#,
+    r#"--health-cmd "healthcheck.sh --connect --innodb_initialized" --health-interval 2s --health-timeout 3s --health-retries 30"#,
+];
+
+/// The keys a job container or service may use: no `volumes`,
+/// `credentials`, `entrypoint` or `command`.
+pub(crate) const CONTAINER_KEYS: [&str; 4] = ["image", "env", "ports", "options"];
+
+/// docker options refused in any container or service `options:`, even a
+/// listed one: environment, files, mounts, entry points, privileges and
+/// networks.
+pub(crate) const REFUSED_CONTAINER_FLAGS: [&str; 10] = [
+    "-e",
+    "--env",
+    "--env-file",
+    "-v",
+    "--volume",
+    "--mount",
+    "--entrypoint",
+    "--privileged",
+    "--network",
+    "--cap-add",
+];
+
+/// Job containers and services: only `CONTAINER_KEYS`, `options:` exactly
+/// one of `ALLOWED_CONTAINER_OPTIONS` and without `REFUSED_CONTAINER_FLAGS`,
+/// and numeric `ports:`. Their `env:` falls under `ALLOWED_VARIABLES`.
+fn container_problems(documents: &[YamlNode]) -> Vec<(usize, String)> {
+    let mut nodes = Vec::new();
+    documents
+        .iter()
+        .for_each(|document| document.visit(&mut nodes));
+    let mut containers = Vec::new();
+    for node in nodes {
+        let YamlNode::Mapping(entries) = node else {
+            continue;
+        };
+        for (key, value) in entries {
+            match (key.scalar(), value) {
+                (Some("container"), YamlNode::Mapping(_)) => containers.push(value),
+                (Some("services"), YamlNode::Mapping(services)) => {
+                    containers.extend(services.iter().map(|(_, service)| service));
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut problems = Vec::new();
+    for container in containers {
+        let YamlNode::Mapping(entries) = container else {
+            problems.push((0, "a service must be a mapping".to_owned()));
+            continue;
+        };
+        for (key, value) in entries {
+            let (name, line) = match key {
+                YamlNode::Scalar(name, line) => (name.as_str(), *line),
+                _ => ("", 0),
+            };
+            if !CONTAINER_KEYS.contains(&name) {
+                problems.push((
+                    line,
+                    format!(
+                        "the container or service key `{name}` is not allowed (CONTAINER_KEYS)"
+                    ),
+                ));
+            }
+            match name {
+                "options" => {
+                    let options = value.scalar().unwrap_or_default();
+                    for word in options.split_whitespace() {
+                        let word = word.trim_matches(['"', '\'']);
+                        if REFUSED_CONTAINER_FLAGS.iter().any(|flag| {
+                            word == *flag
+                                || word.starts_with(&format!("{flag}="))
+                                || (flag.len() == 2 && word.starts_with(flag))
+                        }) {
+                            problems
+                                .push((line, format!("the container option `{word}` is refused")));
+                        }
+                    }
+                    if !ALLOWED_CONTAINER_OPTIONS.contains(&options) {
+                        problems.push((
+                            line,
+                            "container options must be one of ALLOWED_CONTAINER_OPTIONS exactly"
+                                .to_owned(),
+                        ));
+                    }
+                }
+                "ports" => {
+                    let numeric = |port: &str| {
+                        port.split(':').count() <= 2
+                            && port.split(':').all(|part| {
+                                !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit())
+                            })
+                    };
+                    let fine = match value {
+                        YamlNode::Sequence(ports) => {
+                            ports.iter().all(|port| port.scalar().is_some_and(numeric))
+                        }
+                        _ => false,
+                    };
+                    if !fine {
+                        problems
+                            .push((line, "ports must be a list of PORT or PORT:PORT".to_owned()));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    problems
 }
 
 /// The `with:` inputs of the allowlisted actions that choose a version: an
@@ -1987,10 +2180,22 @@ fn action_input_violations(name: &str, documents: &[YamlNode]) -> Vec<String> {
     violations
 }
 
+/// The exact contents a `rust-toolchain` or `rust-toolchain.toml` file may
+/// have: the repository's and hello-forge's (the pinned channel, its
+/// components and profile) and the generator's template. rustup reads more
+/// spellings than a line rule could follow (quoted or inline-table `path`,
+/// a legacy plain-text toolchain name or path), so any other content is
+/// refused; a toolchain bump updates this list in the same reviewed change.
+pub(crate) const ALLOWED_TOOLCHAIN_FILES: [&str; 3] = [
+    "[toolchain]\nchannel = \"1.98.1\"\ncomponents = [\"clippy\", \"rustfmt\"]\nprofile = \"minimal\"\n\n",
+    "[toolchain]\nchannel = \"1.98.1\"\ncomponents = [\"clippy\", \"rustfmt\"]\nprofile = \"minimal\"\n",
+    "[toolchain]\nchannel = \"%%RUST_VERSION%%\"\ncomponents = [\"clippy\", \"rustfmt\"]\nprofile = \"minimal\"\n",
+];
+
 /// Files that configure a tool from the tree, anywhere below `root` (a
 /// template's `.tmpl` suffix ignored): a cargo configuration
-/// (`.cargo/config`, `.cargo/config.toml`), a rust-toolchain file naming a
-/// `path`, a go workspace (`go.work`, `go.work.sum`), a go env file
+/// (`.cargo/config`, `.cargo/config.toml`), a rust-toolchain file whose
+/// content is not one of `ALLOWED_TOOLCHAIN_FILES`, a go workspace (`go.work`, `go.work.sum`), a go env file
 /// (`go.env`, `go/env`) and shell startup files (`.bashrc`, `.profile`,
 /// `.bash_profile`, `.envrc`). A linked `.cargo` or `go` directory counts;
 /// the walk does not enter `skipped` nor follow links to directories.
@@ -2026,11 +2231,7 @@ pub(crate) fn tool_configuration_files(
                 | ".envrc" => found.push(path.clone()),
                 "rust-toolchain" | "rust-toolchain.toml" => {
                     let text = std::fs::read_to_string(&path).unwrap_or_default();
-                    if text.lines().any(|line| {
-                        line.trim_start()
-                            .strip_prefix("path")
-                            .is_some_and(|rest| rest.trim_start().starts_with('='))
-                    }) {
+                    if !ALLOWED_TOOLCHAIN_FILES.contains(&text.as_str()) {
                         found.push(path.clone());
                     }
                 }
