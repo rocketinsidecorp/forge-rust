@@ -21,7 +21,7 @@ use forge_core::Cancellation;
 use forge_jobs::{
     Backoff, EnqueueOptions, Job, JobContext, JobError, JobHandler, JobId, Jobs, JobsError,
     WorkerSettings,
-    postgres::{PgJobStore, migrator},
+    postgres::{PgJobStore, Pruning, migrator},
     testing::RlsTestDatabase,
 };
 use serde::{Deserialize, Serialize};
@@ -201,6 +201,10 @@ fn settings(first: First) -> WorkerSettings {
 }
 
 async fn rig(first: First) -> Rig {
+    rig_with(first, Pruning::default()).await
+}
+
+async fn rig_with(first: First, pruning: Pruning) -> Rig {
     lines().lock().expect("lock").clear();
     let db = RlsTestDatabase::create(&[migrator()]).await.expect(IGNORE);
     let store = PgJobStore::new(db.runtime().clone());
@@ -214,6 +218,7 @@ async fn rig(first: First) -> Rig {
     })
     .expect("register");
     jobs.settings(settings(first));
+    jobs.pruning(Some(pruning));
     let shutdown = Cancellation::new();
     let running = Some(tokio::spawn(jobs.run(store.clone(), shutdown.clone())));
     Rig {
@@ -447,5 +452,30 @@ async fn claiming_resumes_after_an_outage() {
     rig.go.notify_one();
     rig.completed(id).await;
     assert_eq!(rig.runs.load(Ordering::SeqCst), 1);
+    rig.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "needs FORGE_TEST_DATABASE_URL"]
+async fn pruning_deletes_finished_jobs_and_reports_an_outage_without_stopping() {
+    let _serial = SERIAL.lock().await;
+    let pruning = Pruning::default()
+        .completed_after(Duration::ZERO)
+        .interval(Duration::from_secs(1));
+    let rig = rig_with(First::Succeed, pruning).await;
+    let id = rig.enqueue().await;
+    rig.started.notified().await;
+    rig.go.notify_one();
+    logged(&["pruned finished jobs", "deleted=1"]).await;
+    let remaining: i64 = sqlx::query_scalar("SELECT count(*) FROM forge_jobs WHERE id = $1")
+        .bind(id.into_uuid())
+        .fetch_one(rig.db.admin().pool())
+        .await
+        .expect("count");
+    assert_eq!(remaining, 0, "the finished job was deleted");
+
+    rig.sabotage().await;
+    logged(&["pruning finished jobs failed"]).await;
+    rig.restore().await;
     rig.stop().await;
 }
