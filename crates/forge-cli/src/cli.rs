@@ -206,7 +206,9 @@ pub(crate) enum Command {
         command: I18nCommand,
     },
     /// Database lifecycle, like Rails' `db:*` tasks. Every command runs the
-    /// application's own subcommand; the CLI never reads the database URL.
+    /// application's own subcommand, except `console`, which runs the
+    /// database's own client, and the privilege restore of `reset`, which
+    /// runs `psql`: only those read the database URL.
     Db {
         #[command(subcommand)]
         command: DbCommand,
@@ -537,6 +539,20 @@ pub(crate) enum DbCommand {
     Status,
     /// Load the seed data (the same as `forge seed`).
     Seed,
+    /// Open the database's own client (psql, mysql or sqlite3) on
+    /// FORGE_DATABASE_URL's database, with the credentials of
+    /// FORGE_MIGRATION_DATABASE_URL when it is set. The password goes to the
+    /// client through the environment or a private option file, never an
+    /// argument. Arguments after -- go to the client.
+    Console {
+        /// Arguments for the client, after `--` (for example `-c 'select 1'`).
+        #[arg(
+            last = true,
+            value_name = "CLIENT-ARGUMENTS",
+            allow_hyphen_values = true
+        )]
+        arguments: Vec<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]

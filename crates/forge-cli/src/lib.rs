@@ -9,6 +9,7 @@ mod credentials;
 mod credentials_edit;
 #[cfg(test)]
 mod credentials_tests;
+mod dbclient;
 mod deploy;
 mod destroy;
 mod dev;
@@ -278,6 +279,7 @@ fn execute(
                 },
                 DbCommand::Status => Db::Status,
                 DbCommand::Seed => Db::Seed,
+                DbCommand::Console { arguments } => Db::Console(arguments),
             };
             lifecycle(current_dir, |app| app.db(&command))
         }
@@ -630,8 +632,11 @@ fn lifecycle(
     // unprotected FORGE_ENV.
     let environment =
         |key: &str| env::var_os(key).map(|value| value.to_string_lossy().into_owned());
+    let mut client = dbclient::System;
     let mut lifecycle = Lifecycle {
         app: CargoApplication::new(project.clone()),
+        client: &mut client,
+        root: &project.root,
         name: &project.name,
         environment: &environment,
         input: &mut input,

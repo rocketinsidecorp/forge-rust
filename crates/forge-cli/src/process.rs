@@ -75,12 +75,25 @@ impl Signals {
 
     /// [`install`](Self::install), setting an existing flag.
     pub(crate) fn install_for(shutdown: Shutdown) -> Result<Self, CliError> {
+        Self::install_mode(shutdown, Mode::Stop)
+    }
+
+    /// Handlers for an interactive client (`forge db console`): hang-up, quit
+    /// and terminate ask to stop, while Ctrl-C is swallowed. The terminal
+    /// delivers it to the client too (same foreground process group), which
+    /// uses it to cancel a query; ending the CLI there would end the session
+    /// and skip the clean-up of the credential file.
+    pub(crate) fn install_for_client(shutdown: Shutdown) -> Result<Self, CliError> {
+        Self::install_mode(shutdown, Mode::Client)
+    }
+
+    fn install_mode(shutdown: Shutdown, mode: Mode) -> Result<Self, CliError> {
         let (stop, stopped) = oneshot::channel();
         let (ready, registered) = std::sync::mpsc::channel();
         let flag = shutdown.clone();
         let thread = std::thread::Builder::new()
             .name("forge-signals".to_owned())
-            .spawn(move || listen(&flag, stopped, &ready))
+            .spawn(move || listen(&flag, stopped, &ready, mode))
             .map_err(CliError::Signals)?;
         match registered.recv() {
             Ok(Ok(())) => Ok(Self {
@@ -119,10 +132,31 @@ impl Drop for Signals {
     }
 }
 
+/// What the signal thread does with Ctrl-C.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Mode {
+    /// SIGINT and SIGTERM ask to stop.
+    Stop,
+    /// SIGTERM, SIGHUP and SIGQUIT ask to stop; SIGINT is swallowed.
+    Client,
+}
+
+/// The next delivery of an optional signal; never, when it is not registered.
+#[cfg(unix)]
+async fn received(stream: &mut Option<tokio::signal::unix::Signal>) {
+    match stream {
+        Some(stream) => {
+            stream.recv().await;
+        }
+        None => std::future::pending().await,
+    }
+}
+
 fn listen(
     shutdown: &Shutdown,
     mut stopped: oneshot::Receiver<()>,
     ready: &std::sync::mpsc::Sender<io::Result<()>>,
+    mode: Mode,
 ) {
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -139,9 +173,22 @@ fn listen(
         {
             use tokio::signal::unix::{SignalKind, signal};
 
-            let registered = signal(SignalKind::terminate())
-                .and_then(|terminate| signal(SignalKind::interrupt()).map(|int| (terminate, int)));
-            let (mut terminate, mut interrupt) = match registered {
+            let registered = (|| {
+                let terminate = signal(SignalKind::terminate())?;
+                let interrupt = signal(SignalKind::interrupt())?;
+                // Hang-up and quit keep their default meaning (they end the
+                // CLI) unless a client runs and must be told.
+                let (hangup, quit) = if mode == Mode::Client {
+                    (
+                        Some(signal(SignalKind::hangup())?),
+                        Some(signal(SignalKind::quit())?),
+                    )
+                } else {
+                    (None, None)
+                };
+                Ok::<_, io::Error>((terminate, interrupt, hangup, quit))
+            })();
+            let (mut terminate, mut interrupt, mut hangup, mut quit) = match registered {
                 Ok(streams) => streams,
                 Err(error) => {
                     let _ = ready.send(Err(error));
@@ -152,7 +199,13 @@ fn listen(
             loop {
                 tokio::select! {
                     _ = terminate.recv() => shutdown.request(),
-                    _ = interrupt.recv() => shutdown.request(),
+                    _ = interrupt.recv() => {
+                        if mode == Mode::Stop {
+                            shutdown.request();
+                        }
+                    }
+                    () = received(&mut hangup) => shutdown.request(),
+                    () = received(&mut quit) => shutdown.request(),
                     _ = &mut stopped => return,
                 }
             }
@@ -163,7 +216,7 @@ fn listen(
             loop {
                 tokio::select! {
                     result = tokio::signal::ctrl_c() => {
-                        if result.is_ok() {
+                        if result.is_ok() && mode == Mode::Stop {
                             shutdown.request();
                         }
                     }
@@ -179,6 +232,9 @@ fn listen(
 pub(crate) struct OwnedChild {
     child: Child,
     own_group: bool,
+    /// Whether the group was already swept after the child exited: its id
+    /// may be reused by then, so it is signalled once, right after the exit.
+    group_swept: bool,
 }
 
 impl OwnedChild {
@@ -197,7 +253,16 @@ impl OwnedChild {
         let child = command
             .spawn()
             .map_err(|source| CliError::SpawnProcess { program, source })?;
-        Ok(Self { child, own_group })
+        Ok(Self {
+            child,
+            own_group,
+            group_swept: false,
+        })
+    }
+
+    /// Takes the child's piped standard input.
+    pub(crate) fn take_stdin(&mut self) -> Option<std::process::ChildStdin> {
+        self.child.stdin.take()
     }
 
     /// Takes the child's piped standard output.
@@ -231,6 +296,21 @@ impl OwnedChild {
         } else {
             kill_process(pid, signal)
         };
+    }
+
+    /// Kills what an exited child left running in its process group (workers
+    /// and helpers it started), so a restart never finds orphans holding its
+    /// port. Does nothing for a child that is still running, one without a
+    /// group of its own, or a group already swept. Call it right after the
+    /// exit was seen: the group id is the child's pid, which the system may
+    /// reuse once the group is empty.
+    pub(crate) fn sweep_group(&mut self) {
+        if !self.own_group || self.group_swept || !matches!(self.child.try_wait(), Ok(Some(_))) {
+            return;
+        }
+        self.group_swept = true;
+        #[cfg(unix)]
+        self.signal(rustix::process::Signal::KILL);
     }
 
     /// Kills the child and waits for it.
@@ -354,6 +434,74 @@ mod tests {
             .wait(&shutdown, Duration::from_millis(300))
             .expect("wait");
         assert!(interrupted && !status.success());
+    }
+
+    /// Whether a process exists and is not a zombie (Linux).
+    #[cfg(target_os = "linux")]
+    fn running(pid: u32) -> bool {
+        std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|stat| {
+                stat.rsplit_once(") ")
+                    .and_then(|(_, rest)| rest.chars().next())
+            })
+            .is_some_and(|state| state != 'Z')
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn descendants_of_a_child_that_exited_on_its_own_are_swept() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let pid_file = directory.path().join("pid");
+        // The shell leaves a background `sleep` behind and exits at once.
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "sleep 60 & echo $! > \"$1\"", "sh"])
+            .arg(&pid_file)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let mut child = OwnedChild::spawn(command, true).expect("spawn");
+        let (status, interrupted) = child
+            .wait(&Shutdown::new(), Duration::from_secs(5))
+            .expect("wait");
+        assert!(status.success() && !interrupted);
+        let orphan: u32 = std::fs::read_to_string(&pid_file)
+            .expect("pid file")
+            .trim()
+            .parse()
+            .expect("pid");
+        assert!(
+            running(orphan),
+            "the premise: the helper outlives its parent"
+        );
+
+        child.sweep_group();
+
+        let began = Instant::now();
+        while running(orphan) && began.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!running(orphan), "the helper was killed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_running_child_or_one_without_a_group_is_never_swept() {
+        let mut child = OwnedChild::spawn(sleeper("30"), true).expect("spawn");
+        child.sweep_group();
+        assert!(
+            matches!(child.try_wait(), Ok(None)),
+            "a running child is left alone"
+        );
+        assert!(!child.group_swept);
+        child.kill();
+
+        // Without a group of its own the child's pid is not a group id.
+        let mut shared = OwnedChild::spawn(Command::new("true"), false).expect("spawn");
+        let _ = shared.wait(&Shutdown::new(), Duration::from_secs(5));
+        shared.sweep_group();
+        assert!(!shared.group_swept);
     }
 
     #[cfg(unix)]

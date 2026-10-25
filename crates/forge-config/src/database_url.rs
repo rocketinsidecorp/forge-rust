@@ -7,7 +7,9 @@
 //! overrides the driver applies (`host`, `hostaddr`, `port` and `dbname` for
 //! PostgreSQL, `socket` for MySQL/MariaDB), so what is described is what the
 //! driver would connect to. Nothing here returns a user, a password or another
-//! query parameter.
+//! query parameter, with one deliberate exception: [`client_target`], for
+//! tools that execute the vendor client (`psql`, `mysql`) and must hand it the
+//! credentials.
 //!
 //! A URL is **well formed** only when `url` parses it and no `@` follows its
 //! authority. An unescaped `/`, `?` or `#` in a password ends the authority
@@ -39,6 +41,8 @@ struct Location {
     host: Option<String>,
     port: Option<u16>,
     socket: bool,
+    /// The socket directory or file, when the URL names one.
+    socket_path: Option<String>,
     database: Option<String>,
 }
 
@@ -92,21 +96,203 @@ pub fn describe_location(
     let name = database.map_or_else(|| "?".to_owned(), |name| format!("\"{name}\""));
     match (host, port) {
         (Some(host), Some(port)) => {
-            let host = if host.contains(':') {
-                format!("[{host}]")
-            } else {
-                host.to_owned()
-            };
-            format!("{engine} database {name} on {host}:{port}")
+            format!("{engine} database {name} on {}:{port}", bracketed(host))
         }
-        (Some(host), None) => format!("{engine} database {name} on {host}"),
+        (Some(host), None) => format!("{engine} database {name} on {}", bracketed(host)),
         _ => format!("{engine} database {name}"),
     }
 }
 
-/// The TCP endpoint a server URL names, with the engine's default port when
-/// the URL has none; `None` for SQLite, a Unix socket or a URL that is not
-/// well formed.
+/// An IPv6 literal in brackets, exactly once: SQLx hands back the host of
+/// `postgres://u@[::1]/db` already bracketed, `url`'s parser does not.
+fn bracketed(host: &str) -> String {
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .unwrap_or(host);
+    if bare.contains(':') {
+        format!("[{bare}]")
+    } else {
+        bare.to_owned()
+    }
+}
+
+/// Where the driver would connect for a server URL.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Server {
+    /// A TCP endpoint; an IPv6 host has no brackets.
+    Tcp {
+        /// Host name or address.
+        host: String,
+        /// Port, from the URL, the environment or the engine's default.
+        port: u16,
+    },
+    /// A Unix socket: the directory (PostgreSQL) or file (MySQL/MariaDB) when
+    /// the URL or the environment names one.
+    Socket {
+        /// The directory or file, when known.
+        path: Option<String>,
+        /// PostgreSQL only: the port, which names the socket file
+        /// (`.s.PGSQL.<port>`).
+        port: Option<u16>,
+    },
+    /// PostgreSQL with no host in the URL or the environment: the driver
+    /// uses a socket in one of
+    /// [`DEFAULT_POSTGRES_SOCKET_DIRECTORIES`] when a server listens there,
+    /// and `localhost` otherwise.
+    Default {
+        /// The port of the socket file name and of the `localhost` fallback.
+        port: u16,
+    },
+}
+
+/// The socket directories SQLx tries, in order, for a PostgreSQL URL without
+/// a host: the first that holds `.s.PGSQL.<port>` is used.
+pub const DEFAULT_POSTGRES_SOCKET_DIRECTORIES: [&str; 3] =
+    ["/var/run/postgresql", "/private/tmp", "/tmp"];
+
+/// What the driver would connect to for `url`, applying the URL's query
+/// overrides and, for PostgreSQL, the `PGHOSTADDR`, `PGHOST` and `PGPORT`
+/// defaults read through `env` (the process environment for a tool that
+/// describes the real connection; `|_| None` for one that must ignore it).
+/// An empty host is unset, as in libpq. `None` for SQLite, a URL that is not
+/// well formed or another engine.
+#[must_use]
+pub fn server(url: &SecretString, env: &dyn Fn(&str) -> Option<String>) -> Option<Server> {
+    let raw = url.expose();
+    let scheme = DatabaseScheme::of_url(raw)?;
+    if scheme == DatabaseScheme::Sqlite {
+        return None;
+    }
+    let found = location(raw)?;
+    let host = found.host.filter(|host| !host.is_empty());
+    match scheme {
+        DatabaseScheme::Postgres => {
+            let port = found
+                .port
+                .or_else(|| {
+                    env("PGPORT")
+                        .and_then(|port| port.trim().parse::<u16>().ok())
+                        .filter(|port| *port != 0)
+                })
+                .unwrap_or(5432);
+            if found.socket {
+                return Some(Server::Socket {
+                    path: found.socket_path,
+                    port: Some(port),
+                });
+            }
+            let host = host.or_else(|| {
+                ["PGHOSTADDR", "PGHOST"]
+                    .into_iter()
+                    .find_map(|key| env(key).filter(|value| !value.is_empty()))
+            });
+            Some(match host {
+                Some(host) if host.starts_with('/') => Server::Socket {
+                    path: Some(host),
+                    port: Some(port),
+                },
+                Some(host) => Server::Tcp { host, port },
+                None => Server::Default { port },
+            })
+        }
+        DatabaseScheme::MySql if found.socket => Some(Server::Socket {
+            path: found.socket_path,
+            port: None,
+        }),
+        DatabaseScheme::MySql => Some(Server::Tcp {
+            host: host.unwrap_or_else(|| "localhost".to_owned()),
+            port: found.port.unwrap_or(3306),
+        }),
+        DatabaseScheme::Sqlite => None,
+    }
+}
+
+/// TLS settings a client tool needs, as the URL spells them.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ClientTls {
+    /// `sslmode` (PostgreSQL) or `ssl-mode` (MySQL/MariaDB).
+    pub mode: Option<String>,
+    /// The CA bundle file.
+    pub root_certificate: Option<String>,
+    /// The client certificate file.
+    pub certificate: Option<String>,
+    /// The client key file.
+    pub key: Option<String>,
+}
+
+/// Everything a vendor client tool (`psql`, `mysql`) needs to connect where
+/// the driver would, including the credentials. The password is a
+/// [`SecretString`]; hand it to the tool through the environment or an option
+/// file, never an argument.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClientTarget {
+    /// The user name, decoded; `None` leaves the tool's default.
+    pub user: Option<String>,
+    /// The password, decoded.
+    pub password: Option<SecretString>,
+    /// The database name after the driver's overrides.
+    pub database: Option<String>,
+    /// Where to connect.
+    pub server: Server,
+    /// TLS settings.
+    pub tls: ClientTls,
+}
+
+/// Reads the connection a client tool needs from a PostgreSQL or
+/// MySQL/MariaDB URL, with the query overrides the driver applies (`user`,
+/// `password`, `host`, `hostaddr`, `port`, `dbname`, `socket` and the TLS
+/// options). `None` when the URL is not well formed, names SQLite or another
+/// engine. `env` is as in [`server`].
+///
+/// This is the one function of this module that returns credentials: it
+/// exists for tools that execute the vendor client, and its result must not
+/// be printed.
+#[must_use]
+pub fn client_target(
+    url: &SecretString,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Option<ClientTarget> {
+    let raw = url.expose();
+    let scheme = DatabaseScheme::of_url(raw)?;
+    let found = location(raw)?;
+    let server = server(url, env)?;
+    let parsed = Url::parse(raw.trim()).ok()?;
+    let mut user = if parsed.username().is_empty() {
+        None
+    } else {
+        percent_decode(parsed.username())
+    };
+    let mut password = parsed.password().and_then(percent_decode);
+    let mut tls = ClientTls::default();
+    for (key, value) in parsed.query_pairs() {
+        let value = value.into_owned();
+        match (scheme, &*key) {
+            (DatabaseScheme::Postgres, "user") => user = Some(value),
+            (DatabaseScheme::Postgres, "password") => password = Some(value),
+            (_, "sslmode" | "ssl-mode") => tls.mode = Some(value),
+            (DatabaseScheme::Postgres, "sslrootcert" | "ssl-root-cert" | "ssl-ca")
+            | (DatabaseScheme::MySql, "sslca" | "ssl-ca") => tls.root_certificate = Some(value),
+            (_, "sslcert" | "ssl-cert") => tls.certificate = Some(value),
+            (_, "sslkey" | "ssl-key") => tls.key = Some(value),
+            _ => {}
+        }
+    }
+    Some(ClientTarget {
+        user: user.filter(|value| !value.is_empty()),
+        password: password
+            .filter(|value| !value.is_empty())
+            .map(SecretString::new),
+        database: found.database,
+        server,
+        tls,
+    })
+}
+
+/// The TCP endpoint a server URL names by itself, with the engine's default
+/// port when the URL has none; `None` for SQLite, a Unix socket, a host-less
+/// URL or a URL that is not well formed. It ignores the environment; use
+/// [`server`] to describe the connection the driver would make.
 #[must_use]
 pub fn endpoint(url: &SecretString) -> Option<(String, u16)> {
     let raw = url.expose();
@@ -173,6 +359,7 @@ fn location(raw: &str) -> Option<Location> {
         host: None,
         port: url.port(),
         socket: false,
+        socket_path: None,
         database: None,
     };
     match url.host() {
@@ -180,6 +367,7 @@ fn location(raw: &str) -> Option<Location> {
             if scheme == DatabaseScheme::Postgres && domain.to_ascii_lowercase().starts_with("%2f")
             {
                 found.socket = true;
+                found.socket_path = percent_decode(domain);
             } else if !domain.is_empty() {
                 found.host = Some(domain.to_owned());
             }
@@ -194,7 +382,10 @@ fn location(raw: &str) -> Option<Location> {
     }
     for (key, value) in url.query_pairs() {
         match (scheme, &*key) {
-            (DatabaseScheme::Postgres, "host") if value.starts_with('/') => found.socket = true,
+            (DatabaseScheme::Postgres, "host") if value.starts_with('/') => {
+                found.socket = true;
+                found.socket_path = Some(value.into_owned());
+            }
             // A host that carries a URL delimiter, a backslash, whitespace
             // or a control character is no host name (found by the
             // config_database_url fuzz target; seed `host-query-delimiter`):
@@ -216,7 +407,10 @@ fn location(raw: &str) -> Option<Location> {
             }
             (DatabaseScheme::Postgres, "port") => found.port = Some(value.parse().ok()?),
             (DatabaseScheme::Postgres, "dbname") => found.database = Some(value.into_owned()),
-            (DatabaseScheme::MySql, "socket") => found.socket = true,
+            (DatabaseScheme::MySql, "socket") => {
+                found.socket = true;
+                found.socket_path = Some(value.into_owned());
+            }
             _ => {}
         }
     }
@@ -244,6 +438,19 @@ fn percent_decode(text: &str) -> Option<String> {
         }
     }
     String::from_utf8(decoded).ok()
+}
+
+/// The file a SQLite URL names, without scheme or query and percent-decoded
+/// like the driver does; `None` for another engine. `:memory:` is returned
+/// as is.
+#[must_use]
+pub fn sqlite_file(url: &SecretString) -> Option<String> {
+    let raw = url.expose();
+    if DatabaseScheme::of_url(raw)? != DatabaseScheme::Sqlite {
+        return None;
+    }
+    let path = sqlite_path(raw);
+    Some(percent_decode(path).unwrap_or_else(|| path.to_owned()))
 }
 
 /// The file of a `sqlite:` URL, without scheme or query.
@@ -467,5 +674,208 @@ mod tests {
         assert_eq!(endpoint("sqlite:dev.db"), None);
         assert_eq!(endpoint("postgres://u:p@h:notaport/app"), None);
         assert_eq!(endpoint("redis://h/app"), None);
+    }
+
+    #[test]
+    fn an_ipv6_host_is_bracketed_once_whether_or_not_the_driver_already_did() {
+        for host in ["::1", "[::1]"] {
+            assert_eq!(
+                describe_location("postgres", Some("shop"), Some(host), Some(5432)),
+                "postgres database \"shop\" on [::1]:5432",
+                "{host}"
+            );
+            assert_eq!(
+                describe_location("postgres", Some("shop"), Some(host), None),
+                "postgres database \"shop\" on [::1]",
+                "{host}"
+            );
+        }
+        assert_eq!(
+            describe_location("mysql", Some("shop"), Some("db.internal"), Some(3306)),
+            "mysql database \"shop\" on db.internal:3306"
+        );
+        assert_eq!(
+            describe_location("mysql", Some("shop"), Some("10.0.0.5"), Some(3306)),
+            "mysql database \"shop\" on 10.0.0.5:3306"
+        );
+    }
+
+    fn environment<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |key| {
+            pairs
+                .iter()
+                .find(|(name, _)| *name == key)
+                .map(|(_, value)| (*value).to_owned())
+        }
+    }
+
+    fn tcp(host: &str, port: u16) -> Option<Server> {
+        Some(Server::Tcp {
+            host: host.to_owned(),
+            port,
+        })
+    }
+
+    #[test]
+    fn the_server_follows_the_pg_environment_like_the_driver() {
+        let none = environment(&[]);
+        let host = environment(&[("PGHOST", "db.internal"), ("PGPORT", "6543")]);
+        let both = environment(&[("PGHOSTADDR", "10.0.0.5"), ("PGHOST", "db.internal")]);
+        let socket = environment(&[("PGHOST", "/var/run/postgresql")]);
+        let bad_port = environment(&[("PGHOST", "h"), ("PGPORT", "many")]);
+        let empty = environment(&[("PGHOST", ""), ("PGHOSTADDR", "")]);
+        let url = |text: &str| secret(text);
+
+        // The URL wins; the environment fills what it leaves out.
+        assert_eq!(
+            server(&url("postgres://u:p@h:7000/app"), &host),
+            tcp("h", 7000)
+        );
+        assert_eq!(
+            server(&url("postgres:///app"), &host),
+            tcp("db.internal", 6543)
+        );
+        assert_eq!(
+            server(&url("postgres://u:p@/app"), &host),
+            None,
+            "not a URL"
+        );
+        assert_eq!(server(&url("postgres://u:p@h/app"), &host), tcp("h", 6543));
+        // PGHOSTADDR is read before PGHOST, as SQLx does.
+        assert_eq!(
+            server(&url("postgres:///app"), &both),
+            tcp("10.0.0.5", 5432)
+        );
+        assert_eq!(
+            server(&url("postgres:///app"), &socket),
+            Some(Server::Socket {
+                path: Some("/var/run/postgresql".to_owned()),
+                port: Some(5432)
+            })
+        );
+        assert_eq!(server(&url("postgres:///app"), &bad_port), tcp("h", 5432));
+        // Nothing anywhere: the driver's default socket or localhost.
+        assert_eq!(
+            server(&url("postgres:///app"), &none),
+            Some(Server::Default { port: 5432 })
+        );
+        assert_eq!(
+            server(&url("postgres:///app?port=5433"), &empty),
+            Some(Server::Default { port: 5433 })
+        );
+        // The query overrides beat the environment.
+        assert_eq!(
+            server(&url("postgres:///app?host=prod"), &socket),
+            tcp("prod", 5432)
+        );
+        assert_eq!(
+            server(&url("postgres:///app?host=/tmp"), &host),
+            Some(Server::Socket {
+                path: Some("/tmp".to_owned()),
+                port: Some(6543)
+            })
+        );
+        assert_eq!(
+            server(&url("postgres://%2Fvar%2Frun%2Fpostgresql/app"), &host),
+            Some(Server::Socket {
+                path: Some("/var/run/postgresql".to_owned()),
+                port: Some(6543)
+            })
+        );
+        // IPv6 hosts are bare, so they can be dialled.
+        assert_eq!(
+            server(&url("postgres://u:p@[::1]:5433/app"), &none),
+            tcp("::1", 5433)
+        );
+        // MySQL has no environment defaults; SQLite and malformed URLs no server.
+        assert_eq!(server(&url("mysql://u:p@db/app"), &host), tcp("db", 3306));
+        assert_eq!(server(&url("mysql:///app"), &host), tcp("localhost", 3306));
+        assert_eq!(
+            server(&url("mysql://u:p@h/app?socket=/tmp/m.sock"), &none),
+            Some(Server::Socket {
+                path: Some("/tmp/m.sock".to_owned()),
+                port: None
+            })
+        );
+        assert_eq!(server(&url("sqlite:dev.db"), &none), None);
+        assert_eq!(server(&url("postgres://a:b/c@h/app"), &none), None);
+    }
+
+    #[test]
+    fn the_client_target_decodes_credentials_and_applies_the_drivers_overrides() {
+        let none = environment(&[]);
+        let target = client_target(
+            &secret(
+                "postgres://app%40corp:p%2Fw%3F%23@db.internal:5433/shop?sslmode=verify-full&\
+                 sslrootcert=/etc/ca.pem&application_name=x",
+            ),
+            &none,
+        )
+        .expect("target");
+        assert_eq!(target.user.as_deref(), Some("app@corp"));
+        assert_eq!(
+            target.password.as_ref().map(SecretString::expose),
+            Some("p/w?#")
+        );
+        assert_eq!(target.database.as_deref(), Some("shop"));
+        assert_eq!(
+            target.server,
+            Server::Tcp {
+                host: "db.internal".to_owned(),
+                port: 5433
+            }
+        );
+        assert_eq!(target.tls.mode.as_deref(), Some("verify-full"));
+        assert_eq!(target.tls.root_certificate.as_deref(), Some("/etc/ca.pem"));
+        assert!(
+            !format!("{target:?}").contains("p/w"),
+            "the password stays redacted"
+        );
+
+        // `user`, `password` and `dbname` in the query win, as in SQLx.
+        let target = client_target(
+            &secret("postgres://a:b@h/shop?user=c&password=d&dbname=other"),
+            &none,
+        )
+        .expect("target");
+        assert_eq!(target.user.as_deref(), Some("c"));
+        assert_eq!(
+            target.password.as_ref().map(SecretString::expose),
+            Some("d")
+        );
+        assert_eq!(target.database.as_deref(), Some("other"));
+
+        let target = client_target(
+            &secret("mariadb://root@127.0.0.1/shop?ssl-mode=REQUIRED&ssl-ca=/ca"),
+            &none,
+        )
+        .expect("target");
+        assert_eq!(target.password, None);
+        assert_eq!(target.tls.mode.as_deref(), Some("REQUIRED"));
+        assert_eq!(target.tls.root_certificate.as_deref(), Some("/ca"));
+
+        for refused in [
+            "sqlite:dev.db",
+            "redis://h/x",
+            "postgres://admin:s3cr/et@db/shop",
+        ] {
+            assert_eq!(client_target(&secret(refused), &none), None, "{refused}");
+        }
+    }
+
+    #[test]
+    fn the_sqlite_file_is_the_path_without_scheme_or_query() {
+        for (url, file) in [
+            (
+                "sqlite://storage/dev.sqlite3?mode=rwc",
+                "storage/dev.sqlite3",
+            ),
+            ("sqlite:dev.db", "dev.db"),
+            ("sqlite:///var/lib/my%20app.db", "/var/lib/my app.db"),
+            ("sqlite::memory:", ":memory:"),
+        ] {
+            assert_eq!(sqlite_file(&secret(url)).as_deref(), Some(file), "{url}");
+        }
+        assert_eq!(sqlite_file(&secret("postgres://h/app")), None);
     }
 }

@@ -6,7 +6,10 @@
 //! builds with Cargo. **The old process keeps serving until a build
 //! succeeds**; only then is it sent SIGTERM, awaited (up to 35 seconds, then
 //! killed) and replaced. A failed build prints Cargo's diagnostics and leaves
-//! the running application alone. If the tree changes while a build runs, the
+//! the running application alone, and so does an error that kept Cargo from
+//! running at all: it is printed, the previous build keeps serving, and the
+//! next change builds again. When the application exits (by itself or on a
+//! stop) whatever it left running in its process group is killed too. If the tree changes while a build runs, the
 //! finished build is discarded and the build restarts. A crashed application
 //! is not restarted in a loop: it waits for the next change.
 //!
@@ -210,6 +213,15 @@ fn pause(duration: Duration, shutdown: &Shutdown) {
     }
 }
 
+/// What a failed build leaves behind.
+fn still_serving(running: bool) -> &'static str {
+    if running {
+        "the previous build keeps running"
+    } else {
+        "nothing is running yet, save a fix to build again"
+    }
+}
+
 /// The supervisor: build, run, and follow changes until a shutdown request.
 /// The first build happens at once, so a build error at start does not end
 /// the loop: the developer fixes the code and saves.
@@ -230,14 +242,23 @@ pub(crate) fn supervise(
         if build_now {
             build_now = false;
             log("building");
-            match host.build()? {
-                BuildOutcome::Interrupted => break,
-                BuildOutcome::Failed(_) => log(if running.is_some() {
-                    "build failed; the previous build keeps running"
-                } else {
-                    "build failed; nothing is running yet, save a fix to build again"
-                }),
-                BuildOutcome::Built(binary) => {
+            // An error that stopped the build from running at all (cargo
+            // missing, no binary of that name) is a failed build like any
+            // other: the previous build keeps serving, the error is printed,
+            // and the next save builds again.
+            match host.build() {
+                Ok(BuildOutcome::Interrupted) => break,
+                Ok(BuildOutcome::Failed(_)) => {
+                    log(&format!(
+                        "build failed; {}",
+                        still_serving(running.is_some())
+                    ));
+                }
+                Err(error) => log(&format!(
+                    "build failed ({error}); {}",
+                    still_serving(running.is_some())
+                )),
+                Ok(BuildOutcome::Built(binary)) => {
                     let after = scan_tree().unwrap_or_else(|_| previous.clone());
                     let moved = changed(&previous, &after);
                     if moved.is_empty() {
@@ -347,12 +368,19 @@ struct Running {
 
 impl Instance for Running {
     fn exited(&mut self) -> bool {
-        !matches!(self.child.try_wait(), Ok(None))
+        let exited = !matches!(self.child.try_wait(), Ok(None));
+        if exited {
+            // It exited by itself: what it started must not outlive it.
+            self.child.sweep_group();
+        }
+        exited
     }
 
     fn stop(&mut self) {
         // A failure to wait leaves nothing more to do: dropping kills it.
         let _ = self.child.stop(&self.shutdown, STOP_GRACE);
+        // The application is gone; so is whatever ignored its SIGTERM.
+        self.child.sweep_group();
     }
 }
 
@@ -481,7 +509,7 @@ mod tests {
 
     struct FakeHost {
         events: Events,
-        builds: VecDeque<BuildOutcome>,
+        builds: VecDeque<Result<BuildOutcome, CliError>>,
         shutdown: Shutdown,
         /// Stop supervising after this many builds.
         stop_after: usize,
@@ -503,10 +531,9 @@ mod tests {
                 // The last build ends the test once it has been handled.
                 self.shutdown.request();
             }
-            Ok(self
-                .builds
+            self.builds
                 .pop_front()
-                .unwrap_or_else(|| BuildOutcome::Built(PathBuf::from("/bin/app"))))
+                .unwrap_or_else(|| Ok(BuildOutcome::Built(PathBuf::from("/bin/app"))))
         }
 
         fn start(&mut self, binary: &Path) -> Result<Box<dyn Instance>, CliError> {
@@ -521,6 +548,22 @@ mod tests {
 
     fn drive(
         builds: Vec<BuildOutcome>,
+        stop_after: usize,
+        on_build: Option<Box<dyn FnMut()>>,
+        files: Rc<RefCell<Snapshot>>,
+        edit_after_scans: Option<(usize, Edit)>,
+    ) -> (Vec<String>, Vec<String>) {
+        drive_results(
+            builds.into_iter().map(Ok).collect(),
+            stop_after,
+            on_build,
+            files,
+            edit_after_scans,
+        )
+    }
+
+    fn drive_results(
+        builds: Vec<Result<BuildOutcome, CliError>>,
         stop_after: usize,
         on_build: Option<Box<dyn FnMut()>>,
         files: Rc<RefCell<Snapshot>>,
@@ -619,6 +662,56 @@ mod tests {
     }
 
     #[test]
+    fn a_build_that_could_not_run_keeps_the_running_application_and_the_loop() {
+        let files = Rc::new(RefCell::new(Snapshot::new()));
+        let (events, logs) = drive_results(
+            vec![
+                Ok(BuildOutcome::Built(PathBuf::from("/bin/app"))),
+                Err(CliError::NoBinary {
+                    name: Some("shop".to_owned()),
+                }),
+            ],
+            2,
+            None,
+            files,
+            Some((3, Box::new(edit_main))),
+        );
+        // The error neither ends the supervisor nor kills the application:
+        // the shutdown stops it gracefully, like after a failed build.
+        assert_eq!(
+            events,
+            ["build 1", "start /bin/app#1", "build 2", "stop /bin/app#1"]
+        );
+        let failure = logs
+            .iter()
+            .find(|line| line.starts_with("build failed ("))
+            .unwrap_or_else(|| panic!("{logs:?}"));
+        assert_eq!(
+            failure,
+            "build failed (`cargo build` produced no binary named `shop`); \
+             the previous build keeps running"
+        );
+    }
+
+    #[test]
+    fn a_first_build_that_could_not_run_waits_for_a_fix_too() {
+        let files = Rc::new(RefCell::new(Snapshot::new()));
+        let (events, logs) = drive_results(
+            vec![Err(CliError::NoBinary { name: None })],
+            1,
+            None,
+            files,
+            None,
+        );
+        assert_eq!(events, ["build 1"]);
+        assert!(
+            logs.iter()
+                .any(|line| line.contains("nothing is running yet")),
+            "{logs:?}"
+        );
+    }
+
+    #[test]
     fn a_failed_first_build_waits_for_a_fix() {
         let files = Rc::new(RefCell::new(Snapshot::new()));
         let (events, logs) = drive(vec![BuildOutcome::Failed(Some(101))], 1, None, files, None);
@@ -657,6 +750,50 @@ mod tests {
                 .any(|line| line.contains("changed while building")),
             "{logs:?}"
         );
+    }
+
+    /// An application that starts a helper and exits on its own: the helper
+    /// must not outlive it (Linux, for /proc).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_helpers_of_an_application_that_exited_by_itself_are_killed() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let pid_file = directory.path().join("pid");
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "sleep 60 & echo $! > \"$1\"", "sh"])
+            .arg(&pid_file)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut running = Running {
+            child: OwnedChild::spawn(command, true).expect("spawn"),
+            shutdown: Shutdown::new(),
+        };
+        let began = Instant::now();
+        while !running.exited() {
+            assert!(began.elapsed() < Duration::from_secs(5), "never exited");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let helper: u32 = fs::read_to_string(&pid_file)
+            .expect("pid file")
+            .trim()
+            .parse()
+            .expect("pid");
+        let alive = |pid: u32| {
+            fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .and_then(|stat| {
+                    stat.rsplit_once(") ")
+                        .and_then(|(_, rest)| rest.chars().next())
+                })
+                .is_some_and(|state| state != 'Z')
+        };
+        let waited = Instant::now();
+        while alive(helper) && waited.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!alive(helper), "the helper outlived the application");
     }
 
     #[test]

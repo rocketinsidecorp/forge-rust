@@ -99,7 +99,8 @@ the work is finished and waiting for its review; **Planned** means not started.
   `setup`, `seed` and `db create|drop|reset|setup|prepare|migrate|rollback|status|seed`
   with Forge-Go's names, flags and refusals. Still open, in this order, each
   an application subcommand so the CLI keeps holding no credentials:
-  `db schema:dump|schema:load|console`, browser reload in `forge dev` (the Go
+  `db schema:dump|schema:load` (`db console` exists since P5: it runs the
+  client with the URL's credentials in the environment, like Forge-Go), browser reload in `forge dev` (the Go
   proxy needs a reviewed Rust port with the same CSP rules), and
   `.env.development`/`.env.local` files in `forge dev` and the lifecycle
   commands together with generating them. Planned right after the generators

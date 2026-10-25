@@ -234,6 +234,17 @@ mod tests {
         }
 
         #[test]
+        fn an_ipv6_host_is_described_with_one_pair_of_brackets() {
+            // SQLx returns the host of this URL already bracketed.
+            let target = target::<Pg>(&secret("postgres://m:pw@[::1]:5433/shop")).expect("parses");
+            assert_eq!(
+                target.describe(),
+                "postgres database \"shop\" on [::1]:5433"
+            );
+            assert!(target.is_local());
+        }
+
+        #[test]
         fn malformed_urls_are_refused_without_echoing_them() {
             for url in [
                 "postgres://admin:s3cr/et@db.internal/shop",

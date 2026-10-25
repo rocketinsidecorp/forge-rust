@@ -4,7 +4,10 @@
 //! The database URL is read only to describe it and to open a TCP connection
 //! to its host: the report names the engine, database and host, never a user,
 //! a password or a query parameter, and the CLI does not log in (the
-//! application does, with its own credentials). Like Forge-Go's `forge
+//! application does, with its own credentials). The host and port are the
+//! ones the driver would use: for PostgreSQL, a URL that leaves them out takes
+//! `PGHOSTADDR`, `PGHOST` and `PGPORT` from the environment, and with none of
+//! them the default socket if a server listens there, else `localhost`. Like Forge-Go's `forge
 //! doctor` it exits with status 1 when anything is wrong.
 
 use std::ffi::OsString;
@@ -14,7 +17,8 @@ use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
-use forge_config::{AppConfig, DatabaseScheme, database_url};
+use forge_config::database_url::{self, DEFAULT_POSTGRES_SOCKET_DIRECTORIES, Server};
+use forge_config::{AppConfig, DatabaseScheme};
 use serde_json::{Value, json};
 
 use crate::CliError;
@@ -120,7 +124,15 @@ pub(crate) fn run(
         .into_iter()
         .filter(|(key, _)| key != ALLOW_DESTRUCTIVE)
         .collect::<Vec<_>>();
-    match AppConfig::from_vars(variables) {
+    // Only the host and port settings of the driver are read from it.
+    let process_environment = |name: &str| {
+        variables
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.to_string_lossy().into_owned())
+    };
+    let process_environment: &dyn Fn(&str) -> Option<String> = &process_environment;
+    match AppConfig::from_vars(variables.clone()) {
         Err(error) => {
             diagnostics.push(Diagnostic::error(
                 "configuration.invalid",
@@ -156,7 +168,7 @@ pub(crate) fn run(
                             "database reachability: not checked (the URL is malformed)".to_owned(),
                         );
                     } else {
-                        lines.push(match reachability(url, directory, probes) {
+                        lines.push(match reachability(url, directory, probes, process_environment) {
                         Ok(text) => format!("database reachability: {text}"),
                         Err(reason) => {
                             diagnostics.push(Diagnostic::error(
@@ -239,6 +251,7 @@ fn reachability(
     url: &forge_config::SecretString,
     directory: &Path,
     probes: &dyn Probes,
+    environment: &dyn Fn(&str) -> Option<String>,
 ) -> Result<String, String> {
     if DatabaseScheme::of_url(url.expose()) == Some(DatabaseScheme::Sqlite) {
         // The file is created on first use; only say whether it exists yet.
@@ -254,11 +267,27 @@ fn reachability(
                 .to_owned()
         });
     }
-    match database_url::endpoint(url) {
-        None => Ok("not checked (a Unix socket)".to_owned()),
-        Some((host, port)) => probes
-            .connect(&host, port)
-            .map(|()| "the server accepts connections".to_owned()),
+    let accepts = |host: &str, port: u16| {
+        probes
+            .connect(host, port)
+            .map(|()| "the server accepts connections".to_owned())
+    };
+    match database_url::server(url, environment) {
+        Some(Server::Tcp { host, port }) => accepts(&host, port),
+        // The driver prefers a socket in a well-known directory when a
+        // server listens there, and falls back to `localhost`.
+        Some(Server::Default { port }) => {
+            let socket = format!(".s.PGSQL.{port}");
+            if DEFAULT_POSTGRES_SOCKET_DIRECTORIES
+                .iter()
+                .any(|directory| probes.file_exists(&Path::new(directory).join(&socket)))
+            {
+                Ok("not checked (a Unix socket)".to_owned())
+            } else {
+                accepts("localhost", port)
+            }
+        }
+        Some(Server::Socket { .. }) | None => Ok("not checked (a Unix socket)".to_owned()),
     }
 }
 
@@ -480,6 +509,91 @@ mod tests {
             &probes,
         );
         result.expect("healthy");
+        assert!(text.contains("not checked (a Unix socket)"), "{text}");
+        assert!(probes.connected.borrow().is_empty());
+    }
+
+    #[test]
+    fn the_probe_honors_the_pg_environment_like_the_real_connection() {
+        let url = "postgres:///shop";
+        // PGHOST and PGPORT fill what the URL leaves out.
+        let probes = Fake::healthy();
+        let (result, text) = report(
+            false,
+            &[
+                ("FORGE_DATABASE_URL", url),
+                ("PGHOST", "db.internal"),
+                ("PGPORT", "6543"),
+            ],
+            &probes,
+        );
+        result.expect("healthy");
+        assert!(text.contains("the server accepts connections"), "{text}");
+        assert_eq!(
+            *probes.connected.borrow(),
+            [("db.internal".to_owned(), 6543)]
+        );
+        // PGHOSTADDR wins over PGHOST, as in the driver; the URL wins over both.
+        let probes = Fake::healthy();
+        report(
+            false,
+            &[
+                ("FORGE_DATABASE_URL", url),
+                ("PGHOST", "db.internal"),
+                ("PGHOSTADDR", "10.0.0.5"),
+            ],
+            &probes,
+        )
+        .0
+        .expect("healthy");
+        assert_eq!(*probes.connected.borrow(), [("10.0.0.5".to_owned(), 5432)]);
+        let probes = Fake::healthy();
+        report(
+            false,
+            &[
+                ("FORGE_DATABASE_URL", "postgres://u:p@own.host:7000/shop"),
+                ("PGHOST", "db.internal"),
+                ("PGPORT", "6543"),
+            ],
+            &probes,
+        )
+        .0
+        .expect("healthy");
+        assert_eq!(*probes.connected.borrow(), [("own.host".to_owned(), 7000)]);
+        // A socket directory in PGHOST is not a TCP endpoint.
+        let probes = Fake::healthy();
+        let (_, text) = report(
+            false,
+            &[
+                ("FORGE_DATABASE_URL", url),
+                ("PGHOST", "/var/run/postgresql"),
+            ],
+            &probes,
+        );
+        assert!(text.contains("not checked (a Unix socket)"), "{text}");
+        assert!(probes.connected.borrow().is_empty());
+        // The probe never prints what it read.
+        let (_, text) = report(
+            false,
+            &[
+                ("FORGE_DATABASE_URL", url),
+                ("PGHOST", "db.internal"),
+                ("PGPASSWORD", "hunter2"),
+            ],
+            &Fake::healthy(),
+        );
+        assert!(!text.contains("hunter2"), "{text}");
+    }
+
+    #[test]
+    fn without_a_host_anywhere_the_default_socket_or_localhost_is_probed() {
+        let url = ("FORGE_DATABASE_URL", "postgres:///shop");
+        let probes = Fake::healthy();
+        report(false, &[url], &probes).0.expect("healthy");
+        assert_eq!(*probes.connected.borrow(), [("localhost".to_owned(), 5432)]);
+        let mut probes = Fake::healthy();
+        probes.file = true; // the default socket file exists
+        let (_, text) = report(false, &[url], &probes);
         assert!(text.contains("not checked (a Unix socket)"), "{text}");
         assert!(probes.connected.borrow().is_empty());
     }

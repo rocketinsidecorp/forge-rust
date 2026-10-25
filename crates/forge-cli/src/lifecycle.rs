@@ -3,8 +3,12 @@
 //!
 //! Every command delegates to the generated application's own subcommands
 //! (`<app> migrate`, `<app> db create`, ...), so development and production
-//! share one implementation and this crate holds no database code and reads
-//! no database credential: the application inherits the environment.
+//! share one implementation and this crate holds no database code: the
+//! application inherits the environment and reads its own credentials. Two
+//! things run the database's own client instead (see [`crate::dbclient`]):
+//! `forge db console`, and the restoring of `docker/postgres/init.sql`'s
+//! privileges after `forge db reset` has dropped and created the database
+//! (the grants inside a database go with it; the roles do not).
 //!
 //! Destructive commands (`db drop`, `db reset`, `db rollback`) are refused
 //! when `FORGE_ENV` is not `development` or `test`, unless `--force-production`
@@ -14,13 +18,16 @@
 //! refuses a drop of a server that is not on this machine by itself, since
 //! only it sees the URL.
 
+use std::fs;
 use std::io::{BufRead, Write};
+use std::path::Path;
 use std::str::FromStr as _;
 
-use forge_config::Environment;
+use forge_config::{DatabaseScheme, Environment};
 
 use crate::CliError;
 use crate::application::Application;
+use crate::dbclient::{self, Client, INIT_SCRIPT, Input, Invocation, Sources};
 
 /// The environment variable that lets `--yes` skip the prompt.
 pub(crate) const ALLOW_DESTRUCTIVE: &str = "FORGE_ALLOW_DESTRUCTIVE";
@@ -49,12 +56,19 @@ pub(crate) enum Db {
         steps: Option<u32>,
         destructive: Destructive,
     },
+    /// The database's own client; the arguments go after the connection
+    /// options.
+    Console(Vec<String>),
 }
 
 /// Everything a lifecycle command touches, injectable so the destructive
 /// paths can be tested without a database or a terminal.
 pub(crate) struct Lifecycle<'a, A: Application> {
     pub(crate) app: A,
+    /// The database's own client tools (`psql`, `mysql`, `sqlite3`).
+    pub(crate) client: &'a mut dyn Client,
+    /// The application directory.
+    pub(crate) root: &'a Path,
     /// The package name, shown in messages and typed to confirm.
     pub(crate) name: &'a str,
     /// The process environment: the one place `FORGE_ENV` and
@@ -117,8 +131,16 @@ impl<A: Application> Lifecycle<'_, A> {
             }
             Db::Reset(flags) => {
                 self.confirm("drop", *flags)?;
+                // Found out before anything is dropped: a reset that cannot
+                // restore the privileges must not start.
+                let restore = self.privilege_restore()?;
                 self.drop_database(*flags)?;
-                self.setup_database()
+                self.call(&["db", "create"])?;
+                if let Some((invocation, sql)) = restore {
+                    self.restore_privileges(&invocation, &sql)?;
+                }
+                self.call(&["migrate"])?;
+                self.call(&["seed"])
             }
             Db::Setup => self.setup_database(),
             Db::Prepare => self.prepare(),
@@ -131,6 +153,87 @@ impl<A: Application> Lifecycle<'_, A> {
                 self.confirm("roll back", *destructive)?;
                 self.call_with("rollback", &[], &steps_flag(*steps))
             }
+            Db::Console(arguments) => self.console(arguments),
+        }
+    }
+
+    /// `forge db console [-- CLIENT-ARGUMENTS]`: the database's own client on
+    /// the terminal. It does not build or run the application.
+    fn console(&mut self, arguments: &[String]) -> Result<(), CliError> {
+        let invocation = self.invocation(|sources| dbclient::console(sources, arguments))?;
+        self.run_client(&invocation, Input::Terminal)
+    }
+
+    /// What `forge db reset` restores after it creates the database again: the
+    /// part of `docker/postgres/init.sql` that follows its `\connect` line (the
+    /// revokes, grants and default privileges inside the database), as the
+    /// migration role. `None` when the application has no such script or does
+    /// not use PostgreSQL. Fails, before anything is dropped, when the script
+    /// cannot be applied: the client is missing, the script is for another
+    /// database or uses psql commands.
+    fn privilege_restore(&mut self) -> Result<Option<(Invocation, String)>, CliError> {
+        let path = self.root.join(INIT_SCRIPT);
+        let init = match fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(CliError::Usage(format!(
+                    "could not read {}: {error}",
+                    path.display()
+                )));
+            }
+        };
+        let url = (self.environment)("FORGE_MIGRATION_DATABASE_URL")
+            .filter(|url| !url.is_empty())
+            .or_else(|| (self.environment)("FORGE_DATABASE_URL"));
+        if url.is_none_or(|url| DatabaseScheme::of_url(&url) != Some(DatabaseScheme::Postgres)) {
+            return Ok(None);
+        }
+        let (invocation, database) = self.invocation(dbclient::psql_script).map_err(|error| {
+            CliError::Usage(format!(
+                "{error}; `forge db reset` restores the privileges of {INIT_SCRIPT} with psql \
+                 (or recreate the Compose volume instead)"
+            ))
+        })?;
+        let sql = dbclient::bootstrap_sql(&init, &database)
+            .map_err(|reason| CliError::Usage(format!("cannot restore {INIT_SCRIPT}: {reason}")))?;
+        Ok(Some((invocation, sql)))
+    }
+
+    fn restore_privileges(&mut self, invocation: &Invocation, sql: &str) -> Result<(), CliError> {
+        self.run_client(invocation, Input::Script(sql))?;
+        writeln!(
+            self.messages,
+            "restored the privileges of {INIT_SCRIPT} in the new database"
+        )
+        .map_err(CliError::Output)
+    }
+
+    fn invocation<T>(
+        &self,
+        build: impl FnOnce(&Sources<'_>) -> Result<T, CliError>,
+    ) -> Result<T, CliError> {
+        let environment = |name: &str| (self.environment)(name);
+        let locate = |tool: &str| self.client.locate(tool);
+        let mariadb = |path: &Path| self.client.is_mariadb(path);
+        build(&Sources {
+            environment: &environment,
+            locate: &locate,
+            mariadb: &mariadb,
+            root: self.root,
+        })
+    }
+
+    fn run_client(&mut self, invocation: &Invocation, input: Input<'_>) -> Result<(), CliError> {
+        match self.client.run(invocation, input)? {
+            Some(0) => Ok(()),
+            code => Err(CliError::ClientFailed {
+                program: invocation
+                    .program
+                    .file_name()
+                    .map_or_else(String::new, |name| name.to_string_lossy().into_owned()),
+                code,
+            }),
         }
     }
 
@@ -268,22 +371,101 @@ fn failed(arguments: &[String], code: Option<i32>) -> CliError {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
     use std::collections::HashMap;
     use std::io::Cursor;
+    use std::path::PathBuf;
+    use std::rc::Rc;
 
     use super::*;
+
+    /// Everything the fake application and the fake client did, in order.
+    type Order = Rc<RefCell<Vec<String>>>;
 
     /// A fake application: records every call, answers from a script.
     #[derive(Default)]
     struct Fake {
         calls: Vec<Vec<String>>,
+        order: Order,
         /// Exit code by the first two arguments joined; default 0.
         codes: HashMap<String, Option<i32>>,
+    }
+
+    /// What the fake client was asked to run.
+    #[derive(Debug)]
+    struct ClientRun {
+        program: String,
+        args: Vec<String>,
+        variables: HashMap<String, String>,
+        script: Option<String>,
+        terminal: bool,
+    }
+
+    /// A fake client: records its runs, finds the tools it is given.
+    struct FakeClient {
+        order: Order,
+        tools: Vec<&'static str>,
+        runs: Vec<ClientRun>,
+        code: Option<i32>,
+    }
+
+    impl Client for FakeClient {
+        fn locate(&self, tool: &str) -> Option<PathBuf> {
+            self.tools
+                .contains(&tool)
+                .then(|| PathBuf::from(format!("/usr/bin/{tool}")))
+        }
+
+        fn is_mariadb(&self, _: &Path) -> bool {
+            false
+        }
+
+        fn run(
+            &mut self,
+            invocation: &Invocation,
+            input: Input<'_>,
+        ) -> Result<Option<i32>, CliError> {
+            let program = invocation
+                .program
+                .file_name()
+                .expect("program")
+                .to_string_lossy()
+                .into_owned();
+            self.order.borrow_mut().push(format!("client {program}"));
+            let variables = invocation
+                .environment(Vec::new())
+                .into_iter()
+                .map(|(name, value)| {
+                    (
+                        name.to_string_lossy().into_owned(),
+                        value.to_string_lossy().into_owned(),
+                    )
+                })
+                .collect();
+            self.runs.push(ClientRun {
+                program,
+                args: invocation
+                    .args
+                    .iter()
+                    .map(|argument| argument.to_string_lossy().into_owned())
+                    .collect(),
+                variables,
+                script: match input {
+                    Input::Script(script) => Some(script.to_owned()),
+                    Input::Terminal => None,
+                },
+                terminal: input == Input::Terminal,
+            });
+            Ok(self.code)
+        }
     }
 
     impl Application for &mut Fake {
         fn run(&mut self, arguments: &[String]) -> Result<Option<i32>, CliError> {
             self.calls.push(arguments.to_vec());
+            self.order
+                .borrow_mut()
+                .push(format!("app {}", arguments.join(" ")));
             let key = arguments
                 .iter()
                 .take(2)
@@ -296,6 +478,8 @@ mod tests {
 
     struct Harness {
         fake: Fake,
+        client: FakeClient,
+        root: tempfile::TempDir,
         environment: HashMap<&'static str, &'static str>,
         input: &'static str,
         interactive: bool,
@@ -304,13 +488,37 @@ mod tests {
 
     impl Harness {
         fn new() -> Self {
+            let order = Order::default();
             Self {
-                fake: Fake::default(),
+                fake: Fake {
+                    order: Rc::clone(&order),
+                    ..Fake::default()
+                },
+                client: FakeClient {
+                    order,
+                    tools: vec!["psql", "mysql", "sqlite3"],
+                    runs: Vec::new(),
+                    code: Some(0),
+                },
+                root: tempfile::tempdir().expect("tempdir"),
                 environment: HashMap::new(),
                 input: "",
                 interactive: false,
                 prompt: Vec::new(),
             }
+        }
+
+        /// Everything run so far, application and client, in order.
+        fn order(&self) -> Vec<String> {
+            self.fake.order.borrow().clone()
+        }
+
+        /// Writes `docker/postgres/init.sql` into the application.
+        fn init_script(self, text: &str) -> Self {
+            let path = self.root.path().join(INIT_SCRIPT);
+            fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+            fs::write(path, text).expect("write");
+            self
         }
 
         fn env(mut self, key: &'static str, value: &'static str) -> Self {
@@ -330,6 +538,8 @@ mod tests {
             let mut input = Cursor::new(self.input.as_bytes().to_vec());
             let mut lifecycle = Lifecycle {
                 app: &mut self.fake,
+                client: &mut self.client,
+                root: self.root.path(),
                 name: "shop",
                 environment: &lookup,
                 input: &mut input,
@@ -483,9 +693,9 @@ mod tests {
                     "{value:?} {message}"
                 );
                 assert!(
-                    harness.fake.calls.is_empty(),
+                    harness.order().is_empty(),
                     "{value:?}: {:?}",
-                    harness.calls()
+                    harness.order()
                 );
             }
         }
@@ -624,5 +834,207 @@ mod tests {
             ["rollback --steps 2"],
             "the flags are consumed here"
         );
+    }
+
+    const URLS: [(&str, &str); 2] = [
+        (
+            "FORGE_DATABASE_URL",
+            "postgres://app_runtime:rt-secret@127.0.0.1:5432/shop",
+        ),
+        (
+            "FORGE_MIGRATION_DATABASE_URL",
+            "postgres://app_migrator:mg-secret@127.0.0.1:5432/shop",
+        ),
+    ];
+
+    const INIT: &str = "CREATE ROLE app_migrator LOGIN;\nCREATE DATABASE shop OWNER app_migrator;\n\n\
+        \\connect shop\n\nGRANT CONNECT ON DATABASE shop TO app_runtime;\n";
+
+    fn postgres_harness() -> Harness {
+        let mut harness = Harness::new().init_script(INIT);
+        for (name, value) in URLS {
+            harness = harness.env(name, value);
+        }
+        harness
+    }
+
+    #[test]
+    fn reset_restores_the_init_script_privileges_between_create_and_migrate() {
+        let mut harness = postgres_harness();
+        harness
+            .run(|l| l.db(&Db::Reset(Destructive::default())))
+            .expect("reset");
+        assert_eq!(
+            harness.order(),
+            [
+                "app db drop",
+                "app db create",
+                "client psql",
+                "app migrate",
+                "app seed"
+            ],
+            "the grants go in after the database exists and before the tables"
+        );
+        let run = &harness.client.runs[0];
+        assert_eq!(
+            run.script.as_deref(),
+            Some("\nGRANT CONNECT ON DATABASE shop TO app_runtime;\n"),
+            "only what follows \\connect: the roles survive a drop"
+        );
+        assert_eq!(
+            run.variables["PGUSER"], "app_migrator",
+            "as the migration role"
+        );
+        assert_eq!(run.variables["PGDATABASE"], "shop");
+        assert_eq!(run.variables["PGPASSWORD"], "mg-secret");
+        let shown = format!(
+            "{:?} {}",
+            run.args,
+            String::from_utf8_lossy(&harness.prompt)
+        );
+        assert!(
+            !shown.contains("secret"),
+            "no password in arguments or messages: {shown}"
+        );
+        assert!(
+            String::from_utf8_lossy(&harness.prompt)
+                .contains("restored the privileges of docker/postgres/init.sql"),
+        );
+    }
+
+    #[test]
+    fn reset_without_an_init_script_or_a_postgres_url_starts_no_client() {
+        // No script (a --skip-docker application, or another engine).
+        let mut harness = Harness::new();
+        for (name, value) in URLS {
+            harness = harness.env(name, value);
+        }
+        harness
+            .run(|l| l.db(&Db::Reset(Destructive::default())))
+            .expect("reset");
+        assert!(harness.client.runs.is_empty());
+        // A script, but a MySQL database.
+        let mut harness = Harness::new()
+            .init_script(INIT)
+            .env("FORGE_DATABASE_URL", "mysql://u:p@127.0.0.1/shop");
+        harness
+            .run(|l| l.db(&Db::Reset(Destructive::default())))
+            .expect("reset");
+        assert!(harness.client.runs.is_empty());
+        assert_eq!(harness.calls(), ["db drop", "db create", "migrate", "seed"]);
+    }
+
+    #[test]
+    fn reset_refuses_before_dropping_anything_when_the_privileges_cannot_be_restored() {
+        let refusals: Vec<(Harness, &str)> = vec![
+            (
+                {
+                    let mut harness = postgres_harness();
+                    harness.client.tools.clear();
+                    harness
+                },
+                "psql was not found on PATH",
+            ),
+            (
+                {
+                    let mut harness = postgres_harness()
+                        .init_script("\\connect other\nGRANT CONNECT ON DATABASE other TO a;\n");
+                    harness.client.tools = vec!["psql"];
+                    harness
+                },
+                "is for the database \"other\"",
+            ),
+            (
+                postgres_harness().init_script("\\connect shop\n\\! touch /tmp/pwned\n"),
+                "meta-command",
+            ),
+            (
+                postgres_harness().init_script("CREATE ROLE a;\n"),
+                "no \\connect line",
+            ),
+            (
+                Harness::new()
+                    .init_script(INIT)
+                    .env("FORGE_DATABASE_URL", URLS[0].1),
+                "FORGE_MIGRATION_DATABASE_URL is required",
+            ),
+        ];
+        for (mut harness, expected) in refusals {
+            let error = harness
+                .run(|l| l.db(&Db::Reset(Destructive::default())))
+                .expect_err(expected)
+                .to_string();
+            assert!(error.contains(expected), "{expected}: {error}");
+            assert!(!error.contains("secret"), "{error}");
+            assert!(
+                harness.order().is_empty(),
+                "{expected}: nothing was dropped: {:?}",
+                harness.order()
+            );
+        }
+    }
+
+    #[test]
+    fn a_failed_restore_stops_reset_before_the_tables_are_made() {
+        let mut harness = postgres_harness();
+        harness.client.code = Some(3);
+        let error = harness
+            .run(|l| l.db(&Db::Reset(Destructive::default())))
+            .expect_err("psql failed");
+        assert_eq!(error.to_string(), "psql exited with status 3");
+        assert_eq!(
+            harness.order(),
+            ["app db drop", "app db create", "client psql"]
+        );
+    }
+
+    #[test]
+    fn setup_and_prepare_do_not_start_a_client() {
+        let mut harness = postgres_harness();
+        harness.run(|l| l.db(&Db::Setup)).expect("setup");
+        harness.run(|l| l.db(&Db::Prepare)).expect("prepare");
+        assert!(harness.client.runs.is_empty());
+    }
+
+    #[test]
+    fn console_runs_the_client_on_the_terminal_without_touching_the_application() {
+        let mut harness = postgres_harness();
+        harness
+            .run(|l| l.db(&Db::Console(vec!["-c".to_owned(), "select 1".to_owned()])))
+            .expect("console");
+        assert_eq!(
+            harness.order(),
+            ["client psql"],
+            "no build, no application command"
+        );
+        let run = &harness.client.runs[0];
+        assert!(run.terminal && run.script.is_none());
+        assert_eq!(run.program, "psql");
+        assert_eq!(run.args, ["-X", "-c", "select 1"]);
+        assert_eq!(run.variables["PGPASSWORD"], "mg-secret");
+        assert!(!run.args.iter().any(|argument| argument.contains("secret")));
+    }
+
+    #[test]
+    fn console_reports_the_clients_failure_and_a_missing_client() {
+        let mut harness = postgres_harness();
+        harness.client.code = Some(2);
+        let error = harness
+            .run(|l| l.db(&Db::Console(Vec::new())))
+            .expect_err("failed");
+        assert_eq!(error.to_string(), "psql exited with status 2");
+
+        let mut harness = postgres_harness();
+        harness.client.tools.clear();
+        let error = harness
+            .run(|l| l.db(&Db::Console(Vec::new())))
+            .expect_err("missing");
+        assert!(
+            error
+                .to_string()
+                .contains("psql was not found on PATH: install the postgres client tools"),
+            "{error}"
+        );
+        assert!(harness.client.runs.is_empty());
     }
 }
