@@ -195,7 +195,21 @@ fn location(raw: &str) -> Option<Location> {
     for (key, value) in url.query_pairs() {
         match (scheme, &*key) {
             (DatabaseScheme::Postgres, "host") if value.starts_with('/') => found.socket = true,
-            (DatabaseScheme::Postgres, "host") => found.host = Some(value.into_owned()),
+            // A host that carries a URL delimiter, a backslash, whitespace
+            // or a control character is no host name (found by the
+            // config_database_url fuzz target; seed `host-query-delimiter`):
+            // the URL is not well formed.
+            (DatabaseScheme::Postgres, "host") => {
+                let plain = !value.chars().any(|character| {
+                    character.is_whitespace()
+                        || character.is_control()
+                        || "@/?#\\".contains(character)
+                });
+                if !plain {
+                    return None;
+                }
+                found.host = Some(value.into_owned());
+            }
             (DatabaseScheme::Postgres, "hostaddr") => {
                 value.parse::<std::net::IpAddr>().ok()?;
                 found.host = Some(value.into_owned());
@@ -297,6 +311,16 @@ mod tests {
         assert_eq!(found.port, Some(6543));
         let found = located("postgres:///shop?host=/var/run/postgresql").expect("parses");
         assert!(found.socket);
+        for delimited in [
+            "postgres://u:p@tqtidata/ipzp.d5?host=rwcerify-ll:0/dE",
+            "postgres://u:p@h/shop?host=a%40b",
+            "postgres://u:p@h/shop?host=a%5Cb",
+            "postgres://u:p@h/shop?host=a%20b",
+            "postgres://u:p@h/shop?host=a%0Ab",
+        ] {
+            assert!(located(delimited).is_none(), "{delimited}");
+            assert_eq!(endpoint(&secret(delimited)), None, "{delimited}");
+        }
         let found = located("postgres://%2Fvar%2Frun%2Fpostgresql/shop").expect("parses");
         assert!(found.socket);
         let found = located("mysql://u:p@h/shop?socket=/tmp/mysql.sock").expect("parses");
