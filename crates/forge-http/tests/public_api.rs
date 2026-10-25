@@ -413,5 +413,8 @@ async fn shutdown_aborts_a_handler_that_outlives_the_grace_period() {
         .expect("stops in time");
     outcome.expect("task").expect("serves cleanly");
     let mut rest = Vec::new();
-    let _ = tokio::time::timeout(Duration::from_secs(10), client.read_to_end(&mut rest)).await;
+    tokio::time::timeout(Duration::from_secs(10), client.read_to_end(&mut rest))
+        .await
+        .expect("the client sees the connection end in time")
+        .expect("the aborted connection reads to its end");
 }

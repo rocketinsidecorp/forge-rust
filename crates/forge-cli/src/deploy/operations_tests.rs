@@ -2,6 +2,7 @@
 //! failure paths of every step (warnings that must not fail a deploy, errors
 //! that must), locks, hooks, local builds, details, logs and `forge app`.
 
+use std::io::Write as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -1374,6 +1375,15 @@ fn the_system_factory_builds_the_ssh_and_local_runners() {
         .output(&Cancel::never(), &PathBuf::from("."), &["true".to_owned()])
         .expect("true runs");
     assert_eq!(output, "");
-    // The process streams are the process's own.
-    let _ = Io::process();
+    // The process streams are two distinct, writable handles (an empty
+    // write and a flush print nothing, whatever the harness captures).
+    let io = Io::process();
+    assert!(!Arc::ptr_eq(&io.stdout, &io.stderr));
+    for stream in [&io.stdout, &io.stderr] {
+        let mut stream = stream.lock().expect("stream");
+        stream
+            .write_all(b"")
+            .expect("the process stream accepts a write");
+        stream.flush().expect("the process stream flushes");
+    }
 }
