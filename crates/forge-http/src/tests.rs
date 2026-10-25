@@ -349,7 +349,58 @@ async fn allow_header_lists_registered_methods_sorted() {
     let response = router.dispatch(request(Method::POST, "/customers/1")).await;
 
     assert_eq!(response.status, StatusCode::METHOD_NOT_ALLOWED);
-    assert_eq!(response.headers[header::ALLOW], "DELETE, GET, PUT");
+    assert_eq!(response.headers[header::ALLOW], "DELETE, GET, HEAD, PUT");
+}
+
+#[tokio::test]
+async fn head_is_served_by_the_get_route_with_the_head_method() {
+    let mut router = Router::new();
+    router
+        .route(Method::GET, "/posts/{id}", |request: Request| async move {
+            Response::text(StatusCode::OK, format!("{} post", request.method()))
+        })
+        .expect("GET route must register");
+
+    let response = router.dispatch(request(Method::HEAD, "/posts/7")).await;
+
+    assert_eq!(response.status, StatusCode::OK);
+    // In process the body stays; the server drops it on the wire.
+    assert_eq!(response.body(), "HEAD post");
+}
+
+#[tokio::test]
+async fn an_explicit_head_route_wins_over_the_get_route() {
+    let mut router = Router::new();
+    router
+        .route(Method::GET, "/report", |_| async {
+            Response::new(StatusCode::OK, "get")
+        })
+        .expect("GET route must register")
+        .route(Method::HEAD, "/report", |_| async {
+            Response::empty(StatusCode::NO_CONTENT)
+        })
+        .expect("HEAD route must register");
+
+    let response = router.dispatch(request(Method::HEAD, "/report")).await;
+
+    assert_eq!(response.status, StatusCode::NO_CONTENT);
+    let post = router.dispatch(request(Method::POST, "/report")).await;
+    assert_eq!(post.headers[header::ALLOW], "GET, HEAD");
+}
+
+#[tokio::test]
+async fn head_without_a_get_route_is_not_allowed() {
+    let mut router = Router::new();
+    router
+        .route(Method::POST, "/posts", |_| async {
+            Response::empty(StatusCode::CREATED)
+        })
+        .expect("POST route must register");
+
+    let response = router.dispatch(request(Method::HEAD, "/posts")).await;
+
+    assert_eq!(response.status, StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(response.headers[header::ALLOW], "POST");
 }
 
 #[tokio::test]
@@ -366,7 +417,7 @@ async fn dynamic_route_method_mismatch_reports_allowed_methods() {
         .await;
 
     assert_eq!(response.status, StatusCode::METHOD_NOT_ALLOWED);
-    assert_eq!(response.headers[header::ALLOW], "GET");
+    assert_eq!(response.headers[header::ALLOW], "GET, HEAD");
 }
 
 #[test]
@@ -1074,5 +1125,88 @@ async fn a_client_that_stops_reading_a_stream_is_disconnected() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     drop(client);
+    server.stop().await;
+}
+
+/// The response head (status line and headers) and everything after it.
+fn split_head(response: &str) -> (&str, &str) {
+    response
+        .split_once("\r\n\r\n")
+        .unwrap_or_else(|| panic!("no header block in {response:?}"))
+}
+
+#[tokio::test]
+async fn head_answers_with_the_get_headers_and_no_body() {
+    let mut router = test_router();
+    router
+        .route(Method::GET, "/ticks", |_| async {
+            counting(3, Duration::from_millis(1))
+        })
+        .expect("stream route must register");
+    let server = TestServer::start(test_config(Duration::from_secs(10)), router).await;
+
+    let response = exchange(
+        server.addr,
+        "HEAD /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    let (head, body) = split_head(&response);
+    let lower = head.to_ascii_lowercase();
+    assert!(head.starts_with("HTTP/1.1 200 "), "{response}");
+    // The length of the GET body ({"status":"ok"}), which is not sent.
+    assert!(lower.contains("content-length: 15"), "{response}");
+    assert!(lower.contains("content-type: application/json"), "{response}");
+    assert!(lower.contains("x-request-id: "), "{response}");
+    assert_eq!(body, "", "{response}");
+
+    // A streamed GET: headers only, no length, and the stream is not sent.
+    let response = exchange(
+        server.addr,
+        "HEAD /ticks HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    let (head, body) = split_head(&response);
+    assert!(head.starts_with("HTTP/1.1 200 "), "{response}");
+    assert!(!head.to_ascii_lowercase().contains("content-length"), "{response}");
+    assert_eq!(body, "", "{response}");
+
+    // A route without GET still refuses HEAD and lists what it serves.
+    let response = exchange(
+        server.addr,
+        "HEAD /echo HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    let (head, body) = split_head(&response);
+    assert!(head.starts_with("HTTP/1.1 405 "), "{response}");
+    assert!(head.to_ascii_lowercase().contains("allow: post"), "{response}");
+    assert_eq!(body, "", "{response}");
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn a_keep_alive_connection_continues_cleanly_after_head() {
+    let server = TestServer::start(test_config(Duration::from_secs(10)), test_router()).await;
+    let addr = server.addr;
+
+    tokio::task::spawn_blocking(move || {
+        let mut stream = connect(addr);
+        stream
+            .write_all(
+                b"HEAD /health/live HTTP/1.1\r\nHost: localhost\r\n\r\n\
+                  GET /health/live HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            )
+            .expect("requests must be written");
+        let mut received = Vec::new();
+        stream
+            .read_to_end(&mut received)
+            .expect("server must close after the second response");
+        let text = String::from_utf8_lossy(&received);
+        // Two responses, and only the second carries the body.
+        assert_eq!(text.matches("HTTP/1.1 200 ").count(), 2, "{text}");
+        assert_eq!(text.matches(r#"{"status":"live"}"#).count(), 1, "{text}");
+        assert!(text.ends_with(r#"{"status":"live"}"#), "{text}");
+    })
+    .await
+    .expect("client task must not panic");
     server.stop().await;
 }

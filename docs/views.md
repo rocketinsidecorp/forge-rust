@@ -612,7 +612,8 @@ binary on the next `cargo run`.
 `AssetSet::register` adds one exact `GET` route per manifest entry. There is
 no wildcard route, so `..`, percent-encoded separators (`%2e`, `%2f`),
 undigested names, wrong digests, directory URLs and paths outside the prefix
-match nothing and answer `404`. `HEAD` answers `405`. Responses carry:
+match nothing and answer `404`. `HEAD` gets the `GET` headers without the
+body, like every route. Responses carry:
 
 | Header | Value |
 | --- | --- |

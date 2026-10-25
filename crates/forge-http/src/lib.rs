@@ -709,9 +709,12 @@ impl Router {
     /// Layers added with [`Router::layer`] run first, in registration order;
     /// then the request is routed. The raw (still percent-encoded) path is matched segment by segment;
     /// static segments win over `{name}` captures. Unmatched paths answer
-    /// `404`. A matched path without a handler for the request method
-    /// answers `405` with an `Allow` header listing the registered methods in
-    /// sorted order. A captured segment containing an encoded slash (`%2F`)
+    /// `404`. `HEAD` is served by the path's `GET` route unless a `HEAD`
+    /// route is registered; the handler sees the `HEAD` method, and the
+    /// [`Server`] sends the headers without the body (here the body is
+    /// left in place). A matched path without a handler for the request
+    /// method answers `405` with an `Allow` header listing the served methods
+    /// in sorted order (`HEAD` included wherever `GET` is). A captured segment containing an encoded slash (`%2F`)
     /// answers `400`, because it would let a client smuggle a path separator
     /// past routing; other malformed escapes are reported by
     /// [`Request::path_param_as`] when the handler reads the parameter.
@@ -731,7 +734,7 @@ impl Router {
         let Some(node) = self.root.find(&path, &mut captures) else {
             return Response::new(StatusCode::NOT_FOUND, "not found");
         };
-        let Some(endpoint) = node.endpoint(&request.method) else {
+        let Some(endpoint) = node.serving(&request.method) else {
             let allow = node.allow();
             let mut response = Response::new(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
             if let Ok(value) = HeaderValue::from_str(&allow) {
@@ -1057,6 +1060,7 @@ async fn handle_request(
         .as_ref()
         .map(forge_telemetry::http::RequestTelemetry::context);
     let span = request_span(request_id, &method, &path, remote_addr, trace.as_ref());
+    let head = method == Method::HEAD;
     let response = async move {
         let matched = MatchedRoute::default();
         let (parts, body) = request.into_parts();
@@ -1103,6 +1107,11 @@ async fn handle_request(
         if let Some(telemetry) = telemetry {
             telemetry.finish(matched.0.get().map(AsRef::as_ref), response.status.as_u16());
         }
+        let response = if head {
+            without_body(response)
+        } else {
+            response
+        };
         to_hyper_response(response, request_id)
     }
     .instrument(span)
@@ -1168,6 +1177,27 @@ async fn collect_body(body: Incoming, max_body_bytes: usize) -> Result<Bytes, Bo
         Err(error) if error.is::<LengthLimitError>() => Err(BodyRejection::TooLarge),
         Err(_) => Err(BodyRejection::Unreadable),
     }
+}
+
+/// The answer to a `HEAD` request: the headers of the response the route
+/// produced, without its body (RFC 9110 §9.3.2). A buffered body becomes its
+/// `Content-Length` (unless the handler set one, or the status has no
+/// content); a streamed body is dropped without being polled and its length,
+/// unknown, is left out.
+fn without_body(mut response: Response) -> Response {
+    let body = std::mem::replace(&mut response.body, ResponseBody::Full(Bytes::new()));
+    let may_have_length = !(response.status.is_informational()
+        || response.status == StatusCode::NO_CONTENT
+        || response.status == StatusCode::NOT_MODIFIED);
+    if let ResponseBody::Full(bytes) = body
+        && may_have_length
+        && !response.headers.contains_key(header::CONTENT_LENGTH)
+    {
+        response
+            .headers
+            .insert(header::CONTENT_LENGTH, HeaderValue::from(bytes.len()));
+    }
+    response
 }
 
 fn to_hyper_response(response: Response, request_id: Uuid) -> hyper::Response<OutgoingBody> {
