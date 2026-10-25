@@ -534,6 +534,11 @@ fn yaml_refuses_what_it_does_not_read_with_a_line_number() {
         ("key: ? x\n", "complex keys"),
         ("key: @x\n", "cannot start any token"),
         ("\tkey: 1\n", "tab character"),
+        (
+            "    a: 1\n  b: 2\n",
+            "did not find expected key (bad indentation)",
+        ),
+        ("key: [\n", "unclosed flow collection"),
     ] {
         let error = match yaml::parse(text) {
             Ok(_) => "accepted".to_owned(),
@@ -577,6 +582,15 @@ fn yaml_reads_empty_items_flow_pairs_and_empty_flow_values() {
     };
     assert_eq!(flow[0].1.value, Value::Null);
     assert_eq!(flow.len(), 2);
+    // A document can be a single scalar.
+    let node = yaml::parse("hello\n").expect("parse").expect("a document");
+    assert_eq!(
+        node.value,
+        Value::Scalar {
+            text: "hello".to_owned(),
+            plain: true
+        }
+    );
     // A comment-only document is nothing.
     assert_eq!(yaml::parse("# nothing\n\n").expect("parse"), None);
 }

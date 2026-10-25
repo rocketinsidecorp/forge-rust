@@ -433,3 +433,36 @@ fn version_prints_the_package_version() {
     let text = succeeds(directory.path(), &["version"]);
     assert_eq!(text, format!("forge {}\n", env!("CARGO_PKG_VERSION")));
 }
+
+#[test]
+fn dry_runs_of_models_and_public_controllers() {
+    let (_parent, root) = application();
+    let model = succeeds(
+        &root,
+        &[
+            "generate",
+            "model",
+            "comment",
+            "body:text",
+            "--global",
+            "--dry-run",
+        ],
+    );
+    assert!(
+        model.contains("  would create src/domain/entities/comment.rs\n"),
+        "{model}"
+    );
+    assert!(!root.join("src/domain/entities/comment.rs").exists());
+
+    // Public pages need no access policy: nothing is reused or created.
+    let controller = succeeds(
+        &root,
+        &["generate", "controller", "pages", "index", "--public"],
+    );
+    assert!(
+        controller.contains("  create       templates/pages/index.html\n"),
+        "{controller}"
+    );
+    assert!(!controller.contains("reuse"), "{controller}");
+    assert!(!root.join("src/adapters/http/access.rs").exists());
+}

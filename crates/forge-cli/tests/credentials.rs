@@ -147,3 +147,71 @@ fn sigterm_during_the_edit_wipes_the_plaintext_and_keeps_the_credentials() {
     );
     assert_eq!(fs::read(&encrypted).expect("file"), before);
 }
+
+#[test]
+fn rotate_key_replaces_the_key_and_prints_it_only_when_asked() {
+    let app = tempfile::tempdir().expect("app");
+    let root = app.path();
+    assert!(forge(root, &["credentials", "init"], &[]).status.success());
+    let key_file = root.join("config/credentials/development.key");
+    let first = fs::read_to_string(&key_file).expect("key");
+
+    // The report goes to stderr; stdout stays empty unless the key is asked
+    // for.
+    let rotated = forge(
+        root,
+        &["credentials", "rotate-key", "--write-key-file"],
+        &[],
+    );
+    assert!(rotated.status.success(), "{rotated:?}");
+    assert!(rotated.stdout.is_empty(), "{rotated:?}");
+    let report = String::from_utf8_lossy(&rotated.stderr);
+    assert!(
+        report.starts_with("re-encrypted config/credentials/development.json.enc with key "),
+        "{report}"
+    );
+    assert!(
+        report.contains("the previous key is no longer accepted"),
+        "{report}"
+    );
+    let second = fs::read_to_string(&key_file).expect("key");
+    assert_ne!(first, second, "the key file holds the new key");
+    assert!(forge(root, &["credentials", "show"], &[]).status.success());
+
+    let kept = forge(
+        root,
+        &[
+            "credentials",
+            "rotate-key",
+            "--keep-old",
+            "--write-key-file",
+        ],
+        &[],
+    );
+    assert!(kept.status.success(), "{kept:?}");
+    assert!(
+        String::from_utf8_lossy(&kept.stderr).contains("the previous key list stays readable"),
+        "{}",
+        String::from_utf8_lossy(&kept.stderr)
+    );
+
+    let printed = forge(root, &["credentials", "rotate-key", "--print-key"], &[]);
+    assert!(printed.status.success(), "{printed:?}");
+    let stdout = String::from_utf8_lossy(&printed.stdout).into_owned();
+    let new_key = stdout
+        .lines()
+        .next()
+        .expect("the key is the first line")
+        .to_owned();
+    assert_eq!(
+        fs::read_to_string(&key_file).expect("key").trim(),
+        new_key,
+        "a key file source keeps the printed key in the key file"
+    );
+    let shown = forge(
+        root,
+        &["credentials", "show"],
+        &[("FORGE_MASTER_KEY", &new_key)],
+    );
+    assert!(shown.status.success(), "{shown:?}");
+}

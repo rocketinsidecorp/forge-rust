@@ -815,3 +815,187 @@ fn dev_keeps_the_running_application_when_a_build_fails() {
     assert!(status.success(), "{status:?}");
     wait_for(&fixture, "stopped", 1);
 }
+
+#[test]
+fn the_remaining_database_commands_and_setup_options_reach_the_application() {
+    let fixture = Fixture::new(FAKE_APP);
+    for arguments in [
+        &["db", "create"][..],
+        &["db", "migrate"],
+        &["db", "status"],
+        &["db", "seed"],
+        &["db", "rollback", "--steps", "2"],
+        &[
+            "setup",
+            "--tenant",
+            "acme",
+            "--email",
+            "owner@example.com",
+            "--password-stdin",
+        ],
+    ] {
+        let output = fixture.run(arguments);
+        assert!(
+            output.status.success(),
+            "{arguments:?}: {}",
+            stderr(&output)
+        );
+    }
+    assert_eq!(
+        fixture.app_calls(),
+        [
+            "db create",
+            "migrate",
+            "migrate status",
+            "seed",
+            "rollback --steps 2",
+            "setup --tenant acme --email owner@example.com --password-stdin",
+        ]
+    );
+}
+
+#[test]
+fn dev_without_reload_builds_and_runs_once() {
+    let fixture = Fixture::new(FAKE_APP);
+    let output = fixture.run(&["dev", "--no-reload"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    // The application ran without arguments, in the foreground.
+    assert_eq!(fixture.app_calls(), [""]);
+
+    let failing = fixture
+        .command(&["dev", "--no-reload"])
+        .env("APP_EXIT", "3")
+        .output()
+        .expect("forge runs");
+    assert_eq!(failing.status.code(), Some(1));
+    assert!(
+        stderr(&failing).contains("application command \"shop\" failed with status 3"),
+        "{}",
+        stderr(&failing)
+    );
+}
+
+#[test]
+fn dev_refuses_binary_names_cargo_would_not_accept() {
+    let fixture = Fixture::new(FAKE_APP);
+    for name in ["bad/name", "-flag", "has space", &"x".repeat(65)] {
+        let output = fixture.run(&["dev", "--no-reload", "--", name]);
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{name:?}: {}",
+            stderr(&output)
+        );
+        assert!(
+            stderr(&output).contains("invalid binary name"),
+            "{name:?}: {}",
+            stderr(&output)
+        );
+    }
+    assert!(fixture.lines().is_empty(), "nothing was built");
+    // A valid name selects the binary to build and run.
+    let output = fixture.run(&["dev", "--no-reload", "shop"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(
+        fixture
+            .lines()
+            .iter()
+            .any(|line| line.ends_with("--bin shop")),
+        "{:?}",
+        fixture.lines()
+    );
+}
+
+#[test]
+fn a_signal_during_the_build_stops_cargo_and_the_command() {
+    let fixture = Fixture::new(FAKE_APP);
+    executable(
+        &fixture.directory.path().join("bin/cargo"),
+        "#!/bin/sh\necho \"cargo $*\" >> \"$RECORD\"\nexec sleep 30\n",
+    );
+    let mut forge = fixture
+        .command(&["migrate"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("forge starts");
+    wait_for(
+        &fixture,
+        "cargo build --locked --message-format=json-render-diagnostics --bin shop",
+        1,
+    );
+    signal(&forge, "TERM");
+    let status = forge.wait().expect("forge ends");
+    assert_eq!(status.code(), Some(1), "{status:?}");
+    let mut log = String::new();
+    std::io::Read::read_to_string(&mut forge.stderr.take().expect("stderr"), &mut log)
+        .expect("stderr");
+    assert!(log.contains("interrupted"), "{log}");
+    assert!(fixture.app_calls().is_empty(), "the application never ran");
+}
+
+#[test]
+fn a_signal_while_the_application_runs_stops_it_and_ends_the_command() {
+    let fixture = Fixture::new(SERVER_APP);
+    let mut forge = fixture
+        .command(&["migrate"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("forge starts");
+    wait_for(&fixture, "started", 1);
+    signal(&forge, "TERM");
+    let status = forge.wait().expect("forge ends");
+    assert_eq!(status.code(), Some(1), "{status:?}");
+    wait_for(&fixture, "stopped", 1);
+    let mut log = String::new();
+    std::io::Read::read_to_string(&mut forge.stderr.take().expect("stderr"), &mut log)
+        .expect("stderr");
+    assert!(log.contains("interrupted"), "{log}");
+}
+
+#[test]
+fn doctor_says_whether_the_sqlite_file_exists_yet() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let run = || {
+        forge_command()
+            .arg("doctor")
+            .current_dir(directory.path())
+            .env("FORGE_DATABASE_URL", "sqlite://shop.db")
+            .env_remove("FORGE_ENV")
+            .output()
+            .expect("forge runs")
+    };
+    let before = run();
+    assert!(
+        before.status.success(),
+        "{}",
+        String::from_utf8_lossy(&before.stdout)
+    );
+    let text = String::from_utf8_lossy(&before.stdout).into_owned();
+    assert!(text.contains("the file does not exist yet"), "{text}");
+    fs::write(directory.path().join("shop.db"), "").expect("database file");
+    let after = String::from_utf8_lossy(&run().stdout).into_owned();
+    assert!(after.contains("the file exists"), "{after}");
+}
+
+#[test]
+fn doctor_reports_a_toolchain_that_cannot_be_run() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let bin = directory.path().join("bin");
+    fs::create_dir(&bin).expect("bin");
+    // `cargo` runs but fails; there is no `rustc` at all.
+    executable(&bin.join("cargo"), "#!/bin/sh\nexit 1\n");
+    let output = forge_command()
+        .args(["doctor", "--json"])
+        .current_dir(directory.path())
+        .env("PATH", &bin)
+        .env_remove("FORGE_DATABASE_URL")
+        .env_remove("FORGE_ENV")
+        .output()
+        .expect("forge runs");
+    assert_eq!(output.status.code(), Some(1));
+    let text = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert!(text.contains("\"toolchain.cargo_missing\""), "{text}");
+    assert!(text.contains("\"toolchain.rustc_missing\""), "{text}");
+}
