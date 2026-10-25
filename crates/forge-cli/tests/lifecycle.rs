@@ -104,18 +104,16 @@ impl Fixture {
     }
 }
 
-/// A `forge` command without the test harness's own `FORGE_TEST_*` variables:
-/// the application's configuration loader (and `forge doctor`) refuse unknown
-/// `FORGE_*` keys.
+/// A `forge` command without the test harness's own `FORGE_TEST_*` variables
+/// (whichever CI sets: database URLs, `FORGE_TEST_REQUIRE_SSHD`,
+/// `FORGE_TEST_FAKE_DOCKER`, ...): the application's configuration loader
+/// (and `forge doctor`) refuse unknown `FORGE_*` keys.
 fn forge_command() -> Command {
     let mut command = Command::new(FORGE);
-    for name in [
-        "FORGE_TEST_DATABASE_URL",
-        "FORGE_TEST_MYSQL_URL",
-        "FORGE_TEST_MARIADB_URL",
-        "FORGE_TEST_REQUIRE_SSHD",
-    ] {
-        command.env_remove(name);
+    for (name, _) in std::env::vars_os() {
+        if name.to_string_lossy().starts_with("FORGE_TEST_") {
+            command.env_remove(name);
+        }
     }
     command
 }

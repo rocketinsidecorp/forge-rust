@@ -122,14 +122,12 @@ fn command(
         Path::new(env!("CARGO_TARGET_TMPDIR")).join("scaffold-apps"),
     );
     if program != "cargo" {
-        // A generated binary refuses unknown FORGE_* keys at startup.
-        for name in [
-            "FORGE_TEST_DATABASE_URL",
-            "FORGE_TEST_MYSQL_URL",
-            "FORGE_TEST_MARIADB_URL",
-            "FORGE_TEST_REQUIRE_SSHD",
-        ] {
-            command.env_remove(name);
+        // A generated binary refuses unknown FORGE_* keys at startup: drop
+        // every FORGE_TEST_* the harness or CI sets.
+        for (name, _) in std::env::vars_os() {
+            if name.to_string_lossy().starts_with("FORGE_TEST_") {
+                command.env_remove(name);
+            }
         }
     }
     for (name, value) in environment {
