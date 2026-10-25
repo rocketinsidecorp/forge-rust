@@ -112,3 +112,28 @@ fn a_testing_composition_can_be_given_the_outbox_setup() {
     let debug = format!("{:?}", composition.events().expect("attached"));
     assert!(debug.contains("publisher: true"), "{debug}");
 }
+
+#[cfg(all(feature = "broadcast", feature = "mysql"))]
+#[tokio::test]
+async fn postgres_fanout_is_refused_on_mysql_too() -> Result<(), Box<dyn std::error::Error>> {
+    let config = AppConfig::default();
+    let mut router = Router::new();
+    // A lazy pool never connects: only the backend matters.
+    let url = forge_config::SecretString::new("mysql://app:secret@127.0.0.1:1/app");
+    let database = forge_db::MySqlDatabase::connect_lazy(&url)?;
+    let mut composition = Composition::for_testing(&config, &mut router).with_mysql(database);
+
+    let refused = composition
+        .broadcast(Fanout::Postgres)
+        .err()
+        .ok_or("MySQL must be refused")?;
+
+    let reason = refused
+        .source()
+        .map(ToString::to_string)
+        .unwrap_or_default();
+    assert!(reason.contains("requires PostgreSQL"), "{reason}");
+    assert!(composition.mysql().is_ok());
+    assert!(composition.broadcast(Fanout::InProcess).is_ok());
+    Ok(())
+}

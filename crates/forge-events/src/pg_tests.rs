@@ -539,9 +539,12 @@ impl EventPublisher for Picky {
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test]
 #[ignore = "needs FORGE_TEST_DATABASE_URL"]
 async fn deliveries_are_traced_and_measured_by_outcome() {
+    // A subscriber that records spans, so the delivery's log span carries
+    // the trace and span ids of its telemetry span.
+    let _subscriber = tracing::subscriber::set_default(Warnings(Arc::new(AtomicUsize::new(0))));
     use forge_telemetry::{
         Options, SpanSink, Telemetry,
         testing::{Behavior, Receiver},
@@ -911,4 +914,145 @@ async fn dead_events_are_listed_newest_first_a_page_at_a_time() {
         "only an existing dead event is requeued"
     );
     db.cleanup().await.expect("cleanup");
+}
+
+/// Takes the lease away while it publishes, as another dispatcher would
+/// after the lease expired, then answers `outcome`.
+struct LeaseTaken {
+    admin: PgDatabase,
+    outcome: fn() -> Result<(), PublishError>,
+    published: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl EventPublisher for LeaseTaken {
+    async fn publish(&self, event: &EventEnvelope) -> Result<(), PublishError> {
+        sqlx::query("UPDATE forge_outbox_events SET lease_token = $1 WHERE id = $2")
+            .bind(Uuid::now_v7())
+            .bind(event.id().into_uuid())
+            .execute(self.admin.pool())
+            .await?;
+        let outcome = (self.outcome)();
+        self.published.fetch_add(1, Ordering::SeqCst);
+        outcome
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs FORGE_TEST_DATABASE_URL"]
+async fn a_publication_whose_lease_was_lost_changes_nothing_either_way() {
+    for outcome in [(|| Ok(())) as fn() -> Result<(), PublishError>, || {
+        Err(PublishError::retry("broker unavailable"))
+    }] {
+        let db = fresh().await;
+        let store = PgOutboxStore::new(db.runtime().clone());
+        let mut transaction = db.runtime().begin().await.expect("begin");
+        let id = append(&mut transaction, &InvoicePaid { invoice: 1 })
+            .await
+            .expect("append");
+        transaction.commit().await.expect("commit");
+        let published = Arc::new(AtomicUsize::new(0));
+        let publisher = LeaseTaken {
+            admin: db.admin().clone(),
+            outcome,
+            published: Arc::clone(&published),
+        };
+        let warnings = Arc::new(AtomicUsize::new(0));
+        let _guard = tracing::subscriber::set_default(Warnings(Arc::clone(&warnings)));
+
+        let (shutdown, handle) = spawn(Dispatcher::new(store, publisher).settings(fast()));
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while published.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the event is published");
+        // Stopping waits for the delivery in progress to be recorded.
+        stop(shutdown, handle).await;
+
+        assert_eq!(
+            warnings.load(Ordering::SeqCst),
+            1,
+            "the lost lease is reported once"
+        );
+        assert_eq!(
+            state(&db, id).await,
+            ("publishing".to_owned(), 1),
+            "neither a publication nor a failure is recorded for a lease that is not ours"
+        );
+        db.cleanup().await.expect("cleanup");
+    }
+}
+
+/// Closes the pool the dispatcher records with, so recording fails, and
+/// optionally begins shutdown.
+struct PoolClosed {
+    runtime: PgDatabase,
+    shutdown: Option<Cancellation>,
+    outcome: fn() -> Result<(), PublishError>,
+}
+
+#[async_trait]
+impl EventPublisher for PoolClosed {
+    async fn publish(&self, _: &EventEnvelope) -> Result<(), PublishError> {
+        self.runtime.close().await;
+        if let Some(shutdown) = &self.shutdown {
+            shutdown.cancel();
+        }
+        (self.outcome)()
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs FORGE_TEST_DATABASE_URL"]
+async fn a_dispatcher_that_cannot_record_a_result_logs_it_and_stops_cleanly() {
+    // (outcome, whether the batch is cut short by a shutdown, warnings expected at least)
+    type Case = (fn() -> Result<(), PublishError>, bool, usize);
+    let cases: [Case; 3] = [
+        (|| Ok(()), false, 1),
+        (|| Err(PublishError::retry("broker unavailable")), false, 1),
+        // Three events claimed, the first delivered and not recorded, the
+        // others could not be released: each failure is its own warning.
+        (|| Ok(()), true, 3),
+    ];
+    for (outcome, cut_short, at_least) in cases {
+        let db = fresh().await;
+        let store = PgOutboxStore::new(db.runtime().clone());
+        let mut transaction = db.runtime().begin().await.expect("begin");
+        for invoice in 1..=3 {
+            append(&mut transaction, &InvoicePaid { invoice })
+                .await
+                .expect("append");
+        }
+        transaction.commit().await.expect("commit");
+        let shutdown = Cancellation::new();
+        let publisher = PoolClosed {
+            runtime: db.runtime().clone(),
+            shutdown: cut_short.then(|| shutdown.clone()),
+            outcome,
+        };
+        let warnings = Arc::new(AtomicUsize::new(0));
+        let _guard = tracing::subscriber::set_default(Warnings(Arc::clone(&warnings)));
+        let dispatcher = Dispatcher::new(store, publisher).settings(fast().batch(3));
+
+        if cut_short {
+            tokio::time::timeout(Duration::from_secs(30), dispatcher.run(shutdown))
+                .await
+                .expect("the dispatcher stops")
+                .expect("clean shutdown");
+        } else {
+            let handle = tokio::spawn(dispatcher.run(shutdown.clone()));
+            tokio::time::timeout(Duration::from_secs(30), async {
+                while warnings.load(Ordering::SeqCst) < at_least {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the failure to record is logged");
+            stop(shutdown, handle).await;
+        }
+        assert!(warnings.load(Ordering::SeqCst) >= at_least);
+        db.cleanup().await.expect("cleanup");
+    }
 }

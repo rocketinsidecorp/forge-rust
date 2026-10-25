@@ -97,6 +97,19 @@ async fn the_pool_is_observed_until_the_observation_stops() {
     // Each observation is its own; stopping one leaves the instruments.
     assert!(observe_database(&telemetry, &handle).is_some());
     observation.stop();
+
+    // Instruments of the same names registered as something else: the
+    // application still runs, only without its pool metrics.
+    let taken = Telemetry::new(forge_telemetry::Options::new("demo")).expect("telemetry");
+    taken
+        .metrics()
+        .counter("db.client.connection.count", "taken", "1", &[])
+        .expect("registers first");
+    let log = warnings(|| assert!(observe_database(&taken, &handle).is_none()));
+    assert!(
+        log.contains("connection pool metrics are not recorded"),
+        "{log}"
+    );
     database.close().await;
 }
 

@@ -9,7 +9,7 @@ use std::sync::{
 };
 
 use super::lifecycle_tests::{
-    args, config, free_port, raise, request, serialized, start, wait_until_serving,
+    RunBoxed as _, config, free_port, raise, request, serialized, start, wait_until_serving,
 };
 use super::*;
 use forge_http::{Response, StatusCode};
@@ -25,11 +25,10 @@ fn migrations() -> forge_db::Migrator {
 }
 
 fn run(app: App, command: &[&str], url: &str) -> ExitCode {
-    app.run_with(args(command), || {
+    app.run_boxed(command, || {
         config(&[
             ("FORGE_DATABASE_URL", url),
             ("FORGE_MIGRATION_DATABASE_URL", url),
-            ("FORGE_LOG", "error"),
         ])
     })
 }
@@ -148,7 +147,6 @@ fn serve_over_mysql_answers_readiness_and_stops_on_sigterm() {
             ),
             ("FORGE_DATABASE_URL", test.url().expose().to_owned()),
             ("FORGE_SHUTDOWN_GRACE_SECS", "2".to_owned()),
-            ("FORGE_LOG", "error".to_owned()),
         ],
     );
 

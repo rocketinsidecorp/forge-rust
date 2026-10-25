@@ -64,3 +64,15 @@ async fn a_dropped_lifecycle_counts_as_shutdown() {
     shutdown.requested().await;
     assert!(!shutdown.is_requested());
 }
+
+#[tokio::test]
+async fn a_queue_ends_when_every_sender_is_gone() {
+    let (queue, worker) = queue("mail", 4, |_: u8| async {});
+    let (_stop, receiver) = watch::channel(false);
+    drop(queue);
+
+    // Nothing can ever arrive: the worker returns without being told to stop.
+    tokio::time::timeout(Duration::from_secs(30), (worker.run)(Shutdown(receiver)))
+        .await
+        .expect("the worker ends with its queue");
+}

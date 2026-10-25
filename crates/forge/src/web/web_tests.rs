@@ -73,3 +73,44 @@ fn a_reported_failure_keeps_the_response_and_logs_by_category() {
     );
     assert!(log.contains("audit_conflict"), "{log}");
 }
+
+/// A request type whose description cannot be built.
+#[derive(serde::Deserialize)]
+struct Undescribable {}
+
+impl forge_openapi::OpenApiSchema for Undescribable {
+    fn schema(generator: &mut forge_openapi::SchemaGenerator) -> forge_openapi::Schema {
+        generator.fail("the description contradicts itself");
+        forge_openapi::Schema::Null
+    }
+}
+
+#[test]
+fn a_request_type_without_a_description_is_refused_with_a_500_and_the_reason_in_the_logs() {
+    let mut headers = forge_http::HeaderMap::new();
+    headers.insert(
+        forge_http::header::CONTENT_TYPE,
+        forge_http::HeaderValue::from_static("application/json"),
+    );
+    let request = Request::new_for_test(
+        forge_http::Method::POST,
+        forge_http::Uri::from_static("/x"),
+        headers,
+        bytes::Bytes::from_static(b"{}"),
+        "127.0.0.1:4000".parse().expect("address"),
+        uuid::Uuid::now_v7(),
+    );
+
+    let failure = decode_json_strict::<Undescribable>(&request)
+        .err()
+        .expect("refused");
+
+    assert_eq!(failure.category(), ErrorCategory::Internal);
+    assert_eq!(failure.code(), "json_description_invalid");
+    let log = warnings(|| {
+        let response = error(&failure);
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!String::from_utf8_lossy(response.body()).contains("contradicts"));
+    });
+    assert!(log.contains("contradicts itself"), "{log}");
+}

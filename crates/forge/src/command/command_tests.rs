@@ -217,6 +217,7 @@ async fn a_postgres_pool_can_be_attached() {
     let context = context().with_postgres(database);
 
     assert!(context.postgres().is_ok());
+    assert!(format!("{context:?}").contains("database: Some"));
     #[cfg(feature = "sqlite")]
     assert!(context.sqlite().is_err());
 }
@@ -229,6 +230,7 @@ async fn a_mysql_pool_can_be_attached() {
     let context = context().with_mysql(database);
 
     assert!(context.mysql().is_ok());
+    assert!(format!("{context:?}").contains("database: Some"));
     #[cfg(feature = "postgres")]
     assert!(context.postgres().is_err());
 }

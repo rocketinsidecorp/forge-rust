@@ -12,7 +12,7 @@ use std::sync::{
 };
 
 use super::lifecycle_tests::{
-    args, config, free_port, raise, request, serialized, start, wait_until_serving,
+    RunBoxed as _, config, free_port, raise, request, serialized, start, wait_until_serving,
 };
 use super::*;
 use forge_http::{Response, StatusCode};
@@ -31,11 +31,10 @@ fn sibling(url: &str, database: &str) -> String {
 }
 
 fn run(app: App, command: &[&str], url: &str) -> ExitCode {
-    app.run_with(args(command), || {
+    app.run_boxed(command, || {
         config(&[
             ("FORGE_DATABASE_URL", url),
             ("FORGE_MIGRATION_DATABASE_URL", url),
-            ("FORGE_LOG", "error"),
         ])
     })
 }
@@ -85,11 +84,10 @@ fn db_commands_fail_cleanly_when_the_server_is_unreachable() {
         assert_eq!(run(app(), command, url), ExitCode::FAILURE, "{command:?}");
     }
     // Production drops need the explicit flag, which this does not give.
-    let production = app().run_with(args(&["db", "drop"]), || {
+    let production = app().run_boxed(&["db", "drop"], || {
         config(&[
             ("FORGE_ENV", "production"),
             ("FORGE_MIGRATION_DATABASE_URL", url),
-            ("FORGE_LOG", "error"),
         ])
     });
     assert_eq!(production, ExitCode::FAILURE);
@@ -284,7 +282,6 @@ mod jobs {
                 ("FORGE_BIND", format!("127.0.0.1:{port}")),
                 ("FORGE_DATABASE_URL", url),
                 ("FORGE_SHUTDOWN_GRACE_SECS", "2".to_owned()),
-                ("FORGE_LOG", "error".to_owned()),
             ],
         );
         assert_eq!(wait_until_serving(&running, port, "/marker").status, 200);
@@ -324,7 +321,6 @@ mod jobs {
                     format!("127.0.0.1:{metrics}"),
                 ),
                 ("FORGE_SHUTDOWN_GRACE_SECS", "2".to_owned()),
-                ("FORGE_LOG", "error".to_owned()),
             ],
         );
 
@@ -370,7 +366,6 @@ mod jobs {
             vec![
                 ("FORGE_BIND", format!("127.0.0.1:{port}")),
                 ("FORGE_DATABASE_URL", url),
-                ("FORGE_LOG", "error".to_owned()),
             ],
         );
         assert_eq!(wait_until_serving(&running, port, "/marker").status, 200);
@@ -598,6 +593,35 @@ mod jobs {
                 "{command:?}"
             );
         }
+        runtime.block_on(test.cleanup()).expect("cleanup");
+    }
+
+    #[test]
+    #[ignore = "needs FORGE_TEST_DATABASE_URL"]
+    fn a_runtime_without_handlers_or_a_publisher_starts_and_stops_with_the_shutdown() {
+        let runtime = runtime();
+        let test = runtime
+            .block_on(TestDatabase::create_empty())
+            .expect("needs FORGE_TEST_DATABASE_URL");
+        migrate(test.url().expose());
+        let mut declaration = crate::background::JobsDeclaration::new(WorkerMode::InServe);
+        #[cfg(feature = "events")]
+        {
+            declaration.events = true;
+        }
+        let _ = &mut declaration;
+        // The job registry is empty and, with `events`, nothing publishes
+        // the outbox: both are a normal starting point.
+        let background = crate::background::JobsParts::new(declaration)
+            .into_background(test.database().clone(), None);
+        let shutdown = Cancellation::new();
+        shutdown.cancel();
+
+        let log = crate::test_support::capture();
+        let result = runtime.block_on(background.run(shutdown));
+        drop(log.1);
+
+        assert!(result.is_ok(), "{result:?}");
         runtime.block_on(test.cleanup()).expect("cleanup");
     }
 

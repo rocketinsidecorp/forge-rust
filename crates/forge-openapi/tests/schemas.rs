@@ -363,6 +363,7 @@ failing_type!(Described, |generator| {
 });
 
 /// Members flattened from a type that also has a member of the same name.
+#[derive(Clone)]
 struct Inner;
 
 impl OpenApiSchema for Inner {
@@ -449,4 +450,54 @@ fn nested_flattening_is_bounded() {
         .map(|error| error.to_string())
         .unwrap_or_default();
     assert!(message.contains("contains itself"), "{message}");
+}
+
+/// An object that flattens `T` and nothing else.
+struct Holder<T: ?Sized>(std::marker::PhantomData<T>);
+
+impl<T: OpenApiSchema + ?Sized + 'static> OpenApiSchema for Holder<T> {
+    fn schema(generator: &mut SchemaGenerator) -> Schema {
+        generator.component::<Self>(Some("Holder"), |generator| {
+            let mut object = ObjectSchema::new();
+            object.flatten::<T>(generator, "inner");
+            object.into_schema()
+        })
+    }
+}
+
+fn holder<T: OpenApiSchema + ?Sized + 'static>() -> Value {
+    schema_of::<Holder<T>>().expect("describable").1["Holder"].clone()
+}
+
+#[test]
+fn a_flattened_wrapper_contributes_what_its_target_does() {
+    let members = holder::<Inner>();
+    assert_eq!(members["required"], json!(["id"]));
+    for flattened in [
+        holder::<Box<Inner>>(),
+        holder::<Arc<Inner>>(),
+        holder::<Rc<Inner>>(),
+        holder::<&'static Inner>(),
+        holder::<Cow<'static, Inner>>(),
+    ] {
+        assert_eq!(flattened, members);
+    }
+    // An option may be absent, so its members are not required.
+    assert_eq!(
+        holder::<Option<Inner>>()["properties"],
+        members["properties"]
+    );
+    assert!(holder::<Option<Inner>>().get("required").is_none());
+}
+
+#[test]
+fn a_flattened_map_collects_the_other_members() {
+    let expected = json!({"type": "integer", "format": "int32", "minimum": 0, "maximum": 255});
+    for map in [
+        holder::<BTreeMap<String, u8>>(),
+        holder::<HashMap<String, u8>>(),
+    ] {
+        assert_eq!(map["additionalProperties"], expected);
+        assert_eq!(map["properties"], json!({}));
+    }
 }

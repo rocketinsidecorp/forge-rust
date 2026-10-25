@@ -33,6 +33,29 @@ pub(super) fn args(values: &[&str]) -> Vec<OsString> {
     values.iter().map(OsString::from).collect()
 }
 
+/// Runs an application through one instantiation of `run_with` whatever
+/// closure loads the configuration: every test that goes through it adds to
+/// the coverage of the same generic functions, instead of each closure type
+/// getting an instantiation of its own.
+pub(super) trait RunBoxed {
+    fn run_boxed<'a>(
+        self,
+        command: &[&str],
+        load: impl FnOnce() -> Result<AppConfig, ConfigError> + 'a,
+    ) -> ExitCode;
+}
+
+impl RunBoxed for App {
+    fn run_boxed<'a>(
+        self,
+        command: &[&str],
+        load: impl FnOnce() -> Result<AppConfig, ConfigError> + 'a,
+    ) -> ExitCode {
+        let load: Box<dyn FnOnce() -> Result<AppConfig, ConfigError> + 'a> = Box::new(load);
+        self.run_with(args(command), load)
+    }
+}
+
 pub(super) fn config(vars: &[(&str, &str)]) -> Result<AppConfig, ConfigError> {
     AppConfig::from_vars(
         vars.iter()
@@ -106,7 +129,7 @@ pub(super) fn start(
     vars: Vec<(&'static str, String)>,
 ) -> JoinHandle<ExitCode> {
     thread::spawn(move || {
-        app.run_with(args(command), move || {
+        app.run_boxed(command, move || {
             let vars: Vec<(&str, &str)> = vars
                 .iter()
                 .map(|(key, value)| (*key, value.as_str()))
@@ -161,7 +184,6 @@ fn serve_runs_until_sigterm_and_stops_what_it_started() {
             ),
             ("FORGE_DATABASE_URL", sqlite_url(&directory)),
             ("FORGE_SHUTDOWN_GRACE_SECS", "2".to_owned()),
-            ("FORGE_LOG", "error".to_owned()),
         ],
     );
 
@@ -222,10 +244,7 @@ fn serve_also_stops_on_sigint() {
     let running = start(
         marker_app(),
         &["serve"],
-        vec![
-            ("FORGE_BIND", format!("127.0.0.1:{port}")),
-            ("FORGE_LOG", "error".to_owned()),
-        ],
+        vec![("FORGE_BIND", format!("127.0.0.1:{port}"))],
     );
     assert_eq!(wait_until_serving(&running, port, "/marker").status, 200);
 
@@ -238,15 +257,11 @@ fn serve_fails_when_an_address_is_taken() {
     let _serial = serialized();
     let taken = StdListener::bind("127.0.0.1:0").expect("a listener");
     let taken_port = taken.local_addr().expect("address").port();
-    let quiet = ("FORGE_LOG", "error".to_owned());
 
     let main = start(
         marker_app(),
         &["serve"],
-        vec![
-            ("FORGE_BIND", format!("127.0.0.1:{taken_port}")),
-            quiet.clone(),
-        ],
+        vec![("FORGE_BIND", format!("127.0.0.1:{taken_port}"))],
     );
     assert_eq!(main.join().expect("serve thread"), ExitCode::FAILURE);
 
@@ -259,7 +274,6 @@ fn serve_fails_when_an_address_is_taken() {
                 "FORGE_TELEMETRY_METRICS_ADDR",
                 format!("127.0.0.1:{taken_port}"),
             ),
-            quiet,
         ],
     );
     assert_eq!(metrics.join().expect("serve thread"), ExitCode::FAILURE);
@@ -274,19 +288,19 @@ fn composition_failures_stop_startup_before_listening() {
         Ok(())
     });
     assert_eq!(
-        duplicate.run_with(args(&["serve"]), || config(&[])),
+        duplicate.run_boxed(&["serve"], || config(&[])),
         ExitCode::FAILURE,
         "a duplicate route"
     );
     let failing = App::new("demo").compose(|_| Err(ComposeError::other(io::Error::other("no"))));
     assert_eq!(
-        failing.run_with(args(&["serve"]), || config(&[])),
+        failing.run_boxed(&["serve"], || config(&[])),
         ExitCode::FAILURE,
         "a composition hook"
     );
     let failing = App::new("demo").compose(|_| Err(ComposeError::other(io::Error::other("no"))));
     assert_eq!(
-        failing.run_with(args(&["routes"]), || config(&[])),
+        failing.run_boxed(&["routes"], || config(&[])),
         ExitCode::FAILURE,
         "inspection composes the application too"
     );
@@ -313,7 +327,7 @@ fn an_invalid_log_filter_is_a_configuration_error_for_every_command() {
         &["seed"],
     ] {
         assert_eq!(
-            app().run_with(args(command), || config(&vars)),
+            app().run_boxed(command, || config(&vars)),
             ExitCode::from(EXIT_CONFIG),
             "{command:?}"
         );
@@ -331,12 +345,7 @@ mod sqlite {
     }
 
     fn run(app: App, command: &[&str], url: &str) -> ExitCode {
-        app.run_with(args(command), || {
-            config(&[
-                ("FORGE_MIGRATION_DATABASE_URL", url),
-                ("FORGE_LOG", "error"),
-            ])
-        })
+        app.run_boxed(command, || config(&[("FORGE_MIGRATION_DATABASE_URL", url)]))
     }
 
     #[test]
@@ -421,15 +430,15 @@ mod sqlite {
                 .command("seed", "x", |_| async { Ok(()) })
         };
         assert_eq!(
-            app().run_with(args(&["serve"]), || config(&[])),
+            app().run_boxed(&["serve"], || config(&[])),
             ExitCode::from(EXIT_CONFIG)
         );
         assert_eq!(
-            app().run_with(args(&["routes"]), || config(&[])),
+            app().run_boxed(&["routes"], || config(&[])),
             ExitCode::from(EXIT_CONFIG)
         );
         assert_eq!(
-            app().run_with(args(&["seed"]), || config(&[])),
+            app().run_boxed(&["seed"], || config(&[])),
             ExitCode::from(EXIT_CONFIG)
         );
     }
@@ -462,7 +471,7 @@ fn the_openapi_command_prints_the_document_and_reports_what_it_cannot_do() {
         })
     };
     assert_eq!(
-        app().run_with(args(&["openapi"]), || config(&[])),
+        app().run_boxed(&["openapi"], || config(&[])),
         ExitCode::SUCCESS,
         "to standard output"
     );
@@ -471,17 +480,14 @@ fn the_openapi_command_prints_the_document_and_reports_what_it_cannot_do() {
     let missing_directory = directory.path().join("missing").join("openapi.json");
     let missing_directory = missing_directory.to_string_lossy().into_owned();
     assert_eq!(
-        app().run_with(args(&["openapi", "--output", &missing_directory]), || {
+        app().run_boxed(&["openapi", "--output", &missing_directory], || {
             config(&[])
         }),
         ExitCode::FAILURE,
         "an unwritable file"
     );
     assert_eq!(
-        app().run_with(
-            args(&["openapi", "--check", &missing_directory]),
-            || config(&[])
-        ),
+        app().run_boxed(&["openapi", "--check", &missing_directory], || config(&[])),
         ExitCode::FAILURE,
         "an unreadable file"
     );
@@ -499,7 +505,7 @@ fn the_openapi_command_prints_the_document_and_reports_what_it_cannot_do() {
         Ok(())
     });
     assert_eq!(
-        invalid.run_with(args(&["openapi"]), || config(&[])),
+        invalid.run_boxed(&["openapi"], || config(&[])),
         ExitCode::FAILURE
     );
 }
@@ -518,7 +524,7 @@ fn serve_refuses_to_start_with_an_inaccurate_description() {
         Ok(())
     });
     assert_eq!(
-        invalid.run_with(args(&["serve"]), || config(&[("FORGE_LOG", "error")])),
+        invalid.run_boxed(&["serve"], || config(&[])),
         ExitCode::FAILURE
     );
 }
@@ -534,7 +540,7 @@ fn legacy_migration_handlers_report_their_failures_and_absence() {
         |_| async { Err::<(), _>(io::Error::other("rollback exploded")) },
     );
     assert_eq!(
-        failing.run_with(args(&["migrate"]), || config(&url)),
+        failing.run_boxed(&["migrate"], || config(&url)),
         ExitCode::FAILURE
     );
     let failing = App::new("demo").migrations(
@@ -542,20 +548,20 @@ fn legacy_migration_handlers_report_their_failures_and_absence() {
         |_| async { Err::<(), _>(io::Error::other("rollback exploded")) },
     );
     assert_eq!(
-        failing.run_with(args(&["rollback"]), || config(&url)),
+        failing.run_boxed(&["rollback"], || config(&url)),
         ExitCode::FAILURE
     );
     // Neither declared nor registered: nothing can migrate.
     for command in [&["migrate"][..], &["rollback"]] {
         assert_eq!(
-            App::new("demo").run_with(args(command), || config(&url)),
+            App::new("demo").run_boxed(command, || config(&url)),
             ExitCode::FAILURE,
             "{command:?}"
         );
     }
     // And without the credential the command cannot even start.
     assert_eq!(
-        App::new("demo").run_with(args(&["migrate"]), || config(&[])),
+        App::new("demo").run_boxed(&["migrate"], || config(&[])),
         ExitCode::from(EXIT_CONFIG)
     );
 }
@@ -574,9 +580,136 @@ fn inspection_commands_compose_over_the_declared_database_and_close_it() {
             })
     };
     for command in [&["routes"][..], &["openapi"]] {
-        let code = app().run_with(args(command), || {
-            config(&[("FORGE_DATABASE_URL", &url), ("FORGE_LOG", "error")])
-        });
+        let code = app().run_boxed(command, || config(&[("FORGE_DATABASE_URL", &url)]));
         assert_eq!(code, ExitCode::SUCCESS, "{command:?}");
     }
+}
+
+#[test]
+fn a_configuration_that_cannot_be_loaded_is_a_configuration_error_for_every_command() {
+    let unloadable = || Err(ConfigError::NotUnicode { key: "FORGE_BIND" });
+    let app = || {
+        let app = App::new("demo").command("seed", "x", |_| async { Ok(()) });
+        #[cfg(feature = "sqlite")]
+        let app = app.sqlite(forge_db::Migrator::DEFAULT);
+        app
+    };
+    let mut commands: Vec<&[&str]> = vec![
+        &["serve"],
+        &["migrate"],
+        &["migrate", "status"],
+        &["rollback"],
+        &["db", "create"],
+        &["routes"],
+        &["openapi"],
+        &["seed"],
+    ];
+    #[cfg(feature = "jobs")]
+    commands.extend([&["jobs", "status"][..], &["jobs", "work"]]);
+    for command in commands {
+        assert_eq!(
+            app().run_boxed(command, unloadable),
+            ExitCode::from(EXIT_CONFIG),
+            "{command:?}"
+        );
+    }
+}
+
+#[cfg(feature = "jobs")]
+#[test]
+fn an_invalid_log_filter_also_stops_the_jobs_commands() {
+    let app = || {
+        App::new("demo")
+            .postgres(forge_db::Migrator::DEFAULT)
+            .jobs(crate::background::WorkerMode::InServe)
+    };
+    let vars = [("FORGE_LOG", "demo=loudest")];
+    for command in [&["jobs", "status"][..], &["jobs", "work"]] {
+        assert_eq!(
+            app().run_boxed(command, || config(&vars)),
+            ExitCode::from(EXIT_CONFIG),
+            "{command:?}"
+        );
+    }
+}
+
+#[cfg(feature = "postgres")]
+#[test]
+fn a_database_url_the_driver_cannot_parse_stops_startup_and_the_db_commands() {
+    // The scheme is right, so configuration accepts it; the port is not a number.
+    let url = "postgres://user:secret@localhost:notaport/app";
+    let vars = [
+        ("FORGE_DATABASE_URL", url),
+        ("FORGE_MIGRATION_DATABASE_URL", url),
+    ];
+    let app = || App::new("demo").postgres(forge_db::Migrator::DEFAULT);
+    for command in [
+        &["serve"][..],
+        &["migrate"],
+        &["db", "create"],
+        &["db", "exists"],
+        &["db", "drop"],
+    ] {
+        assert_eq!(
+            app().run_boxed(command, || config(&vars)),
+            ExitCode::FAILURE,
+            "{command:?}"
+        );
+    }
+}
+
+#[cfg(feature = "jobs")]
+#[test]
+fn a_composition_hook_that_fails_stops_the_job_worker_before_it_starts() {
+    let app = App::new("demo")
+        .postgres(forge_db::Migrator::DEFAULT)
+        .jobs(crate::background::WorkerMode::Dedicated)
+        .compose(|composition| {
+            // The registry is there, and the hook still refuses to compose.
+            composition.jobs()?;
+            Err(ComposeError::other(io::Error::other("adapter missing")))
+        });
+    let vars = [("FORGE_DATABASE_URL", "postgres://u:p@127.0.0.1:1/app")];
+
+    assert_eq!(
+        app.run_boxed(&["jobs", "work"], || config(&vars)),
+        ExitCode::FAILURE
+    );
+}
+
+#[test]
+fn environments_have_their_names() {
+    assert_eq!(environment_name(Environment::Development), "development");
+    assert_eq!(environment_name(Environment::Test), "test");
+    assert_eq!(environment_name(Environment::Production), "production");
+}
+
+#[cfg(feature = "sqlite")]
+#[test]
+fn a_bookkeeping_table_that_cannot_be_read_fails_the_status_command() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let url = sqlite_url(&directory);
+    let file = directory.path().join("app.db");
+    // Another tool's table of the same name: not sqlx's bookkeeping.
+    let runtime = tokio::runtime::Runtime::new().expect("runtime");
+    runtime.block_on(async {
+        let database = forge_db::SqliteDatabase::connect(&SecretString::new(&url))
+            .await
+            .expect("create the file");
+        sqlx::query("CREATE TABLE _sqlx_migrations (unrelated TEXT)")
+            .execute(database.pool())
+            .await
+            .expect("table");
+        database.close().await;
+    });
+    assert!(file.exists());
+    let app = || App::new("demo").sqlite(sqlx::migrate!("tests/migrations/sqlite"));
+    let run = |command: &[&str]| {
+        app().run_boxed(command, || {
+            config(&[("FORGE_MIGRATION_DATABASE_URL", &url)])
+        })
+    };
+
+    assert_eq!(run(&["migrate", "status"]), ExitCode::FAILURE);
+    assert_eq!(run(&["migrate"]), ExitCode::FAILURE);
 }
