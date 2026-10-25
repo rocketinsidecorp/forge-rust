@@ -38,7 +38,7 @@ forge migrate [status]
 forge rollback [--steps N]
 forge setup --tenant SLUG --email EMAIL [--organization NAME] [--password-stdin]
 forge seed
-forge db create | drop | reset | setup | prepare | migrate | status | seed
+forge db create | drop | reset | setup | prepare | migrate | status | seed | console
 forge db rollback [--steps N]
 forge openapi [--output FILE | --check FILE]
 forge routes
@@ -736,7 +736,9 @@ forge setup --tenant acme --email owner@example.com --organization "Acme Inc"
 forge seed
 forge db setup                     # create + migrate + seed
 forge db prepare                   # setup if the database is missing, else migrate (safe to repeat)
-forge db reset                     # drop + setup: a clean development database
+forge db reset                     # drop + create + restore init.sql's privileges + migrate + seed
+forge db console                   # psql / mysql / sqlite3 on the database
+forge db console -- -c 'select 1'  # arguments after -- go to the client
 forge db status
 forge db drop
 FORGE_ALLOW_DESTRUCTIVE=true forge db drop --force-production --yes
@@ -805,7 +807,8 @@ CLI started outlives it.
 | `setup --tenant SLUG --email EMAIL [--organization NAME] [--password-stdin]` | `<app> setup ...` | The password is prompted for with echo off (standard input stays your terminal), piped with `--password-stdin` or in `FORGE_SETUP_PASSWORD`; never an argument. |
 | `db create` | `<app> db create` | Prints `created ...` or `... already exists`. Uses `FORGE_MIGRATION_DATABASE_URL`, whose role must be allowed to create databases (PostgreSQL `CREATEDB`; the Compose `app_migrator` is). |
 | `db drop` | `<app> db drop` | Guarded, below. Prints `dropped ...` or `... does not exist`. |
-| `db reset` | `db drop`, then `db setup` | Guarded once, before the drop. Against the Compose container it does not re-run `docker/postgres/init.sql`'s per-database statements (`REVOKE CONNECT ... FROM PUBLIC`, `GRANT CONNECT`, `ALTER DEFAULT PRIVILEGES ... TO app_runtime`): the generated migrations grant the runtime role what it needs, but the new database lets `PUBLIC` connect and gives tables you create by hand no default privileges; `docker compose down -v && docker compose up -d db` restores the original. |
+| `db reset` | `db drop`, `db create`, the privilege restore below, `migrate`, `seed` | Guarded once, before the drop. A PostgreSQL application that has `docker/postgres/init.sql` (every one `forge new` made with Docker) gets the same privileges after a reset as after a fresh `docker compose up`: the roles survive a drop, but the grants inside the database do not (`REVOKE CONNECT ... FROM PUBLIC`, `GRANT CONNECT`, the schema grants and `ALTER DEFAULT PRIVILEGES ... TO app_runtime`). The CLI therefore runs the part of that script after its `\connect` line with `psql -w` (never a password prompt), as the migration role, in one transaction, between `db create` and `migrate`. It connects where the application does: the host, port, user, password and TLS mode a URL leaves out come from `PGHOSTADDR`, `PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD` and `PGSSLMODE`, as SQLx reads them. It needs `psql` and `FORGE_MIGRATION_DATABASE_URL`, and refuses **before dropping anything** when it cannot apply the script: no `psql`; `FORGE_DATABASE_URL` and `FORGE_MIGRATION_DATABASE_URL` name different databases (the application's `db create` and `db drop` act on the migration URL's); the script's `\connect` names another database; or the part after `\connect` contains a backslash anywhere or a colon that is not half of a `::` cast (psql runs backslash commands such as `\!`, `\o`, `\gexec` and `\copy` even after SQL on the same line, and interpolates `:name`, `:'name'` and `:"name"`, so only plain SQL is sent; comments and string literals count). The restore needs PostgreSQL 15 or later: before 15 the `public` schema is owned by the bootstrap superuser, so `REVOKE ... ON SCHEMA public` as the migration role only warns. Applications without the script, and MySQL/MariaDB/SQLite, are not affected. `db drop` followed by `db setup` does not restore the grants; use `db reset`. |
+| `db console [-- ARGS]` | the database's own client | `psql -X`, `mysql` or `sqlite3` on the database of `FORGE_DATABASE_URL`, with the credentials of `FORGE_MIGRATION_DATABASE_URL` when it is set, like Forge-Go. Does not build or run the application. The password is never an argument: PostgreSQL gets it in `PGPASSWORD`, MySQL/MariaDB in an option file (mode 0600, in a 0700 directory removed when the client exits), SQLite has none. Every inherited `PG*` variable and every `FORGE_*` variable (the application's URLs, keys and passwords) are dropped from the client's environment; the server is the one the application would connect to (the URL, else `PGHOSTADDR`, `PGHOST`, `PGPORT`, with `PGUSER`, `PGPASSWORD` and `PGSSLMODE` filling the user, password and TLS mode a URL omits), passed to the client explicitly. Ctrl-C reaches the client (it cancels a query) and not `forge`, so the option file is always removed; SIGTERM, SIGHUP and SIGQUIT stop the client. Refuses the engines' system databases, a missing client (`psql was not found on PATH: install the postgres client tools`) and a client that fails (`psql exited with status N`). |
 | `db setup` | `db create`, `migrate`, `seed` | Stops at the first failure. |
 | `db prepare` | `db exists`; then `migrate`, or `db setup` when it is missing | `db exists` exits 3 for "missing", so a failure is never mistaken for it. |
 | `db migrate`, `db status`, `db seed` | as `migrate`, `migrate status`, `seed` | |
@@ -845,6 +848,13 @@ passed, whether it is started by `forge` or directly in a container. The CLI
 passes `--force-production` on only after confirmation, and asks for it whenever
 you give the flag, even in development, because it cannot see the address.
 
+"Local" is judged on the address the driver connects to, not on what is behind
+it: a Unix socket (a `host` starting with `/`, `PGHOST=/dir`, or `postgres:///shop`
+resolved to the default socket directory or `localhost`) and a loopback address
+count as local even when a tunnel or proxy forwards them to a remote server.
+That is not a safeguard against such setups; the protection that applies to
+them is the `FORGE_ENV` rule and `--force-production`.
+
 ### `forge doctor`
 
 Checks, prints and exits 1 when something is wrong:
@@ -864,9 +874,14 @@ toolchain: cargo 1.98.1 (...); rustc 1.98.1 (...)
   the key; secret values never appear, and `--json` omits values altogether.
 - **Database**: the URL is described (engine, database, host and port, never a
   user, password or query) and a TCP connection to the host is opened (3
-  seconds). The CLI does not log in; the application does that with its own
-  credentials, so a wrong password still shows up only when you migrate or
-  serve. SQLite reports whether the file exists. A Unix socket is not checked.
+  seconds). The host and port are the ones the driver would use: a PostgreSQL
+  URL that leaves them out takes `PGHOSTADDR`, `PGHOST` and `PGPORT` from the
+  environment (a `PGHOST` starting with `/` is a socket directory), and with
+  none of them the default socket (`/var/run/postgresql`, `/private/tmp` or
+  `/tmp`) when a server listens there, else `localhost`. The CLI does not log
+  in; the application does that with its own credentials, so a wrong password
+  still shows up only when you migrate or serve. SQLite reports whether the
+  file exists. A Unix socket is not checked.
   `FORGE_MIGRATION_DATABASE_URL` missing is mentioned, not an error.
 
 `--json` prints the report Forge-Go prints: `schema_version`, `ok`,
@@ -892,8 +907,12 @@ Builds and runs the application, then follows changes:
 - **The old process keeps serving until a build succeeds.** Then it gets
   SIGTERM, is awaited (35 seconds, then killed) and the new binary starts. A
   failed build prints Cargo's diagnostics and leaves the running application
-  alone; if the tree changes while a build runs, that build is discarded and
-  the build starts over. A crashed application waits for the next change.
+  alone, and so does an error that kept Cargo from running at all (printed as
+  `build failed (...); the previous build keeps running`); if the tree changes
+  while a build runs, that build is discarded and the build starts over. A
+  crashed application waits for the next change, and whatever it left running
+  in its process group is killed as soon as the exit is seen (the same happens
+  after a stop), so an orphaned worker cannot hold the port of the next build.
 - The application and `cargo build` each run in their own process group, which
   is signalled as a whole, so helpers they started do not outlive a restart or
   Ctrl-C. Progress lines start with `forge dev:` on standard error.
@@ -909,8 +928,7 @@ Same command names, flags, messages and exit codes, except:
 
 - `forge rollback --steps N`: Rust CLIs spell long flags with two dashes
   (Go's `flag` package accepts `-steps` and `--steps`).
-- `forge db create|drop` and `exists` run in the application, not the CLI, so
-  the CLI never holds a database credential. They use
+- `forge db create|drop` and `exists` run in the application, not the CLI. They use
   `FORGE_MIGRATION_DATABASE_URL` for both the credentials and the database
   name; Forge-Go takes the name from `FORGE_DATABASE_URL` and the credentials
   from the privileged URL.
@@ -923,10 +941,20 @@ Same command names, flags, messages and exit codes, except:
   `/v1/<plural>` JSON routes of resources, which Forge-Go's scan misses; `ACTION` is always `-`
   because there is no `Resources` router. Tracked in
   [Rails parity](rails-parity.md#parity-follow-ups).
-- Not ported: `forge inspect`, `db schema:dump`, `db schema:load` and
-  `db console` (they run `pg_dump`, `psql` and friends with the database
-  credential), `destroy`, `deploy`, `logs`, `app`. They are
-  tracked in [Rails parity](rails-parity.md).
+- `forge db console` is the same command (name, `--` for client arguments,
+  credentials from the migration URL, the password never an argument). The URL
+  is read in Rust's spelling, with SQLx's query parameters (`sslmode`, `host`,
+  `port`, `user`, `ssl-mode`, `socket`, ...) honored instead of refused.
+  `forge db reset` additionally restores `docker/postgres/init.sql`'s
+  privileges with `psql` (Forge-Go's generated applications have no such
+  script: their Compose database has one role).
+- `forge doctor` probes the host the driver would use, including `PG*` defaults;
+  Forge-Go's `doctor` does not probe the database at all. A PostgreSQL URL with
+  no host (`postgres:///shop`) is a local socket for the production guard here;
+  Forge-Go refuses such a URL as ambiguous.
+- Not ported: `forge inspect`, `db schema:dump`, `db schema:load` (they run
+  `pg_dump` and friends with the database credential), `destroy`, `deploy`,
+  `logs`, `app`. They are tracked in [Rails parity](rails-parity.md).
 - `forge doctor` also checks the toolchain and that the database server answers.
 - Progress lines of `forge dev` carry no time stamp.
 

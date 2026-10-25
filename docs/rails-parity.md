@@ -41,6 +41,15 @@ the work is finished and waiting for its review; **Planned** means not started.
 
 ## Parity follow-ups
 
+- Database URLs without a host (tracked 2026-10-25, forge-rust#24): the Rust
+  production guard of `db drop` treats `postgres:///shop` as a local socket
+  (what SQLx resolves it to: `PGHOST=/dir`, or the first default socket
+  directory with a server, else `localhost`). Forge-Go's `forge db` refuses
+  such a URL as ambiguous, because its checks need an explicit host. Both fail
+  closed for a remote host; the difference is that Rust accepts the URL. Decide
+  once whether Go should resolve the same way or Rust should refuse it, and
+  change the other framework to match.
+
 - TOTP MFA ([ADR 0040](adr/0040-totp-multi-factor-authentication.md)): the
   primitives, storage format, key, throttle limits, audit names (including
   `auth.mfa.backup_codes_regenerated`) and the HTML enrollment, rotation,
@@ -99,7 +108,8 @@ the work is finished and waiting for its review; **Planned** means not started.
   `setup`, `seed` and `db create|drop|reset|setup|prepare|migrate|rollback|status|seed`
   with Forge-Go's names, flags and refusals. Still open, in this order, each
   an application subcommand so the CLI keeps holding no credentials:
-  `db schema:dump|schema:load|console`, browser reload in `forge dev` (the Go
+  `db schema:dump|schema:load` (`db console` exists since P5: it runs the
+  client with the URL's credentials in the environment, like Forge-Go), browser reload in `forge dev` (the Go
   proxy needs a reviewed Rust port with the same CSP rules), and
   `.env.development`/`.env.local` files in `forge dev` and the lifecycle
   commands together with generating them. Planned right after the generators

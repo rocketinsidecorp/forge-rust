@@ -70,6 +70,12 @@ pub enum CliError {
         command: String,
         code: Option<i32>,
     },
+    /// The database's own client (`psql`, `mysql`, `sqlite3`) exited
+    /// unsuccessfully (`None`: killed by a signal).
+    ClientFailed {
+        program: String,
+        code: Option<i32>,
+    },
     /// A destructive command was refused or not confirmed; nothing changed.
     Refused(String),
     /// An argument is invalid in a way the argument parser cannot see.
@@ -193,6 +199,10 @@ impl fmt::Display for CliError {
                     "application command \"{command}\" was terminated by a signal"
                 ),
             },
+            Self::ClientFailed { program, code } => match code {
+                Some(code) => write!(formatter, "{program} exited with status {code}"),
+                None => write!(formatter, "{program} was terminated by a signal"),
+            },
             Self::Refused(reason) | Self::Usage(reason) => formatter.write_str(reason),
             Self::Interrupted => formatter.write_str("interrupted"),
             Self::Signals(error) => {
@@ -234,6 +244,7 @@ impl std::error::Error for CliError {
             | Self::NotAnApplication(_)
             | Self::NoBinary { .. }
             | Self::AppCommandFailed { .. }
+            | Self::ClientFailed { .. }
             | Self::Refused(_)
             | Self::Usage(_)
             | Self::Interrupted

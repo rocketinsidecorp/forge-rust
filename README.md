@@ -226,7 +226,9 @@ forge db status                                # same as forge migrate status
 forge db migrate                               # same as forge migrate
 forge db seed                                  # same as forge seed
 forge db rollback --steps 1                    # guarded like drop
-forge db reset                                 # drop + setup: a clean development database
+forge db reset                                 # drop + create + restore docker/postgres/init.sql privileges + migrate + seed (needs psql)
+forge db console                               # psql / mysql / sqlite3 on FORGE_DATABASE_URL's database (password never in argv)
+forge db console -- -c 'select 1'              # arguments after -- go to the client
 forge db drop                                  # refused when FORGE_ENV=production or the server is remote
 FORGE_ALLOW_DESTRUCTIVE=true forge db drop --force-production --yes   # the only way in production
 forge openapi                                  # the OpenAPI 3.1 document of the JSON routes

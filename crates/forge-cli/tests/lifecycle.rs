@@ -28,6 +28,20 @@ if [ "$1 $2" = "db exists" ]; then exit "${EXISTS_CODE:-0}"; fi
 exit "${APP_EXIT:-0}"
 "#;
 
+/// A `psql` stand-in: records its arguments, the connection variables it was
+/// given and the script on its standard input.
+const FAKE_PSQL: &str = r#"#!/bin/sh
+echo "psql $*" >> "$RECORD"
+echo "env user=$PGUSER password=$PGPASSWORD host=$PGHOST port=$PGPORT db=$PGDATABASE service=${PGSERVICE-unset} forge_url=${FORGE_DATABASE_URL-unset}" >> "$RECORD"
+if [ "$1 $2" != "-X -c" ] && [ "$#" -gt 3 ]; then cat >> "$RECORD.sql"; fi
+exit "${PSQL_EXIT:-0}"
+"#;
+
+const RUNTIME_URL: &str = "postgres://app_runtime:rt-secret@127.0.0.1:5432/shop";
+const MIGRATION_URL: &str = "postgres://app_migrator:mg-secret@127.0.0.1:5432/shop";
+
+const INIT_SCRIPT: &str = "CREATE ROLE app_migrator LOGIN;\nCREATE DATABASE shop OWNER app_migrator;\n\n\\connect shop\n\nGRANT CONNECT ON DATABASE shop TO app_runtime;\n";
+
 const SERVER_APP: &str = r#"#!/bin/sh
 trap 'echo stopped >> "$RECORD"; exit 0' TERM
 echo started >> "$RECORD"
@@ -236,6 +250,172 @@ fn db_setup_reset_and_prepare_compose_the_applications_commands() {
     assert_eq!(
         missing.app_calls(),
         ["db exists", "db create", "migrate", "seed"]
+    );
+}
+
+impl Fixture {
+    /// Puts the fake `psql` on the `PATH` and returns the command with both
+    /// database URLs set.
+    fn with_psql(&self, arguments: &[&str]) -> Command {
+        executable(&self.directory.path().join("bin/psql"), FAKE_PSQL);
+        let mut command = self.command(arguments);
+        command
+            .env("FORGE_DATABASE_URL", RUNTIME_URL)
+            .env("FORGE_MIGRATION_DATABASE_URL", MIGRATION_URL)
+            .env("PGSERVICE", "elsewhere");
+        command
+    }
+
+    fn init_script(&self) {
+        let path = self.project().join("docker/postgres/init.sql");
+        fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        fs::write(path, INIT_SCRIPT).expect("init.sql");
+    }
+}
+
+#[test]
+fn db_console_runs_the_client_with_the_password_in_the_environment_only() {
+    let fixture = Fixture::new(FAKE_APP);
+    let output = fixture
+        .with_psql(&["db", "console", "--", "-c", "select 1"])
+        .output()
+        .expect("forge runs");
+    assert!(output.status.success(), "{}", stderr(&output));
+    let lines = fixture.lines();
+    assert_eq!(
+        lines[0], "psql -X -c select 1",
+        "arguments after -- reach the client"
+    );
+    assert_eq!(
+        lines[1],
+        "env user=app_migrator password=mg-secret host=127.0.0.1 port=5432 db=shop \
+         service=unset forge_url=unset",
+        "the migration role's credentials, the URL's database, no inherited PG* variable"
+    );
+    assert_eq!(
+        fixture.app_calls(),
+        Vec::<String>::new(),
+        "the application is not built or run"
+    );
+    assert!(
+        !lines[0].contains("secret"),
+        "the password is not an argument: {}",
+        lines[0]
+    );
+    let shown = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        stderr(&output)
+    );
+    assert!(!shown.contains("secret"), "{shown}");
+}
+
+#[test]
+fn db_console_names_a_missing_client_and_a_missing_url_without_leaking_either() {
+    let fixture = Fixture::new(FAKE_APP);
+    let mut command = fixture.command(&["db", "console"]);
+    command
+        .env("FORGE_DATABASE_URL", RUNTIME_URL)
+        .env("PATH", fixture.directory.path().join("bin"));
+    let output = command.output().expect("forge runs");
+    assert!(!output.status.success());
+    let text = stderr(&output);
+    assert!(
+        text.contains("psql was not found on PATH: install the postgres client tools"),
+        "{text}"
+    );
+    assert!(!text.contains("secret"), "{text}");
+
+    let output = fixture.run(&["db", "console"]);
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("set FORGE_DATABASE_URL"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn db_console_returns_the_clients_failure() {
+    let fixture = Fixture::new(FAKE_APP);
+    let output = fixture
+        .with_psql(&["db", "console"])
+        .env("PSQL_EXIT", "2")
+        .output()
+        .expect("forge runs");
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("psql exited with status 2"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn db_reset_restores_the_init_script_privileges_after_creating_the_database() {
+    let fixture = Fixture::new(FAKE_APP);
+    fixture.init_script();
+    let output = fixture
+        .with_psql(&["db", "reset"])
+        .output()
+        .expect("forge runs");
+    assert!(output.status.success(), "{}", stderr(&output));
+    let order: Vec<String> = fixture
+        .lines()
+        .into_iter()
+        .filter(|line| line.starts_with("app ") || line.starts_with("psql "))
+        .collect();
+    assert_eq!(
+        order,
+        [
+            "app db drop",
+            "app db create",
+            "psql -X -q -w -v ON_ERROR_STOP=1 -1 -f -",
+            "app migrate",
+            "app seed",
+        ]
+    );
+    let script = fs::read_to_string(format!("{}.sql", fixture.record().display())).expect("script");
+    assert_eq!(script, "\nGRANT CONNECT ON DATABASE shop TO app_runtime;\n");
+    assert!(
+        fixture
+            .lines()
+            .iter()
+            .any(|line| line.contains("user=app_migrator password=mg-secret"))
+    );
+    let shown = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        stderr(&output)
+    );
+    assert!(
+        shown.contains("restored the privileges of docker/postgres/init.sql"),
+        "{shown}"
+    );
+    assert!(!shown.contains("secret"), "{shown}");
+}
+
+#[test]
+fn db_reset_without_psql_refuses_before_dropping_the_database() {
+    let fixture = Fixture::new(FAKE_APP);
+    fixture.init_script();
+    let mut command = fixture.command(&["db", "reset"]);
+    command
+        .env("FORGE_DATABASE_URL", RUNTIME_URL)
+        .env("FORGE_MIGRATION_DATABASE_URL", MIGRATION_URL)
+        .env("PATH", fixture.directory.path().join("bin"));
+    let output = command.output().expect("forge runs");
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("psql was not found on PATH"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(!stderr(&output).contains("secret"));
+    assert_eq!(
+        fixture.app_calls(),
+        Vec::<String>::new(),
+        "nothing was dropped, nothing built"
     );
 }
 
