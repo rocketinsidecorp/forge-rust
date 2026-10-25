@@ -115,6 +115,11 @@ sqlx = { workspace = true, features = ["macros"] }
 tempfile.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
+# Test-only: the supply-chain gate (tests/supply_chain.rs) parses every
+# gated workflow and template with a real YAML parser and checks that its
+# line scanner reads the same keys (docs/dependency-policy.md, "Test-only
+# dependencies"). No default features: no encoding_rs.
+yaml-rust2 = { version = "=0.13.0", default-features = false }
 
 [lints]
 workspace = true

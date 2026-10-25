@@ -215,29 +215,43 @@ does not match either form.
   the gate also fails when an allowlisted action is no longer used. A
   sub-path cannot leave the repository (no empty, `.` or `..` segment).
 - Gated files are written in a simple YAML subset. The gate reads the
-  workflows, local actions and generated-app CI templates line by line, and
-  refuses whatever such a reader could misread rather than guess:
-  - a carriage return not followed by a line feed, U+0085, U+2028 or U+2029
-    (line breaks a YAML parser sees and a line reader does not), and a
-    byte-order mark anywhere but at the start;
-  - outside block scalars (`run: |`) and plain scalars continued on deeper
-    lines, an anchor (`&`), alias (`*`), tag (`!`, `!!`), explicit key (`?`)
-    or merge key (`<<`) where any key or value starts (`${{ !cancelled() }}`,
-    quoted strings and `run: |` text stay allowed);
-  - a flow collection (`[...]`, `{...}`) that does not close on its line, a
-    quoted scalar that does not close on its line, and a double-quoted key
-    with an escape (`"u\x73es"`).
-  Write a multi-line expression as a `>-` block scalar.
+  workflows, local actions and generated-app CI template (its `%%...%%`
+  markers blanked line-aligned, so every branch is read where it stands) line
+  by line, and refuses whatever such a reader could misread rather than guess:
+  - a carriage return not followed by a line feed, U+0085, U+2028 or U+2029,
+    and a byte-order mark anywhere but at the start;
+  - a YAML directive (`%YAML`), content after a document marker (`---`,
+    `...`), and a document root that does not start at column 0;
+  - outside block scalars (`run: |`), an anchor (`&`), alias (`*`), tag (`!`,
+    `!!`), explicit key (`?`) or merge key (`<<`) where any key or value
+    starts (`${{ !cancelled() }}`, quoted strings and `run: |` text stay
+    allowed);
+  - a plain scalar continued on a deeper line: write a multi-line expression
+    as a `>-` block scalar;
+  - a flow collection (`[...]`, `{...}`) or quoted scalar that does not close
+    on its line, a flow indicator or a `:` without a blank inside a flow
+    collection's plain scalar, a quoted key whose `:` is not followed by a
+    blank, and a double-quoted key with an escape (`"u\x73es"`).
+  A `#` inside a quoted scalar is text, not a comment.
+- Every gated file is also parsed with a YAML parser (`yaml-rust2`, a
+  test-only dependency, docs/dependency-policy.md): the parser and the line
+  reader must find the same `uses` keys, the same values on the same lines
+  (block-scalar text is not read for keys, so a decoy there cannot stand in
+  for a key the reader misses), and the checkout (`with:
+  persist-credentials: false` in the step itself) and `permissions` rules
+  read the parsed tree, not the text.
 - The install rule reads `run` text as text: with and without YAML comments
   removed, continued lines joined with and without a space, quotes and
   backslashes ignored. It refuses ANSI-C quoting (`$'...'`), any command
   whose program is a variable (`c=cargo; $c install`) or a path to cargo
   when it installs, and every `.cargo/config` or `.cargo/config.toml` in the
-  repository (cargo reads them from every parent directory; one could
-  redirect crate sources or alias `install`). What remains beyond a text
-  scanner (a script the workflow runs, `eval` of computed text, a tool
-  downloaded by an allowlisted action) is covered by review and by the rule
-  that only the reviewed scripts and actions run.
+  repository, symbolic links included (cargo reads them from every parent
+  directory; one could redirect crate sources or alias `install`).
+- What text scanning cannot see: the shell inside `run` is not parsed (a
+  script the workflow runs, `eval` of computed text, a command assembled at
+  run time), and an allowlisted action or a reviewed script can still fetch a
+  tool. Those are covered by review of every script and allowlisted action,
+  not by the gate.
 - Cargo tools are installed only through that action, plus one reviewed
   exception: the `Install cargo-auditable` step of `release.yml`, which
   installs exactly `cargo-auditable`. Both use one exact `--version` and

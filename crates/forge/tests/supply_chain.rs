@@ -155,11 +155,31 @@ fn image_references<'a>(text: &'a str, prefix: &str) -> Vec<&'a str> {
 /// A YAML line split into its code and its comment: a `#` that starts the
 /// line or follows a space or a tab.
 fn split_comment(line: &str) -> (&str, &str) {
+    // A quote that starts a token (after the line start, a blank or `[`, `{`,
+    // `,`, `:`) opens a quoted scalar, in which `#` is text.
     let bytes = line.as_bytes();
-    let position = bytes.iter().enumerate().position(|(index, byte)| {
-        *byte == b'#' && (index == 0 || matches!(bytes[index - 1], b' ' | b'\t'))
-    });
-    position.map_or((line, ""), |index| line.split_at(index))
+    let mut quote: Option<u8> = None;
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        match quote {
+            Some(b'"') if byte == b'\\' => index += 1,
+            Some(b'\'') if byte == b'\'' && bytes.get(index + 1) == Some(&b'\'') => index += 1,
+            Some(open) if byte == open => quote = None,
+            Some(_) => {}
+            None => {
+                let starts_token = index == 0
+                    || matches!(bytes[index - 1], b' ' | b'\t' | b'[' | b'{' | b',' | b':');
+                if matches!(byte, b'"' | b'\'') && starts_token {
+                    quote = Some(byte);
+                } else if byte == b'#' && (index == 0 || matches!(bytes[index - 1], b' ' | b'\t')) {
+                    return line.split_at(index);
+                }
+            }
+        }
+        index += 1;
+    }
+    (line, "")
 }
 
 fn indentation(line: &str) -> usize {
@@ -290,17 +310,25 @@ fn action_repository(reference: &str) -> Option<String> {
         .then(|| format!("{owner}/{repository}").to_ascii_lowercase())
 }
 
-/// What makes a gated file leave the simple YAML subset the gate can read exactly (docs/supply-chain.md,
-/// "Gated files are written in a simple YAML subset"):
+/// Which lines of a gated file are nodes (keys and values the rules read;
+/// block-scalar text, comments, blank lines and document markers are not),
+/// and what makes the file leave the simple YAML subset the gate reads
+/// exactly (docs/supply-chain.md, "Gated files are written in a simple YAML
+/// subset"):
 /// - a `\r` not followed by `\n`, U+0085, U+2028 or U+2029 (hidden line
 ///   breaks), or U+FEFF anywhere but at the start;
-/// - outside block scalars and plain-scalar continuations, an anchor (`&`),
-///   alias (`*`), tag (`!`), explicit key (`?`) or merge key (`<<`) where a
-///   key or value starts (after the indentation, `- `, `: `, or a flow
-///   collection's `[`, `{`, `,`);
-/// - a flow collection that does not close on its line, a quoted scalar that
-///   does not close on its line, and a double-quoted key with an escape.
-fn yaml_subset(text: &str) -> Vec<(usize, &'static str)> {
+/// - a directive (`%YAML`), content after a document marker (`---`, `...`),
+///   and a document root that does not start at column 0;
+/// - outside block scalars, an anchor (`&`), alias (`*`), tag (`!`),
+///   explicit key (`?`) or merge key (`<<`) where a key or value starts
+///   (after the indentation, `- `, `: `, or a flow collection's `[`, `{`,
+///   `,`);
+/// - a plain scalar continued on a deeper line (write a `>-` block scalar);
+/// - a flow collection or quoted scalar that does not close on its line, a
+///   flow indicator or a `:` without a blank inside a flow collection's
+///   plain scalar, a quoted key whose `:` is not followed by a blank, and a
+///   double-quoted key with an escape.
+fn yaml_subset(text: &str) -> (Vec<bool>, Vec<(usize, &'static str)>) {
     let mut problems = Vec::new();
     let mut line = 0;
     for (offset, character) in text.char_indices() {
@@ -317,26 +345,67 @@ fn yaml_subset(text: &str) -> Vec<(usize, &'static str)> {
             ));
         }
     }
-    // Column of the key whose block scalar, or of the node whose plain
-    // scalar, the following deeper lines continue.
-    let mut text_under: Option<usize> = None;
+    let mut nodes = Vec::new();
+    // The column of the key whose block scalar is being skipped, and of the
+    // node whose plain scalar a deeper line would continue.
+    let mut block: Option<usize> = None;
+    let mut plain: Option<usize> = None;
+    let mut expect_root = true;
     for (number, raw) in text.split('\n').enumerate() {
         let line = raw.strip_suffix('\r').unwrap_or(raw);
+        let line = if number == 0 {
+            line.strip_prefix('\u{feff}').unwrap_or(line)
+        } else {
+            line
+        };
         let content = line.trim_start_matches([' ', '\t']);
         let indent = line.len() - content.len();
         if content.is_empty() || content.starts_with('#') {
-            // A comment no deeper than the scalar's node ends that scalar.
-            if content.starts_with('#') && text_under.is_some_and(|column| indent <= column) {
-                text_under = None;
+            if content.starts_with('#') && block.is_some_and(|column| indent <= column) {
+                block = None;
             }
+            nodes.push(false);
             continue;
         }
-        if let Some(column) = text_under {
+        if let Some(column) = block {
             if indent > column {
+                nodes.push(false);
                 continue;
             }
-            text_under = None;
+            block = None;
         }
+        if indent == 0
+            && ["---", "..."]
+                .iter()
+                .any(|marker| content == *marker || content.starts_with(&format!("{marker} ")))
+        {
+            let rest = split_comment(&content[3..]).0.trim();
+            if !rest.is_empty() {
+                problems.push((number, "content after a document marker"));
+            }
+            expect_root = true;
+            plain = None;
+            nodes.push(false);
+            continue;
+        }
+        nodes.push(true);
+        if indent == 0 && content.starts_with('%') {
+            problems.push((number, "a YAML directive"));
+            continue;
+        }
+        if expect_root {
+            if indent != 0 {
+                problems.push((number, "a document root that does not start at column 0"));
+            }
+            expect_root = false;
+        }
+        if plain.is_some_and(|column| indent > column) {
+            problems.push((
+                number,
+                "a plain scalar continued on a deeper line (write a `>-` block scalar)",
+            ));
+        }
+        plain = None;
         let mut content = content;
         while let Some(rest) = content
             .strip_prefix('-')
@@ -349,8 +418,6 @@ fn yaml_subset(text: &str) -> Vec<(usize, &'static str)> {
         let mut index = 0;
         let mut depth = 0_usize;
         let mut at_node = true;
-        // Whether the last node started on this line is a plain scalar,
-        // and whether it is a block scalar indicator.
         let mut last_plain = false;
         let mut last_block = false;
         while index < characters.len() {
@@ -363,24 +430,20 @@ fn yaml_subset(text: &str) -> Vec<(usize, &'static str)> {
                 at_node = false;
                 last_plain = false;
                 last_block = false;
-                let rest = &content[at..];
-                if matches!(character, '&' | '*' | '!' | '?') || rest.starts_with("<<") {
+                if matches!(character, '&' | '*' | '!' | '?') || content[at..].starts_with("<<") {
                     problems.push((number, "an anchor, alias, tag, explicit key or merge key"));
                 }
                 match character {
                     '"' | '\'' => {
-                        // A quoted scalar closes on this line.
                         let mut end = None;
-                        let mut escaped = false;
                         let mut scan = index + 1;
                         while scan < characters.len() {
                             let (_, inner) = characters[scan];
-                            if character == '"' && inner == '\\' && !escaped {
-                                escaped = true;
-                                scan += 1;
+                            if character == '"' && inner == '\\' {
+                                scan += 2;
                                 continue;
                             }
-                            if inner == character && !escaped {
+                            if inner == character {
                                 if character == '\''
                                     && characters
                                         .get(scan + 1)
@@ -392,7 +455,6 @@ fn yaml_subset(text: &str) -> Vec<(usize, &'static str)> {
                                 end = Some(scan);
                                 break;
                             }
-                            escaped = false;
                             scan += 1;
                         }
                         let Some(end) = end else {
@@ -400,12 +462,18 @@ fn yaml_subset(text: &str) -> Vec<(usize, &'static str)> {
                                 .push((number, "a quoted scalar that does not close on its line"));
                             break;
                         };
-                        let quoted = &content[at..characters[end].0];
-                        let is_key = content[characters[end].0 + 1..]
-                            .trim_start()
-                            .starts_with(':');
-                        if character == '"' && quoted.contains('\\') && is_key {
-                            problems.push((number, "a double-quoted key with an escape"));
+                        let after = &content[characters[end].0 + 1..];
+                        let trimmed = after.trim_start_matches([' ', '\t']);
+                        if let Some(value) = trimmed.strip_prefix(':') {
+                            if character == '"' && content[at..characters[end].0].contains('\\') {
+                                problems.push((number, "a double-quoted key with an escape"));
+                            }
+                            if !(value.is_empty() || value.starts_with([' ', '\t'])) {
+                                problems.push((
+                                    number,
+                                    "a quoted key whose `:` is not followed by a blank",
+                                ));
+                            }
                         }
                         index = end + 1;
                         continue;
@@ -417,20 +485,18 @@ fn yaml_subset(text: &str) -> Vec<(usize, &'static str)> {
                         continue;
                     }
                     ']' | '}' if depth > 0 => {
-                        // An empty collection, or a trailing comma.
                         depth -= 1;
                         index += 1;
                         continue;
                     }
                     '|' | '>' => last_block = depth == 0,
                     '#' => break,
-                    // Only a plain scalar outside a flow collection may go on,
-                    // more indented, on the next lines.
                     _ => last_plain = depth == 0,
                 }
                 index += 1;
                 continue;
             }
+            let next = characters.get(index + 1).map(|(_, next)| *next);
             match character {
                 '#' if characters
                     .get(index.wrapping_sub(1))
@@ -438,17 +504,20 @@ fn yaml_subset(text: &str) -> Vec<(usize, &'static str)> {
                 {
                     break;
                 }
-                ':' if characters
-                    .get(index + 1)
-                    .is_none_or(|(_, next)| matches!(next, ' ' | '\t' | ',' | ']' | '}')) =>
-                {
-                    // A key ends: what follows is its value, not the key.
+                ':' if next.is_none_or(|next| matches!(next, ' ' | '\t' | ',' | ']' | '}')) => {
+                    // A key ends: what follows is its value.
                     at_node = true;
                     last_plain = false;
                     last_block = false;
                 }
+                ':' if depth > 0 => {
+                    problems.push((number, "a `:` without a blank inside a flow collection"));
+                }
                 ',' if depth > 0 => at_node = true,
                 ']' | '}' if depth > 0 => depth -= 1,
+                '[' | '{' if depth > 0 => {
+                    problems.push((number, "a flow indicator inside a plain scalar"));
+                }
                 _ => {}
             }
             index += 1;
@@ -457,28 +526,310 @@ fn yaml_subset(text: &str) -> Vec<(usize, &'static str)> {
             problems.push((number, "a flow collection that spans lines"));
         }
         if depth == 0 && last_block {
-            text_under = Some(column);
+            block = Some(column);
         } else if depth == 0 && last_plain {
-            // A plain scalar may go on, more indented, on the next lines.
-            text_under = Some(column);
+            plain = Some(column);
         }
     }
-    problems
+    (nodes, problems)
 }
 
 /// The YAML subset rule as violations.
 fn yaml_subset_violations(name: &str, text: &str) -> Vec<String> {
     let lines: Vec<&str> = text.split('\n').collect();
     yaml_subset(text)
+        .1
         .into_iter()
         .map(|(number, problem)| {
             format!(
-                "{name}:{}: `{}`: {problem}: gated files are written in a simple YAML subset (docs/supply-chain.md); write a multi-line expression as a `>-` block scalar",
+                "{name}:{}: `{}`: {problem}: gated files are written in a simple YAML subset (docs/supply-chain.md)",
                 number + 1,
                 lines.get(number).map_or("", |line| line.trim())
             )
         })
         .collect()
+}
+
+/// A generated-app template with its `%%...%%` markers blanked line-aligned
+/// (a line that is only markers becomes empty, an inline `%%NAME%%` the
+/// word `x`), so the scanner and the parser read every branch at the line
+/// it has in the template.
+fn blank_template_markers(text: &str) -> String {
+    text.split('\n')
+        .map(|line| {
+            let mut kept = String::new();
+            let mut rest = line;
+            while let Some(start) = rest.find("%%") {
+                let Some(length) = rest[start + 2..].find("%%") else {
+                    break;
+                };
+                kept.push_str(&rest[..start]);
+                kept.push('\u{0}');
+                rest = &rest[start + 2 + length + 2..];
+            }
+            kept.push_str(rest);
+            if kept
+                .chars()
+                .all(|character| character == '\u{0}' || character.is_whitespace())
+                && kept.contains('\u{0}')
+            {
+                String::new()
+            } else {
+                kept.replace('\u{0}', "x")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// A YAML node as the parser reads it, with the 1-based line it starts on.
+#[derive(Debug)]
+enum YamlNode {
+    Scalar(String, usize),
+    Sequence(Vec<YamlNode>),
+    Mapping(Vec<(YamlNode, YamlNode)>),
+}
+
+impl YamlNode {
+    fn scalar(&self) -> Option<&str> {
+        match self {
+            Self::Scalar(value, _) => Some(value),
+            _ => None,
+        }
+    }
+
+    /// The value of `key` in a mapping (the first one, as written).
+    fn get(&self, key: &str) -> Option<&YamlNode> {
+        match self {
+            Self::Mapping(entries) => entries
+                .iter()
+                .find(|(name, _)| name.scalar() == Some(key))
+                .map(|(_, value)| value),
+            _ => None,
+        }
+    }
+
+    /// Every node of the tree, this one first.
+    fn visit<'a>(&'a self, found: &mut Vec<&'a YamlNode>) {
+        found.push(self);
+        match self {
+            Self::Scalar(..) => {}
+            Self::Sequence(items) => items.iter().for_each(|item| item.visit(found)),
+            Self::Mapping(entries) => entries.iter().for_each(|(key, value)| {
+                key.visit(found);
+                value.visit(found);
+            }),
+        }
+    }
+}
+
+#[derive(Default)]
+struct YamlTree {
+    stack: Vec<(bool, Vec<YamlNode>)>,
+    documents: Vec<YamlNode>,
+    problems: Vec<String>,
+}
+
+impl YamlTree {
+    fn push(&mut self, node: YamlNode) {
+        match self.stack.last_mut() {
+            Some((_, items)) => items.push(node),
+            None => self.documents.push(node),
+        }
+    }
+}
+
+impl yaml_rust2::parser::MarkedEventReceiver for YamlTree {
+    fn on_event(&mut self, event: yaml_rust2::Event, mark: yaml_rust2::scanner::Marker) {
+        use yaml_rust2::Event;
+        let line = mark.line();
+        let refuse = |anchor: usize, tag: bool| anchor != 0 || tag;
+        match event {
+            Event::Scalar(value, _, anchor, tag) => {
+                if refuse(anchor, tag.is_some()) {
+                    self.problems.push(format!("line {line}: an anchor or tag"));
+                }
+                self.push(YamlNode::Scalar(value, line));
+            }
+            Event::Alias(_) => {
+                self.problems.push(format!("line {line}: an alias"));
+                self.push(YamlNode::Scalar(String::new(), line));
+            }
+            Event::SequenceStart(anchor, ref tag) | Event::MappingStart(anchor, ref tag) => {
+                if refuse(anchor, tag.is_some()) {
+                    self.problems.push(format!("line {line}: an anchor or tag"));
+                }
+                let mapping = matches!(event, Event::MappingStart(..));
+                self.stack.push((mapping, Vec::new()));
+            }
+            Event::SequenceEnd | Event::MappingEnd => {
+                let Some((mapping, items)) = self.stack.pop() else {
+                    return;
+                };
+                if mapping {
+                    let mut entries = Vec::new();
+                    let mut items = items.into_iter();
+                    while let (Some(key), Some(value)) = (items.next(), items.next()) {
+                        if key.scalar() == Some("<<") {
+                            self.problems.push(format!("line {line}: a merge key"));
+                        }
+                        entries.push((key, value));
+                    }
+                    self.push(YamlNode::Mapping(entries));
+                } else {
+                    self.push(YamlNode::Sequence(items));
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The documents of a gated file as a YAML parser (yaml-rust2) reads them;
+/// anchors, aliases, tags and merge keys are refused here too.
+fn parse_yaml(text: &str) -> Result<Vec<YamlNode>, String> {
+    let mut tree = YamlTree::default();
+    yaml_rust2::parser::Parser::new_from_str(text)
+        .load(&mut tree, true)
+        .map_err(|error| error.to_string())?;
+    if tree.problems.is_empty() {
+        Ok(tree.documents)
+    } else {
+        Err(tree.problems.join("; "))
+    }
+}
+
+/// Every `uses` key the parser reads, as `line:value`.
+fn parsed_uses(documents: &[YamlNode]) -> Vec<String> {
+    let mut nodes = Vec::new();
+    documents
+        .iter()
+        .for_each(|document| document.visit(&mut nodes));
+    let mut found = Vec::new();
+    for node in nodes {
+        if let YamlNode::Mapping(entries) = node {
+            for (key, value) in entries {
+                if let YamlNode::Scalar(name, line) = key
+                    && name == "uses"
+                {
+                    found.push(format!(
+                        "{line}:{}",
+                        value.scalar().unwrap_or("<not a scalar>")
+                    ));
+                }
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+/// Every `uses` the line scanner reads on node lines (block-scalar text
+/// aside, so a decoy there cannot stand in for a key it misses), as
+/// `line:value`.
+fn scanned_uses(text: &str) -> Vec<String> {
+    let (nodes, _) = yaml_subset(text);
+    let mut found = Vec::new();
+    for (number, line) in text.split('\n').enumerate() {
+        if !nodes.get(number).copied().unwrap_or(false) {
+            continue;
+        }
+        for value in key_values(
+            split_comment(line.strip_suffix('\r').unwrap_or(line)).0,
+            "uses",
+        ) {
+            found.push(format!("{}:{value}", number + 1));
+        }
+    }
+    found.sort();
+    found
+}
+
+/// The parser and the line scanner read the same `uses` keys: the same
+/// values on the same lines.
+fn parser_violations(name: &str, text: &str) -> Vec<String> {
+    match parse_yaml(text) {
+        Err(error) => vec![format!("{name}: {error}")],
+        Ok(documents) => {
+            let (parsed, scanned) = (parsed_uses(&documents), scanned_uses(text));
+            if parsed == scanned {
+                Vec::new()
+            } else {
+                vec![format!(
+                    "{name}: the YAML parser reads uses keys {parsed:?}, the gate {scanned:?}: write every uses: key plainly"
+                )]
+            }
+        }
+    }
+}
+
+/// Read from the parsed tree: every step that uses actions/checkout (any
+/// case) sets `with: persist-credentials: false` itself, and no
+/// `permissions` grants `write` beyond the release job's `id-token` and
+/// `packages` (or `write-all`).
+fn tree_violations(name: &str, text: &str, release: bool) -> Vec<String> {
+    let documents = match parse_yaml(text) {
+        Ok(documents) => documents,
+        Err(error) => return vec![format!("{name}: {error}")],
+    };
+    let mut nodes = Vec::new();
+    documents
+        .iter()
+        .for_each(|document| document.visit(&mut nodes));
+    let mut violations = Vec::new();
+    for node in nodes {
+        let YamlNode::Mapping(entries) = node else {
+            continue;
+        };
+        if let Some(YamlNode::Scalar(reference, line)) = node.get("uses") {
+            let action = reference
+                .split_once('@')
+                .map_or(reference.as_str(), |(action, _)| action);
+            let kept = node
+                .get("with")
+                .and_then(|with| with.get("persist-credentials"))
+                .and_then(YamlNode::scalar)
+                == Some("false");
+            if action.eq_ignore_ascii_case("actions/checkout") && !kept {
+                violations.push(format!(
+                    "{name}:{line}: this checkout step must set with: persist-credentials: false"
+                ));
+            }
+        }
+        for (key, value) in entries {
+            if key.scalar() != Some("permissions") {
+                continue;
+            }
+            match value {
+                YamlNode::Scalar(scope, line) if scope != "read-all" && !scope.is_empty() => {
+                    violations.push(format!(
+                        "{name}:{line}: `permissions: {scope}` is not allowed"
+                    ));
+                }
+                YamlNode::Mapping(scopes) => {
+                    for (scope, access) in scopes {
+                        let scope = scope.scalar().unwrap_or_default();
+                        let allowed = match access.scalar() {
+                            Some("read" | "none") => true,
+                            Some("write") => release && matches!(scope, "id-token" | "packages"),
+                            _ => false,
+                        };
+                        if !allowed {
+                            violations.push(format!(
+                                "{name}: `{scope}: {:?}` is not allowed",
+                                access.scalar()
+                            ));
+                        }
+                    }
+                }
+                YamlNode::Scalar(..) => {}
+                YamlNode::Sequence(_) => {
+                    violations.push(format!("{name}: permissions must be a mapping"));
+                }
+            }
+        }
+    }
+    violations
 }
 
 /// The lines of the step (list item) that line `index` belongs to: from its
@@ -1196,14 +1547,35 @@ fn actions_are_pinned_by_commit_with_their_version_in_a_comment() {
     }
 }
 
+const APP_CI_TEMPLATE: &str = "crates/forge-cli/templates/app/github/workflows/ci.yml.tmpl";
+
+/// The gated files as (name, text): the workflows, the local actions they
+/// reach and the generated-app CI template (markers blanked line-aligned).
+fn gated_files() -> Vec<(String, String)> {
+    let mut files: Vec<(String, String)> = workflows_and_local_actions()
+        .into_iter()
+        .map(|(name, relative)| (name, read(&relative)))
+        .collect();
+    files.push((
+        APP_CI_TEMPLATE.to_owned(),
+        blank_template_markers(&read(APP_CI_TEMPLATE)),
+    ));
+    files
+}
+
+#[test]
+fn a_yaml_parser_reads_the_gated_files_as_the_gate_does() {
+    for (name, text) in gated_files() {
+        assert_clean(&yaml_subset_violations(&name, &text));
+        assert_clean(&parser_violations(&name, &text));
+        assert_clean(&tree_violations(&name, &text, name == "release.yml"));
+    }
+}
+
 #[test]
 fn only_allowlisted_actions_are_used() {
-    let mut files = workflows_and_local_actions();
-    let template = "crates/forge-cli/templates/app/github/workflows/ci.yml.tmpl";
-    files.push((template.to_owned(), template.to_owned()));
     let mut used = BTreeSet::new();
-    for (name, relative) in files {
-        let text = read(&relative);
+    for (name, text) in gated_files() {
         assert_clean(&allowlist_violations(&name, &text));
         assert_clean(&yaml_subset_violations(&name, &text));
         for line in text.lines() {
@@ -1225,8 +1597,23 @@ fn only_allowlisted_actions_are_used() {
 /// it cannot read.
 fn uses_violations(text: &str) -> Vec<String> {
     let mut violations = allowlist_violations("t.yml", text);
-    violations.extend(yaml_subset_violations("t.yml", text));
+    violations.extend(yaml_subset_violations("t.yml", &dedent(text)));
     violations
+}
+
+/// A fragment moved left so that its least indented line starts at column
+/// 0, as a document root must.
+fn dedent(text: &str) -> String {
+    let margin = text
+        .split('\n')
+        .filter(|line| !line.trim().is_empty())
+        .map(indentation)
+        .min()
+        .unwrap_or(0);
+    text.split('\n')
+        .map(|line| line.get(margin..).unwrap_or(line.trim_start()))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[test]
@@ -1296,20 +1683,21 @@ fn the_yaml_subset_refuses_what_a_line_scanner_could_misread() {
     ] {
         let text = snippet(&rejected);
         assert!(
-            !yaml_subset_violations("t.yml", &text).is_empty(),
+            !yaml_subset_violations("t.yml", &dedent(&text)).is_empty(),
             "accepted: {text:?}"
         );
     }
     for accepted in [
         "\u{feff}name: CI\non:\n  push:\n    branches: [main]\n    tags: [\"v*\"]\n",
         "jobs:\n  x:\n    if: ${{ !cancelled() }}\n    steps:\n      - run: |\n          case \"$x\" in\n            *) echo \"!\" & wait ;;\n          esac\n          # deeper comment\n      - uses: actions/checkout@SHA # v7.0.1\n",
-        // A plain scalar continued on deeper lines is text, `&&` and `!` too.
-        "    if: github.event_name == 'push'\n      && !cancelled()\n    runs-on: ubuntu-latest\n",
         "      - run: echo \"a #b\" && echo it's\n      - name: 'it''s'\n        with: {a: b, c: [d, e]}\n",
         "    if: >-\n      github.event_name == 'push'\n      && !cancelled()\n",
         "on:\r\n  push:\r\n",
     ] {
-        assert_clean(&yaml_subset_violations("t.yml", &snippet(accepted)));
+        assert_clean(&yaml_subset_violations(
+            "t.yml",
+            &dedent(&snippet(accepted)),
+        ));
     }
     // The scanner reads every node of the real files, deep ones included:
     // an anchor or a tag anywhere in them is found.
@@ -1328,6 +1716,94 @@ fn the_yaml_subset_refuses_what_a_line_scanner_could_misread() {
             !yaml_subset_violations("ci.yml", &changed).is_empty(),
             "the last `{from}` of ci.yml was not read"
         );
+    }
+}
+
+#[test]
+fn the_parser_check_rejects_what_the_scanner_misreads() {
+    let checkout = "actions/checkout@SHA # v7.0.1";
+    for rejected in [
+        // R2: a quoted `#` is no comment.
+        "jobs:\n  a:\n    steps:\n      - {name: 'build #1', uses: evil/act@main}\n".to_owned(),
+        // R3: flow nesting after a quoted key with no blank.
+        "jobs:\n  b: {\"runs-on\":[ubuntu-latest], \"steps\":[{\"u\\x73es\": evil/act@main}]}\n"
+            .to_owned(),
+        "jobs:\n  b: {runs-on:[x], steps: [{uses: evil/act@main}]}\n".to_owned(),
+        // R4: document markers, directives and an indented root.
+        "---\n  jobs:\n    a:\n      steps:\n        - uses: evil/act@main\n".to_owned(),
+        "--- # c\n  jobs: {}\n".to_owned(),
+        "%YAML 1.2\n---\njobs: {}\n".to_owned(),
+        "jobs: {}\n...\n  more: x\n".to_owned(),
+        // A plain scalar continued on deeper lines.
+        "jobs:\n  a:\n    if: github.event_name == 'push'\n      && !cancelled()\n".to_owned(),
+        // A decoy in a block scalar cannot stand in for a hidden key.
+        format!(
+            "jobs:\n  a:\n    steps:\n      - run: |\n          uses: {checkout}\n      - \"u\\x73es\": evil/act@main\n"
+        ),
+    ] {
+        let text = snippet(&rejected);
+        let mut violations = yaml_subset_violations("t.yml", &text);
+        violations.extend(parser_violations("t.yml", &text));
+        violations.extend(allowlist_violations("t.yml", &text));
+        assert!(!violations.is_empty(), "accepted: {text:?}");
+    }
+    for accepted in [
+        format!("jobs:\n  a:\n    steps:\n      - uses: {checkout}\n        with:\n          persist-credentials: false\n      - {{uses: actions/checkout@SHA, with: {{persist-credentials: false}}}} # v7.0.1\n      - run: |\n          uses: x\n"),
+        "---\njobs:\n  a:\n    if: >-\n      github.event_name == 'push'\n      && !cancelled()\n...\n".to_owned(),
+    ] {
+        let text = snippet(&accepted);
+        assert_clean(&yaml_subset_violations("t.yml", &text));
+        assert_clean(&parser_violations("t.yml", &text));
+    }
+}
+
+#[test]
+fn the_tree_rules_read_checkouts_and_permissions_as_yaml_does() {
+    for rejected in [
+        // X1 (a): a name that spells the setting.
+        "steps:\n  - name: \"x, persist-credentials: false\"\n    uses: actions/checkout@SHA # v7.0.1\n",
+        // X1 (b): the setting in block-scalar text.
+        "steps:\n  - uses: actions/checkout@SHA # v7.0.1\n    with:\n      fetch-depth: 0\n  - run: |\n      persist-credentials: false\n",
+        // X1 (c): one flow line, two steps, one setting.
+        "steps: [{uses: actions/checkout@SHA, with: {persist-credentials: false}}, {uses: Actions/Checkout@SHA}]\n",
+        "steps:\n  - uses: actions/checkout@SHA # v7.0.1\n    with:\n      persist-credentials: \"true\"\n",
+        // X1 (d): a quoted `#` hiding a write scope.
+        "permissions: {a: '#', contents: write}\n",
+        "permissions: write-all\n",
+        "jobs:\n  a:\n    permissions:\n      checks: write\n",
+    ] {
+        let text = snippet(rejected);
+        assert!(
+            !tree_violations("t.yml", &text, false).is_empty(),
+            "accepted: {text}"
+        );
+    }
+    let release = "permissions: {}\njobs:\n  a:\n    permissions:\n      contents: read\n      packages: write\n      id-token: write\n";
+    assert_clean(&tree_violations("release.yml", release, true));
+    assert!(!tree_violations("ci.yml", release, false).is_empty());
+}
+
+#[test]
+fn the_template_is_read_in_every_branch() {
+    let template = read(APP_CI_TEMPLATE);
+    let point = "%%if postgresql%%\n      - run: cargo test";
+    assert!(template.contains(point), "the mutation point moved");
+    // R1: a `%%...%%` marker line must not hide the steps below it.
+    for injected in [
+        "      - \"u\\x73es\": taiki-e/install-action@main\n",
+        "      - !!str uses: evil/act@main\n",
+        "      - uses: evil/act@main\n",
+    ] {
+        let mutated = template.replacen(
+            point,
+            &format!("%%if postgresql%%\n{injected}      - run: cargo test"),
+            1,
+        );
+        let text = blank_template_markers(&mutated);
+        let mut violations = yaml_subset_violations("ci.yml.tmpl", &text);
+        violations.extend(parser_violations("ci.yml.tmpl", &text));
+        violations.extend(allowlist_violations("ci.yml.tmpl", &text));
+        assert!(!violations.is_empty(), "accepted: {injected}");
     }
 }
 
@@ -1416,7 +1892,7 @@ fn dockerfile_bases(text: &str) -> Vec<String> {
 #[test]
 fn generated_application_ci_and_dockerfile_are_pinned() {
     let name = "templates/app/github/workflows/ci.yml.tmpl";
-    let ci = read("crates/forge-cli/templates/app/github/workflows/ci.yml.tmpl");
+    let ci = blank_template_markers(&read(APP_CI_TEMPLATE));
     assert_clean(&pin_violations(name, &ci));
     assert_clean(&checkout_violations(name, &ci));
     assert_clean(&container_violations(name, &ci));
@@ -1821,31 +2297,24 @@ fn the_tool_rule_rejects_installs_that_ignore_a_version_bump() {
     }
 }
 
-/// Every `.cargo/config` or `.cargo/config.toml` below `directory` (build
-/// output and git metadata aside).
-fn cargo_configs(directory: &Path) -> Vec<PathBuf> {
-    let mut found = Vec::new();
+/// Every `.cargo/config` or `.cargo/config.toml` in `directory` or below
+/// it, following symbolic links to them (a linked `.cargo` counts). The
+/// walk does not enter `skipped` (the root's build output and git
+/// metadata) nor symbolic links to directories.
+fn cargo_configs(directory: &Path, skipped: &[PathBuf]) -> Vec<PathBuf> {
+    let mut found: Vec<PathBuf> = ["config", "config.toml"]
+        .iter()
+        .map(|file| directory.join(".cargo").join(file))
+        .filter(|path| path.exists())
+        .collect();
     let Ok(entries) = fs::read_dir(directory) else {
         return found;
     };
     for entry in entries.filter_map(Result::ok) {
         let path = entry.path();
-        let name = entry.file_name();
-        let Ok(kind) = entry.file_type() else {
-            continue;
-        };
-        if kind.is_dir() {
-            if name == ".git" || name == "target" {
-                continue;
-            }
-            if name == ".cargo" {
-                for file in ["config", "config.toml"] {
-                    if path.join(file).exists() {
-                        found.push(path.join(file));
-                    }
-                }
-            }
-            found.extend(cargo_configs(&path));
+        let is_directory = entry.file_type().is_ok_and(|kind| kind.is_dir());
+        if is_directory && !skipped.contains(&path) {
+            found.extend(cargo_configs(&path, skipped));
         }
     }
     found
@@ -1858,7 +2327,8 @@ fn cargo_configs(directory: &Path) -> Vec<PathBuf> {
 /// goes through review and changes this test.
 #[test]
 fn no_cargo_configuration_exists_in_the_repository() {
-    let found = cargo_configs(&root());
+    let skipped = [root().join("target"), root().join(".git")];
+    let found = cargo_configs(&root(), &skipped);
     assert!(found.is_empty(), "cargo configuration found: {found:?}");
     let scratch = tempfile::tempdir().expect("tempdir");
     for (relative, content) in [
@@ -1872,15 +2342,29 @@ fn no_cargo_configuration_exists_in_the_repository() {
         fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
         fs::write(&path, content).expect("write");
     }
+    // A symlinked .cargo, a config below a nested `target`, and one in the
+    // skipped root build directory.
+    fs::create_dir_all(scratch.path().join("elsewhere")).expect("mkdir");
+    fs::write(scratch.path().join("elsewhere/config.toml"), "").expect("write");
+    fs::create_dir_all(scratch.path().join("d")).expect("mkdir");
+    std::os::unix::fs::symlink(
+        scratch.path().join("elsewhere"),
+        scratch.path().join("d/.cargo"),
+    )
+    .expect("symlink");
+    fs::create_dir_all(scratch.path().join("e/target/.cargo")).expect("mkdir");
+    fs::write(scratch.path().join("e/target/.cargo/config"), "").expect("write");
     fs::create_dir_all(scratch.path().join("target/.cargo")).expect("mkdir");
     fs::write(scratch.path().join("target/.cargo/config.toml"), "").expect("write");
-    let mut found = cargo_configs(scratch.path());
+    let mut found = cargo_configs(scratch.path(), &[scratch.path().join("target")]);
     found.sort();
     assert_eq!(
         found,
         vec![
             scratch.path().join("a/.cargo/config.toml"),
             scratch.path().join("b/c/.cargo/config"),
+            scratch.path().join("d/.cargo/config.toml"),
+            scratch.path().join("e/target/.cargo/config"),
         ]
     );
 }
