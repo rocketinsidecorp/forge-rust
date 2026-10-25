@@ -636,8 +636,15 @@ impl PgJobStore {
                 .to_owned()
         } else if !denied.is_empty() {
             let functions = denied.join(", ");
+            // Only a plain name goes into the shell hint as is; anything else
+            // would need quoting for both the shell and libpq.
+            let plain = !role.is_empty()
+                && role
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'));
+            let shell_role = if plain { role.as_str() } else { "ROLE" };
             format!(
-                "it lacks EXECUTE on {functions}; as the migration role run `GRANT EXECUTE ON FUNCTION {functions} TO {grantee};`, or run the workers as the role that has them (the job schema grants them when it is first migrated with PGOPTIONS='-c forge.runtime_role={role}' or forge.worker_role; re-running `forge migrate` later grants nothing)"
+                "it lacks EXECUTE on {functions}; as the migration role run `GRANT EXECUTE ON FUNCTION {functions} TO {grantee};`, or run the workers as the role that has them (the job schema grants them when it is first migrated with PGOPTIONS='-c forge.runtime_role={shell_role}' or forge.worker_role; re-running `forge migrate` later grants nothing)"
             )
         } else {
             return Ok(());

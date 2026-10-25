@@ -26,7 +26,7 @@ services:
 %%end%%
 %%if mysql%%
   db:
-    # Pin the image by digest (image@sha256:...) for anything beyond local development.
+    # Pinned by digest (the same pin as Forge's CI): update the tag and digest together.
     image: mysql:8.4@sha256:0f51e63e537a1f176423fa03ef559aabe6fa4372a53160a44bc7e75da7d15364
     environment:
       # Development-only credentials. Never reuse them in a deployment.
@@ -50,7 +50,7 @@ services:
 %%end%%
 %%if mariadb%%
   db:
-    # Pin the image by digest (image@sha256:...) for anything beyond local development.
+    # Pinned by digest (the same pin as Forge's CI): update the tag and digest together.
     image: mariadb:11.8@sha256:f16d7a344413e519dff518f27bdb221388f84b0d274c97c4fb5f2cb0dc1b34fa
     environment:
       # Development-only credentials. Never reuse them in a deployment.
