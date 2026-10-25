@@ -260,6 +260,14 @@ impl FromStr for HttpTransport {
 }
 
 /// HTTP server settings after validation.
+///
+/// [`ServerConfig::default`] (and a deserialized value without a
+/// `transport`) uses [`HttpTransport::Plain`]: it describes no environment.
+/// The rule that production refuses `plain` lives in
+/// [`AppConfig::from_lookup`], which derives the transport from `FORGE_ENV`;
+/// a `ServerConfig` built in code for production should set
+/// [`HttpTransport::TrustedProxy`] itself (Forge's `serve` warns when it
+/// starts a production server with `plain`).
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ServerConfig {
     /// Address on which the process accepts connections.
@@ -291,7 +299,9 @@ pub struct ServerConfig {
     pub trusted_proxies: Vec<TrustedProxy>,
     /// How clients reach the server (`FORGE_HTTP_TRANSPORT`); anything but
     /// [`HttpTransport::Plain`] adds `Strict-Transport-Security` to every
-    /// response.
+    /// response. Defaults to `Plain` here; only [`AppConfig::from_lookup`]
+    /// applies the production default (`TrustedProxy`) and refuses `plain`
+    /// in production.
     #[serde(default)]
     pub transport: HttpTransport,
 }

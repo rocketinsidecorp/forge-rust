@@ -1465,6 +1465,16 @@ async fn serve(
         telemetry = telemetry.is_some(),
         "listening"
     );
+    if config.environment == Environment::Production
+        && config.server.transport == forge_config::HttpTransport::Plain
+    {
+        // Only reachable with a configuration built in code: loading it
+        // from the environment refuses plain in production.
+        warn!(
+            "FORGE_ENV is production but the HTTP transport is plain: responses carry no \
+             Strict-Transport-Security; use trusted-proxy behind TLS termination"
+        );
+    }
 
     // One shutdown for the server and the job runtime: a signal, or either
     // of them failing, stops both.
