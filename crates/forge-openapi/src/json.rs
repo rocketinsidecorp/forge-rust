@@ -118,3 +118,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod json_tests;

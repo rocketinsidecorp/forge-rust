@@ -552,3 +552,6 @@ mod tests {
         assert!(!is_uuid_v7("0192F1A0-0000-7000-8000-000000000000"));
     }
 }
+
+#[cfg(test)]
+mod validate_tests;

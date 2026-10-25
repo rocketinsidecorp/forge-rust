@@ -841,3 +841,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod document_tests;
