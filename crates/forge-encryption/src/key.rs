@@ -154,7 +154,10 @@ impl fmt::Debug for Key {
 }
 
 /// The active key, used for every new ciphertext, and previous keys, which
-/// remain usable for decryption only. Immutable; identifiers are unique.
+/// remain usable for decryption only. Immutable; identifiers are unique
+/// ignoring ASCII letter case (`K1` and `k1` cannot share a ring), so a
+/// count of values by key id prefix means the same under a case-insensitive
+/// database collation (MySQL and MariaDB defaults) as under a binary one.
 #[derive(Clone)]
 pub struct KeyRing {
     /// The key used for new ciphertexts.
@@ -164,7 +167,8 @@ pub struct KeyRing {
 }
 
 impl KeyRing {
-    /// A ring of `active` and `previous`.
+    /// A ring of `active` and `previous`. Identifiers that are equal
+    /// ignoring ASCII letter case are refused.
     pub fn new(
         active: Key,
         previous: impl IntoIterator<Item = Key>,
@@ -174,9 +178,12 @@ impl KeyRing {
             previous: Vec::new(),
         };
         for key in previous {
-            if ring.keys().any(|existing| existing.id == key.id) {
+            if ring
+                .keys()
+                .any(|existing| existing.id.eq_ignore_ascii_case(&key.id))
+            {
                 return Err(EncryptionError::InvalidKey(format!(
-                    "duplicate key identifier {:?}",
+                    "duplicate key identifier {:?} (identifiers are compared ignoring letter case)",
                     key.id
                 )));
             }
@@ -187,7 +194,8 @@ impl KeyRing {
 
     /// A ring from an active identifier and a map of identifier to canonical
     /// text keys, the shape stored in credentials. Previous keys are ordered
-    /// by identifier.
+    /// by identifier; identifiers equal ignoring ASCII letter case are
+    /// refused.
     ///
     /// Errors never echo an identifier or the active value: one swapped with
     /// a key by mistake would otherwise print the key. They name a key by
@@ -218,6 +226,18 @@ impl KeyRing {
         let mut previous = Vec::with_capacity(keys.len().saturating_sub(1));
         for (position, (id, text)) in keys.iter().enumerate() {
             let key = parse(position, id, text)?;
+            if let Some(earlier) = keys
+                .keys()
+                .take(position)
+                .position(|other| other.eq_ignore_ascii_case(id))
+            {
+                return Err(EncryptionError::InvalidKey(format!(
+                    "keys #{} and #{}: duplicate key identifier (identifiers are compared \
+                     ignoring letter case)",
+                    earlier + 1,
+                    position + 1
+                )));
+            }
             if id.as_str() == active {
                 active_key = Some(key);
             } else {
@@ -302,6 +322,15 @@ mod tests {
         assert!(Key::new("a.b", key.clone()).is_err());
         let one = Key::new("one", key.clone()).expect("key");
         assert!(KeyRing::new(one.clone(), [one.clone()]).is_err());
+        // Identifiers that differ only in letter case collide: a
+        // case-insensitive collation (MySQL, MariaDB) could not tell their
+        // values apart.
+        let upper = Key::new("ONE", generate_key().expect("random")).expect("key");
+        let error = KeyRing::new(one.clone(), [upper]).expect_err("case collision");
+        assert!(
+            error.to_string().contains("ignoring letter case"),
+            "{error}"
+        );
         let ring = KeyRing::new(
             one,
             [Key::new("two", generate_key().expect("random")).expect("key")],
@@ -329,6 +358,23 @@ mod tests {
         broken.insert("d".to_owned(), "secret-looking-text".to_owned());
         let error = KeyRing::parse("c", &broken).expect_err("bad key");
         assert!(!error.to_string().contains("secret-looking-text"));
+        // `K1` and `k1` are two map entries but one identifier to a
+        // case-insensitive collation; the error names positions, never ids.
+        for active in ["K1", "k1"] {
+            let mut colliding = keys.clone();
+            colliding.insert("K1".to_owned(), text(&generate_key().expect("random")));
+            colliding.insert("k1".to_owned(), text(&generate_key().expect("random")));
+            let error = KeyRing::parse(active, &colliding).expect_err("case collision");
+            let message = error.to_string();
+            assert!(
+                message.contains("keys #1 and #5") && message.contains("ignoring letter case"),
+                "{message}"
+            );
+            assert!(
+                !message.contains("K1") && !message.contains("k1"),
+                "{message}"
+            );
+        }
     }
 
     #[test]

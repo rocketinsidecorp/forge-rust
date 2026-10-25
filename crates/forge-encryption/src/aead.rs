@@ -3,7 +3,7 @@
 use std::fmt;
 
 use ring::aead::{AES_256_GCM, Aad as RingAad, LessSafeKey, NONCE_LEN, Nonce, UnboundKey};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize as _, Zeroizing};
 
 use crate::{EncryptionError, KeyMaterial, REDACTED};
 
@@ -36,15 +36,19 @@ impl Aead {
         plaintext: &[u8],
         associated_data: &[u8],
     ) -> Result<Vec<u8>, EncryptionError> {
+        // Sized for the tag so the plaintext copy is never reallocated; it
+        // is encrypted in place, and wiped if sealing fails.
         let mut in_out = Vec::with_capacity(plaintext.len() + TAG_SIZE);
         in_out.extend_from_slice(plaintext);
-        self.key
-            .seal_in_place_append_tag(
-                Nonce::assume_unique_for_key(*nonce),
-                RingAad::from(associated_data),
-                &mut in_out,
-            )
-            .map_err(|_| EncryptionError::TooLarge)?;
+        let sealed = self.key.seal_in_place_append_tag(
+            Nonce::assume_unique_for_key(*nonce),
+            RingAad::from(associated_data),
+            &mut in_out,
+        );
+        if sealed.is_err() {
+            in_out.zeroize();
+            return Err(EncryptionError::TooLarge);
+        }
         Ok(in_out)
     }
 

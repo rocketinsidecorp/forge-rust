@@ -1,5 +1,7 @@
 //! Typed attribute values: the Forge-owned way to encrypt a model column.
 
+use std::io;
+
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use zeroize::Zeroizing;
@@ -23,7 +25,11 @@ impl Plaintext for String {
     }
 
     fn from_plaintext(bytes: &[u8]) -> Result<Self, EncryptionError> {
-        String::from_utf8(bytes.to_vec())
+        // Validate in place: only the returned value copies the plaintext.
+        // `String::from_utf8(bytes.to_vec())` would drop an unwiped copy in
+        // its error.
+        std::str::from_utf8(bytes)
+            .map(str::to_owned)
             .map_err(|_| EncryptionError::Encoding("the decrypted value is not UTF-8".to_owned()))
     }
 }
@@ -44,11 +50,11 @@ pub struct Json<T>(pub T);
 
 impl<T: Serialize + DeserializeOwned> Plaintext for Json<T> {
     fn to_plaintext(&self) -> Result<Zeroizing<Vec<u8>>, EncryptionError> {
-        serde_json::to_vec(&self.0)
-            .map(Zeroizing::new)
-            .map_err(|_| {
-                EncryptionError::Encoding("the value cannot be encoded as JSON".to_owned())
-            })
+        let mut out = ZeroizingWriter(Zeroizing::new(Vec::new()));
+        serde_json::to_writer(&mut out, &self.0).map_err(|_| {
+            EncryptionError::Encoding("the value cannot be encoded as JSON".to_owned())
+        })?;
+        Ok(out.0)
     }
 
     fn from_plaintext(bytes: &[u8]) -> Result<Self, EncryptionError> {
@@ -58,6 +64,34 @@ impl<T: Serialize + DeserializeOwned> Plaintext for Json<T> {
                 "the decrypted JSON does not match the expected type".to_owned(),
             )
         })
+    }
+}
+
+/// A JSON sink that wipes every buffer it outgrows. `serde_json::to_vec`
+/// grows a plain `Vec`, and each reallocation frees a partial copy of the
+/// plaintext without wiping it.
+struct ZeroizingWriter(Zeroizing<Vec<u8>>);
+
+impl io::Write for ZeroizingWriter {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        let needed = self
+            .0
+            .len()
+            .checked_add(data.len())
+            .ok_or_else(|| io::Error::other("value too large"))?;
+        if needed > self.0.capacity() {
+            let capacity = needed.max(self.0.capacity().saturating_mul(2)).max(64);
+            let mut grown = Zeroizing::new(Vec::with_capacity(capacity));
+            grown.extend_from_slice(&self.0);
+            // The old buffer is wiped (its whole capacity) when dropped here.
+            self.0 = grown;
+        }
+        self.0.extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
     }
 }
 
@@ -147,6 +181,27 @@ mod tests {
     struct Address {
         street: String,
         number: u32,
+    }
+
+    #[test]
+    fn json_plaintext_matches_serde_json_across_buffer_growth() {
+        let long = Json(vec!["é\"x".repeat(300); 40]);
+        let plaintext = long.to_plaintext().expect("encode");
+        assert_eq!(
+            plaintext.as_slice(),
+            serde_json::to_vec(&long.0).expect("json")
+        );
+        assert!(plaintext.capacity() >= plaintext.len());
+        assert_eq!(
+            Json::<Vec<String>>::from_plaintext(&plaintext).expect("decode"),
+            long
+        );
+        assert_eq!(
+            String::from_plaintext(&[0xff, 0xfe]),
+            Err(EncryptionError::Encoding(
+                "the decrypted value is not UTF-8".to_owned()
+            ))
+        );
     }
 
     #[test]

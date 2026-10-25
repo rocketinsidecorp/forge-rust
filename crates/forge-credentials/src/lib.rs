@@ -41,8 +41,8 @@ pub use envelope::{
 };
 pub use error::CredentialsError;
 pub use files::{
-    DEFAULT_DIR, ENV_MASTER_KEY, KeySource, file_name, key_file_name, load_keys, read_file,
-    write_file, write_key_file,
+    DEFAULT_DIR, ENV_MASTER_KEY, KeySource, file_name, key_file_name, load_keys, prepare_key_dir,
+    read_file, write_file, write_key_file,
 };
 pub use init::{InitError, init};
 pub use store::{Lookup, Options, Store, load, open, parse};

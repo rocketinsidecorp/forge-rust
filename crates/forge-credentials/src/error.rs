@@ -44,6 +44,18 @@ pub enum CredentialsError {
         /// Its permission bits.
         mode: u32,
     },
+    /// A credentials directory that group or others can write, so they could
+    /// replace the key file.
+    #[error(
+        "credentials: directory must not be writable by group or others (chmod 700): {} is {mode:04o}",
+        path.display()
+    )]
+    DirectoryPermissions {
+        /// The credentials directory.
+        path: PathBuf,
+        /// Its permission bits.
+        mode: u32,
+    },
     /// Key text that cannot be used (the message never echoes it).
     #[error("{0}")]
     InvalidKey(String),

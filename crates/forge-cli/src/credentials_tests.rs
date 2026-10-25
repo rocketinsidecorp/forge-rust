@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use forge_credentials::{load_keys, parse_keys, read_file, seal, unseal, write_file};
 
 use crate::CliError;
-use crate::credentials::{Action, Context};
+use crate::credentials::{Action, Context, WriteHook};
 use crate::credentials_edit::Interrupts;
 
 const SECRET: &str = "sk_live_DISTINCTIVE_9876";
@@ -19,6 +19,8 @@ struct App {
     tty: bool,
     stdout: String,
     stderr: String,
+    /// Passed to `rotate-key` as its after-write hook.
+    after_write: Option<WriteHook<'static>>,
 }
 
 type Editor<'e> = Box<dyn FnMut(&[String], &Path, &Interrupts) -> Result<(), String> + 'e>;
@@ -33,6 +35,7 @@ impl App {
             tty: false,
             stdout: String::new(),
             stderr: String::new(),
+            after_write: None,
         }
     }
 
@@ -52,6 +55,7 @@ impl App {
         let lookup = move |name: &str| env.get(name).cloned();
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
+        let mut after_write = self.after_write.take();
         let result = {
             let mut context = Context {
                 root: self.root.path().to_path_buf(),
@@ -62,9 +66,13 @@ impl App {
                 editor,
                 interrupts,
                 after_read,
+                after_write: after_write
+                    .as_mut()
+                    .map(|hook| Box::new(move |step: &str| hook(step)) as WriteHook<'_>),
             };
             context.run(&action, environment.map(str::to_owned))
         };
+        self.after_write = after_write;
         self.stdout = String::from_utf8(stdout).expect("utf8");
         self.stderr = String::from_utf8(stderr).expect("utf8");
         result
@@ -489,6 +497,254 @@ fn rotate_key_keep_old_reads_old_data_then_rewrites_it() {
         keys[0].id()
     );
     assert_eq!(app.plaintext(), content);
+}
+
+/// A key list already at `MAX_KEYS`, the key that sealed the file last.
+fn full_key_list(app: &App) -> Vec<forge_encryption::Key> {
+    let (current, _) = load_keys(&app.dir(), "development", &|_| None).expect("keys");
+    let mut keys: Vec<_> = (1..forge_credentials::MAX_KEYS)
+        .map(|_| {
+            forge_credentials::new_key(forge_encryption::generate_key().expect("random"))
+                .expect("key")
+        })
+        .collect();
+    keys.extend(current);
+    assert_eq!(keys.len(), forge_credentials::MAX_KEYS);
+    keys
+}
+
+#[test]
+fn rotate_key_with_a_full_key_list_rotates_and_keep_old_fails_cleanly() {
+    let mut app = initialized();
+    let content = app.plaintext();
+    let keys = full_key_list(&app);
+    forge_credentials::write_key_file(&app.dir(), "development", &keys, true).expect("full list");
+    let key_file = app.dir().join("development.key");
+    let (key_before, file_before) = (fs::read_to_string(&key_file).expect("key"), app.file());
+
+    // --keep-old would need MAX_KEYS + 1 keys: refused before any output or
+    // write, with or without --print-key.
+    for print_key in [false, true] {
+        let error = app
+            .run(rotate(true, print_key, false))
+            .expect_err("too many keys");
+        assert!(
+            error.to_string().contains("would keep 9 keys")
+                && error.to_string().contains("at most 8")
+                && error.to_string().contains("nothing was changed"),
+            "{error}"
+        );
+        assert!(app.stdout.is_empty(), "nothing printed");
+        assert_eq!(fs::read_to_string(&key_file).expect("key"), key_before);
+        assert_eq!(app.file(), file_before);
+    }
+
+    // Without --keep-old the full list rotates to the new key alone.
+    app.run(rotate(false, true, false)).expect("rotate");
+    let printed = parse_keys(app.stdout.trim()).expect("printed key list");
+    assert_eq!(printed.len(), 1);
+    let (stored, _) = load_keys(&app.dir(), "development", &|_| None).expect("keys");
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].id(), printed[0].id());
+    assert_eq!(app.plaintext(), content);
+    assert!(unseal("development", &app.file(), &keys).is_err());
+}
+
+#[test]
+fn rotate_key_keep_old_with_a_full_environment_list_prints_nothing() {
+    let mut app = initialized();
+    let keys = full_key_list(&app);
+    let list = keys
+        .iter()
+        .map(|key| forge_encryption::encode_key(key.material()).to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    fs::remove_file(app.dir().join("development.key")).expect("remove");
+    app.env.insert("FORGE_MASTER_KEY".to_owned(), list);
+    let before = app.file();
+    let error = app
+        .run(rotate(true, true, false))
+        .expect_err("too many keys");
+    assert!(error.to_string().contains("at most 8"), "{error}");
+    assert!(app.stdout.is_empty(), "nothing printed");
+    assert!(!app.dir().join("development.key").exists());
+    assert_eq!(app.file(), before);
+}
+
+/// Records, after each file `rotate-key` writes, whether the credentials
+/// file on disk opens with the key file on disk.
+fn readable_at_every_step(app: &mut App) -> std::rc::Rc<std::cell::RefCell<Vec<(String, bool)>>> {
+    let steps = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let (dir, record) = (app.dir(), std::rc::Rc::clone(&steps));
+    app.after_write = Some(Box::new(move |step: &str| {
+        let readable = load_keys(&dir, "development", &|_| None).is_ok_and(|(keys, _)| {
+            read_file(&dir, "development")
+                .is_ok_and(|file| unseal("development", &file, &keys).is_ok())
+        });
+        record.borrow_mut().push((step.to_owned(), readable));
+    }));
+    steps
+}
+
+#[test]
+fn rotate_key_keeps_the_pair_on_disk_readable_at_every_step() {
+    for keep_old in [false, true] {
+        let mut app = initialized();
+        // The file is sealed with the last key of the list, not the first.
+        let mut keys = full_key_list(&app);
+        if keep_old {
+            keys.drain(..keys.len() - 3);
+        }
+        forge_credentials::write_key_file(&app.dir(), "development", &keys, true).expect("list");
+        let steps = readable_at_every_step(&mut app);
+        app.run(rotate(keep_old, false, false)).expect("rotate");
+        let mut expected = vec![
+            ("key file with the new key".to_owned(), true),
+            ("credentials file".to_owned(), true),
+        ];
+        if !keep_old {
+            expected.push(("key file without the old keys".to_owned(), true));
+        }
+        assert_eq!(*steps.borrow(), expected, "keep_old: {keep_old}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn rotate_key_refuses_a_writable_directory_before_showing_a_key() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let mut app = initialized();
+    let key_text = fs::read_to_string(app.dir().join("development.key")).expect("key");
+    fs::remove_file(app.dir().join("development.key")).expect("remove");
+    app.env
+        .insert("FORGE_MASTER_KEY".to_owned(), key_text.trim().to_owned());
+    let before = app.file();
+    fs::set_permissions(app.dir(), fs::Permissions::from_mode(0o775)).expect("chmod");
+    let error = app
+        .run(rotate(false, true, true))
+        .expect_err("writable directory");
+    fs::set_permissions(app.dir(), fs::Permissions::from_mode(0o700)).expect("chmod");
+    assert!(error.to_string().contains("chmod 700"), "{error}");
+    assert!(app.stdout.is_empty(), "no key was printed: {}", app.stdout);
+    assert!(!app.dir().join("development.key").exists());
+    assert_eq!(app.file(), before);
+}
+
+#[test]
+fn a_failed_rotation_removes_a_key_file_that_did_not_exist() {
+    let mut app = initialized();
+    let key_text = fs::read_to_string(app.dir().join("development.key")).expect("key");
+    fs::remove_file(app.dir().join("development.key")).expect("remove");
+    app.env
+        .insert("FORGE_MASTER_KEY".to_owned(), key_text.trim().to_owned());
+    let before = app.file();
+    // Once the key file is written, the credentials file cannot be replaced:
+    // a non-empty directory takes its name.
+    let encrypted = app.dir().join("development.json.enc");
+    app.after_write = Some(Box::new(move |step: &str| {
+        if step == "key file with the new key" {
+            fs::remove_file(&encrypted).expect("remove");
+            fs::create_dir(&encrypted).expect("directory");
+            fs::write(encrypted.join("blocker"), b"x").expect("blocker");
+        }
+    }));
+    app.run(rotate(false, false, true))
+        .expect_err("the credentials file cannot be written");
+    assert!(
+        !app.dir().join("development.key").exists(),
+        "the restore must not leave the new key list behind"
+    );
+    let encrypted = app.dir().join("development.json.enc");
+    fs::remove_dir_all(&encrypted).expect("cleanup");
+    fs::write(&encrypted, &before).expect("restore");
+}
+
+/// An application whose key comes from `FORGE_MASTER_KEY` while a key file
+/// holding another, valid key list stays in place; returns that file.
+fn environment_key_beside_a_key_file(app: &mut App) -> Vec<u8> {
+    let key_text = fs::read_to_string(app.dir().join("development.key")).expect("key");
+    app.env
+        .insert("FORGE_MASTER_KEY".to_owned(), key_text.trim().to_owned());
+    let other =
+        forge_credentials::new_key(forge_encryption::generate_key().expect("random")).expect("key");
+    forge_credentials::write_key_file(&app.dir(), "development", &[other], true).expect("other");
+    fs::read(app.dir().join("development.key")).expect("key file")
+}
+
+#[test]
+fn a_failed_rotation_restores_a_key_file_that_existed() {
+    let mut app = initialized();
+    let key_file = environment_key_beside_a_key_file(&mut app);
+    let before = app.file();
+    let encrypted = app.dir().join("development.json.enc");
+    app.after_write = Some(Box::new(move |step: &str| {
+        if step == "key file with the new key" {
+            fs::remove_file(&encrypted).expect("remove");
+            fs::create_dir(&encrypted).expect("directory");
+            fs::write(encrypted.join("blocker"), b"x").expect("blocker");
+        }
+    }));
+    app.run(rotate(false, false, true))
+        .expect_err("the credentials file cannot be written");
+    assert_eq!(
+        fs::read(app.dir().join("development.key")).expect("key file"),
+        key_file,
+        "the key file that existed is back, byte for byte"
+    );
+    let encrypted = app.dir().join("development.json.enc");
+    fs::remove_dir_all(&encrypted).expect("cleanup");
+    fs::write(&encrypted, &before).expect("restore");
+}
+
+#[cfg(unix)]
+#[test]
+fn an_exposed_key_file_refuses_write_key_file_before_showing_a_key() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let mut app = initialized();
+    let key_file = environment_key_beside_a_key_file(&mut app);
+    let path = app.dir().join("development.key");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("chmod");
+    let before = app.file();
+    let error = app
+        .run(rotate(false, true, true))
+        .expect_err("exposed key file");
+    assert!(error.to_string().contains("chmod 600"), "{error}");
+    assert!(app.stdout.is_empty(), "no key was printed: {}", app.stdout);
+    assert_eq!(fs::read(&path).expect("key file"), key_file);
+    assert_eq!(app.file(), before);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_directory_made_writable_during_rotation_refuses_it_before_showing_a_key() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let mut app = initialized();
+    let key_file = fs::read(app.dir().join("development.key")).expect("key file");
+    let before = app.file();
+    let dir = app.dir();
+    let loosen = move || {
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o775)).expect("chmod");
+    };
+    let error = app
+        .run_with(
+            rotate(false, true, false),
+            None,
+            Box::new(|_, _, _| Ok(())),
+            &Interrupts::none(),
+            Some(Box::new(loosen)),
+        )
+        .expect_err("writable directory");
+    fs::set_permissions(app.dir(), fs::Permissions::from_mode(0o700)).expect("chmod");
+    assert!(error.to_string().contains("chmod 700"), "{error}");
+    assert!(app.stdout.is_empty(), "no key was printed: {}", app.stdout);
+    assert_eq!(
+        fs::read(app.dir().join("development.key")).expect("key file"),
+        key_file
+    );
+    assert_eq!(app.file(), before);
 }
 
 #[test]

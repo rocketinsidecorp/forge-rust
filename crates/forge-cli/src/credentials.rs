@@ -6,8 +6,9 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use forge_credentials::{
-    CredentialsError, DEFAULT_DIR, KeySource, file_name, indent, init, key_file_name, load_keys,
-    new_key, read_file, redact, seal, unseal, validate_environment, write_file, write_key_file,
+    CredentialsError, DEFAULT_DIR, KeySource, MAX_KEYS, file_name, indent, init, key_file_name,
+    key_id, load_keys, new_key, prepare_key_dir, read_file, redact, seal, unseal,
+    validate_environment, write_file, write_key_file,
 };
 use forge_encryption::{Key, encode_key, generate_key};
 use zeroize::Zeroizing;
@@ -36,6 +37,9 @@ pub(crate) enum Action {
     },
 }
 
+/// A test hook `rotate-key` runs after each file it writes, with the step.
+pub(crate) type WriteHook<'a> = Box<dyn FnMut(&str) + 'a>;
+
 /// The process state the subcommands use, so tests can substitute it.
 pub(crate) struct Context<'a> {
     /// The application root (the working directory).
@@ -50,6 +54,8 @@ pub(crate) struct Context<'a> {
     pub(crate) interrupts: &'a Interrupts,
     /// Test hook: runs after `rotate-key` has read the file.
     pub(crate) after_read: Option<Box<dyn FnMut() + 'a>>,
+    /// Test hook: runs after each file `rotate-key` writes, with the step.
+    pub(crate) after_write: Option<WriteHook<'a>>,
 }
 
 /// A decrypted credentials file and how it was opened.
@@ -228,11 +234,29 @@ impl Context<'_> {
                  pass --print-key (to store the new key in your secret manager) or --write-key-file",
             ));
         }
+        // The key lists are checked before anything is printed or written:
+        // a list longer than MAX_KEYS could be neither stored nor parsed.
+        if keep_old && keys.len() + 1 > MAX_KEYS {
+            return Err(fail(format!(
+                "--keep-old would keep {} keys, and a key list holds at most {MAX_KEYS}: \
+                 drop old keys from the list first, or rotate without --keep-old; \
+                 nothing was changed",
+                keys.len() + 1
+            )));
+        }
         let fresh = generate_key()
             .map_err(fail)
             .and_then(|key| new_key(key).map_err(fail))?;
+        // During the swap the key file holds the new key and the keys that
+        // must stay readable: every old key with --keep-old, otherwise only
+        // the key that opens the file on disk, so a full list still rotates.
+        let file_key = key_id(&file).map_err(fail)?;
         let mut with_old = vec![fresh.clone()];
-        with_old.extend(keys.iter().cloned());
+        with_old.extend(
+            keys.iter()
+                .filter(|key| keep_old || key.id() == file_key)
+                .cloned(),
+        );
         let last = if keep_old {
             with_old.clone()
         } else {
@@ -251,6 +275,22 @@ impl Context<'_> {
                 "the credentials file changed during rotation; nothing was re-encrypted, run the command again",
             ));
         }
+        // The key file's directory must accept a key, and what a failed
+        // rotation restores is known, before the new key is shown: the key
+        // list it replaces, or no key file at all.
+        let previous_key_file = if to_file {
+            prepare_key_dir(&dir).map_err(fail)?;
+            match &source {
+                KeySource::File(_) => Some(keys.clone()),
+                KeySource::Environment => match load_keys(&dir, environment, &|_| None) {
+                    Ok((existing, _)) => Some(existing),
+                    Err(CredentialsError::KeyMissing) => None,
+                    Err(error) => return Err(fail(error)),
+                },
+            }
+        } else {
+            None
+        };
         if print_key {
             // Before any file changes: if this fails, nothing was modified.
             let list = Zeroizing::new(
@@ -262,27 +302,40 @@ impl Context<'_> {
             writeln!(self.stdout, "{}", list.as_str()).map_err(output)?;
         }
         // Crash safety: the key file first gains the new key while still
-        // holding the old ones, then the encrypted file changes, and only then
-        // are the old keys dropped. At every instant the file on disk is
-        // readable with the key file on disk.
+        // holding the key of the file on disk (all old keys with --keep-old),
+        // then the encrypted file changes, and only then are the old keys
+        // dropped. At every instant the file on disk is readable with the key
+        // file on disk.
         if to_file {
             write_key_file(&dir, environment, &with_old, true).map_err(fail)?;
+            self.wrote("key file with the new key");
         }
         if let Err(error) = write_file(&dir, environment, &sealed, true) {
             let mut message = error.to_string();
-            if to_file && let Err(restore) = write_key_file(&dir, environment, &keys, true) {
-                message.push_str(&format!(
-                    "\ncould not restore the previous key file: {restore}"
-                ));
+            if to_file {
+                let restored = match &previous_key_file {
+                    Some(previous) => {
+                        write_key_file(&dir, environment, previous, true).map_err(fail)
+                    }
+                    // There was no key file: remove the one just written.
+                    None => fs::remove_file(dir.join(key_file_name(environment))).map_err(fail),
+                };
+                if let Err(restore) = restored {
+                    message.push_str(&format!(
+                        "\ncould not restore the previous key file: {restore}"
+                    ));
+                }
             }
             return Err(fail(message));
         }
+        self.wrote("credentials file");
         if to_file && !keep_old {
             write_key_file(&dir, environment, &last, true).map_err(|error| {
                 fail(format!(
                     "re-encrypted, but could not drop the old keys from the key file: {error}"
                 ))
             })?;
+            self.wrote("key file without the old keys");
         }
         let retained = if keep_old {
             format!(
@@ -300,6 +353,14 @@ impl Context<'_> {
             fresh.id()
         )
         .map_err(output)
+    }
+}
+
+impl Context<'_> {
+    fn wrote(&mut self, step: &str) {
+        if let Some(hook) = self.after_write.as_mut() {
+            hook(step);
+        }
     }
 }
 
