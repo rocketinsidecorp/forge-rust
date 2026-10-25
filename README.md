@@ -313,6 +313,17 @@ forge deploy rollback <previous version>
 forge deploy lock release            # removes only your own lock; --force for anyone's
 ```
 
+forge-proxy's connection limits are Go's `http.Server` ones: a keep-alive
+connection waits `-idle-timeout` (120 s) for its next request, whose headers
+then have `-read-header-timeout` (10 s); a silent first request gets only the
+header timeout. To try them locally (no control socket under `/run`, no state
+file, no HTTPS):
+
+```sh
+cargo run -p forge-proxy -- run -http-addr 127.0.0.1:8080 -https-addr '' \
+  -control /tmp/forge-proxy.sock -state '' -idle-timeout 120s -read-header-timeout 10s
+```
+
 Release note: `retain: 1` in `config/deploy.yml` is now refused (`retain`
 counts the running version, so 1 would prune the previous one and leave
 nothing to roll back to); use 2 to 100, default 5. The deploy lock also needs

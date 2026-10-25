@@ -884,8 +884,9 @@ volume, so it resumes routing after a restart. It:
   application `response_timeout` to send response headers;
 - disconnects clients that hold connections without using them, after
   `-idle-timeout` (120 s by default): a keep-alive connection waiting for its
-  next request (or after the 10 s `-read-header-timeout`, whichever is
-  shorter), a response the client stops reading, and an upgraded
+  next request (whose headers then have the 10 s `-read-header-timeout` from
+  their first byte; the first request on a connection has it from the
+  start, as in Go's `http.Server`), a response the client stops reading, and an upgraded
   (WebSocket) connection with no data in either direction. The application
   connection and the in-flight count are released with it, so a stalled
   client cannot hold a drain open. WebSocket applications should ping more
