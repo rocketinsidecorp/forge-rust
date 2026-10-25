@@ -23,6 +23,8 @@ mod generate;
 #[cfg(test)]
 mod generate_error_tests;
 #[cfg(test)]
+mod generate_io_tests;
+#[cfg(test)]
 mod generator_tests;
 mod generators;
 mod i18n;
