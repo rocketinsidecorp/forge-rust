@@ -1452,6 +1452,59 @@ async fn the_panic_message_is_logged_only_at_debug() {
     assert!(line.contains("secret-detail 4242"), "{line}");
 }
 
+// Current-thread runtime, as above, so the test's subscriber sees the
+// server's tasks.
+#[tokio::test(flavor = "current_thread")]
+async fn a_panic_caught_inside_the_request_is_logged_at_warn_without_its_message() {
+    let log = CapturedLog::default();
+    let writer = log.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_writer(move || writer.clone())
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+    let mut router = test_router();
+    router
+        .route(Method::GET, "/caught", |_| async {
+            // A runtime value, so the payload is a formatted String.
+            let detail = std::hint::black_box(77);
+            let caught = std::panic::catch_unwind(|| panic!("hidden-detail {detail}"));
+            Response::new(StatusCode::OK, format!("caught: {}", caught.is_err()))
+        })
+        .expect("caught route must register");
+    let server = TestServer::start(test_config(Duration::from_secs(10)), router).await;
+
+    let response = exchange(
+        server.addr,
+        "GET /caught HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(response.starts_with("HTTP/1.1 200 "), "{response}");
+    assert!(response.ends_with("caught: true"), "{response}");
+    let request_id = response
+        .to_ascii_lowercase()
+        .lines()
+        .find_map(|line| line.strip_prefix("x-request-id: ").map(str::to_owned))
+        .unwrap_or_else(|| panic!("no x-request-id in {response:?}"));
+    server.stop().await;
+
+    let logged = log.text();
+    let line = logged
+        .lines()
+        .find(|line| line.contains("request code caught a panic"))
+        .unwrap_or_else(|| panic!("caught panic not logged: {logged}"));
+    assert!(line.contains("WARN"), "{line}");
+    assert!(line.contains(request_id.trim()), "{line}");
+    assert!(
+        line.contains("location=crates/forge-http/src/tests.rs:"),
+        "{line}"
+    );
+    assert!(line.contains(r#"payload="String""#), "{line}");
+    assert!(!logged.contains("hidden-detail"), "{logged}");
+    // Answered normally: no error line.
+    assert!(!logged.contains("request handler panicked"), "{logged}");
+}
+
 #[test]
 fn panic_payload_types_are_named_without_their_text() {
     let literal: Box<dyn std::any::Any + Send> = Box::new("text");
@@ -1590,8 +1643,8 @@ async fn a_declared_but_unsent_body_holds_no_budget() {
     })
     .await
     .expect("client task must not panic");
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    assert_eq!(budget.available_permits(), 64);
+    // Their headers reached the server; no budget was taken for them.
+    budget_reaches(&budget, 64).await;
 
     // A small form post and a body of the whole budget still succeed.
     for size in [1, 64] {

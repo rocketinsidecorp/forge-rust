@@ -1178,6 +1178,19 @@ async fn handle_request(
         };
         let exchange = tokio::time::timeout(request_timeout, exchange);
         let (outcome, site) = panics::scoped(io::CatchUnwind::new(exchange)).await;
+        if outcome.is_ok()
+            && let Some(site) = &site
+        {
+            // Caught inside the request (a `catch_unwind` in a handler or a
+            // metric observer): the hook kept it off stderr, so it is
+            // reported here, without its message.
+            warn!(
+                %request_id,
+                location = %site.location,
+                payload = site.payload,
+                "request code caught a panic"
+            );
+        }
         let response = match outcome {
             Ok(Ok(response)) => response,
             Ok(Err(_elapsed)) => Response::new(StatusCode::GATEWAY_TIMEOUT, "request timed out"),
@@ -1188,7 +1201,7 @@ async fn handle_request(
                 // logged only at debug and never reaches the client.
                 error!(
                     %request_id,
-                    location = site.as_deref().unwrap_or("unknown"),
+                    location = site.as_ref().map_or("unknown", |site| site.location.as_str()),
                     payload = panics::payload_type(panic.as_ref()),
                     "request handler panicked"
                 );
