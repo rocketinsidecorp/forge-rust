@@ -660,6 +660,93 @@ fn a_failed_rotation_removes_a_key_file_that_did_not_exist() {
     fs::write(&encrypted, &before).expect("restore");
 }
 
+/// An application whose key comes from `FORGE_MASTER_KEY` while a key file
+/// holding another, valid key list stays in place; returns that file.
+fn environment_key_beside_a_key_file(app: &mut App) -> Vec<u8> {
+    let key_text = fs::read_to_string(app.dir().join("development.key")).expect("key");
+    app.env
+        .insert("FORGE_MASTER_KEY".to_owned(), key_text.trim().to_owned());
+    let other =
+        forge_credentials::new_key(forge_encryption::generate_key().expect("random")).expect("key");
+    forge_credentials::write_key_file(&app.dir(), "development", &[other], true).expect("other");
+    fs::read(app.dir().join("development.key")).expect("key file")
+}
+
+#[test]
+fn a_failed_rotation_restores_a_key_file_that_existed() {
+    let mut app = initialized();
+    let key_file = environment_key_beside_a_key_file(&mut app);
+    let before = app.file();
+    let encrypted = app.dir().join("development.json.enc");
+    app.after_write = Some(Box::new(move |step: &str| {
+        if step == "key file with the new key" {
+            fs::remove_file(&encrypted).expect("remove");
+            fs::create_dir(&encrypted).expect("directory");
+            fs::write(encrypted.join("blocker"), b"x").expect("blocker");
+        }
+    }));
+    app.run(rotate(false, false, true))
+        .expect_err("the credentials file cannot be written");
+    assert_eq!(
+        fs::read(app.dir().join("development.key")).expect("key file"),
+        key_file,
+        "the key file that existed is back, byte for byte"
+    );
+    let encrypted = app.dir().join("development.json.enc");
+    fs::remove_dir_all(&encrypted).expect("cleanup");
+    fs::write(&encrypted, &before).expect("restore");
+}
+
+#[cfg(unix)]
+#[test]
+fn an_exposed_key_file_refuses_write_key_file_before_showing_a_key() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let mut app = initialized();
+    let key_file = environment_key_beside_a_key_file(&mut app);
+    let path = app.dir().join("development.key");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("chmod");
+    let before = app.file();
+    let error = app
+        .run(rotate(false, true, true))
+        .expect_err("exposed key file");
+    assert!(error.to_string().contains("chmod 600"), "{error}");
+    assert!(app.stdout.is_empty(), "no key was printed: {}", app.stdout);
+    assert_eq!(fs::read(&path).expect("key file"), key_file);
+    assert_eq!(app.file(), before);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_directory_made_writable_during_rotation_refuses_it_before_showing_a_key() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let mut app = initialized();
+    let key_file = fs::read(app.dir().join("development.key")).expect("key file");
+    let before = app.file();
+    let dir = app.dir();
+    let loosen = move || {
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o775)).expect("chmod");
+    };
+    let error = app
+        .run_with(
+            rotate(false, true, false),
+            None,
+            Box::new(|_, _, _| Ok(())),
+            &Interrupts::none(),
+            Some(Box::new(loosen)),
+        )
+        .expect_err("writable directory");
+    fs::set_permissions(app.dir(), fs::Permissions::from_mode(0o700)).expect("chmod");
+    assert!(error.to_string().contains("chmod 700"), "{error}");
+    assert!(app.stdout.is_empty(), "no key was printed: {}", app.stdout);
+    assert_eq!(
+        fs::read(app.dir().join("development.key")).expect("key file"),
+        key_file
+    );
+    assert_eq!(app.file(), before);
+}
+
 #[test]
 fn rotate_key_from_the_environment_needs_a_destination_for_the_new_key() {
     let mut app = initialized();
