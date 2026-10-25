@@ -1356,13 +1356,12 @@ pub(crate) fn tool_install_violations(relative: &str, text: &str) -> Vec<String>
 /// Environment variables that redirect where cargo, rustup and their tools
 /// come from or what they run: a crate registry or source replacement
 /// (`CARGO_HOME` points cargo at another `config.toml`), the install root,
-/// the network and HTTP settings (a proxy, a CA bundle), the build and
-/// target settings (`CARGO_BUILD_RUSTC_WRAPPER`, `CARGO_TARGET_*_RUNNER`),
-/// the compiler wrappers, the toolchain download servers, the configuration
+/// the network and HTTP settings (a proxy, a CA bundle), the compiler
+/// wrappers, the toolchain download servers, the configuration
 /// directory (`XDG_CONFIG_HOME`), and the runner switch that re-enables the
 /// deprecated `::set-env` and `::add-path` commands. A prefix ends in `_`;
 /// `CARGO_SOURCE` and `CARGO_CONFIG` are prefixes too.
-pub(crate) const REDIRECTING_VARIABLES: [&str; 17] = [
+pub(crate) const REDIRECTING_VARIABLES: [&str; 15] = [
     "CARGO_HOME",
     "CARGO_REGISTRIES_",
     "CARGO_REGISTRY_",
@@ -1371,8 +1370,6 @@ pub(crate) const REDIRECTING_VARIABLES: [&str; 17] = [
     "CARGO_NET_",
     "CARGO_CONFIG",
     "CARGO_HTTP_",
-    "CARGO_BUILD_",
-    "CARGO_TARGET_",
     "RUSTC_WRAPPER",
     "RUSTC_WORKSPACE_WRAPPER",
     "RUSTUP_DIST_SERVER",
@@ -1391,9 +1388,14 @@ pub(crate) const ASSIGNED_ONLY_VARIABLES: [&str; 2] = ["HOME", "RUSTC"];
 /// `$GITHUB_ENV` write (it sets variables for every later step under a name
 /// the shell may build at run time), the deprecated `::set-env` and
 /// `::add-path` workflow commands, a cargo configuration file
-/// (`.cargo/config`, `cargo/config.toml`, any extension) and cargo's
-/// `--config` flag, which sets any configuration value on the command line.
+/// (`.cargo/config`, `cargo/config.toml`, any extension) and a path into
+/// the runner's command files. Cargo's `--config` flag is refused in cargo
+/// commands (`closed_list_violations`).
 pub(crate) const REFUSED_TEXT: [(&str, &str); 5] = [
+    (
+        "_RUNNER_FILE_COMMANDS",
+        "the runner's command files are written only through their variables",
+    ),
     (
         "GITHUB_ENV",
         "gated files do not write `$GITHUB_ENV`; set variables in an env: block",
@@ -1403,10 +1405,6 @@ pub(crate) const REFUSED_TEXT: [(&str, &str); 5] = [
     (
         "CARGO/CONFIG",
         "a cargo configuration file can redirect crate sources",
-    ),
-    (
-        "--CONFIG",
-        "a `--config` flag can set any cargo configuration value",
     ),
 ];
 
@@ -1458,7 +1456,7 @@ pub(crate) fn environment_violations(name: &str, text: &str) -> Vec<String> {
                 continue;
             }
             let rest = upper[end..].trim_start_matches(['"', '\'', ' ', '\t']);
-            if rest.starts_with([':', '=']) {
+            if rest.starts_with([':', '=']) || rest.starts_with("+=") {
                 violations.push(format!(
                     "{name}:{}: gated files do not set `{variable}`",
                     line(position)
@@ -1467,4 +1465,583 @@ pub(crate) fn environment_violations(name: &str, text: &str) -> Vec<String> {
         }
     }
     violations
+}
+
+// Closed allowlists (engineering decision D8, docs/supply-chain.md "Threat
+// model and residual risk"): a gated file sets only listed variables, writes
+// the runner's files only on listed lines, builds no names from expressions,
+// selects no toolchain or compiler flag, and passes allowlisted actions only
+// exact versions. Each list holds what the gated files use today; growing one
+// is a reviewed change to this file.
+
+/// Every variable a gated file may set: an `env:` key at any level (a
+/// workflow, job, step, container or service) or a shell assignment in
+/// `run` text. Case matters, as it does on the runner. A name whose value a
+/// tool reads as flags or as a program to run takes exactly one value.
+pub(crate) const ALLOWED_VARIABLES: [(&str, Option<&str>); 29] = [
+    // Read by cargo and the Rust runtime: fixed values.
+    ("CARGO_TERM_COLOR", Some("always")),
+    ("CARGO_INCREMENTAL", Some("0")),
+    ("RUST_BACKTRACE", Some("1")),
+    // Test configuration the framework's own tests read; the fake docker is
+    // a program the deploy tests run, so its path is fixed.
+    ("FORGE_TEST_REQUIRE_SSHD", Some("true")),
+    (
+        "FORGE_TEST_FAKE_DOCKER",
+        Some("${{ github.workspace }}/target/debug/examples/fake_docker"),
+    ),
+    ("FORGE_TEST_DATABASE_URL", None),
+    ("FORGE_TEST_MYSQL_URL", None),
+    ("FORGE_TEST_MARIADB_URL", None),
+    // Database and Grafana service containers.
+    ("POSTGRES_PASSWORD", None),
+    ("MYSQL_ROOT_PASSWORD", None),
+    ("MARIADB_ROOT_PASSWORD", None),
+    ("GRAFANA_ADMIN_PASSWORD", None),
+    // Inputs of the workflows' own steps and scripts.
+    ("SBOM_DIR", None),
+    ("BENCH_DURATION", None),
+    ("BENCH_WARMUP", None),
+    ("BENCH_RUNS", None),
+    ("TARGET", None),
+    ("FUZZTIME", None),
+    ("DEFAULT_BRANCH", None),
+    ("NAME", None),
+    ("IMAGE", None),
+    ("DIGEST", None),
+    ("TOOL", None),
+    ("VERSION", None),
+    // Shell locals of `run` scripts.
+    ("version", None),
+    ("name", None),
+    ("app", None),
+    ("status", None),
+    ("_", None),
+];
+
+/// The only lines that write the runner's `$GITHUB_ENV`, `$GITHUB_PATH` or
+/// `$GITHUB_OUTPUT` files, as (gated file, trimmed line).
+pub(crate) const RUNNER_FILE_LINES: [(&str, &str); 3] = [
+    (
+        "fuzz.yml",
+        r#"run: echo "matrix=$(scripts/fuzz.sh -j)" >> "$GITHUB_OUTPUT""#,
+    ),
+    (
+        "release.yml",
+        r#"run: echo "image=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/${NAME}" >> "$GITHUB_OUTPUT""#,
+    ),
+    (
+        ".github/actions/cargo-tool/action.yml",
+        r#"run: echo "$HOME/.forge-tools/$TOOL-$VERSION/bin" >> "$GITHUB_PATH""#,
+    ),
+];
+
+/// The only lines that use an expression function that builds text or
+/// structure (`format`, `fromJSON`, `join`, `toJSON`), as (gated file,
+/// trimmed line).
+pub(crate) const EXPRESSION_LINES: [(&str, &str); 1] = [(
+    "fuzz.yml",
+    "include: ${{ fromJSON(needs.targets.outputs.matrix) }}",
+)];
+
+/// The shells a step may name (`shell:`).
+pub(crate) const ALLOWED_SHELLS: [&str; 1] = ["bash"];
+
+/// The rustup commands a `run` script may use.
+pub(crate) const ALLOWED_RUSTUP: [&str; 2] = ["toolchain install", "component add"];
+
+/// The `+toolchain` overrides a `cargo`, `rustc` or `rustdoc` command may
+/// name: none (rust-toolchain.toml and scripts/fuzz.sh pick toolchains).
+pub(crate) const ALLOWED_TOOLCHAINS: [&str; 0] = [];
+
+/// Text refused anywhere in a gated file, without case: compiler and linker
+/// flags that run another program.
+pub(crate) const REFUSED_FLAGS: [&str; 4] = ["linker", "link-arg", "codegen-backend", "runtool"];
+
+/// Shell words that declare or set the variables named after them.
+const DECLARING: [&str; 10] = [
+    "export",
+    "declare",
+    "typeset",
+    "readonly",
+    "local",
+    "read",
+    "mapfile",
+    "readarray",
+    "getopts",
+    "let",
+];
+
+fn is_identifier(name: &str) -> bool {
+    name.starts_with(|character: char| character.is_ascii_alphabetic() || character == '_')
+        && name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '_')
+}
+
+/// The identifier a word starts with, if any.
+fn leading_identifier(word: &str) -> Option<&str> {
+    let end = word
+        .find(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))
+        .unwrap_or(word.len());
+    Some(&word[..end]).filter(|name| is_identifier(name))
+}
+
+/// A variable a `run` script sets: its name and, for `NAME=value`, the value.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Assignment {
+    pub(crate) name: String,
+    pub(crate) value: Option<String>,
+}
+
+/// Every variable a shell script sets, in every form the gate knows: `NAME=`,
+/// `NAME+=`, `NAME[i]=` (anywhere, `env` and `sudo` arguments included),
+/// `export`/`declare`/`typeset`/`readonly`/`local`/`read`/`mapfile`/
+/// `readarray`/`getopts`/`let` arguments, `printf -v NAME`, `for NAME`,
+/// `select NAME`, `coproc NAME`, `${NAME:=...}`/`${NAME=...}`, `{NAME}>`
+/// redirections and arithmetic (`((NAME = 1))`, `((NAME++))`). It reads
+/// words, not a shell grammar, and so over-approximates: a word that only
+/// looks like an assignment counts too.
+pub(crate) fn assignments(script: &str) -> Vec<Assignment> {
+    let mut found = Vec::new();
+    let mut push = |name: &str, value: Option<String>| {
+        found.push(Assignment {
+            name: name.to_owned(),
+            value,
+        });
+    };
+    for (_, line) in logical_lines(script, true, " ") {
+        let bytes = line.as_bytes();
+        // `${NAME:=...}`, `${NAME=...}` and `{NAME}>` redirections.
+        for (position, _) in line.match_indices('{') {
+            let rest = &line[position + 1..];
+            let Some(name) = leading_identifier(rest) else {
+                continue;
+            };
+            let after = &rest[name.len()..];
+            let expansion = position > 0 && bytes[position - 1] == b'$';
+            if (expansion && (after.starts_with(":=") || after.starts_with('=')))
+                || (!expansion && after.starts_with('}') && after[1..].starts_with(['>', '<']))
+            {
+                push(name, None);
+            }
+        }
+        // Arithmetic: an identifier followed by an assignment operator or
+        // `++`/`--`, or preceded by `++`/`--`.
+        for (start, _) in line.match_indices("((") {
+            let span = line[start + 2..]
+                .find("))")
+                .map_or(&line[start + 2..], |end| &line[start + 2..start + 2 + end]);
+            let mut rest = span;
+            while let Some(offset) =
+                rest.find(|character: char| character.is_ascii_alphabetic() || character == '_')
+            {
+                let before = rest[..offset].trim_end();
+                let candidate = &rest[offset..];
+                let name = leading_identifier(candidate).unwrap_or_default();
+                let after = candidate[name.len()..].trim_start();
+                let read = before.ends_with('$');
+                let operator = [
+                    "<<=", ">>=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "++", "--",
+                ]
+                .iter()
+                .any(|operator| after.starts_with(operator))
+                    || (after.starts_with('=') && !after.starts_with("=="));
+                if !read && (operator || before.ends_with("++") || before.ends_with("--")) {
+                    push(name, None);
+                }
+                rest = &candidate[name.len().max(1)..];
+            }
+        }
+        let words = shell_words(&line);
+        for (index, word) in words.iter().enumerate() {
+            // `NAME=`, `NAME+=`, `NAME[i]=`.
+            if let Some(name) = leading_identifier(word) {
+                let after = &word[name.len()..];
+                let after = if after.starts_with('[') {
+                    after.find(']').map_or("", |end| &after[end + 1..])
+                } else {
+                    after
+                };
+                if let Some(value) = after.strip_prefix('=').or_else(|| after.strip_prefix("+=")) {
+                    push(name, Some(value.to_owned()));
+                }
+            }
+            let following = || {
+                words[index + 1..]
+                    .iter()
+                    .take_while(|word| !is_separator(word))
+            };
+            match word.as_str() {
+                command if DECLARING.contains(&command) => {
+                    for argument in following().filter(|word| !word.starts_with(['-', '+'])) {
+                        if let Some(name) = leading_identifier(argument) {
+                            push(name, None);
+                        }
+                    }
+                }
+                "printf" => {
+                    let mut arguments = following();
+                    while let Some(argument) = arguments.next() {
+                        if argument == "-v" {
+                            if let Some(name) =
+                                arguments.next().and_then(|word| leading_identifier(word))
+                            {
+                                push(name, None);
+                            }
+                        } else if let Some(name) =
+                            argument.strip_prefix("-v").and_then(leading_identifier)
+                        {
+                            push(name, None);
+                        }
+                    }
+                }
+                "for" | "select" | "coproc" => {
+                    if let Some(name) = words
+                        .get(index + 1)
+                        .and_then(|word| leading_identifier(word))
+                    {
+                        push(name, None);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    found
+}
+
+/// The `run` scripts, `env:` mappings and `shell:` values of a gated file,
+/// read from the parsed tree, with the line each starts on.
+fn variable_problems(file: &str, documents: &[YamlNode]) -> Vec<(usize, String)> {
+    let mut problems = Vec::new();
+    let mut nodes = Vec::new();
+    documents
+        .iter()
+        .for_each(|document| document.visit(&mut nodes));
+    let allowed = |name: &str, value: Option<&str>| {
+        ALLOWED_VARIABLES.iter().any(|(listed, fixed)| {
+            *listed == name && fixed.is_none_or(|fixed| value == Some(fixed))
+        })
+    };
+    for node in nodes {
+        let YamlNode::Mapping(entries) = node else {
+            continue;
+        };
+        for (key, value) in entries {
+            let Some(key_name) = key.scalar() else {
+                continue;
+            };
+            let line = match key {
+                YamlNode::Scalar(_, line) => *line,
+                _ => 0,
+            };
+            match (key_name.to_ascii_lowercase().as_str(), value) {
+                ("env", YamlNode::Mapping(variables)) => {
+                    for (variable, setting) in variables {
+                        let name = variable.scalar().unwrap_or_default();
+                        if !allowed(name, setting.scalar()) {
+                            let line = match variable {
+                                YamlNode::Scalar(_, line) => *line,
+                                _ => line,
+                            };
+                            problems.push((
+                                line,
+                                format!("the env: name `{name}` is not allowlisted with this value (ALLOWED_VARIABLES)"),
+                            ));
+                        }
+                    }
+                }
+                ("with", YamlNode::Mapping(_)) => {}
+                ("env" | "with", _) => problems.push((
+                    line,
+                    format!("`{key_name}:` must be a mapping, not an expression or list"),
+                )),
+                ("shell", setting) => {
+                    if !setting
+                        .scalar()
+                        .is_some_and(|shell| ALLOWED_SHELLS.contains(&shell))
+                    {
+                        problems.push((line, "a `shell:` other than bash".to_owned()));
+                    }
+                }
+                ("run", YamlNode::Scalar(script, script_line)) => {
+                    // A listed runner-file line is reviewed as a whole.
+                    let script: String = script
+                        .lines()
+                        .filter(|line| {
+                            !listed_line(&RUNNER_FILE_LINES, file, &format!("run: {line}"))
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    for assignment in assignments(&script) {
+                        if !allowed(&assignment.name, assignment.value.as_deref()) {
+                            problems.push((
+                                *script_line,
+                                format!(
+                                    "the run script sets `{}`, which is not allowlisted with this value (ALLOWED_VARIABLES)",
+                                    assignment.name
+                                ),
+                            ));
+                        }
+                    }
+                    problems.extend(
+                        toolchain_problems(&script)
+                            .into_iter()
+                            .map(|problem| (*script_line, problem)),
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+    problems
+}
+
+/// Toolchain selection and flags in a `run` script: `+toolchain` after
+/// cargo, rustc or rustdoc (outside `ALLOWED_TOOLCHAINS`), cargo's
+/// `--config`, any `-Z` flag, and rustup commands outside `ALLOWED_RUSTUP`.
+fn toolchain_problems(script: &str) -> Vec<String> {
+    let mut problems = Vec::new();
+    for (_, line) in logical_lines(script, true, " ") {
+        let words = shell_words(&line);
+        for (index, word) in words.iter().enumerate() {
+            if word.starts_with("-Z") {
+                problems.push(format!("the unstable flag `{word}`"));
+            }
+            let compiler = is_cargo_program(word)
+                || matches!(word.rsplit('/').next(), Some("rustc" | "rustdoc"));
+            let command = words[index + 1..]
+                .iter()
+                .take_while(|word| !is_separator(word));
+            if compiler {
+                for (position, argument) in command.enumerate() {
+                    if position == 0
+                        && let Some(toolchain) = argument.strip_prefix('+')
+                        && !ALLOWED_TOOLCHAINS.contains(&toolchain)
+                    {
+                        problems.push(format!("the toolchain override `{argument}`"));
+                    }
+                    if argument.starts_with("--config") {
+                        problems.push(format!("cargo's `{argument}` flag"));
+                    }
+                }
+            } else if word == "rustup" || word.ends_with("/rustup") {
+                let subcommand: Vec<&str> = command
+                    .filter(|word| !word.starts_with('-'))
+                    .take(2)
+                    .map(String::as_str)
+                    .collect();
+                if !ALLOWED_RUSTUP.contains(&subcommand.join(" ").as_str()) {
+                    problems.push(format!(
+                        "the rustup command `rustup {}` (ALLOWED_RUSTUP)",
+                        subcommand.join(" ")
+                    ));
+                }
+            }
+        }
+    }
+    problems
+}
+
+/// Is `line` (trimmed) one of the listed lines of the gated file `name`?
+fn listed_line(list: &[(&str, &str)], name: &str, line: &str) -> bool {
+    list.iter()
+        .any(|(file, listed)| *file == name && *listed == line.trim())
+}
+
+/// The closed allowlists of D8 on a gated file: listed variables only (in
+/// `env:` and in `run`), runner files written only on listed lines, no
+/// expression function outside listed lines, no `env:`/`with:` that is a
+/// whole expression, only bash as `shell:`, no toolchain override, cargo
+/// `--config`, `-Z` flag or unlisted rustup command, no linker or runtool
+/// flag, and exact versions in allowlisted actions' inputs.
+pub(crate) fn closed_list_violations(name: &str, text: &str) -> Vec<String> {
+    let mut violations = Vec::new();
+    let documents = match parse_yaml(text) {
+        Ok(documents) => documents,
+        Err(error) => return vec![format!("{name}: {error}")],
+    };
+    for (line, problem) in variable_problems(name, &documents) {
+        violations.push(format!("{name}:{line}: {problem}"));
+    }
+    violations.extend(action_input_violations(name, &documents));
+    for (number, line) in text.lines().enumerate() {
+        let upper = line.to_ascii_uppercase();
+        let number = number + 1;
+        if ["GITHUB_ENV", "GITHUB_PATH", "GITHUB_OUTPUT"]
+            .iter()
+            .any(|file| upper.contains(file))
+            && !listed_line(&RUNNER_FILE_LINES, name, line)
+        {
+            violations.push(format!(
+                "{name}:{number}: a runner file (GITHUB_ENV, GITHUB_PATH, GITHUB_OUTPUT) is written only on a listed line (RUNNER_FILE_LINES)"
+            ));
+        }
+        let lower = line.to_ascii_lowercase();
+        let builds = ["format", "fromjson", "join", "tojson"]
+            .iter()
+            .any(|function| {
+                lower.match_indices(function).any(|(position, _)| {
+                    let before = lower[..position].chars().next_back();
+                    before.is_none_or(|character| {
+                        !(character.is_ascii_alphanumeric() || character == '_')
+                    }) && lower[position + function.len()..]
+                        .trim_start()
+                        .starts_with('(')
+                })
+            });
+        if builds && !listed_line(&EXPRESSION_LINES, name, line) {
+            violations.push(format!(
+                "{name}:{number}: an expression function that builds names or structure (format, fromJSON, join, toJSON) outside a listed line (EXPRESSION_LINES)"
+            ));
+        }
+        for flag in REFUSED_FLAGS {
+            if lower.contains(flag) {
+                violations.push(format!(
+                    "{name}:{number}: the flag `{flag}` runs another program"
+                ));
+            }
+        }
+    }
+    violations
+}
+
+/// The `with:` inputs of the allowlisted actions that choose a version: an
+/// exact version only, never `latest` or a check for it.
+fn action_input_violations(name: &str, documents: &[YamlNode]) -> Vec<String> {
+    let mut nodes = Vec::new();
+    documents
+        .iter()
+        .for_each(|document| document.visit(&mut nodes));
+    let mut violations = Vec::new();
+    let exact = |value: &str, prefix: &str| {
+        value
+            .strip_prefix(prefix)
+            .is_some_and(|version| is_numeric_version(version, 3..=3))
+    };
+    for node in nodes {
+        let Some(YamlNode::Scalar(reference, line)) = node.get("uses") else {
+            continue;
+        };
+        let action = reference
+            .split_once('@')
+            .map_or(reference.as_str(), |(action, _)| action)
+            .to_ascii_lowercase();
+        let with = node.get("with");
+        let input = |key: &str| {
+            with.and_then(|with| with.get(key))
+                .and_then(YamlNode::scalar)
+        };
+        let mut refuse =
+            |problem: &str| violations.push(format!("{name}:{line}: {action}: {problem}"));
+        if let Some(YamlNode::Mapping(entries)) = with {
+            for (key, value) in entries {
+                if value
+                    .scalar()
+                    .is_some_and(|value| value.to_ascii_lowercase().contains("latest"))
+                {
+                    refuse(&format!(
+                        "the input `{}` asks for `latest`",
+                        key.scalar().unwrap_or_default()
+                    ));
+                }
+            }
+        }
+        match action.as_str() {
+            "actions/setup-go" => {
+                let version = input("go-version").is_some_and(|value| exact(value, ""));
+                let file = input("go-version-file") == Some("go.mod");
+                if !(version || file) {
+                    refuse("go-version must be X.Y.Z, or go-version-file go.mod");
+                }
+                if input("check-latest").is_some_and(|value| value != "false") {
+                    refuse("check-latest must be absent or false");
+                }
+            }
+            "golangci/golangci-lint-action" => {
+                if !input("version").is_some_and(|value| exact(value, "v")) {
+                    refuse("version must be vX.Y.Z");
+                }
+            }
+            "sigstore/cosign-installer" => {
+                if input("cosign-release").is_some_and(|value| !exact(value, "v")) {
+                    refuse("cosign-release must be vX.Y.Z");
+                }
+            }
+            "docker/setup-buildx-action" => {
+                if input("version").is_some_and(|value| !exact(value, "v")) {
+                    refuse("version must be vX.Y.Z");
+                }
+                if input("driver-opts").is_some_and(|options| {
+                    !options
+                        .split([',', '\n'])
+                        .any(|option| option.trim().strip_prefix("image=").is_some_and(has_digest))
+                }) {
+                    refuse("driver-opts must give image= pinned by digest");
+                }
+            }
+            _ => {}
+        }
+    }
+    violations
+}
+
+/// Files that configure a tool from the tree, anywhere below `root` (a
+/// template's `.tmpl` suffix ignored): a cargo configuration
+/// (`.cargo/config`, `.cargo/config.toml`), a rust-toolchain file naming a
+/// `path`, a go workspace (`go.work`, `go.work.sum`), a go env file
+/// (`go.env`, `go/env`) and shell startup files (`.bashrc`, `.profile`,
+/// `.bash_profile`, `.envrc`). A linked `.cargo` or `go` directory counts;
+/// the walk does not enter `skipped` nor follow links to directories.
+pub(crate) fn tool_configuration_files(
+    root: &std::path::Path,
+    skipped: &[std::path::PathBuf],
+) -> Vec<std::path::PathBuf> {
+    let mut found = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            let file_name = entry.file_name().to_string_lossy().into_owned();
+            let name = file_name.strip_suffix(".tmpl").unwrap_or(&file_name);
+            let is_directory = entry.file_type().is_ok_and(|kind| kind.is_dir());
+            match name {
+                ".cargo" => found.extend(
+                    ["config", "config.toml", "config.tmpl", "config.toml.tmpl"]
+                        .iter()
+                        .map(|file| path.join(file))
+                        .filter(|path| path.exists()),
+                ),
+                "go" => found.extend(
+                    ["env", "env.tmpl"]
+                        .iter()
+                        .map(|file| path.join(file))
+                        .filter(|path| path.exists()),
+                ),
+                "go.work" | "go.work.sum" | "go.env" | ".bashrc" | ".profile" | ".bash_profile"
+                | ".envrc" => found.push(path.clone()),
+                "rust-toolchain" | "rust-toolchain.toml" => {
+                    let text = std::fs::read_to_string(&path).unwrap_or_default();
+                    if text.lines().any(|line| {
+                        line.trim_start()
+                            .strip_prefix("path")
+                            .is_some_and(|rest| rest.trim_start().starts_with('='))
+                    }) {
+                        found.push(path.clone());
+                    }
+                }
+                _ => {}
+            }
+            if is_directory && !skipped.contains(&path) {
+                pending.push(path);
+            }
+        }
+    }
+    found.sort();
+    found.dedup();
+    found
 }

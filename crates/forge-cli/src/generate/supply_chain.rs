@@ -12,9 +12,10 @@ use std::collections::BTreeSet;
 mod rules;
 
 use rules::{
-    allowlist_violations, checkout_violations, container_violations, environment_violations,
-    parser_violations, permission_violations, pin_violations, secret_violations,
-    tool_install_violations, tree_violations, yaml_subset_violations,
+    allowlist_violations, checkout_violations, closed_list_violations, container_violations,
+    environment_violations, parser_violations, permission_violations, pin_violations,
+    secret_violations, tool_configuration_files, tool_install_violations, tree_violations,
+    yaml_subset_violations,
 };
 
 use super::{
@@ -60,6 +61,7 @@ fn gate(relative: &str, text: &str) -> Vec<String> {
     violations.extend(pin_violations(&name, text));
     violations.extend(allowlist_violations(&name, text));
     violations.extend(environment_violations(&name, text));
+    violations.extend(closed_list_violations(&name, text));
     if !relative.starts_with(".github/workflows/") {
         return violations;
     }
@@ -125,6 +127,13 @@ fn every_rendered_workflow_passes_the_supply_chain_gate() {
             };
             let root = create_application(parent.path(), &options)
                 .unwrap_or_else(|error| panic!("{error}"));
+            // D8: no tool configuration file anywhere in the application.
+            let configured = tool_configuration_files(&root, &[]);
+            assert!(
+                configured.is_empty(),
+                "{name} with {:?}: tool configuration written: {configured:?}",
+                conditions.database
+            );
             let files = github_files(&root);
             let written: BTreeSet<&str> = files.iter().map(|(path, _)| path.as_str()).collect();
             assert!(
@@ -225,4 +234,48 @@ fn a_quoted_escape_cannot_spell_a_step_past_the_rendered_gate() {
             );
         }
     }
+}
+
+/// D (round 7): a template that wrote a tool configuration file anywhere in
+/// the application, not only under `.github/`, is found by the scan the
+/// rendered gate runs on every generated application.
+#[test]
+fn a_generated_tool_configuration_is_found_anywhere_in_the_application() {
+    let parent = tempfile::tempdir().unwrap_or_else(|error| panic!("{error}"));
+    let options = NewApplication {
+        name: "sample-app".to_owned(),
+        docker: true,
+        ci: true,
+        database: Database::Sqlite3,
+        views: false,
+        forge: ForgeSource::GitTag,
+        locale: Locale::En,
+    };
+    let root =
+        create_application(parent.path(), &options).unwrap_or_else(|error| panic!("{error}"));
+    assert!(tool_configuration_files(&root, &[]).is_empty());
+    for (relative, content) in [
+        (
+            ".cargo/config.toml",
+            "[source.crates-io]\nreplace-with = \"m\"\n",
+        ),
+        ("src/.cargo/config", ""),
+        ("go.work", "go 1.25\n"),
+        (".envrc", "export CARGO_HOME=/tmp/h\n"),
+    ] {
+        let path = root.join(relative);
+        let directory = path.parent().unwrap_or(&root).to_path_buf();
+        std::fs::create_dir_all(&directory).unwrap_or_else(|error| panic!("{error}"));
+        std::fs::write(&path, content).unwrap_or_else(|error| panic!("{error}"));
+        assert!(
+            tool_configuration_files(&root, &[]).contains(&path),
+            "{relative} was not found"
+        );
+    }
+    std::fs::write(
+        root.join("rust-toolchain.toml"),
+        "[toolchain]\npath = \"/opt/evil\"\n",
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
+    assert!(tool_configuration_files(&root, &[]).contains(&root.join("rust-toolchain.toml")));
 }

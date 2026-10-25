@@ -255,21 +255,18 @@ does not match either form.
   read the parsed tree, not the text. No mapping repeats a key, compared
   without case (`persist-credentials` and `Persist-Credentials`, a second
   `uses`): readers that keep the first and the last value would disagree.
-- No gated file names a variable that redirects where cargo or rustup fetch
-  from or what they run (`CARGO_HOME`, `CARGO_REGISTRIES_*`,
+- Closed allowlists decide what a gated file may set, write, select and
+  pass (see Threat model and residual risk below). As a second, independent
+  check, no gated file names a variable that redirects where cargo or rustup
+  fetch from or what they run (`CARGO_HOME`, `CARGO_REGISTRIES_*`,
   `CARGO_REGISTRY_*`, `CARGO_SOURCE*`, `CARGO_INSTALL_ROOT`, `CARGO_NET_*`,
-  `CARGO_CONFIG*`, `CARGO_HTTP_*`, `CARGO_BUILD_*`, `CARGO_TARGET_*`,
-  `RUSTC_WRAPPER`, `RUSTC_WORKSPACE_WRAPPER`, `RUSTUP_DIST_SERVER`,
-  `RUSTUP_DIST_ROOT`, `RUSTUP_UPDATE_ROOT`, `XDG_CONFIG_HOME`,
-  `ACTIONS_ALLOW_UNSECURE_COMMANDS`), in any case, in an `env:` block at any
-  level or in `run` text. `HOME` (cargo's default `CARGO_HOME` is
-  `$HOME/.cargo`) and `RUSTC` are refused where they are set, as an `env:`
-  key or a `NAME=` assignment; reading `$HOME` or running `rustc` stays
-  allowed. No gated file writes `$GITHUB_ENV`, whatever it sets (a variable
-  for later steps goes in an `env:` block, where the gate reads its name),
-  uses the deprecated `::set-env` or `::add-path` commands, names a cargo
-  configuration file (`.cargo/config`, `cargo/config.toml`, any extension)
-  or passes cargo's `--config` flag.
+  `CARGO_CONFIG*`, `CARGO_HTTP_*`, `RUSTC_WRAPPER`,
+  `RUSTC_WORKSPACE_WRAPPER`, `RUSTUP_DIST_SERVER`, `RUSTUP_DIST_ROOT`,
+  `RUSTUP_UPDATE_ROOT`, `XDG_CONFIG_HOME`, `ACTIONS_ALLOW_UNSECURE_COMMANDS`)
+  anywhere, in any case; `HOME` and `RUSTC` are refused where set; and
+  `$GITHUB_ENV`, `::set-env`, `::add-path`, the runner's command-file paths
+  and cargo configuration file names (`.cargo/config`, `cargo/config.toml`)
+  are refused anywhere.
 - The install rule reads `run` text as text: with and without YAML comments
   removed, continued lines joined with and without a space, quotes and
   backslashes ignored. It refuses ANSI-C quoting (`$'...'`), any command
@@ -369,27 +366,56 @@ copies to agree).
 
 ## Threat model and residual risk
 
-Engineering decision D6 (2026-10-25). The supply-chain gate is defense in
-depth against unreviewed drift and casual injection in the workflows, local
-actions and generated-app workflows. It is not a shell sandbox, and review is
-the primary control.
+Engineering decisions D6 and D8 (2026-10-25). The supply-chain gate is
+defense in depth against unreviewed drift and casual injection in the
+workflows, local actions and generated-app files. It is not a shell sandbox:
+review of every change is the primary control. Since D8 the gate's core is a
+set of closed allowlists in `crates/forge/tests/gate/rules.rs`, so it
+converges instead of chasing new redirects; growing a list is a reviewed
+change to that file.
 
-- In scope, refused by the gate: every YAML-level and plain-text spelling of
-  a refused action, install, permission, secret, variable or configuration
-  file (YAML escapes, quoting, case, flow style, anchors, aliases, tags,
-  merge and duplicate keys, hidden line breaks, template branches and every
-  rendered variant of the generated application's workflows), and every
-  documented tool or configuration redirect (cargo, rustup and their
-  configuration files and flags, `HOME` and `XDG_CONFIG_HOME`, the runner's
-  `$GITHUB_ENV`, `::set-env` and `::add-path`).
-- Accepted residual risk, left to mandatory review of every change to a
-  workflow, action, script or template: names and commands the shell
-  assembles at run time (`CARGO_""HOME=...`, `eval`, a name built with
-  `printf`, a script the workflow calls), and what an allowlisted action or a
-  reviewed script downloads.
-- Reviews of the gate judge it against this model: a bypass inside the scope
-  above is a defect to fix in the gate; a run-time-assembled name is the
-  accepted residual risk.
+- Variables (`ALLOWED_VARIABLES`): a gated file sets only listed names, in an
+  `env:` key at any level (workflow, job, step, container, service; plain,
+  quoted or flow) or in `run` text (`NAME=`, `NAME+=`, `NAME[i]=`, `export`,
+  `env`, `sudo`, `declare`, `typeset`, `readonly`, `local`, `read`,
+  `mapfile`, `getopts`, `let`, `printf -v`, `for`/`select`/`coproc NAME`,
+  `${NAME:=...}`, `{NAME}>`, arithmetic). Names a tool reads as flags or a
+  program (`CARGO_INCREMENTAL`, `CARGO_TERM_COLOR`, `RUST_BACKTRACE`,
+  `FORGE_TEST_FAKE_DOCKER`, ...) take one exact value. `HOME`, `PATH`,
+  `BASH_ENV`, `LD_PRELOAD`, `RUSTUP_*`, `RUSTFLAGS` and every other unlisted
+  name are refused as assignment targets; reading `$HOME` stays allowed. An
+  `env:` or `with:` that is a whole expression is refused, and `shell:` is
+  bash only.
+- Runner files (`RUNNER_FILE_LINES`): `$GITHUB_ENV`, `$GITHUB_PATH` and
+  `$GITHUB_OUTPUT` are written only on the listed lines (the fuzz matrix and
+  release image name outputs, the cargo-tool action's `bin/` on `PATH`);
+  `::set-env`, `::add-path`, `ACTIONS_ALLOW_UNSECURE_COMMANDS` and the
+  runner's command-file paths are refused.
+- Expressions (`EXPRESSION_LINES`): `format`, `fromJSON`, `join` and `toJSON`
+  appear only on the listed line (the fuzz matrix).
+- Toolchains and flags (`ALLOWED_TOOLCHAINS`, empty; `ALLOWED_RUSTUP`):
+  no `cargo`/`rustc`/`rustdoc +toolchain`, no cargo `--config`, no `-Z`
+  flag, rustup only as `toolchain install` and `component add`, and no
+  `linker`, `link-arg`, `codegen-backend` or `runtool` anywhere.
+- Action inputs: allowlisted actions get exact versions (`go-version` X.Y.Z
+  or `go-version-file: go.mod`, golangci-lint `version` vX.Y.Z,
+  `cosign-release` and setup-buildx `version` vX.Y.Z when set), no
+  `check-latest`, `driver-opts` images by digest, and no `latest` anywhere.
+- Tool configuration files (`tool_configuration_files`): none anywhere in
+  the repository (templates included) or in any generated application, for
+  every `forge new` option: `.cargo/config` and `.cargo/config.toml`, a
+  `rust-toolchain` file with a `path`, `go.work`, `go.work.sum`, `go.env`,
+  `go/env`, `.bashrc`, `.profile`, `.bash_profile`, `.envrc`.
+- The YAML-level rules still apply underneath: the simple subset (no
+  escapes, anchors, tags, hidden line breaks), the parser cross-check,
+  duplicate keys, template branches gated as rendered, and the denylist of
+  redirecting variables as a second, independent check.
+
+Accepted residual risk, left to review: names the shell builds at run time
+(`eval`, a `printf`-built or `$(...)`-built name), the content of the scripts
+the workflows call (`scripts/*.sh`), and what an allowlisted action does
+internally with its pinned inputs. Reviews of the gate judge it against this
+model: a bypass inside the lists' scope is a defect to fix in the gate.
 
 ## Residual risks
 

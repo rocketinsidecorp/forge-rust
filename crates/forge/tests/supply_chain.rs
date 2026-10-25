@@ -556,6 +556,226 @@ fn gated_files_set_no_redirecting_environment() {
     }
 }
 
+/// D8: every gated file sets only listed variables, writes runner files and
+/// uses expression functions only on listed lines, and selects no toolchain
+/// or flag outside the lists; every list entry is still in use.
+#[test]
+fn gated_files_stay_inside_the_closed_allowlists() {
+    let files = gated_files();
+    for (name, text) in &files {
+        assert_clean(&closed_list_violations(name, text));
+    }
+    for (file, line) in RUNNER_FILE_LINES.iter().chain(EXPRESSION_LINES.iter()) {
+        assert!(
+            files
+                .iter()
+                .any(|(name, text)| name == file && text.lines().any(|own| own.trim() == *line)),
+            "{file}: the listed line is no longer used: {line}"
+        );
+    }
+}
+
+/// Round-7 repros (A to E and the expression notes), each refused by the
+/// closed allowlists.
+#[test]
+fn the_closed_allowlists_refuse_every_redirect() {
+    for rejected in [
+        // A: runner files, PATH and shell startup variables.
+        "steps:\n  - run: echo /tmp/evil >> \"$GITHUB_PATH\"\n",
+        "steps:\n  - run: echo /tmp/evil | tee -a \"${GITHUB_PATH}\"\n",
+        "steps:\n  - run: echo x=1 > $GITHUB_OUTPUT\n",
+        "env:\n  PATH: /tmp/evil:/usr/bin\n",
+        "steps:\n  - run: PATH=/tmp/evil:$PATH cargo build\n",
+        "env:\n  BASH_ENV: ./ci/env.sh\n",
+        "env:\n  ENV: ./ci/env.sh\n",
+        "env:\n  LD_PRELOAD: /tmp/evil.so\n",
+        "env:\n  LD_LIBRARY_PATH: /tmp/evil\n",
+        // B: rustup and toolchain selection, compiler flags.
+        "env:\n  RUSTUP_HOME: /tmp/rustup\n",
+        "env:\n  RUSTUP_TOOLCHAIN: /opt/evil-toolchain\n",
+        "steps:\n  - run: cargo +/opt/evil-toolchain build\n",
+        "steps:\n  - run: rustc +nightly --version\n",
+        "steps:\n  - run: rustup toolchain link evil /opt/evil\n",
+        "steps:\n  - run: rustup override set /opt/evil\n",
+        "steps:\n  - run: rustup set profile complete\n",
+        "env:\n  RUSTFLAGS: -C linker=/tmp/evil\n",
+        "env:\n  CARGO_ENCODED_RUSTFLAGS: -Clink-arg=-fuse-ld=/tmp/evil\n",
+        "env:\n  RUSTDOCFLAGS: --test-runtool /tmp/evil\n",
+        "env:\n  RUSTC_BOOTSTRAP: \"1\"\n",
+        "steps:\n  - run: cargo build -Zbuild-std\n",
+        "steps:\n  - run: cargo build --config 'target.x.linker=\"/tmp/evil\"'\n",
+        "env:\n  CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: /tmp/evil\n",
+        "env:\n  CARGO_BUILD_RUSTC: /tmp/evil\n",
+        // E: HOME in every assignment form.
+        "steps:\n  - run: HOME+=/x cargo build\n",
+        "steps:\n  - run: read HOME < /tmp/h\n",
+        "steps:\n  - run: for HOME in /tmp/h; do cargo build; done\n",
+        "steps:\n  - run: printf -v HOME /tmp/h\n",
+        "steps:\n  - run: echo ${HOME:=/tmp/h}\n",
+        "steps:\n  - run: export HOME\n",
+        "steps:\n  - run: declare -x HOME=/tmp/h\n",
+        "steps:\n  - run: local -r HOME\n",
+        "steps:\n  - run: readonly HOME\n",
+        "steps:\n  - run: typeset HOME\n",
+        "steps:\n  - run: mapfile HOME < f\n",
+        "steps:\n  - run: select HOME in a b; do :; done\n",
+        "steps:\n  - run: exec {HOME}>/tmp/h\n",
+        "steps:\n  - run: ((HOME = 1))\n",
+        "steps:\n  - run: env HOME=/tmp/h cargo build\n",
+        // Expressions that build names or structure, whole-expression env:
+        // and with:, and other shells.
+        "env:\n  A: ${{ format('CARGO_{0}', 'HOME') }}\n",
+        "jobs:\n  a:\n    env: ${{ fromJSON(vars.ENV) }}\n",
+        "steps:\n  - uses: actions/cache@SHA # v6.1.0\n    with: ${{ fromJSON(vars.WITH) }}\n",
+        "steps:\n  - run: echo ${{ join(github.event.commits.*.message, ' ') }}\n",
+        "steps:\n  - run: echo '${{ toJSON(github) }}'\n",
+        "steps:\n  - run: echo x\n    shell: bash --rcfile /tmp/evil {0}\n",
+        // Allowlisted actions asked for `latest` or an unpinned image.
+        "steps:\n  - uses: actions/setup-go@SHA # v6.0.0\n    with:\n      go-version: stable\n",
+        "steps:\n  - uses: actions/setup-go@SHA # v6.0.0\n    with:\n      go-version-file: go.mod\n      check-latest: true\n",
+        "steps:\n  - uses: golangci/golangci-lint-action@SHA # v9.0.0\n    with:\n      version: latest\n",
+        "steps:\n  - uses: golangci/golangci-lint-action@SHA # v9.0.0\n",
+        "steps:\n  - uses: sigstore/cosign-installer@SHA # v4.1.2\n    with:\n      cosign-release: latest\n",
+        "steps:\n  - uses: docker/setup-buildx-action@SHA # v4.4.1\n    with:\n      version: latest\n",
+        "steps:\n  - uses: docker/setup-buildx-action@SHA # v4.4.1\n    with:\n      driver-opts: image=moby/buildkit:master\n",
+    ] {
+        let text = snippet(rejected);
+        assert!(parse_yaml(&text).is_ok(), "the snippet must parse: {text}");
+        assert!(
+            !closed_list_violations("t.yml", &text).is_empty(),
+            "accepted: {text}"
+        );
+    }
+}
+
+/// D8: an unlisted name is refused in every position that sets it.
+#[test]
+fn an_unlisted_variable_is_refused_wherever_it_is_set() {
+    for rejected in [
+        "env:\n  UNLISTED: x\n",
+        "jobs:\n  a:\n    env:\n      UNLISTED: x\n",
+        "steps:\n  - run: x\n    env:\n      UNLISTED: x\n",
+        "env: {UNLISTED: x}\n",
+        "env:\n  \"UNLISTED\": x\n",
+        "env:\n  'UNLISTED': x\n",
+        "jobs:\n  a:\n    container:\n      image: x@sha256:DIGEST\n      env:\n        UNLISTED: x\n",
+        "jobs:\n  a:\n    services:\n      db:\n        image: x@sha256:DIGEST\n        env:\n          UNLISTED: x\n",
+        // A listed name with a value other than its fixed one.
+        "env:\n  CARGO_INCREMENTAL: \"1\"\n",
+        "steps:\n  - run: CARGO_TERM_COLOR=never cargo build\n",
+        "steps:\n  - run: UNLISTED=x cargo build\n",
+        "steps:\n  - run: UNLISTED+=x\n",
+        "steps:\n  - run: arr[0]=x; UNLISTED[1]=x\n",
+        "steps:\n  - run: export UNLISTED=x\n",
+        "steps:\n  - run: export UNLISTED\n",
+        "steps:\n  - run: env UNLISTED=x make\n",
+        "steps:\n  - run: sudo UNLISTED=x make\n",
+        "steps:\n  - run: declare UNLISTED\n",
+        "steps:\n  - run: typeset UNLISTED\n",
+        "steps:\n  - run: readonly UNLISTED=x\n",
+        "steps:\n  - run: local UNLISTED\n",
+        "steps:\n  - run: read -r UNLISTED\n",
+        "steps:\n  - run: for UNLISTED in a; do :; done\n",
+        "steps:\n  - run: printf -v UNLISTED x\n",
+        "steps:\n  - run: printf -vUNLISTED x\n",
+        "steps:\n  - run: echo \"${UNLISTED:=x}\"\n",
+        "steps:\n  - run: echo \"${UNLISTED=x}\"\n",
+        "steps:\n  - run: let UNLISTED=1\n",
+        "steps:\n  - run: ((UNLISTED++))\n",
+        "steps:\n  - run: ((++UNLISTED))\n",
+        "steps:\n  - run: (( UNLISTED += 1 ))\n",
+        "steps:\n  - run: getopts ab UNLISTED\n",
+        "steps:\n  - run: coproc UNLISTED { cat; }\n",
+        "steps:\n  - run: |\n      cargo build \\\n        && UNLISTED=x make\n",
+    ] {
+        let text = snippet(rejected);
+        assert!(parse_yaml(&text).is_ok(), "the snippet must parse: {text}");
+        assert!(
+            closed_list_violations("t.yml", &text)
+                .iter()
+                .any(|violation| violation.contains("UNLISTED") || violation.contains("CARGO_")),
+            "accepted: {text}"
+        );
+    }
+    for accepted in [
+        "env:\n  CARGO_TERM_COLOR: always\n  FORGE_TEST_DATABASE_URL: postgres://x\n",
+        "steps:\n  - run: echo \"$HOME/bin\" \"${HOME}\" \"${HOME:-/root}\"\n",
+        "steps:\n  - run: '[ \"$status\" = healthy ] && test \"$(date)\" = 0'\n",
+        "steps:\n  - run: cargo test --locked -- --include-ignored\n",
+        "steps:\n  - run: rustup component add llvm-tools-preview\n",
+        "steps:\n  - run: docker inspect --format '{{.State.Health.Status}}' app\n",
+    ] {
+        assert_clean(&closed_list_violations("t.yml", &snippet(accepted)));
+    }
+}
+
+/// D8: no tool configuration file exists anywhere in the repository,
+/// templates included (a `.tmpl` suffix is ignored).
+#[test]
+fn no_tool_configuration_exists_in_the_repository() {
+    let skipped = [root().join("target"), root().join(".git")];
+    let found = tool_configuration_files(&root(), &skipped);
+    assert!(found.is_empty(), "tool configuration found: {found:?}");
+    let scratch = tempfile::tempdir().expect("tempdir");
+    for (relative, content) in [
+        ("a/.cargo/config.toml", ""),
+        ("b/.cargo/config", ""),
+        (
+            "c/rust-toolchain.toml",
+            "[toolchain]\npath = \"/opt/evil\"\n",
+        ),
+        ("c2/rust-toolchain", "[toolchain]\n  path= \"/opt/evil\"\n"),
+        (
+            "ok/rust-toolchain.toml",
+            "[toolchain]\nchannel = \"1.98.1\"\n",
+        ),
+        ("d/go.work", "go 1.25\n"),
+        ("d/go.work.sum", ""),
+        ("e/go.env", ""),
+        ("f/.ci/go/env", "GOPROXY=https://evil.example\n"),
+        ("g/.bashrc", ""),
+        ("g/.profile", ""),
+        ("g/.bash_profile", ""),
+        ("g/.envrc", ""),
+        ("templates/go.work.tmpl", ""),
+        ("templates/.cargo/config.toml.tmpl", ""),
+        ("target/.cargo/config.toml", ""),
+    ] {
+        let path = scratch.path().join(relative);
+        fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        fs::write(&path, content).expect("write");
+    }
+    let found: Vec<String> =
+        tool_configuration_files(scratch.path(), &[scratch.path().join("target")])
+            .iter()
+            .map(|path| {
+                path.strip_prefix(scratch.path())
+                    .expect("inside")
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+    assert_eq!(
+        found,
+        [
+            "a/.cargo/config.toml",
+            "b/.cargo/config",
+            "c/rust-toolchain.toml",
+            "c2/rust-toolchain",
+            "d/go.work",
+            "d/go.work.sum",
+            "e/go.env",
+            "f/.ci/go/env",
+            "g/.bash_profile",
+            "g/.bashrc",
+            "g/.envrc",
+            "g/.profile",
+            "templates/.cargo/config.toml.tmpl",
+            "templates/go.work.tmpl",
+        ]
+    );
+}
+
 /// F3: every redirecting variable is refused in an env: block at any level,
 /// in any case, and in run text; a `$GITHUB_ENV` write is refused whatever
 /// it sets.
@@ -601,10 +821,11 @@ fn the_environment_rule_rejects_redirecting_variables() {
         "steps:\n  - run: echo '::add-path::/tmp/bin'\n",
     ] {
         let text = snippet(rejected);
-        assert!(
-            !environment_violations("t.yml", &text).is_empty(),
-            "accepted: {text}"
-        );
+        // Round 7 (D8): the build and target prefixes and cargo's --config
+        // moved from the denylist to the closed allowlists.
+        let mut violations = environment_violations("t.yml", &text);
+        violations.extend(closed_list_violations("t.yml", &text));
+        assert!(!violations.is_empty(), "accepted: {text}");
     }
     for accepted in [
         "env:\n  CARGO_TERM_COLOR: always\n  RUSTFLAGS: -D warnings\n",
