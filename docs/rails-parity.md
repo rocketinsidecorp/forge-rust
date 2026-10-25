@@ -21,6 +21,10 @@ the work is finished and waiting for its review; **Planned** means not started.
 | Mailer with previews | Action Mailer | Done | Done (`forge::mail`, password-reset emails, `/_mail` previews, [ADR 0035](adr/0035-mail.md); `forge generate mailer`, [ADR 0038](adr/0038-generators-and-destroy.md)) |
 | Rate limiting | `rate_limit` | Done | Done |
 | Client address behind trusted proxies | `request.remote_ip`, `trusted_proxies` | Done (`FORGE_HTTP_TRUSTED_PROXIES`, ADR 0037) | Done (`FORGE_HTTP_TRUSTED_PROXIES`, ADR 0032; `forge deploy` sets it for the proxied role, [ADR 0042](adr/0042-forge-deploy.md)) |
+| `HEAD` on every `GET` route | `HEAD` routed to `GET` | Done (`http.ServeMux`) | In review (the router serves `HEAD` with the `GET` route unless a `HEAD` route exists, the server drops the body, `Allow` lists `HEAD`) |
+| Handler panic answered with `500` | `ShowExceptions` | Done (`recoverer`: JSON error body with the request id) | In review (text body `internal server error`, `x-request-id`, logged with the request id) |
+| HSTS behind TLS | `config.force_ssl` | Done (`Strict-Transport-Security` unless `FORGE_HTTP_TRANSPORT=plain`) | In review (same header and rule, `FORGE_HTTP_TRANSPORT=plain\|trusted-proxy`, see follow-ups) |
+| Bound on buffered request bodies | — | Not needed (bodies are streamed through `MaxBytesReader`) | In review (`FORGE_MAX_IN_FLIGHT_BODY_BYTES`, 256 MiB for all bodies at once, `503` with `Retry-After`) |
 | Cache | Solid Cache | Done | Done |
 | File storage with signed URLs | Active Storage | Done (disk) | Done (disk) |
 | Import maps, Turbo, Stimulus | Hotwire | In review | Done |
@@ -40,6 +44,24 @@ the work is finished and waiting for its review; **Planned** means not started.
 | Getting Started guide | Rails Guides | Done (Forge-Go docs/GETTING_STARTED.md) | Done ([getting started](getting-started.md)) |
 
 ## Parity follow-ups
+
+- HTTP core (forge-rust QR1, 2026-10-25): `HEAD`, the panic `500` and HSTS
+  follow Forge-Go's rules. Differences: (1) Forge-Go answers a panic with
+  its JSON error body (`{"error":{"code":"internal_error",...}}`), Forge-Rust
+  with `text/plain` `internal server error`, like its other framework
+  refusals; both carry the request id. (2) `FORGE_HTTP_TRANSPORT`: Forge-Rust
+  has no `tls` mode (it never terminates TLS) and refuses it; unset, it is
+  `trusted-proxy` in production, where Forge-Go defaults to `plain` and
+  refuses to start, so its generated Dockerfile sets `trusted-proxy`.
+  Neither forge-proxy adds HSTS; the application's header passes through.
+  (3) `FORGE_MAX_IN_FLIGHT_BODY_BYTES` is Rust-only: Forge-Go streams
+  request bodies, Forge-Rust buffers them before dispatch. (4) A path guard
+  registered before the locale negotiation can no longer be bypassed with a
+  locale prefix in Forge-Rust (the prefix is removed in a rewrite step
+  before every layer); Forge-Go still relies on registering path-sensitive
+  middleware after its i18n middleware, and should strip the prefix before
+  the application middleware the same way. (5) forge-proxy `-idle-timeout`
+  now means what it means in Forge-Go: the wait between requests.
 
 - Database URLs without a host (tracked 2026-10-25, forge-rust#24): the Rust
   production guard of `db drop` treats `postgres:///shop` as a local socket
