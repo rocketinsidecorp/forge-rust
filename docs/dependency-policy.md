@@ -679,9 +679,13 @@ generated-app CI template line by line. A line reader alone could be fooled by
 YAML spellings it does not model (hidden line breaks, quoted `#`, flow nesting,
 document markers), so the gate also parses every gated file with a real YAML
 parser and requires both to read the same `uses` keys (line and value); the
-checkout and `permissions` rules read the parsed tree. The parser is a
-**dev-dependency of the `forge` crate only**: it is compiled for that test and
-never linked into a library, binary or released artifact.
+checkout and `permissions` rules read the parsed tree. The same rules
+(`crates/forge/tests/gate/rules.rs`) also gate the workflows `forge new`
+renders, for every option, in forge-cli's unit tests
+(`crates/forge-cli/src/generate/supply_chain.rs`). The parser is a
+**dev-dependency of the `forge` and `forge-cli` crates only** (the same exact
+pin): it is compiled for those tests and never linked into a library, binary
+or released artifact.
 
 | Crate | Version | Role | Review |
 | --- | --- | --- | --- |
@@ -697,6 +701,8 @@ whose current release is six weeks old; for a gate that must not change under
 us, the settled release wins over one fewer dependency. `cargo deny check`
 (advisories, bans, licenses, sources) passes with it; the `Cargo.lock` change
 is exactly these three packages plus the `foldhash` edge of `hashbrown 0.17`.
+Adding it to forge-cli's dev-dependencies added only the `yaml-rust2` edge of
+`forge-cli` to `Cargo.lock`, no new package.
 
 ## Exceptions and removal
 

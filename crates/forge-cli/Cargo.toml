@@ -63,3 +63,7 @@ forge-auth = { path = "../forge-auth" }
 # tests/scaffold.rs provisions a PostgreSQL database for migrate/rollback.
 forge-db = { path = "../forge-db", features = ["postgres", "testing"] }
 tempfile.workspace = true
+# src/generate/supply_chain.rs gates the rendered workflows with the rules of
+# crates/forge/tests/gate/rules.rs, which parse them with this YAML parser
+# (reviewed in docs/dependency-policy.md; the same pin as the forge crate).
+yaml-rust2 = { version = "=0.13.0", default-features = false }

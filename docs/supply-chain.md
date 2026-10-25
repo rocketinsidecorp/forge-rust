@@ -201,7 +201,7 @@ does not match either form.
   kept whatever rust-cache restored. The release job installs without a
   cache.
 - Only allowlisted actions run (`ALLOWED_ACTIONS` in
-  `crates/forge/tests/supply_chain.rs`, compared without case):
+  `crates/forge/tests/gate/rules.rs`, compared without case):
   `actions/checkout`, `actions/cache`, `actions/upload-artifact`,
   `Swatinem/rust-cache`, `EmbarkStudios/cargo-deny-action`,
   `docker/setup-buildx-action`, `docker/login-action`,
@@ -214,10 +214,18 @@ does not match either form.
   `ALLOWED_ACTIONS` and to the pin table below in the same reviewed change;
   the gate also fails when an allowlisted action is no longer used. A
   sub-path cannot leave the repository (no empty, `.` or `..` segment).
+- The generated application's workflows are gated as `forge new` writes
+  them, not as the template reads: `crates/forge-cli/src/generate/supply_chain.rs`
+  generates an application for every option (each `-d` backend and none,
+  with and without Docker, full-stack and `--api`, two names) and runs every
+  rule below on every file under its `.github/`. A `%%if%%` branch cannot hide
+  a step: a line that is `run: |` text in one render and a step in another is
+  read as both. The framework test also reads the template with its
+  `%%...%%` markers blanked line-aligned, all branches at once; that merged
+  reading is an extra check, not the guarantee, since no render produces it.
 - Gated files are written in a simple YAML subset. The gate reads the
-  workflows, local actions and generated-app CI template (its `%%...%%`
-  markers blanked line-aligned, so every branch is read where it stands) line
-  by line, and refuses whatever such a reader could misread rather than guess:
+  workflows, local actions and rendered generated-app files line by line, and
+  refuses whatever such a reader could misread rather than guess:
   - a carriage return not followed by a line feed, U+0085, U+2028 or U+2029,
     and a byte-order mark anywhere but at the start;
   - a YAML directive (`%YAML`), content after a document marker (`---`,
@@ -239,7 +247,16 @@ does not match either form.
   (block-scalar text is not read for keys, so a decoy there cannot stand in
   for a key the reader misses), and the checkout (`with:
   persist-credentials: false` in the step itself) and `permissions` rules
-  read the parsed tree, not the text.
+  read the parsed tree, not the text. No mapping repeats a key, compared
+  without case (`persist-credentials` and `Persist-Credentials`, a second
+  `uses`): readers that keep the first and the last value would disagree.
+- No gated file names a variable that redirects where cargo or rustup fetch
+  from (`CARGO_HOME`, `CARGO_REGISTRIES_*`, `CARGO_REGISTRY_*`,
+  `CARGO_SOURCE*`, `CARGO_INSTALL_ROOT`, `CARGO_NET_*`, `CARGO_CONFIG*`,
+  `RUSTUP_DIST_SERVER`, `RUSTUP_UPDATE_ROOT`), in any case, in an `env:` block
+  at any level or in `run` text, and none writes `$GITHUB_ENV`, whatever it
+  sets: a variable for later steps goes in an `env:` block, where the gate
+  reads its name.
 - The install rule reads `run` text as text: with and without YAML comments
   removed, continued lines joined with and without a space, quotes and
   backslashes ignored. It refuses ANSI-C quoting (`$'...'`), any command
@@ -248,9 +265,9 @@ does not match either form.
   repository, symbolic links included (cargo reads them from every parent
   directory; one could redirect crate sources or alias `install`).
 - What text scanning cannot see: the shell inside `run` is not parsed (a
-  script the workflow runs, `eval` of computed text, a command assembled at
-  run time), and an allowlisted action or a reviewed script can still fetch a
-  tool. Those are covered by review of every script and allowlisted action,
+  script the workflow runs, `eval` of computed text, a command or variable
+  name assembled at run time), and an allowlisted action or a reviewed
+  script can still fetch a tool. Those are covered by review of every script and allowlisted action,
   not by the gate.
 - Cargo tools are installed only through that action, plus one reviewed
   exception: the `Install cargo-auditable` step of `release.yml`, which
@@ -287,7 +304,8 @@ does not match either form.
   `SECRETS.X`, `secrets:  inherit`, `join(secrets, ...)`, comments after a
   tab. An `image:` is a container only under `services:` or `container:`; an
   action input under `with:` is not.
-- The generated application's CI (`templates/app/github/workflows/ci.yml.tmpl`),
+- The generated application's CI (`templates/app/github/workflows/ci.yml.tmpl`,
+  gated as rendered for every option),
   `Dockerfile.tmpl` (and `examples/hello-forge/Dockerfile`) and
   `compose.yaml.tmpl` follow the same rules: actions pinned by SHA,
   checkouts without credentials, both base images by the digests of
