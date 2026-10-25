@@ -286,6 +286,9 @@ fn cause_chain(failure: &ForgeError) -> String {
 }
 
 #[cfg(test)]
+mod web_tests;
+
+#[cfg(test)]
 mod tests {
     use std::io;
 

@@ -91,6 +91,9 @@ fn check_status_line(line: &str) -> Result<(), ProbeError> {
 }
 
 #[cfg(test)]
+mod probe_tests;
+
+#[cfg(test)]
 mod tests {
     use std::{net::TcpListener, thread::JoinHandle};
 

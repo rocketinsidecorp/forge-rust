@@ -78,6 +78,9 @@ fn install(
 }
 
 #[cfg(test)]
+mod logging_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
