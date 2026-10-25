@@ -296,6 +296,11 @@ COVERAGE_JSON=summary.json scripts/coverage.sh       # report and gate an existi
   file; a line with `0` hits is what no test reaches).
   cargo-llvm-cov builds into its own `target/llvm-cov-target`, a second full
   build: run it locally only with the disk to spare.
+- **Two totals.** The script prints both. The *gross* total counts everything
+  measured except the exclusions below. The *gated* total, the one the floor
+  checks, also leaves out the contract test kits listed under "Contract test
+  kits". `target/coverage/summary.json` is the gross measurement; the per-crate
+  table shows both.
 - **Pinned tools.** cargo-llvm-cov 0.9.1 (2026-09-06, MSRV 1.87, not
   yanked: the newest release at least two weeks old that builds with the
   pinned Rust 1.98.1), installed `--locked` through
@@ -313,7 +318,30 @@ COVERAGE_JSON=summary.json scripts/coverage.sh       # report and gate an existi
   | `forge-bench`, `forge-loadgen` | The benchmark and load-generation harnesses: they measure the framework, they are not part of it. `fuzz/` is outside the workspace. |
   | `crates/forge-cli/templates/` | Generated-application templates: text that `forge new` renders, not code compiled into the framework. Their output is tested by the `scaffold` job. |
   | `forge-cli --test scaffold` | The generated-application suite builds separate applications in other target directories; it runs in the `scaffold` job. |
-  | `tests/` directories, `tests.rs`, `*_tests.rs`, `test_support.rs` | Test code (cargo-llvm-cov's default for `tests/`; the others are `#[cfg(test)]` modules kept in their own files). The `testing` modules behind the `testing` features are shipped API and stay measured. |
+  | `tests/` directories, `tests.rs`, `*_tests.rs`, `test_support.rs` | Test code (cargo-llvm-cov's default for `tests/`; the others are `#[cfg(test)]` modules kept in their own files). |
+
+  The `testing` modules behind the `testing` features are shipped API and stay
+  in the gross total; only the contract test kits below leave the gated one.
+
+### Contract test kits (decision D7)
+
+Coverage measures production code. These `src/testing.rs` files are harnesses
+that every backend's tests call; their only code that does not run is the
+failure branch of an assertion (a `panic!` or `assert!` when a backend breaks
+the contract), which cannot run while every backend passes. They stay verified
+by being run against every real backend (PostgreSQL 18 and 16, MySQL, MariaDB,
+SQLite) in CI, where a broken kit or a broken backend fails the suite. They
+are excluded from the gated total only, and still appear in the gross one:
+
+`crates/forge-cache/src/testing.rs`, `crates/forge-db/src/testing.rs`,
+`crates/forge-jobs/src/testing.rs`, `crates/forge-mail/src/testing.rs`,
+`crates/forge-ratelimit/src/testing.rs`, `crates/forge-storage/src/testing.rs`,
+`crates/forge-telemetry/src/testing.rs`.
+
+The list is explicit in `scripts/coverage.sh` (`kits`), exactly those files and
+never a pattern over `testing`, so production code cannot be hidden by a naming
+accident. A new kit is added to the list, with its reason, in the pull request
+that adds it.
 
 The Forge-Go twin (`scripts/coverage.sh`, `.coverage-floor`, the same job
 name) measures statement coverage with `go test -coverpkg`; see its
