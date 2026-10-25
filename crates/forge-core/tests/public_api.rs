@@ -2,6 +2,8 @@
 //! indirectly: defaults, accessors, conversions and what malformed serde
 //! input reports.
 
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 use forge_core::{Cancellation, ErrorCategory, ForgeError, Id, LifecycleContext, Timestamp, Uuid};
 use serde::{Deserialize as _, de::IntoDeserializer as _};
 

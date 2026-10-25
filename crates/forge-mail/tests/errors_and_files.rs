@@ -7,10 +7,19 @@ use std::os::unix::fs::PermissionsExt as _;
 
 use forge_mail::{Address, FileSender, MailError, Message, Sender};
 
+/// An error, its code, whether it is retryable, its stage and its reply code.
+type Case = (
+    MailError,
+    &'static str,
+    bool,
+    Option<&'static str>,
+    Option<u16>,
+);
+
 #[test]
 fn every_error_has_a_stable_code_and_only_what_is_safe_to_report() {
     use std::io::ErrorKind;
-    let cases: Vec<(MailError, &str, bool, Option<&str>, Option<u16>)> = vec![
+    let cases: Vec<Case> = vec![
         (
             MailError::Invalid {
                 field: "to".into(),
