@@ -1210,3 +1210,104 @@ async fn a_keep_alive_connection_continues_cleanly_after_head() {
     .expect("client task must not panic");
     server.stop().await;
 }
+
+/// A log sink for one test.
+#[derive(Clone, Default)]
+struct CapturedLog(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl Write for CapturedLog {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if let Ok(mut log) = self.0.lock() {
+            log.extend_from_slice(bytes);
+        }
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl CapturedLog {
+    fn text(&self) -> String {
+        self.0
+            .lock()
+            .map(|log| String::from_utf8_lossy(&log).into_owned())
+            .unwrap_or_default()
+    }
+}
+
+fn panicking_router() -> Router {
+    let mut router = test_router();
+    router
+        .route(Method::GET, "/panic", |_| async {
+            panic!("secret-detail 4242");
+        })
+        .expect("panic route must register")
+        .route(Method::POST, "/panic", |_| async {
+            panic!("with a body");
+        })
+        .expect("panic route must register");
+    router
+}
+
+// Current-thread runtime: the server's tasks run on this thread, so the
+// test's log subscriber sees them.
+#[tokio::test(flavor = "current_thread")]
+async fn a_handler_panic_is_a_500_with_the_request_id_and_is_logged() {
+    let log = CapturedLog::default();
+    let writer = log.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_writer(move || writer.clone())
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+    let server = TestServer::start(test_config(Duration::from_secs(10)), panicking_router()).await;
+    let addr = server.addr;
+
+    let text = tokio::task::spawn_blocking(move || {
+        let mut stream = connect(addr);
+        // The connection survives the panic: a second request follows.
+        stream
+            .write_all(
+                b"GET /panic HTTP/1.1\r\nHost: localhost\r\n\r\n\
+                  GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            )
+            .expect("requests must be written");
+        let mut received = Vec::new();
+        stream
+            .read_to_end(&mut received)
+            .expect("server must answer both requests");
+        String::from_utf8_lossy(&received).into_owned()
+    })
+    .await
+    .expect("client task must not panic");
+
+    let (first, rest) = text
+        .split_once("HTTP/1.1 200 ")
+        .unwrap_or_else(|| panic!("no second response in {text:?}"));
+    assert!(first.starts_with("HTTP/1.1 500 "), "{text}");
+    let lower = first.to_ascii_lowercase();
+    assert!(lower.contains("content-type: text/plain; charset=utf-8"), "{text}");
+    assert!(lower.contains("x-content-type-options: nosniff"), "{text}");
+    assert!(first.ends_with("\r\n\r\ninternal server error"), "{text}");
+    assert!(!text.contains("secret-detail"), "the panic message leaked: {text}");
+    assert!(rest.ends_with(r#"{"status":"ok"}"#), "{text}");
+    let request_id = lower
+        .lines()
+        .find_map(|line| line.strip_prefix("x-request-id: "))
+        .unwrap_or_else(|| panic!("no x-request-id in {text:?}"))
+        .trim()
+        .to_owned();
+    server.stop().await;
+
+    let logged = log.text();
+    let line = logged
+        .lines()
+        .find(|line| line.contains("request handler panicked"))
+        .unwrap_or_else(|| panic!("panic not logged: {logged}"));
+    // Logged with the request id, the message kept server-side.
+    assert!(line.contains(&request_id), "{line}");
+    assert!(line.contains("secret-detail 4242"), "{line}");
+    assert!(line.contains("ERROR"), "{line}");
+}

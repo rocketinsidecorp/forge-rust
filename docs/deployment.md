@@ -149,8 +149,12 @@ from env files, Kubernetes manifests and unit files.
 Logs go to standard output, and the platform (Docker, Kubernetes, journald)
 collects them. The HTTP layer also enforces a header-read timeout and adds
 `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY` and a UUIDv7
-`x-request-id` to responses. Transient `accept` errors, such as running out of
-file descriptors, do not stop the server.
+`x-request-id` to responses. A handler that panics gets a `500` with the body
+`internal server error` and its `x-request-id`; the panic message is logged
+(`request handler panicked`, with the request id) and never sent to the
+client, and the connection stays usable. `HEAD` is answered by the `GET`
+route of the path without the body. Transient `accept` errors, such as
+running out of file descriptors, do not stop the server.
 
 Do not put secrets in the image or in build arguments. Both database URLs contain
 credentials and must come from the deployment platform's secret mechanism.

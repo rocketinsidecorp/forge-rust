@@ -115,10 +115,10 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for StallTimeout<T> {
     }
 }
 
-/// Polls a future inside `catch_unwind`, so the server can record a
-/// panicking handler before the panic continues (`resume_unwind`). Without
-/// it the panic reaches the connection task, which tokio catches only after
-/// the request's state is gone.
+/// Polls a future inside `catch_unwind`, so the server can answer a
+/// panicking handler with a `500` and record it. Without it the panic
+/// reaches the connection task, which tokio catches only after the request's
+/// state is gone, and the client is cut off without a response.
 pub(crate) struct CatchUnwind<F> {
     inner: Pin<Box<F>>,
 }

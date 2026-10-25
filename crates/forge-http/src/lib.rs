@@ -33,7 +33,7 @@ use tokio::{
     task::{JoinError, JoinSet},
 };
 use tokio_util::sync::CancellationToken;
-use tracing::{Instrument, Span, info_span, warn};
+use tracing::{Instrument, Span, error, info_span, warn};
 use uuid::Uuid;
 
 use crate::body::{OutgoingBody, ResponseBody};
@@ -1096,12 +1096,15 @@ async fn handle_request(
             Ok(Ok(response)) => response,
             Ok(Err(_elapsed)) => Response::new(StatusCode::GATEWAY_TIMEOUT, "request timed out"),
             Err(panic) => {
-                // Recorded as a server error, then the panic continues as
-                // before: the connection task fails and the client is cut off.
-                if let Some(telemetry) = telemetry {
-                    telemetry.finish(matched.0.get().map(AsRef::as_ref), 500);
-                }
-                std::panic::resume_unwind(panic);
+                // Like Forge-Go's recoverer: logged here, in the request's
+                // span, and answered with a generic 500 that carries the
+                // request id; the panic message never reaches the client.
+                error!(
+                    %request_id,
+                    panic = panic_message(panic.as_ref()),
+                    "request handler panicked"
+                );
+                Response::text(StatusCode::INTERNAL_SERVER_ERROR, "internal server error")
             }
         };
         if let Some(telemetry) = telemetry {
@@ -1118,6 +1121,16 @@ async fn handle_request(
     .await;
 
     Ok(response)
+}
+
+/// The text of a panic payload for the log (`panic!` with a literal or a
+/// formatted message); other payloads are not printable.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    payload
+        .downcast_ref::<&'static str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("non-string panic payload")
 }
 
 /// The log span of a request; with telemetry it carries the trace and span
