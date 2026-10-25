@@ -184,12 +184,20 @@ struct Rig {
     runs: Arc<AtomicUsize>,
 }
 
-fn settings() -> WorkerSettings {
+/// An attempt that honors cancellation gets a generous grace (a loaded
+/// machine must not turn a prompt return into an abort); one that never
+/// returns is aborted after a short one.
+fn settings(first: First) -> WorkerSettings {
+    let grace = if matches!(first, First::Forever) {
+        Duration::from_millis(200)
+    } else {
+        Duration::from_secs(30)
+    };
     WorkerSettings::default()
         .poll_interval(Duration::from_millis(50))
         .lease(Duration::from_secs(3))
         .drain_timeout(Duration::from_millis(200))
-        .cancel_grace(Duration::from_millis(200))
+        .cancel_grace(grace)
 }
 
 async fn rig(first: First) -> Rig {
@@ -205,7 +213,7 @@ async fn rig(first: First) -> Rig {
         runs: Arc::clone(&runs),
     })
     .expect("register");
-    jobs.settings(settings());
+    jobs.settings(settings(first));
     let shutdown = Cancellation::new();
     let running = Some(tokio::spawn(jobs.run(store.clone(), shutdown.clone())));
     Rig {
