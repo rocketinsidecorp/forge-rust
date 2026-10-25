@@ -1269,10 +1269,11 @@ impl BodyRejection {
 }
 
 /// Buffers a request body, enforcing the configured size limit and charging
-/// it to the in-flight `budget`: a declared `Content-Length` up front, before
-/// a byte is read, and every byte beyond it as it arrives (chunked bodies).
-/// Returns the body and its charge, which the caller holds while the body is
-/// in use.
+/// it to the in-flight `budget` as its bytes arrive. A declared
+/// `Content-Length` is only checked against the limit, never charged ahead:
+/// a client that declares a large body and sends nothing holds no budget
+/// (only its connection slot, until the request timeout). Returns the body
+/// and its charge, which the caller holds while the body is in use.
 async fn collect_body(
     mut body: Incoming,
     max_body_bytes: usize,
@@ -1280,15 +1281,11 @@ async fn collect_body(
 ) -> Result<(Bytes, BodyCharge), BodyRejection> {
     // Reject a declared Content-Length above the limit without reading it.
     let declared = body.size_hint().lower();
-    let declared = match usize::try_from(declared) {
-        Ok(declared) if declared <= max_body_bytes => declared,
-        _ => return Err(BodyRejection::TooLarge),
-    };
-    let mut held = BodyCharge::default();
-    if !budget.charge(&mut held, declared) {
-        return Err(BodyRejection::Busy);
+    if !usize::try_from(declared).is_ok_and(|declared| declared <= max_body_bytes) {
+        return Err(BodyRejection::TooLarge);
     }
-    let mut charged = declared;
+    let mut held = BodyCharge::default();
+    let mut charged = 0_usize;
     let mut received = 0_usize;
     let mut chunks: Vec<Bytes> = Vec::new();
     while let Some(frame) = body.frame().await {

@@ -275,9 +275,9 @@ pub struct ServerConfig {
     /// Maximum number of concurrently open client connections.
     pub max_connections: usize,
     /// Request body bytes buffered at once across all connections
-    /// (`FORGE_MAX_IN_FLIGHT_BODY_BYTES`): a body is charged as it arrives
-    /// (its whole `Content-Length` up front) and released when the request
-    /// ends, however it ends. A body that does not fit is refused with
+    /// (`FORGE_MAX_IN_FLIGHT_BODY_BYTES`): a body is charged byte by byte as
+    /// it arrives (a declared `Content-Length` is never charged ahead) and
+    /// released when the request ends, however it ends. A body that does not fit is refused with
     /// `503`. Should be at least `max_body_bytes`, or the largest bodies
     /// are never admitted.
     #[serde(default = "default_max_in_flight_body_bytes")]

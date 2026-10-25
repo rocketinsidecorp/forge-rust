@@ -1446,17 +1446,21 @@ async fn exchange_owned(addr: SocketAddr, raw: String) -> String {
 }
 
 #[tokio::test]
-async fn a_declared_body_beyond_the_in_flight_budget_is_refused_with_503() {
+async fn content_length_bodies_are_charged_as_they_arrive_and_refused_with_503() {
     let (server, budget) = budget_server(64, Duration::from_secs(10)).await;
     let addr = server.addr;
 
-    // A trickling upload holds its whole Content-Length (40 of 64 bytes).
+    // A trickling upload declares 60 bytes and holds the 40 it sent.
     let mut holder = tokio::task::spawn_blocking(move || {
         let mut stream = connect(addr);
         stream
             .write_all(
-                b"POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 40\r\n\
-                  Connection: close\r\n\r\nab",
+                format!(
+                    "POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 60\r\n\
+                     Connection: close\r\n\r\n{}",
+                    "a".repeat(40)
+                )
+                .as_bytes(),
             )
             .expect("partial body must be written");
         stream
@@ -1465,11 +1469,15 @@ async fn a_declared_body_beyond_the_in_flight_budget_is_refused_with_503() {
     .expect("client task must not panic");
     budget_reaches(&budget, 24).await;
 
-    // 40 more do not fit: refused before a byte of the body is read.
-    let refused = exchange(
+    // 40 more bytes do not fit in the 24 left (one write, so the server
+    // has read them all when it refuses).
+    let refused = exchange_owned(
         addr,
-        "POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 40\r\n\
-         Connection: close\r\n\r\n",
+        format!(
+            "POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 40\r\n\
+             Connection: close\r\n\r\n{}",
+            "b".repeat(40)
+        ),
     )
     .await;
     let lower = refused.to_ascii_lowercase();
@@ -1494,7 +1502,7 @@ async fn a_declared_body_beyond_the_in_flight_budget_is_refused_with_503() {
     // The first upload completes and returns its share.
     let completed = tokio::task::spawn_blocking(move || {
         holder
-            .write_all("c".repeat(38).as_bytes())
+            .write_all("c".repeat(20).as_bytes())
             .expect("rest of the body must be written");
         let mut response = Vec::new();
         holder
@@ -1506,9 +1514,52 @@ async fn a_declared_body_beyond_the_in_flight_budget_is_refused_with_503() {
     .expect("client task must not panic");
     assert!(completed.starts_with("HTTP/1.1 200 "), "{completed}");
     assert!(
-        completed.ends_with(&format!("ab{}", "c".repeat(38))),
+        completed.ends_with(&format!("{}{}", "a".repeat(40), "c".repeat(20))),
         "{completed}"
     );
+    budget_reaches(&budget, 64).await;
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn a_declared_but_unsent_body_holds_no_budget() {
+    let (server, budget) = budget_server(64, Duration::from_secs(10)).await;
+    let addr = server.addr;
+
+    // Several clients declare the largest body and send none of it.
+    let holders = tokio::task::spawn_blocking(move || {
+        (0..4)
+            .map(|_| {
+                let mut stream = connect(addr);
+                stream
+                    .write_all(
+                        b"POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 64\r\n\
+                          Connection: close\r\n\r\n",
+                    )
+                    .expect("headers must be written");
+                stream
+            })
+            .collect::<Vec<_>>()
+    })
+    .await
+    .expect("client task must not panic");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(budget.available_permits(), 64);
+
+    // A small form post and a body of the whole budget still succeed.
+    for size in [1, 64] {
+        let response = exchange_owned(
+            addr,
+            format!(
+                "POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: {size}\r\n\
+                 Connection: close\r\n\r\n{}",
+                "y".repeat(size)
+            ),
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 200 "), "{size}: {response}");
+    }
+    drop(holders);
     budget_reaches(&budget, 64).await;
     server.stop().await;
 }
