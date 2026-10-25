@@ -22,7 +22,7 @@ fn document() -> Vec<u8> {
   "list": [1, 2],
   "encryption": {{"active": "k1", "keys": {{"k1": "{key}"}}}}
 }}"#,
-        key = &*encode_key(&generate_key().unwrap())
+        key = *encode_key(&generate_key().unwrap())
     )
     .into_bytes()
 }
