@@ -332,6 +332,7 @@ fn run_credentials(
         editor: Box::new(credentials_edit::run_editor_process),
         interrupts: &interrupts,
         after_read: None,
+        after_write: None,
     };
     context.run(&action, environment)
 }

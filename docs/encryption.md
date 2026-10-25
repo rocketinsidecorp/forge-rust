@@ -218,11 +218,21 @@ deterministic encryption mode.
    count must be `0`. The rotation refuses views: point it at the table that
    stores the column. Compare a prefix rather than `NOT LIKE
    'fg1.2026_10.%'`: `_` is a `LIKE` wildcard and key ids may contain it.
-   MySQL and MariaDB compare with the column's collation, which ignores case
-   by default; the count is still exact because a key ring refuses identifiers
-   that differ only in letter case, so no other key's values share the
-   prefix. (`BINARY` or `COLLATE utf8mb4_bin` on the comparison makes it
-   byte-exact regardless.)
+   On MySQL and MariaDB compare bytes, not the column's collation (which
+   ignores case by default):
+
+   ```sql
+   -- MySQL and MariaDB, as a role that reads the whole table
+   SELECT count(CASE WHEN ssn IS NOT NULL
+                      AND CAST(substr(ssn, 1, length('fg1.2026-10.')) AS BINARY)
+                          <> 'fg1.2026-10.' THEN 1 END) AS stale,
+          count(*) AS total
+     FROM people;
+   ```
+
+   (`COLLATE utf8mb4_bin` on the comparison works too.) A key ring also
+   refuses identifiers that differ only in letter case, so even a
+   case-insensitive comparison cannot mix two keys' values.
 
    A report never proves completion: `scanned == 0`, `rotated == 0` and
    `conflicts == 0` are exactly what a role that cannot see the rows reports.

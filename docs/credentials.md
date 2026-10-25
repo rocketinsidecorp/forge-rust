@@ -167,7 +167,10 @@ chmod 600 config/credentials/*.key
 ```
 
 A fresh clone made with umask 002 has a group-writable `config/credentials/`;
-run the first command once.
+run the first command once. Kubernetes `secret` and `configMap` volumes are
+refused when mounted as the directory: the mount is a world-writable sticky
+directory whose files are symbolic links into `..data`. Mount the key with
+`subPath` into a private directory, or pass it as `FORGE_MASTER_KEY`.
 
 In CI, store the key as a secret and expose it only to the job that needs it
 (`FORGE_MASTER_KEY: ${{ secrets.FORGE_MASTER_KEY_PRODUCTION }}`). Tests and
