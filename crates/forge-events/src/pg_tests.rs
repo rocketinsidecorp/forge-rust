@@ -596,3 +596,319 @@ async fn deliveries_are_traced_and_measured_by_outcome() {
     assert!(!spans.contains("rejected by the broker"), "{spans}");
     db.cleanup().await.expect("cleanup");
 }
+
+#[tokio::test]
+#[ignore = "needs FORGE_TEST_DATABASE_URL"]
+async fn a_dispatcher_with_invalid_settings_refuses_to_run() {
+    let db = fresh().await;
+    let defaults = DispatcherSettings::default();
+    for (settings, said) in [
+        (defaults.batch(0), "batch"),
+        (defaults.batch(1001), "batch"),
+        (
+            defaults.poll_interval(Duration::from_millis(1)),
+            "poll_interval",
+        ),
+        (
+            defaults.publish_timeout(Duration::from_millis(1)),
+            "publish_timeout",
+        ),
+        (
+            defaults.publish_timeout(Duration::from_secs(601)),
+            "publish_timeout",
+        ),
+        (defaults.max_attempts(0), "max_attempts"),
+    ] {
+        let dispatcher =
+            Dispatcher::new(PgOutboxStore::new(db.runtime().clone()), Picky).settings(settings);
+        let error = dispatcher
+            .run(Cancellation::new())
+            .await
+            .expect_err("invalid settings must not start");
+        assert!(
+            matches!(error, EventsError::InvalidSetting(text) if text.contains(said)),
+            "{said}"
+        );
+    }
+    assert!(
+        format!(
+            "{:?}",
+            Dispatcher::new(PgOutboxStore::new(db.runtime().clone()), Picky)
+        )
+        .starts_with("Dispatcher { settings: DispatcherSettings")
+    );
+    db.cleanup().await.expect("cleanup");
+}
+
+/// Counts the warnings of the current thread.
+struct Warnings(Arc<AtomicUsize>);
+
+impl tracing::Subscriber for Warnings {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        if *event.metadata().level() == tracing::Level::WARN {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn enter(&self, _: &tracing::span::Id) {}
+
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+#[tokio::test]
+#[ignore = "needs FORGE_TEST_DATABASE_URL"]
+async fn a_failing_claim_is_logged_and_retried_until_shutdown() {
+    let db = fresh().await;
+    let store = PgOutboxStore::new(db.runtime().clone());
+    // Every claim now fails: the pool is closed.
+    db.runtime().close().await;
+    let warnings = Arc::new(AtomicUsize::new(0));
+    let _guard = tracing::subscriber::set_default(Warnings(Arc::clone(&warnings)));
+
+    let (shutdown, handle) = spawn(Dispatcher::new(store, Picky).settings(fast()));
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while warnings.load(Ordering::SeqCst) < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the failed claims are logged and retried");
+    stop(shutdown, handle).await;
+    db.cleanup().await.expect("cleanup");
+}
+
+/// Never answers.
+struct Silent;
+
+#[async_trait]
+impl EventPublisher for Silent {
+    async fn publish(&self, _: &EventEnvelope) -> Result<(), PublishError> {
+        std::future::pending().await
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs FORGE_TEST_DATABASE_URL"]
+async fn a_publication_that_exceeds_its_timeout_fails_the_attempt() {
+    let db = fresh().await;
+    let store = PgOutboxStore::new(db.runtime().clone());
+    let mut transaction = db.runtime().begin().await.expect("begin");
+    let id = append(&mut transaction, &InvoicePaid { invoice: 1 })
+        .await
+        .expect("append");
+    transaction.commit().await.expect("commit");
+
+    let settings = fast().publish_timeout(Duration::from_millis(20));
+    let (shutdown, handle) = spawn(Dispatcher::new(store, Silent).settings(settings));
+    wait_until("the event to die", || async {
+        state(&db, id).await.0 == "dead"
+    })
+    .await;
+    stop(shutdown, handle).await;
+
+    assert_eq!(state(&db, id).await.1, 3, "every attempt timed out");
+    let error: Option<String> =
+        sqlx::query_scalar("SELECT last_error FROM forge_outbox_events WHERE id = $1")
+            .bind(id.into_uuid())
+            .fetch_one(db.admin().pool())
+            .await
+            .expect("error");
+    assert_eq!(error.as_deref(), Some("publication exceeded its timeout"));
+    db.cleanup().await.expect("cleanup");
+}
+
+/// Delivers the first event and then begins shutdown.
+struct StopsAfterOne(Cancellation);
+
+#[async_trait]
+impl EventPublisher for StopsAfterOne {
+    async fn publish(&self, _: &EventEnvelope) -> Result<(), PublishError> {
+        self.0.cancel();
+        Ok(())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs FORGE_TEST_DATABASE_URL"]
+async fn shutdown_releases_the_rest_of_a_claimed_batch_without_using_attempts() {
+    let db = fresh().await;
+    let store = PgOutboxStore::new(db.runtime().clone());
+    let mut transaction = db.runtime().begin().await.expect("begin");
+    let mut ids = Vec::new();
+    for invoice in 1..=3 {
+        ids.push(
+            append(&mut transaction, &InvoicePaid { invoice })
+                .await
+                .expect("append"),
+        );
+    }
+    transaction.commit().await.expect("commit");
+
+    let shutdown = Cancellation::new();
+    let dispatcher =
+        Dispatcher::new(store, StopsAfterOne(shutdown.clone())).settings(fast().batch(3));
+    tokio::time::timeout(Duration::from_secs(30), dispatcher.run(shutdown))
+        .await
+        .expect("the dispatcher stops")
+        .expect("clean shutdown");
+
+    // Ids are time-ordered: the first claimed event was delivered, the other
+    // two went back to the outbox as if never claimed.
+    assert_eq!(state(&db, ids[0]).await, ("published".to_owned(), 1));
+    for id in &ids[1..] {
+        assert_eq!(state(&db, *id).await, ("pending".to_owned(), 0));
+    }
+    db.cleanup().await.expect("cleanup");
+}
+
+/// Cannot be written as JSON.
+struct Unwritable;
+
+impl Serialize for Unwritable {
+    fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+        Err(serde::ser::Error::custom("cannot be written"))
+    }
+}
+
+impl<'de> Deserialize<'de> for Unwritable {
+    fn deserialize<D: serde::Deserializer<'de>>(_: D) -> Result<Self, D::Error> {
+        Ok(Self)
+    }
+}
+
+impl IntegrationEvent for Unwritable {
+    const TYPE: &'static str = "test.unwritable";
+}
+
+#[derive(Serialize, Deserialize)]
+struct Unversioned;
+
+impl IntegrationEvent for Unversioned {
+    const TYPE: &'static str = "test.unversioned";
+    const VERSION: u16 = 0;
+}
+
+#[derive(Serialize, Deserialize)]
+struct Misnamed;
+
+impl IntegrationEvent for Misnamed {
+    const TYPE: &'static str = "Not A Name";
+}
+
+#[tokio::test]
+#[ignore = "needs FORGE_TEST_DATABASE_URL"]
+async fn an_event_that_breaks_the_contract_is_refused_before_anything_is_written() {
+    let db = fresh().await;
+    let mut transaction = db.runtime().begin().await.expect("begin");
+
+    assert!(matches!(
+        append(&mut transaction, &Misnamed).await,
+        Err(EventsError::InvalidName {
+            kind: "event type",
+            ..
+        })
+    ));
+    assert!(matches!(
+        append(&mut transaction, &Unversioned).await,
+        Err(EventsError::InvalidVersion)
+    ));
+    assert!(matches!(
+        append(&mut transaction, &Unwritable).await,
+        Err(EventsError::Serialize(_))
+    ));
+    // Over the limit in the application, before the database sees it.
+    let wide = Wide(vec![1; 300_000]);
+    assert!(matches!(
+        append(&mut transaction, &wide).await,
+        Err(EventsError::PayloadTooLarge { limit }) if limit == crate::MAX_PAYLOAD_BYTES
+    ));
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM forge_outbox_events")
+        .fetch_one(transaction.connection())
+        .await
+        .expect("count");
+    assert_eq!(rows, 0);
+    transaction.rollback().await.expect("rollback");
+
+    // A consumer name follows the same grammar as an event type.
+    let mut transaction = db.runtime().begin().await.expect("begin");
+    for consumer in ["", "Billing Ledger", &"c".repeat(crate::MAX_NAME + 1)] {
+        assert!(
+            matches!(
+                record_delivery(&mut transaction, consumer, EventId::new()).await,
+                Err(EventsError::InvalidName {
+                    kind: "consumer",
+                    ..
+                })
+            ),
+            "{consumer:?}"
+        );
+    }
+    transaction.rollback().await.expect("rollback");
+    db.cleanup().await.expect("cleanup");
+}
+
+#[tokio::test]
+#[ignore = "needs FORGE_TEST_DATABASE_URL"]
+async fn dead_events_are_listed_newest_first_a_page_at_a_time() {
+    let db = fresh().await;
+    let store = PgOutboxStore::new(db.runtime().clone());
+    let (older, newer) = (EventId::new(), EventId::new());
+    for id in [older, newer] {
+        sqlx::query(
+            "INSERT INTO forge_outbox_events
+                (id, event_type, version, payload, occurred_at, state, attempts, last_error)
+             VALUES ($1, 'test.dead', 1, '{}', now(), 'dead', 3, 'gave up')",
+        )
+        .bind(id.into_uuid())
+        .execute(db.admin().pool())
+        .await
+        .expect("a dead event");
+    }
+
+    let first_page = store.dead(1, None).await.expect("first page");
+    assert_eq!(
+        first_page.iter().map(|event| event.id).collect::<Vec<_>>(),
+        [newer]
+    );
+    assert_eq!(first_page[0].event_type, "test.dead");
+    assert_eq!((first_page[0].version, first_page[0].attempts), (1, 3));
+    assert_eq!(first_page[0].last_error.as_deref(), Some("gave up"));
+    assert_eq!(first_page[0].tenant_id, None);
+    let second_page = store.dead(10, Some(newer)).await.expect("second page");
+    assert_eq!(
+        second_page.iter().map(|event| event.id).collect::<Vec<_>>(),
+        [older]
+    );
+    assert!(
+        store
+            .dead(10, Some(older))
+            .await
+            .expect("last page")
+            .is_empty()
+    );
+    assert_eq!(
+        store
+            .dead(0, None)
+            .await
+            .expect("limit is at least one")
+            .len(),
+        1
+    );
+    assert!(
+        !store.retry(EventId::new()).await.expect("unknown id"),
+        "only an existing dead event is requeued"
+    );
+    db.cleanup().await.expect("cleanup");
+}

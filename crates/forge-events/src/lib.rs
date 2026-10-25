@@ -360,3 +360,6 @@ mod tests {
         assert!(validate_name("consumer", "Billing").is_err());
     }
 }
+
+#[cfg(test)]
+mod envelope_tests;
