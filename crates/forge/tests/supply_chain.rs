@@ -70,8 +70,12 @@ fn workflows_and_local_actions() -> Vec<(String, String)> {
         }
         if action.ends_with(".yml") || action.ends_with(".yaml") {
             // A local reusable workflow: it must be one of the gated workflows.
+            // Directly in .github/workflows: `../` cannot lead elsewhere.
+            let direct = action
+                .strip_prefix(".github/workflows/")
+                .is_some_and(|file| !file.contains('/'));
             assert!(
-                action.starts_with(".github/workflows/") && root().join(&action).is_file(),
+                direct && root().join(&action).is_file(),
                 "`./{action}` is not a workflow of .github/workflows"
             );
             continue;
@@ -465,29 +469,71 @@ fn secret_violations(name: &str, text: &str, release: bool) -> Vec<String> {
     violations
 }
 
-/// The shell commands of a line of code, each with the separator before it:
-/// split at `&&`, `||`, `;`, `|`, and at command substitutions and
-/// subshells (`$(`, `(`, `)`, backquotes).
-fn shell_commands(code: &str) -> Vec<(&'static str, &str)> {
+/// The one place outside the cargo-tool action that may install a cargo
+/// tool: release.yml builds from a clean cache, so it installs
+/// cargo-auditable itself, in this named step.
+const RELEASE_INSTALL: (&str, &str) = (".github/workflows/release.yml", "Install cargo-auditable");
+const TOOL_ACTION: &str = ".github/actions/cargo-tool/action.yml";
+
+/// The logical lines of a file: comments removed and `\`-continued lines
+/// joined, each with the index of its first physical line.
+fn logical_lines(text: &str) -> Vec<(usize, String)> {
+    let mut lines: Vec<(usize, String)> = Vec::new();
+    let mut continued = false;
+    for (index, line) in text.lines().enumerate() {
+        let code = split_comment(line).0.trim_end();
+        let (code, continues) = match code.strip_suffix('\\') {
+            Some(code) => (code, true),
+            None => (code, false),
+        };
+        match lines.last_mut() {
+            Some((_, joined)) if continued => {
+                joined.push(' ');
+                joined.push_str(code);
+            }
+            _ => lines.push((index, code.to_owned())),
+        }
+        continued = continues;
+    }
+    lines
+}
+
+/// The words of a logical line, with shell separators (`&&`, `||`, `;`,
+/// `|`, `$(`, `(`, `)`, backquotes) as words of their own.
+fn shell_words(code: &str) -> Vec<String> {
     const SEPARATORS: [&str; 8] = ["&&", "||", "$(", ";", "|", "(", ")", "`"];
-    let mut commands = Vec::new();
-    let (mut start, mut before, mut position) = (0, "", 0);
-    while position < code.len() {
+    let mut spaced = String::with_capacity(code.len() * 2);
+    let mut rest = code;
+    while let Some(character) = rest.chars().next() {
         match SEPARATORS
             .iter()
-            .find(|separator| code[position..].starts_with(**separator))
+            .find(|separator| rest.starts_with(**separator))
         {
             Some(separator) => {
-                commands.push((before, &code[start..position]));
-                before = separator;
-                position += separator.len();
-                start = position;
+                spaced.push_str(&format!(" {separator} "));
+                rest = &rest[separator.len()..];
             }
-            None => position += code[position..].chars().next().map_or(1, char::len_utf8),
+            None => {
+                spaced.push(character);
+                rest = &rest[character.len_utf8()..];
+            }
         }
     }
-    commands.push((before, &code[start..]));
-    commands
+    spaced.split_whitespace().map(str::to_owned).collect()
+}
+
+fn is_separator(word: &str) -> bool {
+    matches!(word, "&&" | "||" | "$(" | ";" | "|" | "(" | ")" | "`")
+}
+
+/// `cargo` in any spelling a shell runs: a path to it, `$CARGO` or
+/// `${CARGO...}`, quoted or not.
+fn is_cargo_program(word: &str) -> bool {
+    let word = word.trim_matches(['"', '\'']);
+    word == "cargo"
+        || word.ends_with("/cargo")
+        || word.starts_with("$CARGO")
+        || word.starts_with("${CARGO")
 }
 
 /// Whether a `cargo install --version` value is one exact `X.Y.Z` (an `=`
@@ -498,94 +544,188 @@ fn is_exact_version(value: &str) -> bool {
     is_numeric_version(value.strip_prefix('=').unwrap_or(value), 3..=3)
 }
 
-/// Tool binaries are versioned: every `cargo install` (any spacing,
-/// `cargo +toolchain install`, a path to `cargo`) names one exact
-/// `--version` and `--locked`, from crates.io (no `--git`, `--path`,
-/// `--registry` or `--index`), and none is skipped because some version is
-/// already there (`... || cargo install`, `command -v`, `which`, `hash`,
-/// `[ -x ~/.cargo/bin/tool ]`): rust-cache restores ~/.cargo/bin, so a bumped
-/// `--version` would never be installed. `cargo binstall` (prebuilt binaries)
-/// is refused, and so is a command the rule cannot read (a quoted
-/// subcommand, a `cargo` continued on the next line). CI jobs install through
-/// the local `cargo-tool` action, whose `$VERSION` is each caller's exact
-/// `version: X.Y.Z`.
-fn tool_install_violations(name: &str, text: &str) -> Vec<String> {
-    let lines: Vec<&str> = text.lines().collect();
-    let in_tool_action = name.ends_with(".github/actions/cargo-tool/action.yml");
-    let mut violations = Vec::new();
-    for (index, line) in lines.iter().enumerate() {
-        let code = split_comment(line).0;
-        let mut refuse = |reason: &str| {
-            violations.push(format!("{name}:{}: `{}`: {reason}", index + 1, line.trim()));
-        };
-        for (before, command) in shell_commands(code) {
-            let words: Vec<&str> = command.split_whitespace().collect();
-            for (position, word) in words.iter().enumerate() {
-                let program = word.trim_matches(['"', '\'']);
-                if program == "cargo-binstall" || program.ends_with("/cargo-binstall") {
-                    refuse("cargo-binstall installs prebuilt binaries; use cargo install");
-                }
-                if program != "cargo" && !program.ends_with("/cargo") {
-                    continue;
-                }
-                let mut next = position + 1;
-                if words.get(next).is_some_and(|word| word.starts_with('+')) {
-                    next += 1;
-                }
-                let Some(subcommand) = words.get(next) else {
-                    if code.trim_end().ends_with('\\') {
-                        refuse("a cargo command continued on the next line cannot be checked");
-                    }
-                    continue;
-                };
-                let bare = subcommand.trim_matches(['"', '\'']);
-                if *subcommand == "\\" {
-                    refuse("a cargo command continued on the next line cannot be checked");
-                } else if bare != *subcommand && matches!(bare, "install" | "binstall") {
-                    refuse("a quoted cargo subcommand cannot be checked");
-                } else if bare == "binstall" {
-                    refuse("cargo binstall installs prebuilt binaries; use cargo install");
-                } else if bare == "install" {
-                    let arguments = &words[next + 1..];
-                    let version = arguments.iter().enumerate().find_map(|(at, argument)| {
-                        match argument.split_once('=') {
-                            Some(("--version" | "--vers", value)) => Some(value),
-                            _ if matches!(*argument, "--version" | "--vers") => {
-                                arguments.get(at + 1).copied()
-                            }
-                            _ => None,
-                        }
+/// One cargo command that installs, as found in a logical line.
+struct CargoInstall {
+    /// The logical line's first physical line.
+    line: usize,
+    /// The whole command: `cargo`, its options, `install`, its arguments.
+    words: Vec<String>,
+    /// Whether the logical line holds nothing but `run:` and this command.
+    alone: bool,
+}
+
+/// Every cargo command of a file that installs: a word `install` or
+/// `binstall` anywhere in a command whose program is cargo (options before
+/// the subcommand included). A cargo command that ends its line is read on
+/// into the next line, as a YAML-folded scalar would be.
+fn cargo_installs(text: &str) -> Vec<CargoInstall> {
+    let lines = logical_lines(text);
+    let mut found = Vec::new();
+    for (at, (line, code)) in lines.iter().enumerate() {
+        let words = shell_words(code);
+        for (position, word) in words.iter().enumerate() {
+            if !is_cargo_program(word) {
+                continue;
+            }
+            let mut command: Vec<String> = words[position..]
+                .iter()
+                .take_while(|word| !is_separator(word))
+                .cloned()
+                .collect();
+            let reaches_end = position + command.len() == words.len();
+            let only_options = command[1..]
+                .iter()
+                .all(|word| word.starts_with('-') || word.starts_with('+'));
+            if reaches_end && only_options {
+                // A YAML-folded scalar continues the command on the next
+                // line; a literal block starts a new one there. Read on only
+                // when the next line goes on with the subcommand.
+                if let Some((_, next)) = lines.get(at + 1) {
+                    let next: Vec<String> = shell_words(next)
+                        .into_iter()
+                        .take_while(|word| !is_separator(word))
+                        .collect();
+                    let subcommand = next.iter().find(|word| {
+                        !(word.starts_with('-') || word.starts_with('+') || word.contains('='))
                     });
-                    let exact = version.is_some_and(|value| {
-                        is_exact_version(value) || (in_tool_action && value == "\"$VERSION\"")
-                    });
-                    let source = arguments.iter().any(|argument| {
-                        let flag = argument.split_once('=').map_or(*argument, |(flag, _)| flag);
-                        matches!(flag, "--git" | "--path" | "--registry" | "--index")
-                    });
-                    if !exact || !arguments.contains(&"--locked") || source {
-                        refuse(
-                            "cargo install needs one exact --version X.Y.Z and --locked, from crates.io",
-                        );
-                    }
-                    if before == "||" {
-                        refuse(
-                            "an install skipped because something else succeeded ignores a version bump",
-                        );
+                    if subcommand.is_some_and(|word| {
+                        matches!(word.trim_matches(['"', '\'']), "install" | "binstall")
+                    }) {
+                        command.extend(next);
                     }
                 }
             }
+            let installs = command[1..]
+                .iter()
+                .any(|word| matches!(word.trim_matches(['"', '\'']), "install" | "binstall"));
+            if installs {
+                let prefix = &words[..position];
+                let alone = (prefix.is_empty() || prefix == ["run:"] || prefix == ["-", "run:"])
+                    && position + command.len() == words.len();
+                found.push(CargoInstall {
+                    line: *line,
+                    words: command,
+                    alone,
+                });
+            }
         }
-        let flat = code.split_whitespace().collect::<Vec<_>>().join(" ");
-        let probes = ["command -v cargo-", "which cargo-", "hash cargo-"];
-        let file_test = [" -x ", " -f ", " -e "]
+    }
+    found
+}
+
+/// Problems of an install at one of the two allowed sites: it must be a
+/// plain `cargo install <crate>` alone in its `run`, with one exact
+/// `--version` (the action's `"$VERSION"`, checked at each caller) and
+/// `--locked`, from crates.io.
+fn allowed_install_problems(install: &CargoInstall, in_tool_action: bool) -> Option<&'static str> {
+    let words: Vec<&str> = install.words.iter().map(String::as_str).collect();
+    if !install.alone || words.get(1) != Some(&"install") {
+        return Some(
+            "must be a plain `cargo install`, alone in its run, with no option before install",
+        );
+    }
+    let arguments = &words[2..];
+    let version =
+        arguments
+            .iter()
+            .enumerate()
+            .find_map(|(at, argument)| match argument.split_once('=') {
+                Some(("--version" | "--vers", value)) => Some(value),
+                _ if matches!(*argument, "--version" | "--vers") => arguments.get(at + 1).copied(),
+                _ => None,
+            });
+    let exact = version.is_some_and(|value| {
+        is_exact_version(value) || (in_tool_action && value == "\"$VERSION\"")
+    });
+    let source = arguments.iter().any(|argument| {
+        let flag = argument.split_once('=').map_or(*argument, |(flag, _)| flag);
+        matches!(
+            flag,
+            "--git" | "--path" | "--registry" | "--index" | "--config" | "-Z"
+        )
+    });
+    (!exact || !arguments.contains(&"--locked") || source)
+        .then_some("needs one exact --version X.Y.Z and --locked, from crates.io")
+}
+
+/// Cargo tools are installed only through the local cargo-tool action
+/// (exact version, cached under it) and in one reviewed release.yml step;
+/// any other install in a workflow or action is refused, however it is
+/// spelled: a path to cargo, `$CARGO`, options before `install`,
+/// `binstall`, `cargo-binstall`, a `CARGO_ALIAS_*` that renames `install`,
+/// a `\`-continued or folded line. Probes that would skip an install
+/// because some binary is already there (`command -v`, `which`, `hash`,
+/// `type`, file tests on `~/.cargo/bin`) are refused too, and a cargo-tool
+/// step needs an exact `version: X.Y.Z`. `relative` is the file's path in
+/// the repository.
+fn tool_install_violations(relative: &str, text: &str) -> Vec<String> {
+    let lines: Vec<&str> = text.lines().collect();
+    let in_tool_action = relative == TOOL_ACTION;
+    let release_step: Vec<usize> = if relative == RELEASE_INSTALL.0 {
+        lines
+            .iter()
+            .position(|line| key_values(split_comment(line).0, "name").contains(&RELEASE_INSTALL.1))
+            .map(|index| {
+                let step = step_lines(&lines, index);
+                let start = lines
+                    .iter()
+                    .position(|line| std::ptr::eq(*line, step[0]))
+                    .unwrap_or(index);
+                (start..start + step.len()).collect()
+            })
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let mut violations = Vec::new();
+    for install in cargo_installs(text) {
+        let shown = install.words.join(" ");
+        let allowed = in_tool_action || release_step.contains(&install.line);
+        let problem = if allowed {
+            allowed_install_problems(&install, in_tool_action)
+        } else {
+            Some("cargo tools are installed only through .github/actions/cargo-tool")
+        };
+        if let Some(problem) = problem {
+            violations.push(format!(
+                "{relative}:{}: `{shown}`: {problem}",
+                install.line + 1
+            ));
+        }
+    }
+    for (index, line) in lines.iter().enumerate() {
+        let code = split_comment(line).0;
+        let words: Vec<&str> = code.split_whitespace().collect();
+        let mut refuse = |reason: &str| {
+            violations.push(format!(
+                "{relative}:{}: `{}`: {reason}",
+                index + 1,
+                line.trim()
+            ));
+        };
+        if words.iter().any(|word| {
+            let word = word.trim_matches(['"', '\'']);
+            word == "cargo-binstall" || word.ends_with("/cargo-binstall")
+        }) {
+            refuse("cargo-binstall installs prebuilt binaries");
+        }
+        if code.contains("CARGO_ALIAS_") {
+            refuse("a CARGO_ALIAS_* can rename install");
+        }
+        let flat = words.join(" ");
+        let probes = [
+            "command -v cargo-",
+            "which cargo-",
+            "hash cargo-",
+            "type cargo-",
+            "type -p cargo-",
+        ];
+        let file_test = [" -x ", " -f ", " -e ", " -s "]
             .iter()
             .any(|test| flat.contains(test))
             && (flat.contains(".cargo/bin") || flat.contains("/cargo-"));
         if probes.iter().any(|probe| flat.contains(probe)) || file_test {
-            refuse(
-                "a cached cargo tool is found by its version, not by command -v, which, hash or a file test",
-            );
+            refuse("a cached cargo tool is found by its version, not by a probe");
         }
         let tool = key_values(code, "uses")
             .iter()
@@ -755,8 +895,8 @@ fn tool_binaries_are_installed_by_exact_version() {
             .any(|(_, relative)| relative == ".github/actions/cargo-tool/action.yml"),
         "the local actions were not followed: {files:?}"
     );
-    for (name, relative) in files {
-        assert_clean(&tool_install_violations(&name, &read(&relative)));
+    for (_, relative) in files {
+        assert_clean(&tool_install_violations(&relative, &read(&relative)));
     }
 }
 
@@ -1110,30 +1250,84 @@ fn the_tool_rule_rejects_installs_that_ignore_a_version_bump() {
         "      - uses: ./.github/actions/cargo-tool\n        with:\n          tool: cargo-fuzz\n          version: 0.13\n",
         "      - uses: ./.github/actions/cargo-tool\n        with:\n          tool: cargo-fuzz\n          version: ${{ inputs.version }}\n",
         "      - uses: ./.github/actions/cargo-tool\n        with:\n          tool: cargo-fuzz\n",
+        // Every install outside the two reviewed sites, however spelled.
+        "        run: cargo install cargo-auditable --version 0.7.7 --locked\n",
+        "        run: cargo -q install x --version 1.2.3 --locked\n",
+        "        run: cargo --locked install x --version 1.2.3\n",
+        "        run: cargo --config k=v install x --version 1.2.3 --locked\n",
+        "        run: cargo -Z unstable-options install x --version 1.2.3 --locked\n",
+        "        run: cargo -C /tmp install x --version 1.2.3 --locked\n",
+        "        run: cargo +stable -v install x --version 1.2.3 --locked\n",
+        "        run: |\n          if ! cargo fuzz --version >/dev/null 2>&1; then\n            cargo install cargo-fuzz --version 0.13.2 --locked\n          fi\n",
+        "        run: if cargo fuzz --version; then :; else cargo install cargo-fuzz --version 0.13.2 --locked; fi\n",
+        "        run: if ! type cargo-fuzz; then echo missing; fi\n",
+        "        run: '[ ! -s ~/.cargo/bin/cargo-fuzz ] && echo stale'\n",
+        "        run: |\n          cargo install x --version 1.2.3 --locked \\\n            --git https://example.com/x\n",
+        "        run: >-\n          cargo\n          install x --version 1.2.3 --locked\n",
+        "        run: $CARGO install x --version 1.2.3 --locked\n",
+        "        run: ${CARGO:-cargo} install x --version 1.2.3 --locked\n",
+        "        run: CARGO_ALIAS_I=install cargo i x\n",
+        "        env:\n          CARGO_ALIAS_GET: install\n",
     ] {
         assert!(
-            !tool_install_violations("t.yml", rejected).is_empty(),
+            !tool_install_violations(".github/workflows/ci.yml", rejected).is_empty(),
             "accepted: {rejected}"
         );
     }
     for accepted in [
-        "        run: cargo install cargo-auditable --version 0.7.7 --locked\n",
-        "        run: cargo  +1.98.1  install cargo-auditable --version=0.7.7 --locked\n",
-        "        run: cargo install cargo-auditable --vers =0.7.7 --locked\n",
         "        run: cargo --version && cargo test --locked\n",
-        "        run: cargo fetch && cargo install cargo-auditable --version 0.7.7 --locked\n",
         "      - name: Install cargo-fuzz\n",
+        "        run: rustup toolchain install nightly --profile minimal\n",
+        "        run: |\n          cargo --version\n          sudo apt-get install -y openssh-server\n",
         "      - uses: ./.github/actions/cargo-tool\n        with:\n          tool: cargo-llvm-cov\n          version: 0.9.1\n      - run: true\n",
     ] {
-        assert_clean(&tool_install_violations("t.yml", accepted));
+        assert_clean(&tool_install_violations(
+            ".github/workflows/ci.yml",
+            accepted,
+        ));
     }
-    // Only the cargo-tool action may pass its caller's checked $VERSION.
-    let action = "      run: cargo install \"$TOOL\" --version \"$VERSION\" --locked --root \"$HOME/.forge-tools/$TOOL-$VERSION\"\n";
+
+    // The reviewed release step: exact version and --locked, alone.
+    let step = |run: &str| {
+        format!(
+            "    steps:\n      - name: Install cargo-auditable\n        run: {run}\n      - name: Build\n        run: cargo build\n"
+        )
+    };
+    let release = ".github/workflows/release.yml";
     assert_clean(&tool_install_violations(
-        ".github/actions/cargo-tool/action.yml",
-        action,
+        release,
+        &step("cargo install cargo-auditable --version 0.7.7 --locked"),
     ));
-    assert!(!tool_install_violations("ci.yml", action).is_empty());
+    for run in [
+        "cargo install cargo-auditable --locked",
+        "cargo install cargo-auditable --version ^0.7 --locked",
+        "cargo -q install cargo-auditable --version 0.7.7 --locked",
+        "true || cargo install cargo-auditable --version 0.7.7 --locked",
+        "cargo install cargo-auditable --version 0.7.7 --locked --git https://example.com/a",
+    ] {
+        assert!(
+            !tool_install_violations(release, &step(run)).is_empty(),
+            "accepted: {run}"
+        );
+    }
+    // Only that step: the same install in another release step is refused.
+    let other = "    steps:\n      - name: Build\n        run: cargo install cargo-auditable --version 0.7.7 --locked\n";
+    assert!(!tool_install_violations(release, other).is_empty());
+
+    // Only the cargo-tool action (by exact path) may pass its caller's
+    // checked $VERSION.
+    let action = "      run: cargo install \"$TOOL\" --version \"$VERSION\" --locked --root \"$HOME/.forge-tools/$TOOL-$VERSION\"\n";
+    assert_clean(&tool_install_violations(TOOL_ACTION, action));
+    for elsewhere in [
+        ".github/workflows/ci.yml",
+        "evil/.github/actions/cargo-tool/action.yml",
+        ".github/actions/cargo-tool/action.yaml",
+    ] {
+        assert!(
+            !tool_install_violations(elsewhere, action).is_empty(),
+            "{elsewhere}"
+        );
+    }
 }
 
 #[test]

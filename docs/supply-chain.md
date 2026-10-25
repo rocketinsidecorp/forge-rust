@@ -200,6 +200,13 @@ does not match either form.
   always installs it, where the former `command -v tool || cargo install`
   kept whatever rust-cache restored. The release job installs without a
   cache.
+- Cargo tools are installed only through that action, plus one reviewed
+  exception: the `Install cargo-auditable` step of `release.yml`. Both use
+  one exact `--version` and `--locked`, from crates.io. The gate refuses any
+  other install in a workflow or action, however it is spelled (a path to
+  cargo, `$CARGO`, options before `install`, `binstall`, `cargo-binstall`,
+  `CARGO_ALIAS_*`, continued or folded lines), and any probe that would skip
+  an install because some binary is already there.
 - `crates/forge/tests/supply_chain.rs` fails `cargo test --workspace` when an
   action is not pinned by SHA with a version comment, a workflow container or
   service image or a Dockerfile base image is not pinned by digest, copies of
@@ -213,9 +220,9 @@ does not match either form.
   fuzz target is not declared, seeded and documented, or `fuzz/` stops being
   a standalone workspace; when a `deny.toml` exception is past its
   `expires` date (the libfuzzer-sys NCSA exception must carry one); when a
-  `cargo install` (any spacing, `cargo +toolchain install`) lacks
-  `--version`/`--locked`, is skipped because a binary is on `PATH`
-  (`||`, `command -v`, `which`, `hash`), or is a `cargo binstall`; when a
+  cargo tool is installed anywhere but the cargo-tool action and the
+  reviewed release step, or there without one exact `--version` and
+  `--locked`; when a
   workspace crate does not take `version.workspace = true` (so the release
   tag check covers every crate); and when the coverage job or
   `.coverage-floor` goes missing.
