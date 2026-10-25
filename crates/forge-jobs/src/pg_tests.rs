@@ -1669,3 +1669,25 @@ async fn attempts_are_traced_and_measured_by_outcome() {
     assert!(!spans.contains("secret payload"), "{spans}");
     db.cleanup().await.expect("cleanup");
 }
+
+#[tokio::test]
+#[ignore = "needs FORGE_TEST_DATABASE_URL"]
+async fn an_unavailable_database_is_an_error_never_a_lost_lease() {
+    let db = fresh().await;
+    let store = PgJobStore::new(db.runtime().clone());
+    let rename = async |from: &str, to: &str| {
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "ALTER TABLE {from} RENAME TO {to}"
+        )))
+        .execute(db.admin().pool())
+        .await
+        .expect("rename the job table");
+    };
+    crate::testing::run_unavailable(
+        &store,
+        async || rename("forge_jobs", "forge_jobs_away").await,
+        async || rename("forge_jobs_away", "forge_jobs").await,
+    )
+    .await;
+    db.cleanup().await.expect("cleanup");
+}

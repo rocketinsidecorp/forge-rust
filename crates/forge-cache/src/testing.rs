@@ -5,6 +5,8 @@
 //! The suite panics with a descriptive message on the first violated
 //! guarantee. Times are short so expiry can be observed with real clocks,
 //! including the database clocks of the shared stores.
+//!
+//! [`run_unavailable`] is the contract of a shared store whose storage fails.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -417,4 +419,85 @@ async fn prunes_expired_entries(subject: Subject) {
         "prune removed a live entry"
     );
     assert_eq!(pruner.prune().await.expect("prune"), 0);
+}
+
+/// What every database-backed cache must do when its storage fails (the
+/// Forge-Go `cachetest.RunUnavailable`): reads, writes, deletes and pruning
+/// report the failure (a failed read is never an ordinary miss), [`fetch`]
+/// still returns the computed value because failures of the cache never fail
+/// it, and the entries stored before the outage are intact afterwards.
+///
+/// `subject` is a cache on fresh storage. `sabotage` makes that storage
+/// unavailable (a renamed table, a revoked grant) and `restore` makes it
+/// available again; both run with a connection that can change the schema.
+///
+/// # Panics
+///
+/// With a message naming the first guarantee the cache broke.
+pub async fn run_unavailable<S, R>(subject: Subject, sabotage: S, restore: R)
+where
+    S: AsyncFnOnce(),
+    R: AsyncFnOnce(),
+{
+    set(&subject, "kept", b"value", HOUR).await;
+
+    sabotage().await;
+    match subject.cache.get("kept").await {
+        Err(CacheError::Store(_)) => {}
+        other => {
+            panic!("get during the outage = {other:?}; want the failure, never a miss or a value")
+        }
+    }
+    assert!(
+        subject.cache.set("new", b"x", HOUR).await.is_err(),
+        "set succeeded during the outage"
+    );
+    assert!(
+        subject.cache.delete("kept").await.is_err(),
+        "delete succeeded during the outage"
+    );
+    if let Some(pruner) = &subject.pruner {
+        assert!(
+            pruner.prune().await.is_err(),
+            "prune succeeded during the outage"
+        );
+    }
+    let computed = AtomicUsize::new(0);
+    let value = fetch(subject.cache.as_ref(), "fetched", MINUTE, || async {
+        computed.fetch_add(1, Ordering::SeqCst);
+        Ok::<_, std::io::Error>(b"computed".to_vec())
+    })
+    .await
+    .unwrap_or_else(|error| panic!("fetch during the outage: {error}; want the computed value"));
+    assert_eq!(value, b"computed", "fetch during the outage");
+    assert_eq!(
+        computed.load(Ordering::SeqCst),
+        1,
+        "fetch computed more than once"
+    );
+    let failed = fetch(subject.cache.as_ref(), "fetched-too", MINUTE, || async {
+        Err::<Vec<u8>, _>(std::io::Error::other("compute failed"))
+    })
+    .await;
+    assert!(
+        matches!(failed, Err(FetchError::Compute(_))),
+        "fetch with a failing computation = {failed:?}, want the computation error"
+    );
+    restore().await;
+
+    assert_eq!(
+        get(&subject, "kept").await.as_deref(),
+        Some(&b"value"[..]),
+        "the entry stored before the outage"
+    );
+    assert_eq!(
+        get(&subject, "new").await,
+        None,
+        "a write that failed during the outage is visible afterwards"
+    );
+    assert_eq!(
+        get(&subject, "fetched").await,
+        None,
+        "fetch stored a value although the store was unavailable"
+    );
 }

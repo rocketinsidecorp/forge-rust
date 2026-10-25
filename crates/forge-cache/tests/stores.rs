@@ -9,7 +9,7 @@ use std::{sync::Arc, time::Duration};
 
 use forge_cache::{
     Cache, CacheError, MAX_PRUNE_ROUNDS, Options, Pruner, StoreOptions,
-    testing::{Subject, run},
+    testing::{Subject, run, run_unavailable},
 };
 use forge_db::{Database, DbError, FRAMEWORK_MIGRATIONS, testing::TestDatabase};
 
@@ -156,6 +156,29 @@ macro_rules! store_tests {
                     Some(20_261_019_000_100)
                 );
                 assert!(second.get("shared").await.is_err(), "the table is gone after rollback");
+            }
+
+            #[tokio::test]
+            $(#[$attr])*
+            async fn an_unavailable_store_is_an_error_and_changes_nothing() {
+                let (store, test) = fresh(StoreOptions::default().with_prune_interval(None)).await;
+                let pool = test.database().pool();
+                run_unavailable(
+                    Subject { cache: store.clone(), pruner: Some(store), guard: Box::new(()) },
+                    async || {
+                        sqlx::query("ALTER TABLE forge_cache_entries RENAME TO forge_cache_entries_away")
+                            .execute(pool)
+                            .await
+                            .expect("rename the table away");
+                    },
+                    async || {
+                        sqlx::query("ALTER TABLE forge_cache_entries_away RENAME TO forge_cache_entries")
+                            .execute(pool)
+                            .await
+                            .expect("rename the table back");
+                    },
+                )
+                .await;
             }
 
             #[tokio::test]

@@ -407,6 +407,18 @@ guarantees, plus negative tests that mirror the Forge-Go reviews:
   repeated text-field budget, cleanup after a store failure, and a strict
   multipart parser table plus a differential/mutation test.
 
+Each shared store also runs an *unavailable backend* contract
+(`forge_cache::testing::run_unavailable`, `forge_ratelimit::testing::run_unavailable`,
+`forge_jobs::testing::run_unavailable`; the Forge-Go `RunUnavailable` helpers of
+`cachetest`, `limitertest` and `storetest`). The test renames the store's table
+away inside its test database and back, and the contract is that the failure is
+reported as a store error and never as an ordinary outcome: a cache read is not a
+miss (and `fetch` still returns the computed value), `allow` returns no decision, a
+job operation is never a lost lease, a missing job or a duplicate key. A write that
+failed changes nothing: cached entries, hit counts and the lease a worker held
+survive the outage. SQLite, PostgreSQL, MySQL and MariaDB run it for the cache and
+the limiter; the job store is PostgreSQL-only (ADR 0025).
+
 The SQLite suites always run. PostgreSQL, MySQL and MariaDB suites are
 `#[ignore]`d unless requested with `-- --include-ignored` and
 `FORGE_TEST_DATABASE_URL`, `FORGE_TEST_MYSQL_URL` or `FORGE_TEST_MARIADB_URL`
