@@ -513,6 +513,13 @@ impl App {
             Ok(built) => built,
             Err(code) => return code,
         };
+        if let Err(code) = runtime.block_on(require_row_security(
+            name,
+            database.as_ref(),
+            config.environment,
+        )) {
+            return code;
+        }
         if let Err(code) = mount_openapi(name, &mut router, &config, &info) {
             return code;
         }
@@ -931,7 +938,12 @@ impl App {
             }
         };
         if command != JobsCommand::Work {
-            let output = runtime.block_on(crate::operator::execute(self.name, &url, command));
+            let output = runtime.block_on(crate::operator::execute(
+                self.name,
+                &url,
+                command,
+                config.environment,
+            ));
             runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
             return match output {
                 Ok(text) => write_stdout(&text),
@@ -969,6 +981,13 @@ impl App {
             Ok(built) => built,
             Err(code) => return code,
         };
+        if let Err(code) = runtime.block_on(require_row_security(
+            self.name,
+            database.as_ref(),
+            config.environment,
+        )) {
+            return code;
+        }
         let Some(background) = background_for(jobs_slot, database.as_ref(), telemetry.as_ref())
         else {
             write_stderr("error: the jobs commands require App::postgres and App::jobs\n");
@@ -1225,6 +1244,32 @@ fn write_openapi(document: &forge_openapi::Document, output: &OpenApiOutput) -> 
                 ExitCode::SUCCESS
             }
         },
+    }
+}
+
+/// Refuses to start `serve` or `jobs work` when the declared PostgreSQL
+/// pool's role could bypass row-level security outside development and test,
+/// or cannot be checked (ADR 0044). The pool is closed before returning the
+/// exit code; the error names the role and the fix, never the URL.
+pub(crate) async fn require_row_security(
+    name: &'static str,
+    database: Option<&DatabaseHandle>,
+    environment: Environment,
+) -> Result<(), ExitCode> {
+    let Some(database) = database else {
+        return Ok(());
+    };
+    match database.require_row_security(environment).await {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            error!(
+                app = name,
+                error = %ErrorChain(&error),
+                "refusing to start: the database role could bypass row-level security, or could not be checked"
+            );
+            database.close().await;
+            Err(ExitCode::FAILURE)
+        }
     }
 }
 

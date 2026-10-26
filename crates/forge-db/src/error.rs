@@ -102,6 +102,15 @@ pub enum DbError {
         /// Credential-free explanation of what is wrong.
         reason: String,
     },
+    /// Outside development and test, the PostgreSQL role the serving pool
+    /// logs in as, or acts as, could escape row-level security
+    /// (`PgDatabase::require_row_security`, ADR 0044). The reason names the
+    /// role and the fix, never the connection URL.
+    #[error("the database role bypasses row-level security: {reason}")]
+    RowSecurityBypass {
+        /// Credential-free explanation naming the role and the fix.
+        reason: String,
+    },
     /// Any other database failure.
     #[error("database query failed")]
     Query(#[source] sqlx::Error),
@@ -131,6 +140,7 @@ impl DbError {
             Self::IrreversibleMigration { .. } => "irreversible_migration",
             Self::FrameworkMigrationOnly { .. } => "framework_migration_only",
             Self::Configuration { .. } => "invalid_configuration",
+            Self::RowSecurityBypass { .. } => "row_security_bypass",
             Self::Query(_) => "query_failed",
         }
     }
@@ -149,9 +159,10 @@ impl DbError {
             Self::Migration(_)
             | Self::IrreversibleMigration { .. }
             | Self::FrameworkMigrationOnly { .. } => DatabaseErrorKind::Migration,
-            Self::NotFound | Self::Configuration { .. } | Self::Query(_) => {
-                DatabaseErrorKind::Infrastructure
-            }
+            Self::NotFound
+            | Self::Configuration { .. }
+            | Self::RowSecurityBypass { .. }
+            | Self::Query(_) => DatabaseErrorKind::Infrastructure,
         }
     }
 
@@ -189,6 +200,7 @@ impl DbError {
             | Self::IrreversibleMigration { .. }
             | Self::FrameworkMigrationOnly { .. }
             | Self::Configuration { .. }
+            | Self::RowSecurityBypass { .. }
             | Self::Query(_) => ErrorCategory::Internal,
         }
     }

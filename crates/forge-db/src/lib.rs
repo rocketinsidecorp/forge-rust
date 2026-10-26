@@ -17,9 +17,10 @@
 //! pooling, [`DbError`] classification, migration runner and transactions.
 //!
 //! PostgreSQL-only capabilities (transaction-scoped advisory locks, row-level
-//! security through `set_config`) are not emulated elsewhere: see
-//! [`advisory_key`], `DbTransaction::advisory_xact_lock` and
-//! `DbTransaction::set_tenant`.
+//! security through `set_config`, the refusal of a serving role that could
+//! bypass it) are not emulated elsewhere: see [`advisory_key`],
+//! `DbTransaction::advisory_xact_lock`, `DbTransaction::set_tenant` and
+//! `PgDatabase::require_row_security`.
 //!
 //! The `testing` feature adds [`testing::TestDatabase`], an isolated migrated
 //! database per test that is removed even when the test panics.
@@ -61,6 +62,8 @@ pub use sqlx::migrate::Migrator;
 mod mysql;
 #[cfg(feature = "postgres")]
 mod postgres;
+#[cfg(feature = "postgres")]
+mod rowsecurity;
 #[cfg(feature = "sqlite")]
 mod sqlite;
 
