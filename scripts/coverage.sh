@@ -57,6 +57,29 @@ out="$root/target/coverage"
 mkdir -p "$out"
 floor="$(tr -d '[:space:]' < .coverage-floor)"
 
+# Gross total floor: the measurement of everything measured, the contract kits
+# included. It only rises.
+gross_floor=95.0
+
+# Security-relevant crates held to crate_floor percent of their own gated lines
+# (docs/test-strategy.md, "Coverage"). Each must exist and be measured. The
+# Forge-Go twin guards auth, auth/postgres, credentials, csrf, encryption,
+# internal/pgurl and postgres; the equivalents here are forge-auth (sessions,
+# passwords, the identity store), forge-credentials, forge-views (the CSRF
+# layer, with CSP and flash cookies), forge-encryption, forge-db (the database
+# layer, URL handling included), forge-security (RBAC) and forge-tenancy.
+# forge-jobs is guarded too: the audit that introduced these gates found it
+# below 95%. A crate joins the list in the pull request that brings it to 95%.
+crate_floor=95.0
+guarded=(forge-auth forge-credentials forge-db forge-encryption forge-jobs forge-security forge-tenancy forge-views)
+
+for crate in "${guarded[@]}"; do
+	if [ ! -f "crates/$crate/Cargo.toml" ]; then
+		echo "guarded crate $crate does not exist: update guarded in scripts/coverage.sh and docs/test-strategy.md" >&2
+		exit 1
+	fi
+done
+
 # The kit crates, the same list as `kits` below (docs/test-strategy.md,
 # "Contract test kits").
 kit_crates=(forge-cache forge-db forge-jobs forge-mail forge-ratelimit forge-storage forge-telemetry)
@@ -143,14 +166,52 @@ read -r gross gated < <(jq -r --arg gated "$gated_ignored" '
 	| "\(pct($gc; $gn)) \(pct($kc; $kn))"
 ' "$summary")
 
-table="$(printf '### Line coverage: %s%% gated, %s%% gross (floor %s%%, checked against the gated total)\n\n| Crate | Gross covered | Gross lines | Gross | Gated covered | Gated lines | Gated |\n| --- | ---: | ---: | ---: | ---: | ---: | ---: |\n%s\n' "$gated" "$gross" "$floor" "$report")"
+# The guarded crates: covered lines, lines and percent of each (gated files,
+# the kits left out), compared exactly (not through the one-decimal rounding of
+# the table). A crate without lines in the measurement is a failure, not a pass.
+guarded_report="$(jq -r --arg root "$root/" --arg gated "$gated_ignored" --arg list "${guarded[*]}" '
+	.data[0].files
+	| map(select(.filename | test($gated) | not)
+	      | {crate: ((.filename | ltrimstr($root) | capture("^crates/(?<name>[^/]+)/").name) // "other"),
+	         covered: .summary.lines.covered, count: .summary.lines.count})
+	| group_by(.crate)
+	| map({key: .[0].crate, value: {covered: (map(.covered) | add), count: (map(.count) | add)}})
+	| from_entries as $by
+	| ($list | split(" "))[] | . as $crate
+	| "\($crate)\t\($by[$crate].covered // 0)\t\($by[$crate].count // 0)"
+' "$summary" | awk -F'\t' -v floor="$crate_floor" '
+	{
+		if ($3 == 0) {
+			printf "| `%s` | 0 | 0 | not measured | %s%% | FAIL |\n", $1, floor
+			next
+		}
+		tenths = int($2 * 1000 / $3)
+		status = ($2 * 100 >= floor * $3) ? "ok" : "FAIL"
+		printf "| `%s` | %d | %d | %d.%d%% | %s%% | %s |\n", $1, $2, $3, int(tenths / 10), tenths % 10, floor, status
+	}
+')"
+
+table="$(printf '### Line coverage: %s%% gated (floor %s%%), %s%% gross (floor %s%%)\n\nGated: production code, without the contract test kits. Gross: also the kits.\n\n| Crate | Gross covered | Gross lines | Gross | Gated covered | Gated lines | Gated |\n| --- | ---: | ---: | ---: | ---: | ---: | ---: |\n%s\n\n### Security-relevant crates (floor %s%% each, gated lines)\n\n| Crate | Covered lines | Lines | Coverage | Floor | |\n| --- | ---: | ---: | ---: | ---: | --- |\n%s\n' "$gated" "$floor" "$gross" "$gross_floor" "$report" "$crate_floor" "$guarded_report")"
 printf '%s\n' "$table"
 if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
 	printf '%s\n' "$table" >> "$GITHUB_STEP_SUMMARY"
 fi
 
+status=0
 if awk -v total="$gated" -v floor="$floor" 'BEGIN { exit !(total + 0 < floor + 0) }'; then
 	echo "gated coverage ${gated}% (gross ${gross}%) is below the floor ${floor}% (.coverage-floor)" >&2
+	status=1
+fi
+if awk -v gross="$gross" -v floor="$gross_floor" 'BEGIN { exit !(gross + 0 < floor + 0) }'; then
+	echo "gross coverage ${gross}% (kits included) is below the gross floor ${gross_floor}% (gross_floor in scripts/coverage.sh)" >&2
+	status=1
+fi
+below="$(awk -F'|' -v floor="$crate_floor" '$7 ~ /FAIL/ { gsub(/[ `]/, "", $2); gsub(/^ +| +$/, "", $5); print "crate " $2 " is " ($5 == "not measured" ? "not measured" : "at " $5) ", below its per-crate floor " floor "% (guarded in scripts/coverage.sh)" }' <<< "$guarded_report")"
+if [ -n "$below" ]; then
+	printf '%s\n' "$below" >&2
+	status=1
+fi
+if [ "$status" -ne 0 ]; then
 	exit 1
 fi
-echo "gated coverage ${gated}% (gross ${gross}%) >= floor ${floor}%"
+echo "gated coverage ${gated}% (gross ${gross}%) >= floor ${floor}%; gross >= ${gross_floor}%; ${#guarded[@]} guarded crates >= ${crate_floor}%"

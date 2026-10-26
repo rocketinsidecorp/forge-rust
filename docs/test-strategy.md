@@ -318,8 +318,11 @@ or weakened.
 ## Coverage
 
 CI's `coverage` job measures line coverage of the framework crates with
-[cargo-llvm-cov](https://github.com/taiki-e/cargo-llvm-cov) and fails when it
-drops below the committed floor in `.coverage-floor`:
+[cargo-llvm-cov](https://github.com/taiki-e/cargo-llvm-cov) and fails when the
+gated total drops below the committed floor in `.coverage-floor`, when the
+gross total drops below its floor, or when a security-relevant crate drops
+below its own floor (three gates, all in `scripts/coverage.sh`, the same as
+Forge-Go's):
 
 ```sh
 rustup component add llvm-tools-preview
@@ -347,10 +350,50 @@ COVERAGE_JSON=summary.json scripts/coverage.sh       # report and gate an existi
   pinned Rust 1.98.1), installed `--locked` through
   `.github/actions/cargo-tool`, cached under its exact version; llvm-tools
   come from the pinned toolchain.
-- **The floor only rises.** It starts at 0 until the first CI run reports
-  the real number, is then set to that number rounded down to 0.1, and is
-  raised, never lowered, as tests are added, toward the project's target of
-  95%. Raise it in the pull request that raises coverage.
+- **The floor only rises.** It is 96.0%, raised from 95.0% (QR8, the twin of
+  Forge-Go's QG12) against a gated total of 96.8% (96.8% gross, kits included),
+  measured on PostgreSQL 18, MySQL and MariaDB; it started at 0 and is raised,
+  never lowered, as tests are added, toward the project's target of 95% (the
+  floor passed it). A change that lowers coverage below the floor fails CI;
+  raise the floor in the same pull request when coverage grows.
+- **The gross floor.** The gross total, which counts the kits, must also be at
+  least 95.0% (`gross_floor` in `scripts/coverage.sh`). The gated total leaves
+  the kits out by an explicit list; the gross gate keeps that list from
+  becoming a way to hide code: a kit added to the list without tests still has
+  to be covered enough for the gross total to hold.
+- **Per-crate floors.** Each security-relevant crate must reach 95% of its own
+  gated lines (`crate_floor` and `guarded` in `scripts/coverage.sh`), so a well
+  covered workspace cannot average away an untested one. The equivalents of
+  Forge-Go's guarded packages: `forge-auth` (`auth`, `auth/postgres`:
+  sessions, passwords, the identity store), `forge-credentials`,
+  `forge-views` (`csrf`: the CSRF layer, with CSP and flash cookies),
+  `forge-encryption`, `forge-db` (`postgres`, `internal/pgurl`: the database
+  layer and its URL handling), plus `forge-security` (RBAC), `forge-tenancy`
+  (tenant isolation) and `forge-jobs` (below 95% when the gates were added).
+  The table in the job summary lists them with their numbers and the script
+  reports every failing gate before it exits 1; a listed crate that does not
+  exist, or has no lines in the measurement, fails too. The comparison is
+  exact, not the table's one-decimal rounding (which truncates, so a failing
+  crate never reads as 95.0%). A crate joins the list in the pull request that
+  brings it to 95%, and the list only grows.
+- **What counts as covered there.** Tests assert behaviour: refusals, error
+  paths and edge inputs, each with a failure that would show if the code were
+  wrong (a state left unchanged, a secret absent from the error). Excluding
+  code from the measurement to pass a floor is not allowed (see Exclusions).
+  Some lines cannot be reached by any test and stay uncovered, each of one
+  kind: the argument lines of a multi-line `tracing` macro call (cargo-llvm-cov
+  reports them with zero hits even when the event is emitted and its fields are
+  asserted, so about 65 lines across the workspace, 44 of them in
+  `forge-jobs`, are never counted); the `Corrupt`/`None` arms that guard
+  against a database function or a decoder returning a value its own contract
+  excludes (`forge-jobs` state and status parsing, the cron search past its
+  nine-year window of a satisfiable expression, a scheduled job that fails the
+  validation `Schedule::new` already passed); and a `match` arm kept for
+  exhaustiveness over a value the caller can never pass (`forge-credentials`
+  `json_type` of a string, which is only asked about non-strings).
+- **Root and CI.** Tests that need a file system enforcing permissions against
+  the user skip for root, so the per-crate numbers of a root run, such as a
+  container's, are a lower bound of CI's.
 - **Exclusions.** Only these, each for the reason given; nothing else may be
   excluded, and a new exclusion needs a reason here:
 
@@ -391,8 +434,8 @@ shipped code, is production code, and has to be covered. A new kit is added to t
 that adds it.
 
 The Forge-Go twin (`scripts/coverage.sh`, `.coverage-floor`, the same job
-name) measures statement coverage with `go test -coverpkg`; see its
-`docs/TESTING.md`.
+name and the same three gates) measures statement coverage with
+`go test -coverpkg`; see its `docs/TESTING.md`.
 
 ## Live updates tests
 

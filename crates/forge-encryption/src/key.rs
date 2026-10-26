@@ -286,6 +286,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn key_material_never_prints_its_bytes() {
+        let key = generate_key().expect("random");
+        let shown = format!("{key:?} {key:#?}");
+        assert!(shown.contains("KeyMaterial([REDACTED])"), "{shown}");
+        assert!(!shown.contains(encode_key(&key).as_str()));
+        assert!(
+            !shown.contains(&format!("{:?}", key.expose())),
+            "the bytes are not printed in any form"
+        );
+    }
+
+    #[test]
     fn keys_round_trip_through_their_canonical_text_only() {
         let key = generate_key().expect("random");
         let text = encode_key(&key);

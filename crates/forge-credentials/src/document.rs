@@ -275,6 +275,56 @@ mod tests {
         assert!(message(&large).contains("exceeds"));
     }
 
+    /// A deserializer of a self-describing format with an absent optional.
+    struct Absent;
+
+    impl<'de> Deserializer<'de> for Absent {
+        type Error = de::value::Error;
+
+        fn deserialize_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
+            visitor.visit_none()
+        }
+
+        serde::forward_to_deserialize_any! {
+            bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string bytes
+            byte_buf option unit unit_struct newtype_struct seq tuple tuple_struct map
+            struct enum identifier ignored_any
+        }
+    }
+
+    #[test]
+    fn the_strict_reader_takes_every_json_value_and_names_what_it_expects() {
+        use serde::de::IntoDeserializer;
+
+        // An owned string and an absent optional are values like any other.
+        let owned: de::value::StringDeserializer<de::value::Error> =
+            "sk_live_owned".to_owned().into_deserializer();
+        let Strict(value) = Strict::deserialize(owned).expect("an owned string");
+        assert_eq!(value, Value::String("sk_live_owned".to_owned()));
+        let Strict(value) = Strict::deserialize(Absent).expect("an absent optional");
+        assert_eq!(value, Value::Null);
+        // Anything JSON cannot express is refused, and the message names the
+        // expectation, not the content.
+        let bytes = de::value::BytesDeserializer::<de::value::Error>::new(b"sk_live_bytes");
+        let error = Strict::deserialize(bytes)
+            .err()
+            .expect("bytes are not JSON");
+        assert!(error.to_string().contains("a JSON value"), "{error}");
+        assert!(!error.to_string().contains("sk_live"));
+        // Numbers that JSON cannot hold are refused too.
+        let error = Strict::deserialize(de::value::F64Deserializer::<de::value::Error>::new(
+            f64::NAN,
+        ))
+        .err()
+        .expect("NaN is not JSON");
+        assert!(error.to_string().contains("number out of range"), "{error}");
+        // Every scalar of a document survives.
+        validate_document(
+            br#"{"t": true, "i": -3, "u": 18446744073709551615, "f": 1.5, "n": null}"#,
+        )
+        .expect("valid");
+    }
+
     #[test]
     fn redaction_keeps_only_the_structure() {
         let redacted =

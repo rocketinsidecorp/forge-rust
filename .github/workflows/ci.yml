@@ -253,9 +253,11 @@ jobs:
     # Line coverage of the framework crates with cargo-llvm-cov over the
     # database job's test set (PostgreSQL 18, MySQL, MariaDB, real sshd).
     # scripts/coverage.sh writes
-    # the total and a per-crate table to the step summary and fails below
-    # .coverage-floor, which only ever rises toward 95 (docs/test-strategy.md,
-    # "Coverage").
+    # the totals, a per-crate table and the table of the security-relevant
+    # crates to the step summary and fails when the gated total is below
+    # .coverage-floor (which only ever rises), the gross total is below 95.0
+    # or a guarded crate is below 95.0 on its own, after reporting every
+    # failing gate (docs/test-strategy.md, "Coverage").
     name: coverage (cargo llvm-cov, gated by .coverage-floor)
     runs-on: ubuntu-latest
     timeout-minutes: 60

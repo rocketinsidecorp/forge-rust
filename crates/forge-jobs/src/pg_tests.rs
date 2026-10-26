@@ -1723,3 +1723,170 @@ async fn an_unavailable_database_is_an_error_never_a_lost_lease() {
     .await;
     db.cleanup().await.expect("cleanup");
 }
+
+#[derive(Serialize, Deserialize)]
+struct Verdict {
+    /// `retry`, `retry_after` or `permanent`.
+    kind: String,
+}
+
+impl Job for Verdict {
+    const NAME: &'static str = "test.verdict";
+    const MAX_ATTEMPTS: u16 = 5;
+    const BACKOFF: Backoff = Backoff::fixed(Duration::from_secs(1800));
+}
+
+struct Judge;
+
+#[async_trait]
+impl JobHandler for Judge {
+    type Job = Verdict;
+
+    async fn perform(&self, _: &JobContext, job: Verdict) -> Result<(), JobError> {
+        match job.kind.as_str() {
+            "retry_after" => Err(JobError::retry("busy").retry_after(Duration::from_secs(7200))),
+            "permanent" => Err(JobError::permanent("invalid address")),
+            _ => Err(JobError::retry("smtp down")),
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs FORGE_TEST_DATABASE_URL"]
+async fn a_failure_decides_its_own_delay_and_a_permanent_one_skips_the_remaining_attempts() {
+    let db = fresh().await;
+    let store = PgJobStore::new(db.runtime().clone());
+    let mut ids = HashMap::new();
+    for kind in ["retry", "retry_after", "permanent"] {
+        let id = store
+            .enqueue(
+                &Verdict {
+                    kind: kind.to_owned(),
+                },
+                EnqueueOptions::new(),
+            )
+            .await
+            .expect("enqueue")
+            .id();
+        ids.insert(kind, id);
+    }
+    let mut jobs = Jobs::new();
+    jobs.register(Judge).expect("register");
+    jobs.settings(fast());
+    let (shutdown, handle) = spawn_runtime(jobs, store.database());
+    wait_until("every job to fail once", || async {
+        let mut failed = 0;
+        for id in ids.values() {
+            failed += i32::from(job_row(&db, *id).await.last_error.is_some());
+        }
+        failed == 3
+    })
+    .await;
+    stop(shutdown, handle).await;
+
+    // The job's own backoff (half an hour, jittered down to half of it) applies
+    // unless the error names a delay.
+    for (kind, low, high) in [("retry", 850.0, 1801.0), ("retry_after", 7100.0, 7201.0)] {
+        let id = ids[kind];
+        let row = job_row(&db, id).await;
+        assert_eq!((row.state.as_str(), row.attempts), ("queued", 1), "{kind}");
+        let wait: f64 = sqlx::query_scalar(
+            "SELECT extract(epoch FROM run_at - now())::float8 FROM forge_jobs WHERE id = $1",
+        )
+        .bind(id.into_uuid())
+        .fetch_one(db.admin().pool())
+        .await
+        .expect("run_at");
+        assert!((low..=high).contains(&wait), "{kind}: {wait}");
+    }
+    // A permanent failure is dead after one attempt of five.
+    let permanent = job_row(&db, ids["permanent"]).await;
+    assert_eq!((permanent.state.as_str(), permanent.attempts), ("dead", 1));
+    assert_eq!(permanent.last_error.as_deref(), Some("invalid address"));
+    db.cleanup().await.expect("cleanup");
+}
+
+#[tokio::test]
+#[ignore = "needs FORGE_TEST_DATABASE_URL"]
+async fn a_tenant_job_enqueued_in_a_transaction_keeps_its_scope_and_obeys_row_level_security() {
+    let db = fresh().await;
+    let runtime = db.runtime();
+    let store = PgJobStore::new(runtime.clone()).notify(true);
+    let (alpha, beta) = (tenant_context(), tenant_context());
+
+    let mut transaction = scoped(runtime, Some(&alpha)).await;
+    let first = store
+        .enqueue_for_tenant_in(
+            &mut transaction,
+            &alpha,
+            &Count { n: 1 },
+            EnqueueOptions::new().unique_key("report"),
+        )
+        .await
+        .expect("enqueue");
+    let again = store
+        .enqueue_for_tenant_in(
+            &mut transaction,
+            &alpha,
+            &Count { n: 2 },
+            EnqueueOptions::new().unique_key("report"),
+        )
+        .await
+        .expect("duplicate");
+    assert!(matches!(first, Enqueued::New(_)));
+    assert_eq!(again, Enqueued::Duplicate(first.id()));
+    transaction.commit().await.expect("commit");
+
+    let row = sqlx::query("SELECT tenant_id, principal_id FROM forge_jobs WHERE id = $1")
+        .bind(first.id().into_uuid())
+        .fetch_one(db.admin().pool())
+        .await
+        .expect("row");
+    assert_eq!(
+        row.get::<Option<Uuid>, _>("tenant_id"),
+        Some(alpha.tenant_id().into_uuid())
+    );
+    assert_eq!(
+        row.get::<Option<Uuid>, _>("principal_id"),
+        Some(alpha.principal_id().into_uuid())
+    );
+    assert_eq!(
+        visible(runtime, Some(&alpha)).await,
+        vec![first.id().into_uuid()]
+    );
+    assert!(
+        visible(runtime, Some(&beta)).await.is_empty(),
+        "another tenant never sees it"
+    );
+
+    // A transaction scoped to another tenant (or to none) cannot enqueue it.
+    for context in [Some(&beta), None] {
+        let mut transaction = scoped(runtime, context).await;
+        let refused = store
+            .enqueue_for_tenant_in(
+                &mut transaction,
+                &alpha,
+                &Count { n: 3 },
+                EnqueueOptions::new(),
+            )
+            .await;
+        assert!(
+            matches!(refused, Err(JobsError::Database(_))),
+            "{refused:?}"
+        );
+    }
+    // A job that fails validation never reaches the database.
+    let mut transaction = scoped(runtime, Some(&alpha)).await;
+    let invalid = store
+        .enqueue_for_tenant_in(
+            &mut transaction,
+            &alpha,
+            &Count { n: 4 },
+            EnqueueOptions::new().unique_key(""),
+        )
+        .await;
+    assert!(matches!(invalid, Err(JobsError::InvalidSetting(_))));
+    drop(transaction);
+    assert_eq!(visible(runtime, Some(&alpha)).await.len(), 1);
+    db.cleanup().await.expect("cleanup");
+}
