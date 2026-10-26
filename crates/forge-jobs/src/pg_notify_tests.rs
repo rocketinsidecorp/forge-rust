@@ -13,9 +13,8 @@ use std::{
 };
 
 use async_trait::async_trait;
-use forge_config::SecretString;
 use forge_core::Cancellation;
-use forge_db::PgDatabase;
+use forge_db::{PgDatabase, PoolSettings};
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgListener;
 use tokio::{
@@ -40,15 +39,15 @@ async fn fresh() -> RlsTestDatabase {
     RlsTestDatabase::create(&[migrator()]).await.expect(IGNORE)
 }
 
-/// A runtime-role pool whose connections carry `forge.jobs_notify=on`, set
-/// as the documented URL option.
-async fn notifying(db: &RlsTestDatabase) -> PgDatabase {
-    let url = db.runtime_url().expose();
-    let separator = if url.contains('?') { '&' } else { '?' };
-    let url = SecretString::new(format!(
-        "{url}{separator}options=-c%20forge.jobs_notify%3Don"
-    ));
-    PgDatabase::connect(&url).await.expect("notifying pool")
+/// A runtime-role pool whose connections set `forge.jobs_notify = on`, as
+/// `forge::App` builds it with `App::jobs_notify` or `FORGE_JOBS_NOTIFY`.
+async fn announcing_pool(db: &RlsTestDatabase) -> PgDatabase {
+    PgDatabase::connect_with(
+        db.runtime_url(),
+        PoolSettings::default().with_job_announcements(true),
+    )
+    .await
+    .expect("announcing pool")
 }
 
 /// Settings whose idle polls are far apart, so a quick claim needs an
@@ -62,9 +61,12 @@ fn slow_polling(poll: Duration) -> WorkerSettings {
         .cancel_grace(Duration::from_millis(200))
 }
 
-fn spawn_runtime(jobs: Jobs, db: &PgDatabase) -> (Cancellation, JoinHandle<Result<(), JobsError>>) {
+fn spawn_runtime(
+    jobs: Jobs,
+    store: &PgJobStore,
+) -> (Cancellation, JoinHandle<Result<(), JobsError>>) {
     let shutdown = Cancellation::new();
-    let handle = tokio::spawn(jobs.run(PgJobStore::new(db.clone()), shutdown.clone()));
+    let handle = tokio::spawn(jobs.run(store.clone(), shutdown.clone()));
     (shutdown, handle)
 }
 
@@ -177,21 +179,25 @@ async fn next_start(started: &mut mpsc::UnboundedReceiver<Instant>, wait: Durati
 
 #[tokio::test]
 #[ignore = "needs FORGE_TEST_DATABASE_URL"]
-async fn only_due_committed_jobs_are_announced_by_sessions_that_opt_in() {
+async fn only_due_committed_jobs_of_a_notifying_store_or_pool_are_announced() {
     let db = fresh().await;
-    let database = notifying(&db).await;
-    let store = PgJobStore::new(database.clone());
+    // The runtime role's own pool has no session setting: the notifying
+    // store announces through its transactions alone.
+    let store = PgJobStore::new(db.runtime().clone()).notify(true);
+    let plain = PgJobStore::new(db.runtime().clone());
+    assert!(store.notifies() && !plain.notifies());
     let mut listener = admin_listener(&db).await;
 
     // A due job, committed: announced with its queue as the payload.
-    let mut transaction = database.begin().await.expect("begin");
-    enqueue(
-        &mut transaction,
-        &Ping,
-        EnqueueOptions::new().unique_key("once"),
-    )
-    .await
-    .expect("enqueue");
+    let mut transaction = db.runtime().begin().await.expect("begin");
+    store
+        .enqueue_in(
+            &mut transaction,
+            &Ping,
+            EnqueueOptions::new().unique_key("once"),
+        )
+        .await
+        .expect("enqueue");
     assert_eq!(next_announcement(&mut listener, QUIET).await, None);
     transaction.commit().await.expect("commit");
     assert_eq!(
@@ -214,17 +220,19 @@ async fn only_due_committed_jobs_are_announced_by_sessions_that_opt_in() {
         )
         .await
         .expect("delayed");
-    let mut transaction = database.begin().await.expect("begin");
-    enqueue(&mut transaction, &Mail, EnqueueOptions::new())
+    let mut transaction = db.runtime().begin().await.expect("begin");
+    store
+        .enqueue_in(&mut transaction, &Mail, EnqueueOptions::new())
         .await
         .expect("enqueue");
     transaction.rollback().await.expect("rollback");
     assert_eq!(next_announcement(&mut listener, QUIET).await, None);
 
     // One announcement per queue and transaction, however many jobs.
-    let mut transaction = database.begin().await.expect("begin");
+    let mut transaction = db.runtime().begin().await.expect("begin");
     for _ in 0..3 {
-        enqueue(&mut transaction, &Mail, EnqueueOptions::new())
+        store
+            .enqueue_in(&mut transaction, &Mail, EnqueueOptions::new())
             .await
             .expect("enqueue");
     }
@@ -235,7 +243,7 @@ async fn only_due_committed_jobs_are_announced_by_sessions_that_opt_in() {
     );
     assert_eq!(next_announcement(&mut listener, QUIET).await, None);
 
-    // Schedule ticks are enqueued by forge_jobs_fire_tick: announced too.
+    // Schedule ticks (forge_jobs_fire_tick) of a notifying store too.
     let tick = store.database_now().await.expect("now");
     let job = NewJob::from_parts(
         JobSpec::of::<Ping>(),
@@ -255,14 +263,36 @@ async fn only_due_committed_jobs_are_announced_by_sessions_that_opt_in() {
         Some("default".to_owned())
     );
 
-    // Without the setting nothing is announced, also within a transaction
-    // that turns it off; a transaction can turn it on by itself.
-    let plain = PgJobStore::new(db.runtime().clone());
+    // A store that does not notify, and the free functions on a plain pool,
+    // announce nothing; the setting does not outlive its transaction.
     plain
         .enqueue(&Ping, EnqueueOptions::new())
         .await
         .expect("plain enqueue");
-    let mut transaction = database.begin().await.expect("begin");
+    let mut transaction = db.runtime().begin().await.expect("begin");
+    plain
+        .enqueue_in(&mut transaction, &Mail, EnqueueOptions::new())
+        .await
+        .expect("enqueue");
+    enqueue(&mut transaction, &Mail, EnqueueOptions::new())
+        .await
+        .expect("enqueue");
+    transaction.commit().await.expect("commit");
+    assert_eq!(next_announcement(&mut listener, QUIET).await, None);
+
+    // The free functions announce on a pool with job announcements, unless
+    // a transaction turns the setting off for itself.
+    let announcing = announcing_pool(&db).await;
+    let mut transaction = announcing.begin().await.expect("begin");
+    enqueue(&mut transaction, &Mail, EnqueueOptions::new())
+        .await
+        .expect("enqueue");
+    transaction.commit().await.expect("commit");
+    assert_eq!(
+        next_announcement(&mut listener, Duration::from_secs(2)).await,
+        Some("mail".to_owned())
+    );
+    let mut transaction = announcing.begin().await.expect("begin");
     sqlx::query("SELECT set_config($1, 'off', true)")
         .bind(NOTIFY_SETTING)
         .execute(transaction.connection())
@@ -273,26 +303,9 @@ async fn only_due_committed_jobs_are_announced_by_sessions_that_opt_in() {
         .expect("enqueue");
     transaction.commit().await.expect("commit");
     assert_eq!(next_announcement(&mut listener, QUIET).await, None);
-    let mut transaction = db.runtime().begin().await.expect("begin");
-    sqlx::query("SELECT set_config($1, 'TRUE', true)")
-        .bind(NOTIFY_SETTING)
-        .execute(transaction.connection())
-        .await
-        .expect("on");
-    enqueue(&mut transaction, &Mail, EnqueueOptions::new())
-        .await
-        .expect("enqueue");
-    transaction.commit().await.expect("commit");
-    assert_eq!(
-        next_announcement(&mut listener, Duration::from_secs(2)).await,
-        Some("mail".to_owned())
-    );
-
-    assert!(store.notifies().await.expect("notifies"));
-    assert!(!plain.notifies().await.expect("notifies"));
 
     drop(listener);
-    database.close().await;
+    announcing.close().await;
     db.cleanup().await.expect("cleanup");
 }
 
@@ -300,10 +313,9 @@ async fn only_due_committed_jobs_are_announced_by_sessions_that_opt_in() {
 #[ignore = "needs FORGE_TEST_DATABASE_URL"]
 async fn an_announcement_wakes_an_idle_worker_well_before_its_poll() {
     let db = fresh().await;
-    let database = notifying(&db).await;
-    let store = PgJobStore::new(database.clone());
+    let store = PgJobStore::new(db.runtime().clone()).notify(true);
     let (jobs, mut started) = started_runtime(slow_polling(Duration::from_secs(60)));
-    let (shutdown, handle) = spawn_runtime(jobs, &database);
+    let (shutdown, handle) = spawn_runtime(jobs, &store);
     wait_until("the listener", Duration::from_secs(10), || async {
         listen_backends(&db).await.len() == 1
     })
@@ -323,7 +335,6 @@ async fn an_announcement_wakes_an_idle_worker_well_before_its_poll() {
     }
 
     stop(shutdown, handle).await;
-    database.close().await;
     db.cleanup().await.expect("cleanup");
 }
 
@@ -331,10 +342,9 @@ async fn an_announcement_wakes_an_idle_worker_well_before_its_poll() {
 #[ignore = "needs FORGE_TEST_DATABASE_URL"]
 async fn polling_continues_while_the_listener_is_down_and_it_reconnects() {
     let db = fresh().await;
-    let database = notifying(&db).await;
-    let store = PgJobStore::new(database.clone());
+    let store = PgJobStore::new(db.runtime().clone()).notify(true);
     let (jobs, mut started) = started_runtime(slow_polling(Duration::from_millis(300)));
-    let (shutdown, handle) = spawn_runtime(jobs, &database);
+    let (shutdown, handle) = spawn_runtime(jobs, &store);
     wait_until("the listener", Duration::from_secs(10), || async {
         listen_backends(&db).await.len() == 1
     })
@@ -375,7 +385,6 @@ async fn polling_continues_while_the_listener_is_down_and_it_reconnects() {
     next_start(&mut started, Duration::from_secs(5)).await;
 
     stop(shutdown, handle).await;
-    database.close().await;
     db.cleanup().await.expect("cleanup");
 }
 
@@ -383,9 +392,9 @@ async fn polling_continues_while_the_listener_is_down_and_it_reconnects() {
 #[ignore = "needs FORGE_TEST_DATABASE_URL"]
 async fn shutdown_closes_an_active_listener_promptly_and_plain_runtimes_never_listen() {
     let db = fresh().await;
-    let database = notifying(&db).await;
+    let store = PgJobStore::new(db.runtime().clone()).notify(true);
     let (jobs, _started) = started_runtime(slow_polling(Duration::from_secs(60)));
-    let (shutdown, handle) = spawn_runtime(jobs, &database);
+    let (shutdown, handle) = spawn_runtime(jobs, &store);
     wait_until("the listener", Duration::from_secs(10), || async {
         listen_backends(&db).await.len() == 1
     })
@@ -399,14 +408,16 @@ async fn shutdown_closes_an_active_listener_promptly_and_plain_runtimes_never_li
     )
     .await;
 
-    // Without forge.jobs_notify the runtime only polls.
+    // A store that does not notify only polls, even on a pool whose
+    // connections announce.
+    let announcing = announcing_pool(&db).await;
     let (jobs, _started) = started_runtime(slow_polling(Duration::from_secs(60)));
-    let (shutdown, handle) = spawn_runtime(jobs, db.runtime());
+    let (shutdown, handle) = spawn_runtime(jobs, &PgJobStore::new(announcing.clone()));
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert!(listen_backends(&db).await.is_empty());
     stop(shutdown, handle).await;
 
-    database.close().await;
+    announcing.close().await;
     db.cleanup().await.expect("cleanup");
 }
 
@@ -488,7 +499,7 @@ async fn claims_never_exceed_the_batch_or_the_free_slots() {
                 .batch(batch),
         )
         .pruning(None);
-        let (shutdown, handle) = spawn_runtime(jobs, db.runtime());
+        let (shutdown, handle) = spawn_runtime(jobs, &store);
 
         let slots = usize::from(concurrency);
         wait_until("every slot to fill", Duration::from_secs(10), || async {
@@ -571,7 +582,7 @@ async fn a_full_batch_is_followed_by_another_claim_at_once() {
                 .batch(1),
         )
         .pruning(None);
-    let (shutdown, handle) = spawn_runtime(jobs, db.runtime());
+    let (shutdown, handle) = spawn_runtime(jobs, &store);
     wait_until("four one-job claims", Duration::from_secs(5), || async {
         completed(&db).await == 4
     })

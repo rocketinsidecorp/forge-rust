@@ -330,8 +330,7 @@ impl Jobs {
     /// schedules exist) and the pruning loop until `shutdown` is cancelled,
     /// then drains them (see [`WorkerSettings`]) and returns.
     ///
-    /// When the store's connections carry
-    /// [`forge.jobs_notify`](crate::postgres::NOTIFY_SETTING) `on`, it also
+    /// When the store [notifies](PgJobStore::notify), it also
     /// holds one `LISTEN` connection (outside the store's pool) and an idle
     /// queue worker claims as soon as a job of its queue is announced, at
     /// most once per 10 ms; on every (re)subscription each queue claims
@@ -373,9 +372,9 @@ impl Jobs {
         if !queues.is_empty() || !schedules.is_empty() || pruning.is_some() {
             store.check_worker_grants().await?;
         }
-        // With `forge.jobs_notify` on, idle workers also wake when a job of
-        // their queue is announced (ADR 0046).
-        let mut wakes = (!queues.is_empty() && store.notifies().await?).then(Wakes::new);
+        // A notifying store also wakes idle workers when a job of their
+        // queue is announced (ADR 0046).
+        let mut wakes = (!queues.is_empty() && store.notifies()).then(Wakes::new);
 
         let stop = shutdown.child();
         let mut tasks: JoinSet<()> = JoinSet::new();

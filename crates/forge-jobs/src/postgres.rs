@@ -82,16 +82,18 @@ pub fn migrator() -> Migrator {
 }
 
 /// The PostgreSQL notification channel on which due jobs are announced when
-/// they are enqueued by a session with [`NOTIFY_SETTING`] on. The payload is
-/// the job's queue name; anything else is ignored.
+/// they are enqueued with [`NOTIFY_SETTING`] on. The payload is the job's
+/// queue name; anything else is ignored.
 pub const NOTIFY_CHANNEL: &str = "forge_jobs";
 
-/// The session setting that turns on enqueue announcements and the workers'
-/// `LISTEN` (ADR 0046), with the meaning of Forge-Go's
-/// `queuepostgres.WithNotify()`: `on` (or `true`, `yes`, `1`) in the
-/// connection settings of every process, for example
-/// `PGOPTIONS='-c forge.jobs_notify=on'` or `?options=-c%20forge.jobs_notify%3Don`
-/// in the database URL. Unset or anything else means off.
+/// The setting the `forge_jobs_announce` trigger reads (ADR 0046): a job
+/// inserted by a transaction where it is `on` announces itself when due.
+/// Forge sets it, never the environment: [`PgJobStore::notify`] sets it in
+/// the store's own transactions ([`PgJobStore::enqueue`],
+/// [`PgJobStore::enqueue_in`], schedule ticks), and
+/// `forge_db::PoolSettings::with_job_announcements` on every connection of a
+/// pool, which is what `forge::App::jobs_notify` and `FORGE_JOBS_NOTIFY` do
+/// for the application's pool.
 pub const NOTIFY_SETTING: &str = "forge.jobs_notify";
 
 /// How long opening the `LISTEN` connection may take.
@@ -111,6 +113,12 @@ const ZERO_TENANT: &str = "00000000-0000-0000-0000-000000000000";
 /// disappears if it rolls back, so business writes and the jobs they imply
 /// are atomic. Under row-level security a transaction that carries a tenant
 /// scope cannot insert global jobs; use [`enqueue_for_tenant`] there.
+///
+/// A due job is announced to listening workers (ADR 0046) when the
+/// connection has [`NOTIFY_SETTING`] on: a pool built with
+/// `forge_db::PoolSettings::with_job_announcements`, as `forge::App` builds
+/// it with `App::jobs_notify` or `FORGE_JOBS_NOTIFY`. Through a notifying
+/// [`PgJobStore`], use [`PgJobStore::enqueue_in`].
 pub async fn enqueue<J: Job>(
     transaction: &mut DbTransaction<Postgres>,
     job: &J,
@@ -125,7 +133,7 @@ pub async fn enqueue<J: Job>(
 /// The transaction must carry the same tenant scope (the transaction-local
 /// `forge.tenant_id`/`forge.principal_id` settings of ADR 0011); otherwise
 /// row-level security rejects the insert. The worker re-installs the scope
-/// when it runs the job.
+/// when it runs the job. Announced like [`enqueue`].
 pub async fn enqueue_for_tenant<J: Job>(
     transaction: &mut DbTransaction<Postgres>,
     context: &TenantContext,
@@ -543,13 +551,50 @@ impl Pruning {
 #[derive(Clone, Debug)]
 pub struct PgJobStore {
     database: PgDatabase,
+    notify: bool,
 }
 
 impl PgJobStore {
     /// Creates a store over the application's runtime pool.
     #[must_use]
     pub const fn new(database: PgDatabase) -> Self {
-        Self { database }
+        Self {
+            database,
+            notify: false,
+        }
+    }
+
+    /// Announces enqueued jobs and lets workers listen for them (ADR 0046),
+    /// with the meaning of Forge-Go's `queuepostgres.WithNotify()`; default
+    /// off.
+    ///
+    /// When on, every due job enqueued through this store
+    /// ([`PgJobStore::enqueue`], [`PgJobStore::enqueue_in`],
+    /// [`PgJobStore::enqueue_for_tenant_in`] and schedule ticks) sends
+    /// `NOTIFY forge_jobs` with its queue when its transaction commits (the
+    /// store sets [`NOTIFY_SETTING`] for that transaction only), and
+    /// [`Jobs::run`](crate::Jobs::run) on this store holds one `LISTEN`
+    /// connection: an idle worker claims a new job within milliseconds
+    /// instead of at its next poll. The free functions [`enqueue`] and
+    /// [`enqueue_for_tenant`] announce only on a connection that already has
+    /// the setting (a pool built with
+    /// `forge_db::PoolSettings::with_job_announcements`).
+    ///
+    /// Costs: one extra connection per job runtime, outside the pool;
+    /// `LISTEN` needs a direct connection or session pooling, not PgBouncer
+    /// transaction pooling; PostgreSQL serializes the commits of notifying
+    /// transactions, which matters at thousands of enqueues per second.
+    /// Announcements are hints: polling still finds every job.
+    #[must_use]
+    pub const fn notify(mut self, on: bool) -> Self {
+        self.notify = on;
+        self
+    }
+
+    /// Whether this store announces enqueued jobs and its workers listen.
+    #[must_use]
+    pub const fn notifies(&self) -> bool {
+        self.notify
     }
 
     /// The underlying pool.
@@ -565,9 +610,48 @@ impl PgJobStore {
         options: EnqueueOptions,
     ) -> Result<Enqueued, JobsError> {
         let mut transaction = self.database.begin().await?;
-        let enqueued = enqueue(&mut transaction, job, options).await?;
+        let enqueued = self.enqueue_in(&mut transaction, job, options).await?;
         transaction.commit().await?;
         Ok(enqueued)
+    }
+
+    /// [`enqueue`] in the caller's transaction, announced when this store
+    /// [notifies](PgJobStore::notify) (Forge-Go's `store.In(tx)`).
+    pub async fn enqueue_in<J: Job>(
+        &self,
+        transaction: &mut DbTransaction<Postgres>,
+        job: &J,
+        options: EnqueueOptions,
+    ) -> Result<Enqueued, JobsError> {
+        let new = NewJob::of(job, &options, None)?;
+        self.announce_in(transaction.connection()).await?;
+        insert(transaction.connection(), &new).await
+    }
+
+    /// [`enqueue_for_tenant`] in the caller's transaction, announced when this
+    /// store [notifies](PgJobStore::notify).
+    pub async fn enqueue_for_tenant_in<J: Job>(
+        &self,
+        transaction: &mut DbTransaction<Postgres>,
+        context: &TenantContext,
+        job: &J,
+        options: EnqueueOptions,
+    ) -> Result<Enqueued, JobsError> {
+        let new = NewJob::of(job, &options, Some(JobTenant::of(context)))?;
+        self.announce_in(transaction.connection()).await?;
+        insert(transaction.connection(), &new).await
+    }
+
+    /// Turns [`NOTIFY_SETTING`] on for the rest of the current transaction
+    /// when this store notifies.
+    async fn announce_in(&self, connection: &mut PgConnection) -> Result<(), JobsError> {
+        if self.notify {
+            sqlx::query("SELECT set_config($1, 'on', true)")
+                .bind(NOTIFY_SETTING)
+                .execute(connection)
+                .await?;
+        }
+        Ok(())
     }
 
     /// Job counts per queue and state.
@@ -688,17 +772,6 @@ impl PgJobStore {
             return Ok(());
         };
         Err(JobsError::WorkerNotGranted { role, detail })
-    }
-
-    /// Whether this store's sessions have [`NOTIFY_SETTING`] on, so its
-    /// workers listen for announcements.
-    pub(crate) async fn notifies(&self) -> Result<bool, JobsError> {
-        Ok(sqlx::query_scalar(
-            "SELECT lower(coalesce(current_setting($1, true), '')) IN ('on', 'true', 'yes', '1')",
-        )
-        .bind(NOTIFY_SETTING)
-        .fetch_one(self.database.pool())
-        .await?)
     }
 
     /// A subscription to [`NOTIFY_CHANNEL`] on one connection outside the
@@ -830,6 +903,10 @@ impl PgJobStore {
         lateness: Duration,
         job: NewJob,
     ) -> Result<TickOutcome, JobsError> {
+        // A notifying store announces the tick's job: the setting is local
+        // to the transaction that runs forge_jobs_fire_tick.
+        let mut transaction = self.database.begin().await?;
+        self.announce_in(transaction.connection()).await?;
         let outcome: String = sqlx::query_scalar(
             "SELECT forge_jobs_fire_tick($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
         )
@@ -843,8 +920,9 @@ impl PgJobStore {
         .bind(job.priority)
         .bind(job.max_attempts)
         .bind(job.unique_key.as_deref())
-        .fetch_one(self.database.pool())
+        .fetch_one(transaction.connection())
         .await?;
+        transaction.commit().await?;
         match outcome.as_str() {
             "fired" => Ok(TickOutcome::Fired(job.id)),
             "skipped" => Ok(TickOutcome::Skipped),
