@@ -15,16 +15,31 @@ use crate::{
 
 /// Longest wait between scheduler passes, so a clock jump is noticed.
 const MAX_SLEEP: Duration = Duration::from_secs(60);
+/// Shortest [`Schedule::max_lateness`]: the database clock decides, and a
+/// replica may notice a tick up to a pass late.
+const MIN_LATENESS: Duration = Duration::from_secs(60);
+/// Most skipped ticks counted one by one (65536 minutes is about 45 days),
+/// Forge-Go's `maxCatchUpWalk`.
+const MAX_CATCH_UP_WALK: u32 = 1 << 16;
+
+/// The time from `from` to `to`, zero when `to` is not later.
+fn micros_between(from: Timestamp, to: Timestamp) -> Duration {
+    Duration::from_micros(u64::try_from(to.unix_micros() - from.unix_micros()).unwrap_or(0))
+}
 
 /// A recurring job: enqueue `job` at every tick of `cron` (UTC).
 ///
 /// Each tick is enqueued **exactly once** no matter how many replicas run the
 /// scheduler: replicas race on a conditional upsert of the schedule's
 /// `last_tick_at` row, only the replica that advances it enqueues the job,
-/// and it does so in the same transaction. Ticks missed while no scheduler
-/// ran are not replayed; only the latest due tick is considered, and it is
-/// skipped when it is older than [`Schedule::max_lateness`] (default five
-/// minutes), so a deployment never fires a burst of stale ticks.
+/// and it does so in the same transaction. Missed ticks are not replayed
+/// back to back: only the latest due tick is considered, once, and only
+/// while it is at most [`Schedule::max_lateness`] late (default: one
+/// interval of the schedule, the gap from the tick to the following one, so
+/// after a stall the latest missed tick still runs once). The earlier missed
+/// ticks a scheduler notices are skipped and reported in a warning, so a
+/// deployment never fires a burst of stale ticks (Forge-Go's
+/// `SchedulerOptions.MaxLateness`, the same default).
 ///
 /// ```
 /// use forge_jobs::{Job, Schedule};
@@ -47,7 +62,8 @@ pub struct Schedule {
     cron: Cron,
     spec: JobSpec,
     payload: String,
-    lateness: Duration,
+    /// `None`: one interval of the schedule.
+    lateness: Option<Duration>,
 }
 
 impl Schedule {
@@ -63,16 +79,47 @@ impl Schedule {
             cron,
             spec,
             payload: serialize(job)?,
-            lateness: Duration::from_secs(300),
+            lateness: None,
         })
     }
 
     /// How late a tick may be enqueued (database clock); older ticks are
-    /// skipped. At least one minute.
+    /// skipped. At least one minute. Without it, one interval of the
+    /// schedule: the gap from the tick to the following one.
     #[must_use]
     pub fn max_lateness(mut self, lateness: Duration) -> Self {
-        self.lateness = lateness.max(Duration::from_secs(60));
+        self.lateness = Some(lateness.max(MIN_LATENESS));
         self
+    }
+
+    /// How late `tick` may be enqueued: [`Schedule::max_lateness`], or the
+    /// gap to the following tick (at least one minute).
+    #[must_use]
+    pub fn lateness_of(&self, tick: Timestamp) -> Duration {
+        self.lateness.unwrap_or_else(|| {
+            self.cron
+                .next_after(tick)
+                .map(|next| micros_between(tick, next))
+                .unwrap_or(MIN_LATENESS)
+                .max(MIN_LATENESS)
+        })
+    }
+
+    /// The due ticks strictly between `last` (handled) and `due` (the
+    /// latest due), which are skipped. Counts at most [`MAX_CATCH_UP_WALK`].
+    pub(crate) fn skipped_between(&self, last: Timestamp, due: Timestamp) -> u32 {
+        let mut skipped = 0;
+        let mut tick = last;
+        while skipped < MAX_CATCH_UP_WALK {
+            match self.cron.next_after(tick) {
+                Some(next) if next < due => {
+                    skipped += 1;
+                    tick = next;
+                }
+                _ => break,
+            }
+        }
+        skipped
     }
 
     /// The schedule's name.
@@ -123,6 +170,18 @@ pub(crate) async fn run(store: PgJobStore, schedules: Vec<Schedule>, shutdown: C
             if last.is_some_and(|last| last >= due) {
                 continue;
             }
+            if let Some(last) = *last {
+                let skipped = schedule.skipped_between(last, due);
+                if skipped > 0 {
+                    // Behind schedule (a stall, an unreachable database):
+                    // only the latest due tick is a candidate.
+                    warn!(
+                        schedule = schedule.name,
+                        skipped,
+                        "skipped missed ticks instead of replaying them; only the latest due tick runs"
+                    );
+                }
+            }
             if fire(&store, schedule, due).await {
                 *last = Some(due);
             }
@@ -158,7 +217,7 @@ async fn fire(store: &PgJobStore, schedule: &Schedule, due: Timestamp) -> bool {
         }
     };
     match store
-        .fire_tick(&schedule.name, due, schedule.lateness, job)
+        .fire_tick(&schedule.name, due, schedule.lateness_of(due), job)
         .await
     {
         Ok(TickOutcome::Fired(job_id)) => {
@@ -171,7 +230,7 @@ async fn fire(store: &PgJobStore, schedule: &Schedule, due: Timestamp) -> bool {
             true
         }
         Ok(TickOutcome::Skipped) => {
-            info!(
+            warn!(
                 schedule = schedule.name,
                 "skipped a tick older than the allowed lateness"
             );
@@ -195,5 +254,54 @@ async fn fire(store: &PgJobStore, schedule: &Schedule, due: Timestamp) -> bool {
             warn!(schedule = schedule.name, %error, "could not fire schedule; will retry");
             false
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use forge_core::Timestamp;
+    use serde::{Deserialize, Serialize};
+
+    use super::{MAX_CATCH_UP_WALK, Schedule};
+    use crate::{Cron, Job};
+
+    #[derive(Serialize, Deserialize)]
+    struct Tick;
+
+    impl Job for Tick {
+        const NAME: &'static str = "scheduler.tick";
+    }
+
+    fn at(text: &str) -> Timestamp {
+        Timestamp::parse(text).expect("timestamp")
+    }
+
+    #[test]
+    fn the_ticks_between_the_last_handled_and_the_latest_due_are_skipped() {
+        let every_minute = Schedule::new(
+            "every-minute",
+            Cron::parse("* * * * *").expect("cron"),
+            &Tick,
+        )
+        .expect("schedule");
+        let last = at("2026-10-26T10:00:00Z");
+        // The next tick: nothing in between.
+        assert_eq!(
+            every_minute.skipped_between(last, at("2026-10-26T10:01:00Z")),
+            0
+        );
+        // A ten-minute stall: nine ticks are skipped, the tenth runs.
+        assert_eq!(
+            every_minute.skipped_between(last, at("2026-10-26T10:10:00Z")),
+            9
+        );
+        // A stall longer than the walk counts no further.
+        assert_eq!(
+            every_minute.skipped_between(last, at("2026-12-26T10:00:00Z")),
+            MAX_CATCH_UP_WALK
+        );
+        let hourly = Schedule::new("hourly", Cron::parse("0 * * * *").expect("cron"), &Tick)
+            .expect("schedule");
+        assert_eq!(hourly.skipped_between(last, at("2026-10-26T13:00:00Z")), 2);
     }
 }

@@ -54,9 +54,36 @@ fn schedules_report_their_name_and_expression_and_floor_their_lateness() {
     let schedule = Schedule::new("registry-report", cron.clone(), &Report).expect("valid");
     assert_eq!(schedule.name(), "registry-report");
     assert_eq!(format!("{:?}", schedule.cron()), format!("{cron:?}"));
+    let tick = forge_core::Timestamp::parse("2026-10-26T10:05:00Z").expect("tick");
+    // By default a tick may be one interval late: the gap to the next tick.
+    assert_eq!(schedule.lateness_of(tick), Duration::from_secs(300));
     // A shorter lateness than a minute is raised to a minute, never to nothing.
     let strict = schedule.clone().max_lateness(Duration::from_secs(1));
     assert_eq!(strict.name(), "registry-report");
+    assert_eq!(strict.lateness_of(tick), Duration::from_secs(60));
+    let loose = schedule.clone().max_lateness(Duration::from_secs(3600));
+    assert_eq!(loose.lateness_of(tick), Duration::from_secs(3600));
+    // Uneven schedules: the gap from this tick to the following one.
+    let workdays = Schedule::new(
+        "registry-workdays",
+        Cron::parse("0 9 * * 1-5").expect("valid"),
+        &Report,
+    )
+    .expect("valid");
+    let friday = forge_core::Timestamp::parse("2026-10-30T09:00:00Z").expect("friday");
+    assert_eq!(workdays.lateness_of(friday), Duration::from_secs(72 * 3600));
+    let monday = forge_core::Timestamp::parse("2026-10-26T09:00:00Z").expect("monday");
+    assert_eq!(workdays.lateness_of(monday), Duration::from_secs(24 * 3600));
+    let daily = Schedule::new(
+        "registry-daily",
+        Cron::parse("30 3 * * *").expect("valid"),
+        &Report,
+    )
+    .expect("valid");
+    assert_eq!(
+        daily.lateness_of(forge_core::Timestamp::parse("2026-10-26T03:30:00Z").expect("tick")),
+        Duration::from_secs(24 * 3600)
+    );
     assert!(Schedule::new("Not Valid", cron, &Report).is_err());
 }
 
