@@ -386,7 +386,9 @@ fn sqlite_application_with_scaffolds_passes_its_gates() {
 /// `forge new --api` has no views, but a model needs none: it is generated,
 /// wired like the printed instructions say, and passes the application's own
 /// gates and its repository tests (the `forge::db::testing` dev-dependency
-/// is part of an `--api` application with a database).
+/// is part of an `--api` application with a database). It has `fn compose`
+/// too: `generate resource` and `controller --api` write JSON layers only,
+/// wire them at its end with `DenyAll`, and the running server answers `403`.
 #[test]
 #[ignore = "slow: builds generated applications; run with --ignored"]
 fn api_application_with_a_model_passes_its_gates() {
@@ -435,6 +437,35 @@ fn api_application_with_a_model_passes_its_gates() {
     );
     assert!(!refused.status.success());
     assert!(String::from_utf8_lossy(&refused.stderr).contains("--api"));
+    // So are the other page generators, whose refusal writes nothing.
+    for arguments in [
+        &["generate", "view", "about"][..],
+        &["generate", "authentication"],
+        &["generate", "controller", "pages", "index"],
+    ] {
+        let refused = run_unchecked(&root, forge, arguments, &[], None);
+        assert!(!refused.status.success(), "{arguments:?}");
+        assert!(
+            String::from_utf8_lossy(&refused.stderr).contains("--api"),
+            "{arguments:?}: {}",
+            String::from_utf8_lossy(&refused.stderr)
+        );
+    }
+    assert!(!root.join("templates").exists());
+    assert!(!root.join("assets").exists());
+    // A resource and an API controller are wired in `compose`, deny-all.
+    for arguments in [
+        &["generate", "resource", "ticket", "title:string", "--global"][..],
+        &["generate", "controller", "status_checks", "index", "--api"],
+    ] {
+        let printed = stdout(&run(&root, forge, arguments, &[]));
+        assert!(printed.contains("DenyAll"), "{printed}");
+        assert!(!printed.contains("&site"), "{printed}");
+        apply_wiring(&root, &printed);
+    }
+    for page in ["templates", "assets", "config/locales"] {
+        assert!(!root.join(page).exists(), "{page}");
+    }
 
     run(&root, "cargo", &["generate-lockfile", "--quiet"], &[]);
     run(&root, "cargo", &["fmt", "--all", "--", "--check"], &[]);
@@ -457,6 +488,39 @@ fn api_application_with_a_model_passes_its_gates() {
         tests.contains("sqlite_round_trip_locking_and_pages ... ok"),
         "{tests}"
     );
+    for test in [
+        "the_generated_deny_all_default_refuses_every_action ... ok",
+        "every_action_answers ... ok",
+    ] {
+        assert!(tests.contains(test), "{test}\n{tests}");
+    }
+
+    // The running application keeps every generated route closed.
+    run(&root, "cargo", &["build", "--locked", "--quiet"], &[]);
+    let binary = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join("scaffold-apps/debug/api-model")
+        .to_string_lossy()
+        .into_owned();
+    let (_server, port) = Server::start(
+        &root,
+        &binary,
+        &[(
+            "FORGE_DATABASE_URL",
+            "sqlite://storage/serve.sqlite3?mode=rwc",
+        )],
+    );
+    assert_eq!(
+        api_request(port, "GET", "/v1/status", None, None).status,
+        200
+    );
+    for (method, path, body) in [
+        ("GET", "/v1/tickets", None),
+        ("POST", "/v1/tickets", Some(r#"{"title":"Launch"}"#)),
+        ("GET", "/v1/status_checks", None),
+    ] {
+        let reply = api_request(port, method, path, None, body);
+        assert_eq!(reply.status, 403, "{method} {path}: {}", reply.body);
+    }
 }
 
 #[test]

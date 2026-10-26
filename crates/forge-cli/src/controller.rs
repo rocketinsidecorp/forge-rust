@@ -235,14 +235,21 @@ fn plan(root: &Path, options: &ControllerOptions, destroy: bool) -> Result<Plan,
         )));
     };
     let bootstrap = read(root, "src/bootstrap/mod.rs").unwrap_or_default();
-    if !root.join("src/adapters/http/views/mod.rs").is_file()
+    if options.api {
+        if !bootstrap.contains("\nfn compose(") {
+            return Err(fail(
+                "src/bootstrap/mod.rs has no `fn compose`, where the printed wiring mounts the \
+                 JSON routes. `forge new` generates it (with `--api` too): add it as `forge \
+                 new` writes it, or add the handlers to src/adapters/http/mod.rs by hand",
+            ));
+        }
+    } else if !root.join("src/adapters/http/views/mod.rs").is_file()
         || !bootstrap.contains("crate::adapters::http::site(")
     {
         return Err(fail(
-            "this application has no views and no `compose` hook (it was created with `forge \
-             new --api`). Controllers are wired in the `compose` function of a full-stack \
-             application; in an API application add the handlers to src/adapters/http/mod.rs \
-             by hand (docs/architecture.md)",
+            "this application has no views (it was created with `forge new --api`) or its \
+             `compose` does not load the site: an HTML controller renders pages. Pass --api \
+             for JSON endpoints under /v1/NAME",
         ));
     }
     let guarded = !options.public;

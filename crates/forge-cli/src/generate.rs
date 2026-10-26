@@ -2327,10 +2327,17 @@ mod tests {
             assert!(manifest.contains("# tests/openapi.rs"));
             assert!(root.join("tests/openapi.rs").exists());
             assert!(read(&root, "src/adapters/http/status.rs").contains("typed("));
+            let bootstrap = read(&root, "src/bootstrap/mod.rs");
+            assert!(bootstrap.contains(".compose(compose)"), "{database:?}");
             assert!(
-                read(&root, "src/bootstrap/mod.rs")
-                    .contains(".routes(crate::adapters::http::routes)")
+                bootstrap.contains(
+                    "fn compose(composition: &mut forge::Composition<'_>) -> \
+                     Result<(), forge::ComposeError> {\n    \
+                     crate::adapters::http::routes(composition.router())?;\n    Ok(())\n}"
+                ),
+                "{database:?}"
             );
+            assert!(!bootstrap.contains(".routes("), "{database:?}");
             assert!(read(&root, "src/adapters/http/mod.rs").contains("Response::json"));
             assert!(!read(&root, "README.md").contains("## Views"));
             assert_eq!(root.join("build.rs").exists(), database.is_enabled());

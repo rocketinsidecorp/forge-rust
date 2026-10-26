@@ -92,6 +92,9 @@ struct Application {
     api_access_exists: bool,
     /// The PostgreSQL bearer session store of `--api-auth` exists.
     bearer_sessions: bool,
+    /// Created with `forge new --api`: no views, no sign-in, nothing that
+    /// issues bearer tokens.
+    api_only: bool,
     /// The application's default locale (`DEFAULT_LOCALE` of
     /// [`LOCALES_MODULE`]).
     default_locale: String,
@@ -563,8 +566,7 @@ fn inspect_application(
         return unsupported(
             "this application has no views (it was created with `forge new --api`). The \
              scaffold generates server-rendered HTML pages next to its JSON API; \
-             `forge generate resource` writes the JSON API alone, in an application with \
-             `fn compose` (created without --api)",
+             `forge generate resource` writes the JSON API alone",
         );
     }
     let Some(sqlx) = dependency("sqlx") else {
@@ -597,9 +599,8 @@ fn inspect_application(
     if layers == Layers::Resource && generating && !compose.contains("\nfn compose(") {
         return unsupported(
             "src/bootstrap/mod.rs has no `fn compose`, where the printed wiring builds the \
-             repository and mounts the JSON routes. Applications created with `forge new --api` \
-             have none yet: create the application without `--api` (`forge new` generates \
-             `compose`), or wire the use cases and `routes` by hand",
+             repository and mounts the JSON routes. `forge new` generates it (with `--api` \
+             too): add it as `forge new` writes it, or wire the use cases and `routes` by hand",
         );
     }
     if scaffold && generating && !compose.contains("crate::adapters::http::site(") {
@@ -731,6 +732,7 @@ fn inspect_application(
         streams_exists,
         api_access_exists,
         bearer_sessions: root.join(BEARER_SESSIONS_MODULE).is_file(),
+        api_only: !root.join("src/adapters/http/views/mod.rs").is_file(),
         default_locale: application_default_locale(root),
     })
 }
@@ -1118,6 +1120,15 @@ fn api_statements(resource: &Resource, application: &Application, policy_defined
              // bearer sessions or memberships yet (ADR 0021), so DenyAll refuses every\n    \
              // request until you implement ApiTenantAccess (src/adapters/http/api_access.rs).\n{}",
             backend.label(),
+            routes(deny)
+        );
+    }
+    if application.api_only {
+        return format!(
+            "    // {plural} JSON API (/v1/{plural}): tenant-scoped. This application has no\n    \
+             // sign-in (`forge new --api`), so DenyAll refuses every request until you\n    \
+             // implement ApiTenantAccess (src/adapters/http/api_access.rs) with the\n    \
+             // authentication of your API clients.\n{}",
             routes(deny)
         );
     }
