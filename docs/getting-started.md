@@ -772,9 +772,10 @@ A session ends 24 hours after sign-in, or earlier after two hours without a
 request (Forge-Go's default and variable). The next request is refused
 exactly as with a revoked session: pages send the browser to
 `/session/new`, JSON clients get `401`; signing in again creates a new
-session. Change the idle limit, from `5m` to `720h` (there is no way to turn
-it off; `720h` is the longest session lifetime), in your env file or the
-deployment's environment:
+session. Change the idle limit, from `5m` to `720h` (Forge-Go's range; there
+is no way to turn it off), in your env file or the deployment's environment.
+At or above the 24-hour session lifetime the idle limit no longer shortens a
+session, but it is still checked:
 
 ```sh
 echo "FORGE_AUTH_SESSION_IDLE_TIMEOUT=30m" >> .env.development

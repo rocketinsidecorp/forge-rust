@@ -48,9 +48,10 @@ pub const MFA_KEY_BYTES: usize = 32;
 pub const SESSION_IDLE_TIMEOUT_KEY: &str = "FORGE_AUTH_SESSION_IDLE_TIMEOUT";
 
 /// Bounds and default of [`AuthConfig::session_idle_timeout`]: at least five
-/// minutes, at most the longest session lifetime (30 days), where it no
-/// longer shortens anything. `forge::auth::SessionIdleTimeout` holds the
-/// same bounds.
+/// minutes, at most 720 hours (30 days), Forge-Go's range. At or above the
+/// generated applications' 24-hour session lifetime the idle limit no longer
+/// shortens a session, but it is still checked; nothing caps the value to
+/// the lifetime. `forge::auth::SessionIdleTimeout` holds the same bounds.
 pub const DEFAULT_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(2 * 3600);
 const MIN_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const MAX_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(720 * 3600);

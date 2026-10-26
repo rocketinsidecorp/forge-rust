@@ -5,8 +5,10 @@
 //! were revoked, and signing in again creates a new one. The store records
 //! each use at most once per [`SESSION_TOUCH_INTERVAL`], so most requests
 //! only read. `FORGE_AUTH_SESSION_IDLE_TIMEOUT` configures it; there is no
-//! value that turns it off (the longest, 720 hours, is the longest session
-//! lifetime, where it no longer shortens anything).
+//! value that turns it off. The range, five minutes to 720 hours, matches
+//! Forge-Go; at or above the generated applications' 24-hour session
+//! lifetime the idle limit no longer shortens a session, but it is still
+//! checked.
 
 use std::time::Duration;
 
@@ -27,8 +29,9 @@ impl SessionIdleTimeout {
     pub const DEFAULT: Self = Self(Duration::from_secs(2 * 3600));
     /// The shortest accepted timeout: five minutes.
     pub const MIN: Duration = Duration::from_secs(5 * 60);
-    /// The longest accepted timeout: 30 days (720 hours), the longest
-    /// session lifetime.
+    /// The longest accepted timeout: 30 days (720 hours), Forge-Go's bound.
+    /// A timeout at or above a session's lifetime no longer shortens it, but
+    /// is still checked.
     pub const MAX: Duration = Duration::from_secs(30 * 24 * 3600);
 
     /// Accepts a timeout between [`Self::MIN`] and [`Self::MAX`] inclusive.

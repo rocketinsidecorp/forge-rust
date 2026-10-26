@@ -1783,10 +1783,11 @@ async fn a_session_use_is_written_at_most_once_a_minute() -> TestResult {
         created
     );
 
-    last_seen(&database, &session, std::time::Duration::from_secs(59)).await?;
+    // Well inside the minute, so a slow run cannot cross it.
+    last_seen(&database, &session, std::time::Duration::from_secs(45)).await?;
     let before = writes().await?;
     resolve_concurrently(digest).await?;
-    assert_eq!(writes().await? - before, 0, "a use 59s old was rewritten");
+    assert_eq!(writes().await? - before, 0, "a use 45s old was rewritten");
 
     let stale = last_seen(&database, &session, std::time::Duration::from_secs(61)).await?;
     let before = writes().await?;
