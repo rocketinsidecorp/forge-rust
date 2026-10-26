@@ -50,6 +50,7 @@ const REQUIRED: &[(&str, &[&str])] = &[
             "pub struct PostgresPasswordCredentialStore",
             "async fn find_by_principal",
             "pub struct PostgresSessionStore",
+            "pub fn with_idle_timeout",
         ],
     ),
     (
@@ -63,6 +64,10 @@ const REQUIRED: &[(&str, &[&str])] = &[
     (
         "migrations/00000000000000000002_forge_identity.up.sql",
         &["CREATE TABLE forge_principals"],
+    ),
+    (
+        "migrations/00000000000000000006_forge_session_idle_timeout.up.sql",
+        &["ADD COLUMN last_seen_at"],
     ),
 ];
 
@@ -178,9 +183,17 @@ fn inspect(root: &Path) -> Result<(), CliError> {
         let source = read(root, file).unwrap_or_default();
         for item in *items {
             if !source.contains(item) {
+                let upgrade =
+                    if *item == "pub fn with_idle_timeout" || *item == "ADD COLUMN last_seen_at" {
+                        " (an application generated before the session idle timeout adds the \
+                     migration and the session store as \"Session idle timeout\" in \
+                     docs/getting-started.md describes)"
+                    } else {
+                        ""
+                    };
                 return refuse(format!(
                     "{file} has no `{item}`; the pages use the PostgreSQL identity \
-                     infrastructure `forge new` generates"
+                     infrastructure `forge new` generates{upgrade}"
                 ));
             }
         }
@@ -382,6 +395,34 @@ mod tests {
                 .to_string()
                 .contains("20260101000000_forge_authentication")
         );
+        assert!(!root.join("src/adapters/http/authentication.rs").exists());
+    }
+
+    /// An application whose session store predates the idle timeout is
+    /// refused before anything is written, with the way to upgrade: the
+    /// printed wiring passes the timeout to the store.
+    #[test]
+    fn a_session_store_without_the_idle_timeout_is_refused_with_the_upgrade() {
+        let (_parent, root) = application(Database::Postgresql, true);
+        strip(&root);
+        let store = root.join("src/infrastructure/auth/mod.rs");
+        let current = fs::read_to_string(&store).expect("generated");
+        fs::write(
+            &store,
+            current.replace("pub fn with_idle_timeout", "pub fn without_it"),
+        )
+        .expect("write");
+        let message = generate(&root, true).expect_err("refused").to_string();
+        assert!(message.contains("`pub fn with_idle_timeout`"), "{message}");
+        assert!(message.contains("\"Session idle timeout\""), "{message}");
+
+        fs::write(&store, current).expect("write");
+        fs::remove_file(
+            root.join("migrations/00000000000000000006_forge_session_idle_timeout.up.sql"),
+        )
+        .expect("remove");
+        let message = generate(&root, true).expect_err("refused").to_string();
+        assert!(message.contains("ADD COLUMN last_seen_at"), "{message}");
         assert!(!root.join("src/adapters/http/authentication.rs").exists());
     }
 

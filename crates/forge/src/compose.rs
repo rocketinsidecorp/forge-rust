@@ -250,6 +250,39 @@ impl<'a> Composition<'a> {
         self.config
     }
 
+    /// Logs one warning when a production process (`FORGE_ENV=production`)
+    /// counts the attempts of `service` (`"sign-in"`, `"two-factor"` or
+    /// `"password-reset"`) in a throttle that keeps its counters in this
+    /// process ([`LoginThrottle::is_process_local`](forge_auth::LoginThrottle::is_process_local),
+    /// `forge::auth::MemoryLoginThrottle`): with several replicas a guesser
+    /// gets each replica's budget, and every restart or deploy resets it.
+    ///
+    /// It is a warning, not a refusal: a single-process application may
+    /// count in memory on purpose. Generated applications call it for their
+    /// three throttles when they register the sign-in pages, so custom
+    /// wiring that swaps in the in-memory throttle is reported; they wire
+    /// `forge::auth::PgLoginThrottle`, which never warns.
+    pub fn warn_if_process_local_throttle(
+        &self,
+        service: &str,
+        throttle: &dyn forge_auth::LoginThrottle,
+    ) {
+        if self.config.environment != forge_config::Environment::Production
+            || !throttle.is_process_local()
+        {
+            return;
+        }
+        tracing::warn!(
+            service,
+            environment = "production",
+            "auth: {service} attempts are throttled in this process only \
+             (forge::auth::MemoryLoginThrottle): with several replicas a guesser gets each \
+             replica's budget, and every restart or deploy resets it; share the counters with \
+             forge::auth::PgLoginThrottle (forge new wires it) unless the application runs as \
+             a single process"
+        );
+    }
+
     /// Returns the application's PostgreSQL pool.
     ///
     /// The pool connects lazily, so this succeeds even while the database is

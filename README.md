@@ -81,6 +81,34 @@ application gets the same files with `forge generate authentication`
 ([ADR 0026](docs/adr/0026-authentication-pages-and-setup.md),
 [docs/cli.md](docs/cli.md#forge-generate-authentication)).
 
+Sessions end after two hours without a request (and at the latest 24 hours
+after sign-in). Set another idle limit, from `5m` to `720h`, with
+`FORGE_AUTH_SESSION_IDLE_TIMEOUT`. An application generated before adds
+migration `00000000000000000006_forge_session_idle_timeout` and the new
+session store and runs `forge migrate` before deploying the code; sessions
+open during the upgrade count as used then
+([upgrading](docs/getting-started.md#session-idle-timeout)):
+
+```sh
+export FORGE_AUTH_SESSION_IDLE_TIMEOUT=30m   # shorter, for example
+(cd /tmp && forge new shop-new -d postgresql --skip-docker --skip-ci --skip-lockfile)
+cp /tmp/shop-new/migrations/00000000000000000006_forge_session_idle_timeout.*.sql migrations/
+diff -u src/infrastructure/auth/mod.rs /tmp/shop-new/src/infrastructure/auth/mod.rs   # PostgresSessionStore
+grep -n 'PostgresSessionStore::new' src/bootstrap/mod.rs   # each one, scaffold wiring included, gets .with_idle_timeout(..)
+forge migrate
+```
+
+Pages embed the CSRF token masked with a fresh one-time pad on every render
+(`csrf_meta`, `csrf_field`; 86 characters of base64url), so compressed
+responses cannot leak it (BREACH); the cookie keeps the token itself. A test
+of an older application that expects the page to carry the cookie's value
+compares through `forge::views::unmask_csrf_token` instead
+([upgrading](docs/views.md#csrf-protection)):
+
+```sh
+grep -rn 'csrf-token\\" content=\\"{' tests/   # tests that compare the meta tag with the cookie
+```
+
 Release note: the MFA store and service contracts changed (step-up proofs
 are required and bound to the account, backup codes are used up with the
 change), reset links now allow 3 submissions per link and address per hour,
@@ -127,10 +155,14 @@ and generated applications should port four files; see
        policy.allow(owner.clone(), permission);
    }
    let pool = composition.postgres()?.pool().clone();
+   // Sessions end after FORGE_AUTH_SESSION_IDLE_TIMEOUT without a request.
+   let sessions = crate::infrastructure::auth::PostgresSessionStore::new(pool.clone())
+       .with_idle_timeout(
+           forge::auth::SessionIdleTimeout::new(composition.config().auth.session_idle_timeout)
+               .map_err(forge::ComposeError::other)?,
+       );
    let access = crate::adapters::http::access::SessionTenantAccess::new(
-       std::sync::Arc::new(crate::infrastructure::auth::PostgresSessionStore::new(
-           pool.clone(),
-       )),
+       std::sync::Arc::new(sessions),
        std::sync::Arc::new(crate::infrastructure::tenancy::PgMembershipStore::new(pool)),
        policy,
    );

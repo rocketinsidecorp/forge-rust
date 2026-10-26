@@ -28,10 +28,14 @@ Forge did not edit any existing file. Wire the resource by hand:
         policy.allow(owner.clone(), permission);
     }
     let pool = composition.postgres()?.pool().clone();
+    // Sessions end after FORGE_AUTH_SESSION_IDLE_TIMEOUT without a request.
+    let sessions = crate::infrastructure::auth::PostgresSessionStore::new(pool.clone())
+        .with_idle_timeout(
+            forge::auth::SessionIdleTimeout::new(composition.config().auth.session_idle_timeout)
+                .map_err(forge::ComposeError::other)?,
+        );
     let access = crate::adapters::http::access::SessionTenantAccess::new(
-        std::sync::Arc::new(crate::infrastructure::auth::PostgresSessionStore::new(
-            pool.clone(),
-        )),
+        std::sync::Arc::new(sessions),
         std::sync::Arc::new(crate::infrastructure::tenancy::PgMembershipStore::new(pool)),
         policy,
     );

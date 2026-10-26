@@ -137,6 +137,15 @@ pub trait LoginThrottle: Send + Sync {
     /// are cleared, the source's is not, so one good password does not reset
     /// the pressure of a source that sprays many accounts.
     async fn success(&self, key: &ThrottleKey) -> Result<(), ThrottleError>;
+
+    /// Whether the counters live in this process only, so that every
+    /// replica gets its own budget and a restart or deploy resets it
+    /// ([`MemoryLoginThrottle`]). Shared stores, such as `PgLoginThrottle`,
+    /// keep the default `false`. Production wiring logs a warning for a
+    /// process-local throttle (`forge::Composition::warn_if_process_local_throttle`).
+    fn is_process_local(&self) -> bool {
+        false
+    }
 }
 
 /// Limits of [`MemoryLoginThrottle`].
@@ -478,6 +487,10 @@ impl LoginThrottle for MemoryLoginThrottle {
         }
         Ok(())
     }
+
+    fn is_process_local(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]
@@ -514,6 +527,14 @@ mod tests {
 
     async fn allowed(throttle: &MemoryLoginThrottle, key: &ThrottleKey) -> bool {
         throttle.attempt(key).await == Ok(ThrottleDecision::Allowed)
+    }
+
+    #[test]
+    fn the_memory_throttle_counts_in_this_process_only() {
+        let (throttle, _) = throttle(config());
+        assert!(throttle.is_process_local());
+        let shared: Arc<dyn LoginThrottle> = Arc::new(throttle);
+        assert!(shared.is_process_local(), "through the trait object too");
     }
 
     #[tokio::test]

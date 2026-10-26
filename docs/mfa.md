@@ -248,6 +248,22 @@ Each `forge::auth::MemoryLoginThrottle::new(CONFIG)` becomes
 grant `SELECT, INSERT, UPDATE, DELETE ON forge_login_throttle` to another
 runtime role yourself. Without the table every attempt is refused (`503`).
 
+With `FORGE_ENV=production`, `authentication::routes` logs one warning per
+throttle that still counts in the process (`MemoryLoginThrottle` for
+sign-in, password reset or two-factor), through
+`Composition::warn_if_process_local_throttle`, with Forge-Go's wording. It
+is a warning, not a refusal: a single-process application may count in
+memory on purpose. An application generated before gets it by adding the
+loop at the top of `routes` in `src/adapters/http/authentication.rs`:
+
+```text
+WARN auth: sign-in attempts are throttled in this process only (forge::auth::MemoryLoginThrottle): ... service="sign-in" environment="production"
+```
+
+```bash
+diff -u src/adapters/http/authentication.rs /tmp/shop-new/src/adapters/http/authentication.rs   # warn_if_process_local_throttle
+```
+
 ## Not included
 
 - A QR code image: Forge-Go renders none either; the page shows the

@@ -3,6 +3,8 @@
 use forge_auth::CsrfToken;
 use forge_http::{FormError, Method};
 
+use crate::csrf::mask_csrf_token;
+
 /// Header that carries the CSRF token on `fetch`/Turbo requests
 /// (`x-csrf-token`), read by [`CsrfProtection`](crate::CsrfProtection) and
 /// by the session-bound check in generated applications.
@@ -28,18 +30,32 @@ pub const BASE_FIELD: &str = "base";
 /// `<meta name="csrf-token" content="...">` for the layout `<head>`, so
 /// Turbo and scripts can send the token in [`CSRF_HEADER_NAME`].
 ///
+/// The content is the token masked with a fresh one-time pad
+/// ([`mask_csrf_token`]), so no two renders embed the same bytes (BREACH).
 /// The result is markup: insert it with `|safe` in a template. The value is
-/// HTML-escaped here even though a [`CsrfToken`] is hex by construction.
+/// HTML-escaped here even though a masked token is base64url by
+/// construction. Should the CSPRNG fail, the content is empty and the page's
+/// requests are refused (fail closed); the failure is logged.
 #[must_use]
 pub fn csrf_meta(token: &CsrfToken) -> String {
-    meta_markup(token.expose())
+    meta_markup(&masked(token))
 }
 
 /// `<input type="hidden" name="csrf_token" value="...">` for every non-GET
-/// form. Insert it with `|safe` in a template.
+/// form, with the token masked afresh on every call as in [`csrf_meta`].
+/// Insert it with `|safe` in a template.
 #[must_use]
 pub fn csrf_field(token: &CsrfToken) -> String {
-    field_markup(token.expose())
+    field_markup(&masked(token))
+}
+
+/// `token` masked, or empty (a form that is then refused) when the CSPRNG
+/// failed.
+fn masked(token: &CsrfToken) -> String {
+    mask_csrf_token(token).unwrap_or_else(|failure| {
+        tracing::error!(error = %failure, "CSRF token masking failed");
+        String::new()
+    })
 }
 
 fn meta_markup(value: &str) -> String {
@@ -215,16 +231,36 @@ mod tests {
         CsrfToken::new(TOKEN).expect("valid token")
     }
 
+    /// The value between `prefix` and the next `"`.
+    fn embedded<'a>(markup: &'a str, prefix: &str) -> &'a str {
+        let rest = markup.strip_prefix(prefix).expect("the expected element");
+        rest.split('"').next().unwrap_or_default()
+    }
+
+    /// Both render the token masked, with a fresh pad each time: never the
+    /// token itself, never the same bytes twice, always the token unmasked.
     #[test]
-    fn meta_and_field_render_the_token() {
-        assert_eq!(
-            csrf_meta(&token()),
-            format!("<meta name=\"csrf-token\" content=\"{TOKEN}\">")
-        );
-        assert_eq!(
-            csrf_field(&token()),
-            format!("<input type=\"hidden\" name=\"csrf_token\" value=\"{TOKEN}\">")
-        );
+    fn meta_and_field_render_the_token_masked_afresh() {
+        let meta_prefix = "<meta name=\"csrf-token\" content=\"";
+        let field_prefix = "<input type=\"hidden\" name=\"csrf_token\" value=\"";
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..8 {
+            let meta = csrf_meta(&token());
+            let field = csrf_field(&token());
+            assert!(
+                meta.ends_with("\">") && field.ends_with("\">"),
+                "{meta} {field}"
+            );
+            for value in [embedded(&meta, meta_prefix), embedded(&field, field_prefix)] {
+                assert_eq!(value.len(), crate::MASKED_CSRF_TOKEN_LEN, "{value}");
+                assert!(!value.contains(TOKEN));
+                assert_eq!(
+                    crate::unmask_csrf_token(value).map(|token| token.expose().to_owned()),
+                    Ok(TOKEN.to_owned())
+                );
+                assert!(seen.insert(value.to_owned()), "a mask was reused: {value}");
+            }
+        }
     }
 
     #[test]

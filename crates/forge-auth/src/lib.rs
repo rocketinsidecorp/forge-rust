@@ -20,6 +20,10 @@
 //! bits from the OS CSPRNG through `getrandom`, persisted only as SHA-256
 //! digests through `sha2`) delivered by a [`PasswordResetNotifier`].
 //!
+//! A session also ends after [`SessionIdleTimeout`] without use (two hours by
+//! default, `FORGE_AUTH_SESSION_IDLE_TIMEOUT`); session stores record each
+//! use at most once per [`SESSION_TOUCH_INTERVAL`].
+//!
 //! The TOTP multi-factor primitives are in [`mfa`]: RFC 6238 codes over
 //! HMAC-SHA-1 (`hmac`, `sha1`), AES-256-GCM seed encryption (`ring`),
 //! one-time backup codes and the sign-in challenge token.
@@ -31,6 +35,7 @@ mod password_reset;
 mod password_work;
 #[cfg(feature = "postgres")]
 mod postgres;
+mod session_idle;
 mod throttle;
 
 use std::num::NonZeroU64;
@@ -61,6 +66,7 @@ pub use password_work::{
 };
 #[cfg(feature = "postgres")]
 pub use postgres::{INLINE_PRUNE_BATCH, PgLoginThrottle};
+pub use session_idle::{SESSION_TOUCH_INTERVAL, SessionIdleTimeout, SessionIdleTimeoutError};
 pub use throttle::{
     LoginThrottle, MemoryLoginThrottle, ThrottleConfig, ThrottleConfigError, ThrottleDecision,
     ThrottleError, ThrottleKey,
@@ -605,6 +611,12 @@ pub trait SessionStore: Send + Sync {
     ) -> Result<(), SessionStoreError>;
 
     /// Resolves a persisted session by credential digest.
+    ///
+    /// A store that enforces a [`SessionIdleTimeout`] returns `None` for a
+    /// session unused for longer than the timeout, exactly as for an unknown
+    /// credential, and records the use of a live one at most once per
+    /// [`SESSION_TOUCH_INTERVAL`]; a failure to record it is an error (fail
+    /// closed), not a pass.
     async fn find_by_credential(
         &self,
         credential: &SessionCredentialDigest,

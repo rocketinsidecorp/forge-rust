@@ -1,13 +1,18 @@
 //! PostgreSQL server-side session persistence.
 //!
 //! Only credential digests are persisted. Raw bearer credentials are never
-//! accepted by this adapter.
+//! accepted by this adapter. A session also ends after the idle timeout
+//! without use (`FORGE_AUTH_SESSION_IDLE_TIMEOUT`, two hours by default):
+//! `last_seen_at`, from migration `00000000000000000006_forge_session_idle_timeout`.
+
+use std::time::Duration;
 
 use async_trait::async_trait;
 use forge::auth::{
     CsrfTokenDigest, PasswordCredential, PasswordCredentialStore, PasswordCredentialStoreError,
-    PasswordCredentialVersion, PasswordHash, Session, SessionCredentialDigest, SessionId,
-    SessionStore, SessionStoreError, UnixTimestamp,
+    PasswordCredentialVersion, PasswordHash, SESSION_TOUCH_INTERVAL, Session,
+    SessionCredentialDigest, SessionId, SessionIdleTimeout, SessionStore, SessionStoreError,
+    UnixTimestamp,
 };
 use forge::security::PrincipalId;
 use sqlx::{PgPool, types::Uuid};
@@ -131,17 +136,52 @@ impl PasswordCredentialStore for PostgresPasswordCredentialStore {
 }
 
 /// SQLx-backed server-side session store.
+///
+/// Besides its absolute expiry, a session ends when nobody used it for the
+/// idle timeout: [`SessionStore::find_by_credential`] no longer finds it, so
+/// the request is refused exactly as with a revoked session (`401`, or the
+/// sign-in page for a browser), and signing in again creates a new session.
+/// Resolving records the use in `last_seen_at` at most once per
+/// [`SESSION_TOUCH_INTERVAL`] (a minute) per session, so most requests only
+/// read; that conditional write makes concurrent requests record one use.
+/// The database clock decides both the idle limit and the throttle, so
+/// replicas with skewed clocks agree. A failed write fails the request
+/// (`SessionStoreError::Unavailable`), never lets it through unrecorded.
 #[derive(Clone)]
 pub struct PostgresSessionStore {
     pool: PgPool,
+    idle_timeout: SessionIdleTimeout,
 }
 
 impl PostgresSessionStore {
-    /// Creates a store using the least-privilege runtime pool.
+    /// Creates a store using the least-privilege runtime pool, with the
+    /// default idle timeout (two hours).
     #[must_use]
     pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            idle_timeout: SessionIdleTimeout::default(),
+        }
     }
+
+    /// Ends sessions unused for `idle_timeout` (`FORGE_AUTH_SESSION_IDLE_TIMEOUT`,
+    /// five minutes to 30 days; there is no way to turn it off).
+    #[must_use]
+    pub fn with_idle_timeout(mut self, idle_timeout: SessionIdleTimeout) -> Self {
+        self.idle_timeout = idle_timeout;
+        self
+    }
+
+    /// How long a session may go unused.
+    #[must_use]
+    pub fn idle_timeout(&self) -> SessionIdleTimeout {
+        self.idle_timeout
+    }
+}
+
+/// `duration` in whole microseconds, for `$n::bigint * interval '1 microsecond'`.
+fn micros(duration: Duration) -> i64 {
+    i64::try_from(duration.as_micros()).unwrap_or(i64::MAX)
 }
 
 #[async_trait]
@@ -185,27 +225,62 @@ impl SessionStore for PostgresSessionStore {
         Ok(())
     }
 
+    /// A session unused for the idle timeout is not found, like an unknown
+    /// credential, and the attempt does not revive it. A live session whose
+    /// recorded use is more than a minute old records this one; a revoked or
+    /// expired session keeps its last use.
     async fn find_by_credential(
         &self,
         credential: &SessionCredentialDigest,
     ) -> Result<Option<Session>, SessionStoreError> {
-        let row = sqlx::query_as::<_, (Uuid, Uuid, i64, i64, Option<i64>)>(
+        let idle = self.idle_timeout.as_micros();
+        let touch = micros(SESSION_TOUCH_INTERVAL);
+        let row = sqlx::query_as::<_, (Uuid, Uuid, i64, i64, Option<i64>, bool)>(
             "SELECT
                 id,
                 principal_id,
                 EXTRACT(EPOCH FROM issued_at)::bigint,
                 EXTRACT(EPOCH FROM expires_at)::bigint,
-                EXTRACT(EPOCH FROM revoked_at)::bigint
+                EXTRACT(EPOCH FROM revoked_at)::bigint,
+                revoked_at IS NULL
+                    AND expires_at > now()
+                    AND last_seen_at <= now() - $3::bigint * interval '1 microsecond'
              FROM forge_sessions
              WHERE credential_digest = $1
+               AND last_seen_at > now() - $2::bigint * interval '1 microsecond'
              LIMIT 1",
         )
         .bind(credential.as_bytes().as_slice())
+        .bind(idle)
+        .bind(touch)
         .fetch_optional(&self.pool)
         .await
         .map_err(map_sqlx_error)?;
 
-        row.map(restore_session).transpose()
+        let Some((id, principal_id, issued_at, expires_at, revoked_at, stale)) = row else {
+            return Ok(None);
+        };
+        if stale {
+            // Conditional on the stored use still being stale, so of many
+            // concurrent requests one writes; and only while the session is
+            // live: one revoked, expired or gone idle meanwhile is left alone.
+            sqlx::query(
+                "UPDATE forge_sessions
+                 SET last_seen_at = now()
+                 WHERE id = $1
+                   AND revoked_at IS NULL
+                   AND expires_at > now()
+                   AND last_seen_at > now() - $2::bigint * interval '1 microsecond'
+                   AND last_seen_at <= now() - $3::bigint * interval '1 microsecond'",
+            )
+            .bind(id)
+            .bind(idle)
+            .bind(touch)
+            .execute(&self.pool)
+            .await
+            .map_err(map_sqlx_error)?;
+        }
+        restore_session((id, principal_id, issued_at, expires_at, revoked_at)).map(Some)
     }
 
     async fn verify_csrf(

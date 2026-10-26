@@ -396,6 +396,9 @@ fn wiring_is_printed_and_never_written() {
     assert!(!second.wiring.contains("pub mod access;"));
     assert!(second.wiring.contains("SessionTenantAccess::new("));
     assert!(second.wiring.contains("PgMembershipStore::new(pool)"));
+    // The session store the scaffold's routes authenticate with ends sessions
+    // after the configured idle timeout, like the sign-in pages' store.
+    assert_every_session_store_has_the_idle_timeout(&second.wiring);
     // RBAC matches exactly: the owner `setup` creates gets both permissions,
     // and nothing else is granted.
     assert!(
@@ -619,4 +622,22 @@ fn a_failed_write_removes_what_it_wrote() {
     assert!(!root.join("fresh/one.rs").exists());
     assert!(!root.join("fresh").exists());
     assert!(root.join("blocker").is_file());
+}
+
+/// Every `PostgresSessionStore` the wiring builds gets
+/// `FORGE_AUTH_SESSION_IDLE_TIMEOUT`: a store left at its default would
+/// ignore the configured idle timeout on the scaffold's routes.
+fn assert_every_session_store_has_the_idle_timeout(wiring: &str) {
+    let stores: Vec<&str> = wiring.split("PostgresSessionStore::new(").skip(1).collect();
+    assert!(!stores.is_empty(), "{wiring}");
+    for after in stores {
+        let statement = after.split(';').next().unwrap_or_default();
+        assert!(
+            statement.contains(".with_idle_timeout(")
+                && statement.contains(
+                    "forge::auth::SessionIdleTimeout::new(composition.config().auth.session_idle_timeout)"
+                ),
+            "a session store without the configured idle timeout:\n{wiring}"
+        );
+    }
 }

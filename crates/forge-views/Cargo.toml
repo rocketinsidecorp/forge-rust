@@ -16,6 +16,7 @@ repository.workspace = true
 default = ["runtime", "build"]
 runtime = [
     "dep:askama",
+    "dep:base64",
     "dep:bytes",
     "dep:cookie",
     "dep:forge-auth",
@@ -32,6 +33,8 @@ build = ["dep:sha2"]
 
 [dependencies]
 askama = { workspace = true, optional = true }
+# Masked CSRF tokens: unpadded base64url, strict decoding.
+base64 = { workspace = true, optional = true }
 bytes = { workspace = true, optional = true }
 cookie = { workspace = true, optional = true }
 forge-auth = { path = "../forge-auth", optional = true }

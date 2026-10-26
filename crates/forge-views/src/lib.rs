@@ -20,7 +20,8 @@
 //!   header) and applies the CSRF-verified `_method` override before
 //!   routing; [`csrf_token`] gives handlers the token to render.
 //! - [`csrf_meta`], [`csrf_field`], [`method_override`], [`FieldErrors`]:
-//!   form helpers.
+//!   form helpers; the CSRF helpers embed the token masked afresh on every
+//!   render ([`mask_csrf_token`], [`unmask_csrf_token`]) against BREACH.
 //! - [`Flash`] and [`FlashLayer`]: one-shot `notice`/`alert` messages.
 //! - [`SignInRedirect`], [`return_path`], [`prefers_html`]: send signed-out
 //!   browsers to the sign-in page with a validated return path (ADR 0026).
@@ -82,8 +83,8 @@ pub use assets::{AssetEntry, AssetError, AssetSet, DEFAULT_PREFIX};
 pub use csp::{ContentSecurityPolicy, CspError};
 #[cfg(feature = "runtime")]
 pub use csrf::{
-    CSRF_COOKIE_NAME, CsrfError, CsrfProtection, csrf_cookie, csrf_token, csrf_verified,
-    presented_csrf_token,
+    CSRF_COOKIE_NAME, CsrfError, CsrfProtection, MASKED_CSRF_TOKEN_LEN, csrf_cookie, csrf_token,
+    csrf_verified, mask_csrf_token, presented_csrf_token, unmask_csrf_token,
 };
 #[cfg(feature = "runtime")]
 pub use flash::{FLASH_COOKIE_NAME, Flash, FlashError, FlashLayer, MAX_FLASH_MESSAGE_BYTES, flash};

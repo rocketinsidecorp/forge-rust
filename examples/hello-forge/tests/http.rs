@@ -82,6 +82,13 @@ fn csrf_cookie(response: &Response) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// The `content` of the page's `csrf-token` meta tag.
+fn csrf_meta(page: &str) -> Option<&str> {
+    let marker = "<meta name=\"csrf-token\" content=\"";
+    let start = page.find(marker)? + marker.len();
+    page[start..].split('"').next()
+}
+
 #[tokio::test]
 async fn home_page_is_html_with_layout_csp_and_csrf_token() -> TestResult {
     let response = router()?
@@ -100,9 +107,15 @@ async fn home_page_is_html_with_layout_csp_and_csrf_token() -> TestResult {
     assert!(page.contains(env!("CARGO_PKG_NAME")), "{page}");
     assert!(page.contains("<script type=\"importmap\">"), "{page}");
     let token = csrf_cookie(&response).ok_or("the page sets the CSRF cookie")?;
-    assert!(
-        page.contains(&format!("<meta name=\"csrf-token\" content=\"{token}\">")),
-        "{page}"
+    // The page embeds the cookie's token masked with a fresh one-time pad
+    // (`forge::views::csrf_meta`), never the token itself (BREACH).
+    let meta = csrf_meta(&page).ok_or("the layout renders the csrf-token meta tag")?;
+    assert_eq!(meta.len(), forge::views::MASKED_CSRF_TOKEN_LEN, "{meta}");
+    assert!(!page.contains(&token), "{page}");
+    assert_eq!(
+        forge::views::unmask_csrf_token(meta)?.expose(),
+        token,
+        "the meta tag carries the cookie's token"
     );
     Ok(())
 }
@@ -201,16 +214,35 @@ async fn form_posts_need_the_csrf_token_of_the_page() -> TestResult {
         );
     }
 
-    let accepted = router
+    // The masked token the page embeds is what a browser submits; each
+    // render masks it afresh, and every mask carries the cookie's token.
+    let masked = csrf_meta(&body(&page)?)
+        .ok_or("the layout renders the csrf-token meta tag")?
+        .to_owned();
+    let again = router
         .dispatch(request(
-            Method::POST,
-            "/test-form",
-            &[("cookie", cookie.as_str()), ("content-type", FORM)],
-            &format!("name=x&csrf_token={token}"),
+            Method::GET,
+            "/",
+            &[("cookie", cookie.as_str())],
+            "",
         )?)
         .await;
-    assert_eq!(accepted.status(), StatusCode::CREATED);
-    assert_eq!(body(&accepted)?, "x");
+    let remasked = csrf_meta(&body(&again)?)
+        .ok_or("the layout renders the csrf-token meta tag")?
+        .to_owned();
+    assert_ne!(masked, remasked, "every render masks the token afresh");
+    for submitted in [&masked, &remasked] {
+        let accepted = router
+            .dispatch(request(
+                Method::POST,
+                "/test-form",
+                &[("cookie", cookie.as_str()), ("content-type", FORM)],
+                &format!("name=x&csrf_token={submitted}"),
+            )?)
+            .await;
+        assert_eq!(accepted.status(), StatusCode::CREATED);
+        assert_eq!(body(&accepted)?, "x");
+    }
     Ok(())
 }
 

@@ -42,6 +42,20 @@ pub const MFA_KEY_KEY: &str = "FORGE_AUTH_MFA_KEY";
 /// Bytes of the `FORGE_AUTH_MFA_KEY` key.
 pub const MFA_KEY_BYTES: usize = 32;
 
+/// `FORGE_AUTH_SESSION_IDLE_TIMEOUT`: how long a session may go unused
+/// before it ends, ahead of its absolute expiry (Forge-Go's key, default and
+/// bounds).
+pub const SESSION_IDLE_TIMEOUT_KEY: &str = "FORGE_AUTH_SESSION_IDLE_TIMEOUT";
+
+/// Bounds and default of [`AuthConfig::session_idle_timeout`]: at least five
+/// minutes, at most 720 hours (30 days), Forge-Go's range. At or above the
+/// generated applications' 24-hour session lifetime the idle limit no longer
+/// shortens a session, but it is still checked; nothing caps the value to
+/// the lifetime. `forge::auth::SessionIdleTimeout` holds the same bounds.
+pub const DEFAULT_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(2 * 3600);
+const MIN_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const MAX_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(720 * 3600);
+
 const DEFAULT_MAIL_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_MAIL_TIMEOUT: Duration = Duration::from_secs(600);
 const MAIL_URL_CONTRACT: &str =
@@ -162,7 +176,7 @@ impl MailConfig {
 }
 
 /// Identity settings that are not secrets of the session layer.
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AuthConfig {
     /// Absolute URL of the page password reset emails link to, such as
     /// `https://app.example.com/passwords/edit`
@@ -173,6 +187,40 @@ pub struct AuthConfig {
     /// redacted in diagnostics. `None` leaves MFA unconfigured: enrolling is
     /// refused and an account with a factor cannot sign in.
     pub mfa_key: Option<SecretString>,
+    /// How long a session may go unused before it ends, ahead of its
+    /// absolute expiry (`FORGE_AUTH_SESSION_IDLE_TIMEOUT`, default `2h`,
+    /// from `5m` to `720h`; no value turns it off). Generated applications
+    /// pass it to their session store through
+    /// `forge::auth::SessionIdleTimeout`.
+    #[serde(default = "default_session_idle_timeout")]
+    pub session_idle_timeout: Duration,
+}
+
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self {
+            password_reset_url: None,
+            mfa_key: None,
+            session_idle_timeout: DEFAULT_SESSION_IDLE_TIMEOUT,
+        }
+    }
+}
+
+fn default_session_idle_timeout() -> Duration {
+    DEFAULT_SESSION_IDLE_TIMEOUT
+}
+
+/// Parses `FORGE_AUTH_SESSION_IDLE_TIMEOUT`: a Go duration from `5m` to
+/// `720h`. An empty value is refused, as in Forge-Go: it names no timeout,
+/// and there is no way to turn the idle limit off.
+fn parse_session_idle_timeout(value: &str) -> Result<Duration, ConfigError> {
+    telemetry::parse_go_duration(value.trim())
+        .filter(|timeout| (MIN_SESSION_IDLE_TIMEOUT..=MAX_SESSION_IDLE_TIMEOUT).contains(timeout))
+        .ok_or_else(|| ConfigError::InvalidValue {
+            key: SESSION_IDLE_TIMEOUT_KEY,
+            value: value.to_owned(),
+            expected: "a duration between 5m and 720h, such as 2h",
+        })
 }
 
 impl AuthConfig {
@@ -264,6 +312,9 @@ pub(crate) fn apply(
         // environment; the rejected value is a secret and never echoed.
         decode_mfa_key(&value)?;
         auth.mfa_key = Some(SecretString::new(value));
+    }
+    if let Some(value) = lookup(SESSION_IDLE_TIMEOUT_KEY) {
+        auth.session_idle_timeout = parse_session_idle_timeout(&value)?;
     }
     Ok(())
 }
@@ -892,6 +943,50 @@ mod tests {
 
     fn rejected(pairs: &[(&str, &str)]) -> ConfigError {
         load(pairs).expect_err("must be rejected")
+    }
+
+    /// Two hours unless `FORGE_AUTH_SESSION_IDLE_TIMEOUT` says otherwise,
+    /// within five minutes and 720 hours; no value turns the idle limit off
+    /// (Forge-Go's `TestSessionIdleTimeout`).
+    #[test]
+    fn the_session_idle_timeout_defaults_to_two_hours_and_is_bounded() {
+        assert_eq!(
+            load(&[]).expect("defaults").auth.session_idle_timeout,
+            Duration::from_secs(7200)
+        );
+        assert_eq!(
+            AuthConfig::default().session_idle_timeout,
+            Duration::from_secs(7200)
+        );
+        for (value, minutes) in [
+            ("5m", 5),
+            ("30m", 30),
+            ("2h", 120),
+            ("720h", 720 * 60),
+            (" 45m ", 45),
+        ] {
+            let config = load(&[(SESSION_IDLE_TIMEOUT_KEY, value)]).expect("valid");
+            assert_eq!(
+                config.auth.session_idle_timeout,
+                Duration::from_secs(minutes * 60),
+                "{value}"
+            );
+        }
+        for value in ["4m59s", "721h", "0", "-1h", "two hours", "", "2"] {
+            let error = rejected(&[(SESSION_IDLE_TIMEOUT_KEY, value)]);
+            let message = error.to_string();
+            assert!(
+                message.contains(SESSION_IDLE_TIMEOUT_KEY)
+                    && message.contains("between 5m and 720h"),
+                "{value:?}: {message}"
+            );
+        }
+        // A configuration serialized before the key existed still loads,
+        // with the default.
+        let legacy: AuthConfig =
+            serde_json::from_str(r#"{"password_reset_url":null,"mfa_key":null}"#)
+                .expect("deserializes");
+        assert_eq!(legacy.session_idle_timeout, DEFAULT_SESSION_IDLE_TIMEOUT);
     }
 
     #[test]
