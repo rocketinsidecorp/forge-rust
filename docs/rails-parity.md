@@ -11,6 +11,7 @@ the work is finished and waiting for its review; **Planned** means not started.
 | --- | --- | --- | --- |
 | New application with Docker and CI | `rails new` | Done | Done |
 | Database selection | `rails new -d` | Done (PostgreSQL, MySQL, MariaDB, SQLite) | Done (PostgreSQL, MySQL, MariaDB, SQLite) |
+| API-only application | `rails new --api` | Done (`forge new --api`: JSON handlers, no views, assets, translations or browser middleware; `forge generate resource` and `controller --api` write JSON layers wired `DenyAll`; the page generators refuse it; Forge-Go [QG11](https://github.com/rocketinsidecorp/forge-go/pull/74)) | Done (same command and flag, refusals and wording; `fn compose` in `src/bootstrap/mod.rs`, so `forge generate resource` and `controller --api` wire `DenyAll` routes in it, [generators](generators.md#in-an-api-only-application)) |
 | Server-rendered HTML, layouts, partials, forms, flash, CSRF | Action View | Done | Done |
 | HTML + JSON CRUD generator | `rails g scaffold` | Done | Done (HTML pages); In review (the JSON API under `/v1/<plural>` behind bearer tokens that `forge generate scaffold` now writes next to its pages, [ADR 0045](adr/0045-json-resources-and-bearer-api-authentication.md)) |
 | Authentication pages, password reset | `rails g authentication` | Done | Done |
@@ -231,7 +232,8 @@ the work is finished and waiting for its review; **Planned** means not started.
   Forge-Go lets tenant roles read them; (6) responses have no
   `created_at`/`updated_at`, pages are in UUIDv7 order without `limit`, and
   undecodable bodies are `422` (Forge-Go `400`); (7) `--api` applications
-  (Forge-Rust only) get no resource, having no `fn compose`. **Forge-Go
+  get resources wired `DenyAll`, as in Forge-Go (they have no identity, so
+  no bearer tokens; see the `rails new --api` row). **Forge-Go
   follow-up:** its `docs/AUTHENTICATION.md` and `RAILS_PARITY.md` still say
   Forge-Rust has no JSON login.
 

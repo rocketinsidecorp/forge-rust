@@ -273,6 +273,35 @@ tenant's rows are not found. Global resources stay `DenyAll` until you
 implement `ApiGlobalAccess`. Details: [generators](docs/generators.md#resource),
 [ADR 0045](docs/adr/0045-json-resources-and-bearer-api-authentication.md).
 
+### An API-only application
+
+`forge new --api` generates a JSON-only service (no views, assets,
+translations or browser middleware) with a `compose` function in
+`src/bootstrap/mod.rs`, so `forge generate resource` and
+`forge generate controller NAME ACTION --api` work in it as in a full-stack
+application, and write JSON layers only. It has no identity, so the printed
+wiring keeps every route closed (`DenyAll`, `403`) until you implement
+`ApiGlobalAccess` (`src/adapters/http/api_access.rs`) or `GlobalAccess`
+(`src/adapters/http/access.rs`) with the authentication of your API clients.
+Generators that write pages (`view`, `scaffold`, `authentication`, and
+`controller` without `--api`) refuse the application and write nothing.
+
+```sh
+forge new shop --api -d sqlite3 --skip-docker && cd shop
+forge generate resource product name:string price_cents:integer --global
+forge generate controller status_checks index --api
+# add the printed `pub mod` lines, and the statements at the end of `fn compose`
+forge migrate
+forge test
+forge dev
+
+curl -i http://127.0.0.1:3000/v1/status          # 200
+curl -i http://127.0.0.1:3000/v1/products        # 403 until you decide who may call it
+curl -i http://127.0.0.1:3000/v1/status_checks   # 403
+```
+
+Details: [generators](docs/generators.md#in-an-api-only-application).
+
 ### Command cheat sheet
 
 ```sh
@@ -280,6 +309,7 @@ forge uuid                                     # print a UUIDv7 (forge uuid --co
 forge new shop                                 # full-stack, PostgreSQL, Docker and CI
 forge new shop -d sqlite3                      # or postgresql, mysql, mariadb, none
 forge new shop --api                           # JSON only, no views
+forge new shop --api && cd shop && forge generate resource product name:string --global   # JSON under /v1/products, DenyAll
 forge new shop --api-auth                      # also the JSON sign-in: bearer tokens at /auth/login (PostgreSQL)
 forge new shop --locale pt-BR                  # pages in Brazilian Portuguese by default (or es; en is the default)
 forge new shop --skip-docker --skip-ci --skip-lockfile
