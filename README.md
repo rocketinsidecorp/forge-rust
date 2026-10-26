@@ -747,21 +747,30 @@ cargo run -- jobs retry-event <EVENT_ID>
 
 Workers claim up to `WorkerSettings::batch` jobs (default 10, never more than
 their free slots) per round trip, and the outbox dispatcher claims
-`DispatcherSettings::batch` events (default 10) per transaction. With the
-session setting `forge.jobs_notify=on`, enqueues announce due jobs
-(`NOTIFY forge_jobs`) and idle workers claim them within milliseconds instead
-of at their next poll (`LISTEN`, polling stays the fallback; Forge-Go's
-`queuepostgres.WithNotify()`); set it for every process that enqueues or
-works ([docs/jobs.md](docs/jobs.md#run-the-workers)):
-
-```sh
-PGOPTIONS='-c forge.jobs_notify=on' cargo run -- serve     # enqueues announce due jobs
-PGOPTIONS='-c forge.jobs_notify=on' cargo run -- jobs work # workers LISTEN and wake at once
-```
+`DispatcherSettings::batch` events (default 10) per transaction.
+`App::jobs_notify(true)` (or `FORGE_JOBS_NOTIFY=true`) makes enqueues announce
+due jobs (`NOTIFY forge_jobs`) and idle workers claim them within
+milliseconds instead of at their next poll (`LISTEN`, polling stays the
+fallback; Forge-Go's `queuepostgres.WithNotify()`;
+[docs/jobs.md](docs/jobs.md#run-the-workers)):
 
 ```rust
-composition.jobs()?.settings(forge::jobs::WorkerSettings::default().batch(10));
-composition.events()?.settings(forge::events::DispatcherSettings::default().batch(10));
+App::new("shop")
+    .postgres(sqlx::migrate!())
+    .jobs(WorkerMode::InServe)
+    .jobs_notify(true) // off by default
+    .events()
+    .compose(|composition| {
+        composition.jobs()?.settings(forge::jobs::WorkerSettings::default().batch(10));
+        composition.events()?.settings(forge::events::DispatcherSettings::default().batch(10));
+        Ok(())
+    })
+    .run()
+```
+
+```sh
+FORGE_JOBS_NOTIFY=true cargo run -- serve     # enqueues announce; in-serve workers LISTEN
+FORGE_JOBS_NOTIFY=true cargo run -- jobs work # workers LISTEN and wake at once
 ```
 
 The full command reference is in [docs/cli.md](docs/cli.md). Container,

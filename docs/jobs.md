@@ -229,9 +229,9 @@ statement (`WorkerSettings::batch`, default 10, 1 to 100; Forge-Go's
 starts at once. A full batch is followed by another claim at once while slots
 remain; `batch(1)` claims one job per round trip.
 
-**Wake-up (`LISTEN/NOTIFY`, opt-in).** With the session setting
-`forge.jobs_notify=on` on the connections of every process (Forge-Go's
-`queuepostgres.WithNotify()`), every due job announces itself on the
+**Wake-up (`LISTEN/NOTIFY`, opt-in).** `App::jobs_notify(true)` (or
+`FORGE_JOBS_NOTIFY=true`, which overrides it per deployment; Forge-Go's
+`queuepostgres.WithNotify()`) makes every due job announce itself on the
 `forge_jobs` channel (payload: its queue) when its transaction commits, and
 `serve`/`jobs work` hold one `LISTEN` connection: an idle worker claims a new
 job within milliseconds instead of at its next poll. Each announcement wakes
@@ -242,12 +242,17 @@ jobs due later, retries and released jobs are found by polling. The listener
 reconnects after a jittered 0.5 s to 1 s, doubling to 15 s to 30 s, and logs
 `listening for job announcements` and each disconnect.
 
+```rust
+forge::App::new("shop")
+    .postgres(sqlx::migrate!())
+    .jobs(forge::WorkerMode::InServe)
+    .jobs_notify(true) // enqueues announce due jobs; workers LISTEN
+    // ...
+```
+
 ```sh
-# every process that enqueues or runs workers
-PGOPTIONS='-c forge.jobs_notify=on' cargo run -- serve
-PGOPTIONS='-c forge.jobs_notify=on' cargo run -- jobs work
-# or in the URL itself
-FORGE_DATABASE_URL='postgres://app_runtime:...@db/shop?options=-c%20forge.jobs_notify%3Don' cargo run -- jobs work
+FORGE_JOBS_NOTIFY=true cargo run -- serve      # or false; unset keeps App::jobs_notify
+FORGE_JOBS_NOTIFY=true cargo run -- jobs work
 ```
 
 ```rust
@@ -258,14 +263,25 @@ composition.jobs()?.settings(
 );
 ```
 
+Forge applies the switch itself; it is not a database URL or `PGOPTIONS`
+setting. With it on, every connection of the application's pool sets the
+session setting `forge.jobs_notify = on`, which the `forge_jobs_announce`
+trigger reads, so every enqueue through that pool announces:
+`forge::jobs::postgres::enqueue`, `enqueue_for_tenant` and schedule ticks.
+Without `forge::App`, the same switch is `PgJobStore::notify(true)` (its
+`enqueue`, `enqueue_in`, `enqueue_for_tenant_in` and schedule ticks set the
+setting for their own transaction, and `Jobs::run` on it listens) plus
+`forge::db::PoolSettings::with_job_announcements(true)` on a pool that the
+free `enqueue` functions use.
+
 Costs of the wake-up: one extra connection per job runtime (outside the
 pool's `FORGE_DATABASE_MAX_CONNS`); `LISTEN` needs a direct connection or
-session pooling, not PgBouncer transaction pooling (behind such a pooler,
-turn it on per transaction with `SELECT set_config('forge.jobs_notify', 'on',
-true)`); and PostgreSQL serializes the commits of notifying transactions,
-which matters only at thousands of enqueues per second. Anyone who can
-`NOTIFY` on the database can wake workers, which then claim once. Design:
-[ADR 0046](adr/0046-job-wake-up-and-claim-batches.md).
+session pooling, not PgBouncer transaction pooling, and behind such a pooler
+the pool's session setting is not reliable either (`PgJobStore::enqueue_in`
+sets it per transaction); and PostgreSQL serializes the commits of
+notifying transactions, which matters only at thousands of enqueues per
+second. Anyone who can `NOTIFY` on the database can wake workers, which then
+claim once. Design: [ADR 0046](adr/0046-job-wake-up-and-claim-batches.md).
 
 ## Failures and dead jobs
 

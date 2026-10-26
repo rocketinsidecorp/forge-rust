@@ -18,23 +18,42 @@ and recorded each scheduler tick once, but had no wake-up and no batch knob,
 and its outbox claimed 50 events per transaction (`DispatcherSettings::batch`).
 The two frameworks must keep the same capabilities, names and defaults.
 
-Two Forge-Rust facts shape the port. Jobs are enqueued by free functions on
-the caller's transaction (`postgres::enqueue`, `enqueue_for_tenant`) and by the
-`forge_jobs_fire_tick` definer function, not through a store object that could
-carry an option. And PostgreSQL serializes the commits of every transaction
-that sent a notification (a global lock held through the commit), so
-announcing unconditionally would tax every application's enqueue throughput,
-listening or not.
+Three facts shape the port. Forge-Rust enqueues mostly through free
+functions on the caller's transaction (`postgres::enqueue`,
+`enqueue_for_tenant`, which generated jobs call) and through the
+`forge_jobs_fire_tick` definer function, not only through a store object.
+PostgreSQL serializes the commits of every transaction that sent a
+notification (a global lock held through the commit), so announcing
+unconditionally would tax every application's enqueue throughput, listening
+or not. And the switch must be typed and set by Forge: both frameworks'
+security audits treat `PGOPTIONS` and URL `options` as a way to inject
+session defaults (`-c forge.tenant_id=...`) and are removing them, so it
+cannot ride on either.
 
 ## Decision
 
-- **Opt-in by session setting.** `forge.jobs_notify` (`NOTIFY_SETTING`) is the
-  one switch, with the meaning of Go's `WithNotify`: when the connections of
-  every process carry it on (`PGOPTIONS='-c forge.jobs_notify=on'`, or
-  `?options=-c%20forge.jobs_notify%3Don` in the database URL; `on`, `true`,
-  `yes` or `1`), enqueues announce due jobs and `Jobs::run` listens. Unset,
-  nothing is announced and no `LISTEN` connection is opened. A transaction can
-  also turn it on or off for itself with `set_config('forge.jobs_notify', ..., true)`.
+- **Typed opt-in.** The switch has the meaning of Go's `WithNotify`
+  (enqueues announce due jobs, the job runtime listens) and is off by
+  default:
+  - `forge::App::jobs_notify(true)`, overridden per deployment by
+    `FORGE_JOBS_NOTIFY=true|false` (unset keeps the code's choice; without
+    `App::jobs` nothing announces). The facade builds the application's pool
+    with `forge_db::PoolSettings::with_job_announcements`, so every new
+    connection runs `SET forge.jobs_notify = on`, and hands `Jobs::run` a
+    notifying store. Every enqueue through that pool announces, including
+    the free functions that generated jobs call.
+  - `forge_jobs::postgres::PgJobStore::notify(true)`, Go's store option:
+    `Jobs::run` on the store listens, and the store's own writes
+    (`enqueue`, `enqueue_in`, `enqueue_for_tenant_in`, the scheduler's
+    `forge_jobs_fire_tick`) set the setting with
+    `set_config('forge.jobs_notify', 'on', true)` for their transaction only,
+    which also works behind PgBouncer transaction pooling.
+  - `PoolSettings::with_job_announcements(true)` covers the free functions on
+    a pool built without the facade.
+
+  The session setting `forge.jobs_notify` (`NOTIFY_SETTING`) stays as the
+  server-side gate the trigger reads; Forge sets it, never the environment.
+  A transaction can still turn it off for itself.
 - **Announcement.** Job migration 2 (`2_forge_jobs_notify`, in
   `_forge_jobs_migrations`; version 1 is released history and is not edited)
   adds the row trigger `forge_jobs_announce` `AFTER INSERT ON forge_jobs`,
@@ -47,8 +66,8 @@ listening or not.
   each queue once. The function runs with the inserter's rights, pins its
   `search_path` and has no `EXECUTE` grant (a trigger needs none to fire); the
   worker-grant check skips trigger functions.
-- **Listener.** `Jobs::run` reads the setting from its store's session at
-  start and, when it is on and some queue has handlers, spawns one listener
+- **Listener.** When its store notifies and some queue has handlers,
+  `Jobs::run` spawns one listener
   task in its own `JoinSet` next to the queue workers: no detached task. The
   listener opens one connection on a one-connection pool built from the
   store's connect options (outside the application's pool, like Go's hijacked
@@ -80,9 +99,12 @@ listening or not.
 - **Always announcing** (the trigger without the setting): every
   application would pay PostgreSQL's commit serialization whether or not a
   worker listens.
-- **A per-call or per-store option** (`EnqueueOptions::notify`, a store
-  wrapper for transactions): every enqueue site and generated job would need
-  to pass it, and `forge_jobs_fire_tick` could not see it.
+- **The switch in `PGOPTIONS` or URL `options`** (this ADR's first draft):
+  untyped, and on a path both frameworks are closing to session defaults.
+- **A per-call option alone** (`EnqueueOptions::notify`): every enqueue site
+  and generated job would need to pass it. The store's transactional
+  methods are offered, but the facade's pool setting is what covers the
+  free functions.
 - **SQLx's automatic reconnect** (`PgListener` with `eager_reconnect`): it
   reconnects immediately and without backoff, and gives no point at which to
   run the catch-up claims.
@@ -91,14 +113,14 @@ listening or not.
 
 ## Consequences
 
-- With the setting on, an idle worker claims a newly enqueued due job within
+- With the switch on, an idle worker claims a newly enqueued due job within
   milliseconds instead of at its next poll (default 1 s); without it nothing
   changes.
 - Costs of turning it on, as in Go: one extra connection per job runtime;
   `LISTEN` needs a direct connection or session pooling, not PgBouncer
-  transaction pooling (a startup option cannot pass through it either; set it
-  per transaction there); notifying commits serialize, which matters at
-  thousands of enqueues per second.
+  transaction pooling (where a pool's session setting is not reliable either;
+  `PgJobStore::enqueue_in` sets it per transaction); notifying commits
+  serialize, which matters at thousands of enqueues per second.
 - Anyone who can `NOTIFY` on the database can wake workers; each wakes at
   most once per 10 ms and claims only what is due.
 - Announcements are hints: a lost one (listener down, a job due later, a job
@@ -109,17 +131,21 @@ listening or not.
   after `LISTEN`, and closing the subscription's own pool awaits that task
   (bounded), the accepted exception already recorded for
   `forge-broadcast` in the [dependency policy](../dependency-policy.md).
-- Remaining differences from Go: the switch is a session setting instead of a
-  store option (Rust enqueues through free functions and a definer function);
-  Rust has no `Listening()` accessor (the listener logs `listening for job
+- Remaining differences from Go: besides the store option, Rust's facade
+  also sets the session setting on its pool, because Rust's free enqueue
+  functions take only a transaction; Rust has no `Listening()` accessor (the listener logs `listening for job
   announcements` and each disconnect); Rust idle workers poll at a fixed
   `poll_interval` instead of Go's doubling to `MaxPollInterval`.
 - Tests (PostgreSQL, `crates/forge-jobs/src/pg_notify_tests.rs`): only due,
-  committed jobs of opted-in sessions are announced, once per queue and
-  transaction, schedule ticks included; an idle worker polling every minute
+  committed jobs of a notifying store or an announcing pool are announced,
+  once per queue and transaction, schedule ticks included, and nothing
+  otherwise; an idle worker polling every minute
   starts announced jobs in under 2 s; after `pg_terminate_backend` of the
   listener, polling still runs jobs and a new `LISTEN` backend appears; a
   shutdown with an active listener returns in under 2 s and leaves no `LISTEN`
-  backend, and a runtime without the setting never listens; claims never
+  backend, and a store that does not notify never listens; claims never
   exceed the batch or the free slots and a full batch is followed by another
-  claim at once.
+  claim at once. `forge-db` checks that `with_job_announcements` sets the
+  setting on every pooled connection; the facade test runs `migrate`, then a
+  composed runtime with `FORGE_JOBS_NOTIFY=true` that listens and sets the
+  setting on its pool.

@@ -18,7 +18,7 @@ the work is finished and waiting for its review; **Planned** means not started.
 | Multi-tenancy with database enforcement | (gems) | Done (PostgreSQL RLS; `app_migrator`/`app_runtime` roles, staging and production refuse a serving role that could bypass RLS, tests run as the runtime role; Forge-Go ADR 0046) | Done (PostgreSQL RLS; `app_migrator`/`app_runtime` roles, [ADR 0011](adr/0011-postgresql-runtime-migration-roles-and-rls-context.md)); In review (production refuses a serving role that could bypass RLS, generated repository tests run as a per-test runtime role and prove it cannot run DDL, [ADR 0044](adr/0044-refused-row-level-security-bypass-and-runtime-role-tests.md); see follow-ups) |
 | TOTP MFA | (gems) | Done | Done (`FORGE_AUTH_MFA_KEY`, `/session/mfa`, `/mfa`, [ADR 0040](adr/0040-totp-multi-factor-authentication.md), [MFA](mfa.md)) |
 | Persistent jobs, cron, outbox | Solid Queue | Done | Done (framework crates); In review (`forge new` wires the job queue into PostgreSQL applications: `jobs` feature, `.jobs(WorkerMode::InServe)`, `jobs_configure`) |
-| Batch claims, `LISTEN/NOTIFY` wake-up, one replica per scheduled tick | Solid Queue (`batch_size`, `polling_interval`, recurring tasks run once) | Done (`WorkerOptions.BatchSize` 10, `queuepostgres.WithNotify`, `DispatcherOptions.BatchSize` 10, `jobs.SchedulerOptions.Ticks` with `forge_job_schedules`; Forge-Go ADR 0047) | Done (ticks recorded once in `forge_job_schedules`); In review (`WorkerSettings::batch` 10, never above the free slots; `forge.jobs_notify=on` announces due jobs on `forge_jobs` and `Jobs::run` listens; `DispatcherSettings::batch` 10; [ADR 0046](adr/0046-job-wake-up-and-claim-batches.md), [forge-rust#80](https://github.com/rocketinsidecorp/forge-rust/issues/80); see follow-ups) |
+| Batch claims, `LISTEN/NOTIFY` wake-up, one replica per scheduled tick | Solid Queue (`batch_size`, `polling_interval`, recurring tasks run once) | Done (`WorkerOptions.BatchSize` 10, `queuepostgres.WithNotify`, `DispatcherOptions.BatchSize` 10, `jobs.SchedulerOptions.Ticks` with `forge_job_schedules`; Forge-Go ADR 0047) | Done (ticks recorded once in `forge_job_schedules`); In review (`WorkerSettings::batch` 10, never above the free slots; `App::jobs_notify(true)` or `FORGE_JOBS_NOTIFY=true` (`PgJobStore::notify` in the library) announces due jobs on `forge_jobs` and `Jobs::run` listens; `DispatcherSettings::batch` 10; [ADR 0046](adr/0046-job-wake-up-and-claim-batches.md), [forge-rust#80](https://github.com/rocketinsidecorp/forge-rust/issues/80); see follow-ups) |
 | Mailer with previews | Action Mailer | Done | Done (`forge::mail`, password-reset emails, `/_mail` previews, [ADR 0035](adr/0035-mail.md); `forge generate mailer`, [ADR 0038](adr/0038-generators-and-destroy.md)) |
 | Rate limiting | `rate_limit` | Done | Done |
 | Sign-in, reset and MFA throttles shared by replicas | `rate_limit` with a shared cache store | Done (`auth/postgres` `LoginThrottler`, `forge_login_throttle`) | In review (`forge::auth::PgLoginThrottle`, same table and transaction, wired in generated PostgreSQL applications; see follow-ups) |
@@ -72,11 +72,14 @@ the work is finished and waiting for its review; **Planned** means not started.
   (re)subscription, merge wake-ups in a one-slot signal per queue with 10 ms
   between woken claims, bound claims by a batch of 10 (at most 100, never
   above the free slots) and claim 10 outbox events per transaction.
-  Differences: (1) the switch is Go's store option `WithNotify` and Rust's
-  session setting `forge.jobs_notify=on` (`PGOPTIONS` or the URL's
-  `options`), because Rust enqueues through free functions on the caller's
-  transaction and through `forge_jobs_fire_tick`, which a store option cannot
-  reach; Rust announces with a trigger, so schedule ticks are announced too.
+  Differences: (1) both switches are typed (Go's store option `WithNotify`,
+  Rust's `PgJobStore::notify(true)`), and Rust's facade adds
+  `App::jobs_notify(true)` and `FORGE_JOBS_NOTIFY`, which also set the
+  session setting `forge.jobs_notify` on the application's pool, because
+  Rust's free enqueue functions take only a transaction; Rust announces with
+  a trigger that reads that setting, so schedule ticks are announced too.
+  Forge-Go adopts `FORGE_JOBS_NOTIFY` with the same meaning (tracked in
+  forge-rust#80).
   (2) Go exposes `Worker.Listening()`; Rust logs the subscription instead.
   (3) Go's idle poll doubles to `MaxPollInterval` (10 s); Rust polls every
   `poll_interval` (1 s).
