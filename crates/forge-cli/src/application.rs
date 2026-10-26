@@ -199,6 +199,40 @@ mod tests {
 
     use super::*;
 
+    /// Writes an executable (mode 0755) script at `path` without this process
+    /// ever holding a write descriptor on it.
+    ///
+    /// Writing the file here (`std::fs::write`) leaves a writable descriptor open
+    /// in this process for a moment. Any other test thread that forks in that
+    /// window (`Command::spawn`) inherits the descriptor until it execs, and
+    /// while any process holds the inode open for writing `execve` of it fails
+    /// with `ETXTBSY` ("Text file busy"). `O_CLOEXEC` only closes the descriptor
+    /// at exec, so it does not close that window. Creating the file from a
+    /// short-lived child keeps the writer out of this process, so forks on other
+    /// threads cannot inherit it, and the child has exited before this returns.
+    fn write_executable(path: &Path, body: &str) {
+        use std::io::Write as _;
+
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "umask 022; cat > \"$1\" && chmod 755 \"$1\"", "sh"])
+            .arg(path)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn sh to write the executable");
+        child
+            .stdin
+            .take()
+            .expect("piped stdin")
+            .write_all(body.as_bytes())
+            .expect("send the script body");
+        let status = child.wait().expect("wait for sh");
+        assert!(
+            status.success(),
+            "writing {} failed: {status}",
+            path.display()
+        );
+    }
+
     fn lines(text: &str) -> impl std::io::BufRead + '_ {
         std::io::Cursor::new(text.as_bytes())
     }
@@ -227,16 +261,12 @@ not json at all
     #[cfg(unix)]
     #[test]
     fn the_application_runs_in_the_project_directory_and_its_exit_code_is_returned() {
-        use std::os::unix::fs::PermissionsExt as _;
-
         let directory = tempfile::tempdir().expect("tempdir");
         let script = directory.path().join("app");
-        fs::write(
+        write_executable(
             &script,
             "#!/bin/sh\npwd > record\necho \"$@\" >> record\nexit 7\n",
-        )
-        .expect("write");
-        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("chmod");
+        );
         let mut app = CargoApplication {
             project: Project {
                 root: directory.path().to_path_buf(),

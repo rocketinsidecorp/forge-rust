@@ -1154,11 +1154,15 @@ fn warnings_are_printed_before_the_summary() {
     });
     let (result, out, _) = project.deploy(DeployAction::Prune, &flags(false, false));
     result.expect("prune");
-    assert!(
-        out.starts_with("warning: 192.0.2.10: listing images failed"),
-        "{out}"
-    );
-    assert!(out.contains("prune complete ("), "{out}");
+    // Hosts run concurrently, so the warnings arrive in any order; each must
+    // come before the summary.
+    let summary = out.find("prune complete (").expect("summary");
+    for host in ["192.0.2.10", "192.0.2.11"] {
+        let warning = out
+            .find(&format!("warning: {host}: listing images failed"))
+            .unwrap_or_else(|| panic!("no warning for {host}: {out}"));
+        assert!(warning < summary, "{host}: warning after summary: {out}");
+    }
 }
 
 #[test]
