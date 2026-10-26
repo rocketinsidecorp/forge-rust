@@ -197,7 +197,8 @@ export FORGE_DATABASE_ALLOW_PLAINTEXT=true
 
 Do **not** inject `FORGE_MIGRATION_DATABASE_URL` into the long-running serving
 process. Run migrations as a separate deployment job/task with the migration
-credential, then start the application with only `FORGE_DATABASE_URL`. The
+credential, then start the application with only `FORGE_DATABASE_URL`
+(`forge deploy` does this with [`migrate.env`](#the-migration-credential)). The
 runtime database role should be `NOSUPERUSER`, `NOCREATEDB`, `NOCREATEROLE`,
 `NOBYPASSRLS`, and should not own application schemas. See
 [ADR 0011](adr/0011-postgresql-runtime-migration-roles-and-rls-context.md).
@@ -678,7 +679,7 @@ servers:
     env: {clear: {JOBS_CONCURRENCY: "8"}}
 env:
   clear: {FORGE_ENV: production}
-  secret: [FORGE_DATABASE_URL, FORGE_MIGRATION_DATABASE_URL, FORGE_AUTH_MFA_KEY]
+  secret: [FORGE_DATABASE_URL, FORGE_AUTH_MFA_KEY]   # every container
 volumes: []                                  # e.g. shop-data:/data (SQLite)
 proxy:
   image: registry.example.com/acme/forge-proxy@sha256:...
@@ -690,7 +691,12 @@ proxy:
   drain_timeout: 30s
   response_timeout: 30s
   max_body_bytes: 67108864
-migrate: {enabled: true, cmd: ["migrate"], role: web}
+migrate:
+  enabled: true
+  cmd: ["migrate"]
+  role: web                                  # whose env file the migrate container starts from
+  env:                                       # added for the migrate container only
+    secret: [FORGE_MIGRATION_DATABASE_URL]   # the schema owner; never in env: or servers.*.env
 accessories:
   db:
     image: postgres:18-alpine
@@ -713,7 +719,8 @@ durations that are not strings (`30s`), a tag in `image`, a password in
 characters, `retain` below 2, and more than one proxied role are errors.
 `retain` counts the running version, so `retain: 1` would prune the previous
 version after every deploy and leave nothing to roll back to; it is refused
-(the default is 5). `servers.web` is proxied by default; set `proxy: true`
+(the default is 5). `migrate.env` is validated like the role `env` blocks and
+must not be empty or null. `servers.web` is proxied by default; set `proxy: true`
 or `false` on a role to change that. An accessory `port` of `5432` or
 `6543:5432` binds `127.0.0.1`; write
 `IP:HOST_PORT:CONTAINER_PORT` to choose another address deliberately.
@@ -737,12 +744,8 @@ stdin and written to `~/.forge/SERVICE/env/ROLE.env` (mode `0600`, `umask
 077`, atomic rename), which containers read with `--env-file`. They never
 appear in command lines, dry runs or progress output.
 
-`migrate` runs with the env file of `migrate.role`, so the role's
-long-running containers receive `FORGE_MIGRATION_DATABASE_URL` too when it is
-listed there. To keep the schema-owner credential out of them, leave it out of
-`env.secret`, set `migrate.enabled: false` and run `migrate` as a separate
-job with only that credential (see [Configuration](#configuration) and
-[ADR 0011](adr/0011-postgresql-runtime-migration-roles-and-rls-context.md)).
+The migrate step has its own file: see [The migration
+credential](#the-migration-credential).
 
 Redaction of streamed output is best effort. `forge logs` and
 non-interactive `forge app exec` replace the exact values from
@@ -751,6 +754,72 @@ otherwise not redacted**: an encoded, partial or derived value passes through,
 and interactive sessions (`forge app exec --interactive`, `forge app shell`)
 and `docker logs` on the host are not filtered at all. Applications must not
 print secrets; treat streamed output as sensitive.
+
+### The migration credential
+
+On PostgreSQL the application serves as a runtime role and migrates as the
+schema owner (`FORGE_MIGRATION_DATABASE_URL`, [Compose](#compose-local-convenience),
+[ADR 0011](adr/0011-postgresql-runtime-migration-roles-and-rls-context.md)).
+`forge deploy` gives that credential to the one-off migrate container alone
+through `migrate.env`, an overlay no serving container ever sees. Name the
+secret under it, keep it out of `env`, and put the value in `.forge/secrets`;
+`forge deploy init` writes this layout:
+
+```yaml
+env:
+  secret: [FORGE_DATABASE_URL, FORGE_AUTH_MFA_KEY]   # every container
+migrate:
+  enabled: true
+  cmd: ["migrate"]
+  role: web
+  env:
+    secret: [FORGE_MIGRATION_DATABASE_URL]           # the migrate step only
+```
+
+```sh
+# .forge/secrets: FORGE_MIGRATION_DATABASE_URL=$FORGE_MIGRATION_DATABASE_URL
+export FORGE_DATABASE_URL="$RUNTIME_DATABASE_URL" \
+       FORGE_MIGRATION_DATABASE_URL="$MIGRATION_DATABASE_URL"
+forge deploy --dry-run     # shows the migrate env file upload, run and rm; values stay hidden
+forge deploy
+```
+
+`migrate.env` has the same `clear` and `secret` keys as the role `env`
+blocks and the same checks; secrets come from `.forge/secrets` like every
+other secret, and a missing one stops the deploy before any remote command.
+The migrate container's environment is the global `env`, plus the env of
+`migrate.role`, plus `migrate.env`. A name in `migrate.env` may not also be in
+the global `env` or in any `servers.*.env`, clear or secret: that is a
+configuration error (`FORGE_MIGRATION_DATABASE_URL is in migrate.env and in
+env.secret: remove it from env.secret, so only the migrate step receives it`),
+because the containers of that block would receive it too. Accessories keep
+their own env and are not checked. An empty `migrate.env` block, an explicit
+`env:` with no value (`null`, `~`) and `migrate.env` with `migrate.enabled:
+false` are errors.
+
+The merged environment is written to its own file,
+`~/.forge/SERVICE/env/migrate.step.env` (mode `0600`, `umask 077`, atomic
+rename, content over stdin, as for the role files), on the first host of the
+migrate role only, used by the `migrate` container alone, and deleted, with
+its temporary `.tmp` copy, when the step ends: after success, a failed
+migration, a failed or interrupted upload and a cancelled deploy. A failed
+upload exits `5` before any container runs. If the delete fails the deploy
+continues with a warning naming the file, and you remove it by hand. A deploy
+that is killed outright (`kill -9`, the machine losing power) cannot clean up,
+so the file stays until the next deploy that uses `migrate.env`; if you remove
+`migrate.env` from the configuration afterwards, delete
+`~/.forge/SERVICE/env/migrate.step.env` on the migrate host by hand, because
+deploys without `migrate.env` never touch it. The role env files, and so the
+serving containers, are written exactly as before.
+
+Without a `migrate.env` block nothing changes: the container gets the env
+file of `migrate.role`, which has no `FORGE_MIGRATION_DATABASE_URL` unless you
+list it for that role (and then every container of the role holds it), and
+`migrate` fails because it requires that variable. To run migrations
+elsewhere instead, set `migrate: {enabled: false}`.
+
+`forge app exec` still uses the role's env file, never `migrate.env`:
+`forge app exec migrate status` runs without the schema owner's credential.
 
 ### Commands
 
@@ -845,7 +914,11 @@ with `ok`, `error` and `exit_code`.
 3. On all hosts in parallel (at most `parallelism`): registry login, `docker
    pull`, write the env files.
 4. Run `migrate` once, in a one-off container on the first host of the
-   migrate role. A failure stops here: nothing was started or switched.
+   migrate role. A failure stops here: nothing was started or switched. With
+   `migrate.env` the host first receives the container's own env file (the
+   migrate role's environment plus `migrate.env`), which is deleted when the
+   step ends ([The migration credential](#the-migration-credential)); without
+   it the container gets that role's env file.
 5. On every host, for each role (the proxied one first), start the new
    container on the `forge` network with no published ports. For the proxied
    role, `forge-proxy deploy` probes `healthcheck.path` until it passes

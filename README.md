@@ -313,6 +313,27 @@ forge deploy rollback <previous version>
 forge deploy lock release            # removes only your own lock; --force for anyone's
 ```
 
+The schema owner's credential reaches the migrate step alone: name it under
+`migrate.env` in `config/deploy.yml` (`forge deploy init` writes this) and keep
+it out of `env`, so no serving container receives it. The deploy writes it to
+a `0600` file on the migrate host for that one container and removes the file
+when the step ends ([deployment guide](docs/deployment.md#the-migration-credential)):
+
+```yaml
+env:
+  secret: [FORGE_DATABASE_URL]                    # every container
+migrate:
+  env:
+    secret: [FORGE_MIGRATION_DATABASE_URL]        # the migrate step only
+```
+
+```sh
+# .forge/secrets: FORGE_MIGRATION_DATABASE_URL=$FORGE_MIGRATION_DATABASE_URL
+export FORGE_DATABASE_URL="$RUNTIME_DATABASE_URL" FORGE_MIGRATION_DATABASE_URL="$MIGRATION_DATABASE_URL"
+forge deploy --dry-run     # prints the upload, run and rm commands for the migrate env file; values stay hidden, nothing runs
+forge deploy
+```
+
 forge-proxy's connection limits are Go's `http.Server` ones: a keep-alive
 connection waits `-idle-timeout` (120 s) for its next request, whose headers
 then have `-read-header-timeout` (10 s); a silent first request gets only the
