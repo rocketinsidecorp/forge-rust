@@ -226,15 +226,15 @@ Recorded after the independent review of the pull request:
   browser over one connection; the stream response sets no hop-by-hop
   header and passes through unchanged.
 - **Key rotation.** `Signer::new(key, previous)` verifies tokens signed with
-  previous keys, but generated applications build the signer from
-  `FORGE_STREAMS_KEY` alone, like Forge-Go's generated `htmlstreams.NewSigner`
-  (whose library also has `SignerOptions.PreviousKeys`). Changing the key
-  makes every open page's token invalid: its next reconnect gets `403` and
-  `EventSource` stops, so the page updates live again once reloaded. The
-  procedure is in [deployment](../deployment.md#rotating-the-stream-signing-key).
-  A `FORGE_STREAMS_PREVIOUS_KEYS` setting is a parity follow-up for both
-  frameworks ([parity](../rails-parity.md#parity-follow-ups)), not added
-  here alone.
+  previous keys and never signs with them. `Signer::from_config` (so every
+  generated application) builds it from `FORGE_STREAMS_KEY` and
+  `FORGE_STREAMS_PREVIOUS_KEYS`, Forge-Go's name: comma-separated, at most 3
+  keys, in the format of the current key, redacted, with errors that name an
+  entry's position and never a key; previous keys without a current key are
+  refused. Without the previous key, changing the key makes every open page's
+  token invalid: its next reconnect gets `403` and `EventSource` stops, so
+  the page updates live again once reloaded. The procedure is in
+  [deployment](../deployment.md#rotating-the-stream-signing-key).
 
 ## Consequences
 

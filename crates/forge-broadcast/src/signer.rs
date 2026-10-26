@@ -104,7 +104,12 @@ impl Signer {
         Self::new(&key, &[])
     }
 
-    /// The signer of a generated application, from `FORGE_STREAMS_KEY`.
+    /// The signer of a generated application, from `FORGE_STREAMS_KEY` and
+    /// `FORGE_STREAMS_PREVIOUS_KEYS`.
+    ///
+    /// The current key signs; the previous keys (at most 3) only verify, so
+    /// the key can be rotated without breaking pages that are open. Previous
+    /// keys without a current key are refused. Errors never contain a key.
     ///
     /// Production refuses to start without the key, because every replica
     /// must sign stream names alike. Development and test use a random
@@ -114,8 +119,19 @@ impl Signer {
         let key = config.streams.key_bytes().map_err(|_| {
             BroadcastError::Configuration("FORGE_STREAMS_KEY is not a valid signing key")
         })?;
+        let previous = config.streams.previous_key_bytes().map_err(|_| {
+            BroadcastError::Configuration(
+                "FORGE_STREAMS_PREVIOUS_KEYS is not valid: at most 3 base64 keys of at least 32 \
+                 bytes, comma-separated",
+            )
+        })?;
+        let previous: Vec<&[u8]> = previous.iter().map(Vec::as_slice).collect();
         match key {
-            Some(key) => Self::new(&key, &[]),
+            Some(key) => Self::new(&key, &previous),
+            None if !previous.is_empty() => Err(BroadcastError::Configuration(
+                "FORGE_STREAMS_PREVIOUS_KEYS needs FORGE_STREAMS_KEY: the previous keys only \
+                 verify, the current key signs",
+            )),
             None if config.environment == Environment::Production => {
                 Err(BroadcastError::Configuration(
                     "FORGE_STREAMS_KEY is required in production: set it to the output of \
@@ -472,6 +488,73 @@ mod tests {
             assert!(signer.source_url(path, &channel).is_err(), "{path:?}");
         }
         assert_eq!(escape_attribute("a&\"'<>"), "a&amp;&quot;&#39;&lt;&gt;");
+    }
+
+    const NEW_B64: &str = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=";
+    const OLD_B64: &str = "ZmVkY2JhOTg3NjU0MzIxMGZlZGNiYTk4NzY1NDMyMTA=";
+
+    fn production_config(vars: &[(&'static str, &str)]) -> AppConfig {
+        AppConfig::from_lookup(|name| {
+            if name == "FORGE_ENV" {
+                return Some("production".to_owned());
+            }
+            vars.iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| (*value).to_owned())
+        })
+        .expect("valid configuration")
+    }
+
+    /// The rotation of the generated application: a name signed with the old
+    /// key still verifies once the old key moves to the previous keys, and
+    /// every new name is signed with the new key.
+    #[test]
+    fn from_config_rotates_the_key_without_breaking_open_pages() {
+        let channel = Channel::for_tenant(TenantId::new(), "posts").expect("valid");
+        let before = Signer::from_config(&production_config(&[("FORGE_STREAMS_KEY", OLD_B64)]))
+            .expect("old key");
+        let token = before.sign(&channel).expect("signs");
+
+        let new_only = Signer::from_config(&production_config(&[("FORGE_STREAMS_KEY", NEW_B64)]))
+            .expect("new key");
+        assert!(matches!(
+            new_only.verify(&token),
+            Err(BroadcastError::InvalidToken)
+        ));
+
+        let rotated = Signer::from_config(&production_config(&[
+            ("FORGE_STREAMS_KEY", NEW_B64),
+            ("FORGE_STREAMS_PREVIOUS_KEYS", OLD_B64),
+        ]))
+        .expect("rotation");
+        assert_eq!(rotated.verify(&token).expect("open page"), channel);
+        let fresh = rotated.sign(&channel).expect("signs");
+        assert_eq!(new_only.verify(&fresh).expect("new key signed"), channel);
+        assert!(
+            matches!(before.verify(&fresh), Err(BroadcastError::InvalidToken)),
+            "the previous key never signs"
+        );
+    }
+
+    #[test]
+    fn previous_keys_without_a_current_key_are_refused_without_echoing_a_key() {
+        for environment in ["production", "development"] {
+            let config = AppConfig::from_lookup(|name| match name {
+                "FORGE_ENV" => Some(environment.to_owned()),
+                "FORGE_STREAMS_PREVIOUS_KEYS" => Some(OLD_B64.to_owned()),
+                _ => None,
+            })
+            .expect("valid configuration");
+            let error = Signer::from_config(&config).expect_err("needs the current key");
+            let text = error.to_string();
+            assert!(text.contains("FORGE_STREAMS_PREVIOUS_KEYS needs"), "{text}");
+            assert!(!text.contains(OLD_B64), "{text}");
+        }
+        // A hand-built configuration with an invalid list is refused as well.
+        let mut config = production_config(&[("FORGE_STREAMS_KEY", NEW_B64)]);
+        config.streams.previous_keys = vec![forge_config::SecretString::new("not-a-key!"); 4];
+        let error = Signer::from_config(&config).expect_err("invalid list");
+        assert!(!error.to_string().contains("not-a-key"), "{error}");
     }
 
     #[test]

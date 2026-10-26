@@ -65,6 +65,13 @@ const MAX_STORAGE_LINK_TTL_SECS: u64 = 7 * 24 * 3600;
 /// Shortest decoded stream-signing key (`FORGE_STREAMS_KEY`), in bytes: an
 /// HMAC-SHA256 key as long as the digest.
 pub const STREAMS_KEY_MIN_BYTES: usize = 32;
+/// Most previous stream-signing keys (`FORGE_STREAMS_PREVIOUS_KEYS`), like
+/// Forge-Go's `broadcast.MaxPreviousKeys`: a rotation needs the old key for
+/// one token lifetime, so more than a few means retired keys were left in
+/// place.
+pub const STREAMS_MAX_PREVIOUS_KEYS: usize = 3;
+/// Name of the setting holding the keys that still verify stream names.
+pub const STREAMS_PREVIOUS_KEYS_KEY: &str = "FORGE_STREAMS_PREVIOUS_KEYS";
 const STREAMS_KEY_CONTRACT: &str = "base64 (standard or URL-safe, padded or not) of at least 32 \
      random bytes, such as `openssl rand -base64 32` prints";
 /// Bounds of the decoded storage signing key, in bytes.
@@ -116,6 +123,7 @@ pub const KNOWN_KEYS: &[&str] = &[
     "FORGE_STORAGE_MAX_UPLOAD_BYTES",
     "FORGE_STORAGE_LINK_TTL_SECS",
     "FORGE_STREAMS_KEY",
+    STREAMS_PREVIOUS_KEYS_KEY,
     I18N_DEFAULT_LOCALE_KEY,
     OPENAPI_ENABLED_KEY,
     // MAIL_KEYS and PASSWORD_RESET_URL_KEY, ADR 0035.
@@ -903,6 +911,13 @@ pub struct StreamsConfig {
     /// (`FORGE_STREAMS_KEY`), shared by every replica. Redacted in
     /// diagnostics.
     pub key: Option<SecretString>,
+    /// Older keys that still verify stream names but never sign
+    /// (`FORGE_STREAMS_PREVIOUS_KEYS`): comma-separated, at most
+    /// [`STREAMS_MAX_PREVIOUS_KEYS`], in the format of `key`. They let
+    /// `FORGE_STREAMS_KEY` be rotated without breaking pages that are open.
+    /// Redacted in diagnostics.
+    #[serde(default)]
+    pub previous_keys: Vec<SecretString>,
 }
 
 impl StreamsConfig {
@@ -914,23 +929,86 @@ impl StreamsConfig {
             .map(|key| decode_streams_key(key.expose()))
             .transpose()
     }
+
+    /// Decodes the previous keys, in order. The error names the entry's
+    /// position and never contains a key.
+    pub fn previous_key_bytes(&self) -> Result<Vec<Vec<u8>>, ConfigError> {
+        if self.previous_keys.len() > STREAMS_MAX_PREVIOUS_KEYS {
+            return Err(too_many_previous_keys());
+        }
+        self.previous_keys
+            .iter()
+            .enumerate()
+            .map(|(index, key)| decode_previous_streams_key(index + 1, key.expose()))
+            .collect()
+    }
 }
 
 /// Decodes `FORGE_STREAMS_KEY` like Forge-Go does: any of the four base64
 /// alphabets/paddings, at least [`STREAMS_KEY_MIN_BYTES`] bytes.
 fn decode_streams_key(value: &str) -> Result<Vec<u8>, ConfigError> {
-    let value = value.trim();
-    let bytes = [STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD]
-        .iter()
-        .find_map(|engine| engine.decode(value).ok());
-    match bytes {
-        Some(bytes) if bytes.len() >= STREAMS_KEY_MIN_BYTES => Ok(bytes),
-        _ => Err(ConfigError::InvalidValue {
+    match decode_base64_key(value) {
+        Some(bytes) => Ok(bytes),
+        None => Err(ConfigError::InvalidValue {
             key: "FORGE_STREAMS_KEY",
             value: REDACTED.to_owned(),
             expected: STREAMS_KEY_CONTRACT,
         }),
     }
+}
+
+/// The bytes of a base64 stream key of any alphabet and padding, if there
+/// are at least [`STREAMS_KEY_MIN_BYTES`] of them.
+fn decode_base64_key(value: &str) -> Option<Vec<u8>> {
+    decode_any_base64(value).filter(|bytes| bytes.len() >= STREAMS_KEY_MIN_BYTES)
+}
+
+fn decode_any_base64(value: &str) -> Option<Vec<u8>> {
+    let value = value.trim();
+    [STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD]
+        .iter()
+        .find_map(|engine| engine.decode(value).ok())
+}
+
+fn too_many_previous_keys() -> ConfigError {
+    ConfigError::InvalidValue {
+        key: STREAMS_PREVIOUS_KEYS_KEY,
+        value: REDACTED.to_owned(),
+        expected: "at most 3 comma-separated keys",
+    }
+}
+
+/// Decodes one entry of `FORGE_STREAMS_PREVIOUS_KEYS` (`entry` is one-based).
+fn decode_previous_streams_key(entry: usize, value: &str) -> Result<Vec<u8>, ConfigError> {
+    let refused = |reason| ConfigError::InvalidStreamsPreviousKey { entry, reason };
+    if value.trim().is_empty() {
+        return Err(refused("is empty"));
+    }
+    let bytes = decode_any_base64(value).ok_or_else(|| refused("is not valid base64"))?;
+    if bytes.len() < STREAMS_KEY_MIN_BYTES {
+        return Err(refused("must decode to at least 32 bytes"));
+    }
+    Ok(bytes)
+}
+
+/// Parses `FORGE_STREAMS_PREVIOUS_KEYS`: comma-separated base64 keys in the
+/// format of `FORGE_STREAMS_KEY`, at most [`STREAMS_MAX_PREVIOUS_KEYS`]. A
+/// blank list is no keys; an empty entry is refused. Errors name an entry's
+/// position, never its content.
+fn parse_previous_streams_keys(list: &str) -> Result<Vec<SecretString>, ConfigError> {
+    if list.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    if list.split(',').count() > STREAMS_MAX_PREVIOUS_KEYS {
+        return Err(too_many_previous_keys());
+    }
+    list.split(',')
+        .enumerate()
+        .map(|(index, entry)| {
+            decode_previous_streams_key(index + 1, entry)?;
+            Ok(SecretString::new(entry.trim()))
+        })
+        .collect()
 }
 
 /// Complete process configuration.
@@ -1293,6 +1371,10 @@ fn apply_services(
         decode_streams_key(&value)?;
         config.streams.key = Some(SecretString::new(value.trim()));
     }
+    if let Some(value) = lookup(STREAMS_PREVIOUS_KEYS_KEY) {
+        // Validates every entry; a rejected entry is a secret and never echoed.
+        config.streams.previous_keys = parse_previous_streams_keys(&value)?;
+    }
     if let Some(value) = lookup("FORGE_STORAGE_LINK_TTL_SECS") {
         config.storage.link_ttl = Duration::from_secs(parse_bounded(
             "FORGE_STORAGE_LINK_TTL_SECS",
@@ -1439,6 +1521,15 @@ pub enum ConfigError {
         entry: usize,
         /// Why it was refused.
         reason: TrustedProxyError,
+    },
+    /// An entry of `FORGE_STREAMS_PREVIOUS_KEYS` was refused. Only its
+    /// position is reported: the value is never echoed.
+    #[error("invalid value for FORGE_STREAMS_PREVIOUS_KEYS: entry {entry} {reason}")]
+    InvalidStreamsPreviousKey {
+        /// One-based position of the refused entry.
+        entry: usize,
+        /// Why it was refused.
+        reason: &'static str,
     },
     /// A known key contains a value that is not valid UTF-8.
     #[error("invalid value for {key}: value is not valid UTF-8")]
@@ -1989,6 +2080,7 @@ mod tests {
             "10",
             "60",
             "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=",
+            "ZmVkY2JhOTg3NjU0MzIxMGZlZGNiYTk4NzY1NDMyMTA=",
             "pt-BR",
             "true",
             "smtps://mailer:secret@smtp.example.com:465",
@@ -2310,6 +2402,80 @@ mod tests {
         let production = load(&[("FORGE_ENV", "production")]).expect("no key needed here");
         assert_eq!(production.streams.key, None);
         assert_eq!(production.streams.key_bytes(), Ok(None));
+    }
+
+    const OLD_KEY: &str = "ZmVkY2JhOTg3NjU0MzIxMGZlZGNiYTk4NzY1NDMyMTA=";
+    const CURRENT_KEY: &str = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=";
+
+    #[test]
+    fn previous_streams_keys_decode_in_order_and_are_never_echoed() {
+        let list = format!("{OLD_KEY}, {KEY_32},{CURRENT_KEY}");
+        let config = load(&[
+            ("FORGE_STREAMS_KEY", CURRENT_KEY),
+            ("FORGE_STREAMS_PREVIOUS_KEYS", &list),
+        ])
+        .expect("valid keys");
+        let decoded = config.streams.previous_key_bytes().expect("decodes");
+        assert_eq!(decoded.len(), 3);
+        assert!(decoded.iter().all(|key| key.len() == 32));
+        assert_eq!(decoded[0], b"fedcba9876543210fedcba9876543210");
+        for secret in [OLD_KEY, KEY_32] {
+            assert!(!format!("{config:?}").contains(secret));
+            assert!(
+                !serde_json::to_string(&config)
+                    .expect("serializes")
+                    .contains(secret)
+            );
+        }
+        // Unset or blank is no previous keys.
+        for blank in [None, Some(""), Some("  ")] {
+            let pairs: Vec<(&str, &str)> = blank
+                .map(|value| ("FORGE_STREAMS_PREVIOUS_KEYS", value))
+                .into_iter()
+                .collect();
+            let config = load(&pairs).expect("no previous keys");
+            assert!(config.streams.previous_keys.is_empty());
+            assert_eq!(config.streams.previous_key_bytes(), Ok(Vec::new()));
+        }
+    }
+
+    #[test]
+    fn previous_streams_keys_are_limited_and_errors_name_a_position_only() {
+        let four = [OLD_KEY; 4].join(",");
+        let error = load(&[("FORGE_STREAMS_PREVIOUS_KEYS", &four)]).expect_err("too many");
+        assert!(error.to_string().contains("at most 3"), "{error}");
+        let three = [OLD_KEY; 3].join(",");
+        assert!(load(&[("FORGE_STREAMS_PREVIOUS_KEYS", &three)]).is_ok());
+
+        let secret_garbage = "s3cr3t-not-base64!";
+        let short = "c2hvcnQ=";
+        let trailing_comma = format!("{OLD_KEY},");
+        let leading_empty = format!(",{OLD_KEY}");
+        let second_bad = format!("{OLD_KEY},{secret_garbage}");
+        let third_short = format!("{OLD_KEY},{KEY_32},{short}");
+        for (list, entry, reason) in [
+            (secret_garbage, 1, "is not valid base64"),
+            (short, 1, "at least 32 bytes"),
+            (trailing_comma.as_str(), 2, "is empty"),
+            (leading_empty.as_str(), 1, "is empty"),
+            (second_bad.as_str(), 2, "is not valid base64"),
+            (third_short.as_str(), 3, "at least 32 bytes"),
+        ] {
+            let error = load(&[("FORGE_STREAMS_PREVIOUS_KEYS", list)]).expect_err(list);
+            let text = error.to_string();
+            assert!(text.contains("FORGE_STREAMS_PREVIOUS_KEYS"), "{text}");
+            assert!(text.contains(&format!("entry {entry} ")), "{text}");
+            assert!(text.contains(reason), "{text}");
+            for secret in [OLD_KEY, KEY_32, secret_garbage, short] {
+                assert!(!text.contains(secret), "{text}");
+            }
+        }
+        // A hand-built configuration is checked again when it is decoded.
+        let config = StreamsConfig {
+            key: None,
+            previous_keys: vec![SecretString::new(OLD_KEY); 4],
+        };
+        assert!(config.previous_key_bytes().is_err());
     }
 
     #[test]

@@ -600,8 +600,10 @@ data:
 In development the signing key is random per process (the application logs
 `FORGE_STREAMS_KEY is not set`, and open pages stop updating after a
 restart). Set `FORGE_STREAMS_KEY` to the same value on every replica in
-staging and production (`openssl rand -base64 32`). [Views](views.md#live-updates)
-has the protections and the limits.
+staging and production (`openssl rand -base64 32`). To rotate it without
+breaking open pages, move the old key to `FORGE_STREAMS_PREVIOUS_KEYS` for 24
+hours ([rotating the key](views.md#rotating-the-stream-signing-key)).
+[Views](views.md#live-updates) has the protections and the limits.
 
 ### 5.3 Test
 

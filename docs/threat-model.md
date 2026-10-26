@@ -364,14 +364,15 @@ difference is stated.
 | Open streams holding up shutdown | D | The broker is bound to the shutdown-start signal; streams end before the server drains | real-server drain test with a 60 s grace that finishes at once |
 | Forged or oversized `NOTIFY` payloads | T, D | Notifications are parsed strictly, bounded in chunk count, chunk size, pending messages (64), bytes and age (30 s); malformed or inconsistent ones are logged and ignored; payloads above 7 500 bytes are never sent; messages above 256 KiB are refused. **Residual:** whoever can `NOTIFY` on the database can publish; the database role is the trust boundary | envelope malformed/out-of-order/budget tests, PostgreSQL malformed-notification and oversize tests |
 | LISTEN/NOTIFY emulated insecurely on other backends | T | `Fanout::Postgres` is refused on MySQL, MariaDB and SQLite (`UnsupportedBackend`); they use the in-process broker | `postgres_fanout_is_refused_on_sqlite_not_emulated`, `ensure_fanout_supported` doctest |
-| Missing or shared signing key | S, E | `FORGE_STREAMS_KEY` is validated (base64 of at least 32 bytes), redacted and never echoed; production refuses to start without it; development and test use a random per-process key | config and `from_config` tests, generated `production_refuses_to_start_without_a_signing_key` |
+| Missing or shared signing key | S, E | `FORGE_STREAMS_KEY` and `FORGE_STREAMS_PREVIOUS_KEYS` (at most 3 keys that only verify, for rotation) are validated (base64 of at least 32 bytes), redacted and never echoed, errors name an entry's position only; previous keys without a current key are refused; production refuses to start without the key; development and test use a random per-process key | config and `from_config` tests, generated `production_refuses_to_start_without_a_signing_key`, `a_rotated_key_keeps_open_pages_working_and_signs_with_the_new_key` and `bad_previous_keys_refuse_to_start_without_echoing_a_key` |
 
 Residual risks beyond the rows above: delivery is at most once without
 replay; the in-process broker reaches one process only; each open stream
 holds a connection slot; stream limits are per process; a vanished client
 keeps its slot until a write fails (at most 30 minutes); rotating
-`FORGE_STREAMS_KEY` stops live updates on open pages until reloaded (no
-previous-key setting yet, a parity follow-up); `sqlx::PgListener` buffers
+`FORGE_STREAMS_KEY` stops live updates on open pages until reloaded unless the
+old key moves to `FORGE_STREAMS_PREVIOUS_KEYS` (which must then stay for the
+token lifetime, 24 hours, and is removed afterwards); `sqlx::PgListener` buffers
 notifications in an unbounded channel and drops with a detached `UNLISTEN`
 task, accepted as bounded in practice (ADR 0031, "Accepted residuals and
 capacity edges").

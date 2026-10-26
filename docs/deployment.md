@@ -150,6 +150,7 @@ from env files, Kubernetes manifests and unit files.
 | `FORGE_STORAGE_LINK_TTL_SECS` | `900` | Default lifetime of signed links, `1` to `604800`. |
 | `FORGE_I18N_DEFAULT_LOCALE` | the application's `DEFAULT_LOCALE` (`forge new --locale`, else `en`) | The locale requests that ask for no available locale get, and the one production shows for a missing translation. A locale such as `en` or `pt-BR`, spelled canonically; `config/locales/LOCALE.json` must exist or start-up fails ([i18n](i18n.md)). |
 | `FORGE_STREAMS_KEY` | none | HMAC key of signed live-update stream names: base64 (standard or URL-safe, padded or not) of at least 32 random bytes, as `openssl rand -base64 32` prints; the same on every replica. Redacted. **Required in `production` by applications that serve live updates** (`scaffold --broadcast`); development and test use a random per-process key ([views](views.md#live-updates)). |
+| `FORGE_STREAMS_PREVIOUS_KEYS` | none | While `FORGE_STREAMS_KEY` is rotated: up to 3 older keys, comma-separated, in the same format. They only verify, so pages open during the rotation keep updating; the current key always signs. Remove them after 24 hours, the token lifetime. Redacted; an error names the entry's position, never the key. Needs `FORGE_STREAMS_KEY` ([rotating the key](deployment.md#rotating-the-stream-signing-key)). |
 | `FORGE_TELEMETRY_*` | on, exporting nothing | Traces, metrics and log export ([observability](observability.md#configuration)). The ones operators set most: `FORGE_TELEMETRY_METRICS_ADDR` (separate Prometheus listener; in a container `0.0.0.0:9464` with `FORGE_TELEMETRY_METRICS_PUBLIC=true` and the port kept off the internet), `FORGE_TELEMETRY_EXPORTER=otlp` and `FORGE_TELEMETRY_LOGS_EXPORTER=otlp` with `FORGE_TELEMETRY_OTLP_ENDPOINT` (`https` in production unless `FORGE_TELEMETRY_OTLP_ALLOW_PLAINTEXT=true`), `FORGE_TELEMETRY_OTLP_HEADERS` (secret, redacted), `FORGE_TELEMETRY_SERVICE_NAME`, `FORGE_TELEMETRY_TRUST_TRACEPARENT` (only behind a gateway that sets or sanitizes `traceparent`). `FORGE_TELEMETRY_ENABLED=false` turns it off. |
 
 Logs go to standard output, and the platform (Docker, Kubernetes, journald)
@@ -570,24 +571,23 @@ its slot until a write fails, at most until the 30 minute maximum age
 
 ### Rotating the stream signing key
 
-Generated applications sign stream names with `FORGE_STREAMS_KEY` only.
-Rotating it invalidates the stream URL of every page already open: on its
-next reconnect (at the latest after 30 minutes) such a page gets `403` and
-stops updating live until it is reloaded. Nothing else breaks, and pages
-loaded afterwards work. Rotate during a quiet period:
+Changing `FORGE_STREAMS_KEY` alone invalidates the stream URL of every page
+already open: on its next reconnect (at the latest after 30 minutes) such a
+page gets `403` and stops updating live until it is reloaded. To rotate
+without that, move the old key to `FORGE_STREAMS_PREVIOUS_KEYS`
+(comma-separated, at most 3, same format). Previous keys only verify, the new
+key signs:
 
 ```sh
+export FORGE_STREAMS_PREVIOUS_KEYS=$OLD_STREAMS_KEY   # the key being retired
 export FORGE_STREAMS_KEY=$(openssl rand -base64 32)   # the new key, on every replica
-# redeploy every replica with it; replicas with different keys refuse each other's pages
+# redeploy every replica with both; replicas with different keys refuse each other's pages
 ```
 
-To keep open pages working across a rotation, build the signer yourself in
-`src/adapters/http/streams.rs` with
-`forge::broadcast::Signer::new(&new_key, &[&old_key])`, which signs with the
-new key and still verifies the old one, keep the old key for at least the
-token lifetime (24 hours), then remove it. A `FORGE_STREAMS_PREVIOUS_KEYS`
-setting will come to Forge-Rust and Forge-Go together
-([parity follow-ups](rails-parity.md#parity-follow-ups)).
+Keep the previous key for at least the token lifetime (24 hours), then unset
+`FORGE_STREAMS_PREVIOUS_KEYS` and redeploy. Both variables are redacted, errors
+name an entry's position and never a key, and previous keys without a current
+key are refused. See [views](views.md#rotating-the-stream-signing-key).
 
 ## forge deploy
 

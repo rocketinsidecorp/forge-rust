@@ -599,6 +599,28 @@ update as failed, so a busy database pool never fails the stored change. `Fanout
 use `Fanout::InProcess`, which reaches the browsers connected to this process
 only. Behind a proxy, see [deployment](deployment.md#live-updates-behind-a-proxy).
 
+### Rotating the stream signing key
+
+Changing `FORGE_STREAMS_KEY` alone invalidates the stream name of every page
+that is already open: its next reconnect gets `403 stream_invalid` and stops
+updating until the page is reloaded. To rotate without that, move the old key
+to `FORGE_STREAMS_PREVIOUS_KEYS` (comma-separated, at most 3, same format as
+`FORGE_STREAMS_KEY`). Previous keys only verify, never sign; the current key
+always signs:
+
+```sh
+export FORGE_STREAMS_PREVIOUS_KEYS=$OLD_STREAMS_KEY      # the key being retired
+export FORGE_STREAMS_KEY=$(openssl rand -base64 32)      # the new key, on every replica
+# redeploy every replica; after 24 hours (the token lifetime) unset FORGE_STREAMS_PREVIOUS_KEYS
+```
+
+`Signer::from_config` (the generated `Streams::register` calls it) reads both
+variables, so an application generated earlier needs no code change, only a
+`forge` dependency that has the setting. Both values are
+redacted in diagnostics, and an error names the entry's position, never the
+key. Previous keys without `FORGE_STREAMS_KEY` are refused: nothing would sign.
+By hand, `Signer::new(&new_key, &[&old_key])` does the same.
+
 ## Assets
 
 Assets live in `assets/` (CSS, JavaScript, images, fonts). The generated

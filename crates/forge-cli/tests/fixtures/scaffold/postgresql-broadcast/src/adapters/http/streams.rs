@@ -23,7 +23,10 @@
 //! Streams end when shutdown begins, after 30 minutes (the browser
 //! reconnects, which checks access again), or when a browser stops reading.
 //! `FORGE_STREAMS_KEY` (`openssl rand -base64 32`, the same on every replica)
-//! is required in production.
+//! is required in production. To rotate it without breaking the pages that
+//! are open, move the old key to `FORGE_STREAMS_PREVIOUS_KEYS` (comma-separated,
+//! at most 3): previous keys only verify, the current key always signs. Remove
+//! them after 24 hours, the token lifetime.
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -61,7 +64,8 @@ pub struct Streams {
 }
 
 impl Streams {
-    /// Builds the broker (`fanout`) and the signer (`FORGE_STREAMS_KEY`), and
+    /// Builds the broker (`fanout`) and the signer (`FORGE_STREAMS_KEY`, and
+    /// `FORGE_STREAMS_PREVIOUS_KEYS` while it is rotated), and
     /// mounts `GET /streams` and `GET /tenants/{tenant_id}/streams`. Call it
     /// once; every broadcasting resource shares the result.
     pub fn register(
@@ -318,6 +322,83 @@ mod tests {
         let mut router = Router::new();
         let mut composition = Composition::for_testing(&development, &mut router);
         assert!(Streams::register(&mut composition, Fanout::InProcess).is_ok());
+        Ok(())
+    }
+
+    const OLD_KEY: &str = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=";
+    const NEW_KEY: &str = "ZmVkY2JhOTg3NjU0MzIxMGZlZGNiYTk4NzY1NDMyMTA=";
+
+    fn production(
+        streams_key: Option<&str>,
+        previous_keys: Option<&str>,
+    ) -> Result<AppConfig, forge::config::ConfigError> {
+        AppConfig::from_lookup(|name| match name {
+            "FORGE_ENV" => Some("production".to_owned()),
+            "FORGE_STREAMS_KEY" => streams_key.map(str::to_owned),
+            "FORGE_STREAMS_PREVIOUS_KEYS" => previous_keys.map(str::to_owned),
+            _ => None,
+        })
+    }
+
+    /// The token of the `<turbo-stream-source>` that `streams` renders.
+    fn token(streams: &Streams, channel: &Channel) -> Result<String, Box<dyn Error>> {
+        let source = streams.source(channel).ok_or("no source rendered")?;
+        let (_, rest) = source.split_once("stream=").ok_or("no stream parameter")?;
+        let (token, _) = rest.split_once('"').ok_or("unterminated attribute")?;
+        Ok(token.to_owned())
+    }
+
+    fn register(config: &AppConfig) -> Result<Arc<Streams>, ComposeError> {
+        let mut router = Router::new();
+        let mut composition = Composition::for_testing(config, &mut router);
+        Streams::register(&mut composition, Fanout::InProcess)
+    }
+
+    #[tokio::test]
+    async fn a_rotated_key_keeps_open_pages_working_and_signs_with_the_new_key()
+    -> Result<(), Box<dyn Error>> {
+        let channel = Channel::global("posts")?;
+        let before = register(&production(Some(OLD_KEY), None)?)?;
+        let open_page = token(&before, &channel)?;
+
+        // The new key alone no longer accepts the name of a page that is open.
+        let without_previous = register(&production(Some(NEW_KEY), None)?)?;
+        assert!(without_previous.signer.verify(&open_page).is_err());
+
+        // With the old key moved to the previous keys it does, and new names
+        // are signed with the new key: previous keys never sign.
+        let rotated = register(&production(Some(NEW_KEY), Some(OLD_KEY))?)?;
+        assert_eq!(rotated.signer.verify(&open_page)?, channel);
+        let fresh = token(&rotated, &channel)?;
+        assert_eq!(without_previous.signer.verify(&fresh)?, channel);
+        assert!(before.signer.verify(&fresh).is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn bad_previous_keys_refuse_to_start_without_echoing_a_key() -> Result<(), Box<dyn Error>>
+    {
+        let too_many = [OLD_KEY; 4].join(",");
+        // Previous keys alone, not base64, too short and an empty entry.
+        for (key, previous) in [
+            (None, OLD_KEY.to_owned()),
+            (Some(NEW_KEY), "not-a-key!".to_owned()),
+            (Some(NEW_KEY), "c2hvcnQ=".to_owned()),
+            (Some(NEW_KEY), format!("{OLD_KEY},")),
+            (Some(NEW_KEY), too_many),
+        ] {
+            let message = match production(key, Some(&previous)) {
+                Err(error) => error.to_string(),
+                Ok(config) => match register(&config) {
+                    Err(error) => format!("{error:?} {error}"),
+                    Ok(_) => return Err(format!("{previous:?} was accepted").into()),
+                },
+            };
+            assert!(message.contains("FORGE_STREAMS_PREVIOUS_KEYS"), "{message}");
+            for secret in [OLD_KEY, NEW_KEY, "not-a-key", "c2hvcnQ"] {
+                assert!(!message.contains(secret), "{message}");
+            }
+        }
         Ok(())
     }
 }
