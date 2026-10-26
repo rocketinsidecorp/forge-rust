@@ -30,7 +30,7 @@ forge generate view [<dir>/]<name> [--dry-run]
 forge destroy model|resource|scaffold|controller|mailer|job|view <arguments of the generator> [--dry-run] [--force] [--migrations]
 forge check
 forge test [ARGS]
-forge format
+forge format [--check]
 forge lint
 forge build [NAME]
 forge version
@@ -43,7 +43,7 @@ forge seed
 forge db create | drop | reset | setup | prepare | migrate | status | seed | console
 forge db rollback [--steps N]
 forge openapi [--output FILE | --check FILE]
-forge routes
+forge routes [NAME]
 forge i18n check [--json]
 forge credentials init|edit|show|rotate-key [-e|--environment ENV] [show: --reveal] [rotate-key: --keep-old --print-key --write-key-file]
 forge deploy [--version TAG] [--skip-build] [--dry-run] [--json] [-c PATH] [--secrets PATH]
@@ -795,6 +795,7 @@ forge credentials rotate-key --keep-old --print-key
 | `forge test` | `cargo test --all-targets --all-features` |
 | `forge test ARGS...` | `cargo test ARGS...`: arguments replace the defaults, like `forge test ARGS` replaces `./...` in Forge-Go (`forge test --lib orders -- --nocapture`) |
 | `forge format` | `cargo fmt --all` |
+| `forge format --check` | `cargo fmt --all -- --check --files-with-diff`: lists the files that are not formatted, writes nothing and exits 1 when there are any (for CI), like Forge-Go's `forge format --check` |
 | `forge lint` | `cargo clippy --all-targets --all-features -- -D warnings` |
 
 ## `forge build`
@@ -835,6 +836,7 @@ forge db drop
 FORGE_ALLOW_DESTRUCTIVE=true forge db drop --force-production --yes
 forge routes                       # every route: METHOD, PATH, ACTION, SOURCE
 forge routes | grep /v1            # only the JSON routes
+forge routes admin                 # the routes of the binary `admin` (--bin admin), like forge dev [NAME]
 forge openapi                      # print the OpenAPI 3.1 document (ADR 0039)
 forge openapi --output openapi.json   # write it, to commit and diff
 forge openapi --check openapi.json    # exit 1 when the committed file is out of date (CI)

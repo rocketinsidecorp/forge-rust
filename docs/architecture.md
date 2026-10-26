@@ -301,10 +301,17 @@ PostgreSQL infrastructure begins an explicit transaction and writes both
 `set_config(..., true)`; RLS policies read them with
 `current_setting(..., true)`. Missing context therefore fails closed, and the
 values disappear at transaction end instead of surviving on pooled connections.
+No session default can stand in for them: a pool refuses to open while
+`PGOPTIONS` is set (`-c forge.tenant_id=...` would give every pooled session
+a default tenant), except the migrator's (forge-rust#85).
 
 Migration and runtime credentials are separate. The schema-owning migration role
-is used only by `migrate`/`rollback`; the serving process uses a role without
-schema ownership or `BYPASSRLS`. Administrative cross-tenant access is a
+is used only by `migrate`/`rollback` and application commands such as `setup`
+and `seed`; the serving process uses a role without schema ownership or
+`BYPASSRLS`, and every PostgreSQL pool outside development and test refuses a
+role that could escape row-level security, including one holding `TRUNCATE`,
+`REFERENCES` or `TRIGGER` on a tenant table ([database
+roles](database.md#database-roles)). Administrative cross-tenant access is a
 separate future capability/role and is never implicit. See
 [ADR 0004](adr/0004-tenancy-and-rls.md) and
 [ADR 0011](adr/0011-postgresql-runtime-migration-roles-and-rls-context.md).

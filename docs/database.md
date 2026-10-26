@@ -93,10 +93,14 @@ runs once to create both roles and the database (development-only
 passwords).
 
 **Refusal outside development and test.** In every environment except
-`development` and `test` (`FORGE_ENV=production`), `serve`, `jobs work` and
-the `jobs` operator commands check the role `FORGE_DATABASE_URL` logs in as
-(`session_user`) and the role in effect (`current_user`) before using the
-pool (`PgDatabase::require_row_security`), and exit with status 1 when either
+`development` and `test` (`FORGE_ENV=production`, or no environment at all),
+every PostgreSQL pool checks the role its URL logs in as (`session_user`)
+and the role in effect (`current_user`), and refuses it with
+`DbError::RowSecurityBypass` (forge-rust#85, Forge-Go's
+`postgres.RequireRowSecurity`). `serve`, `jobs work` and the `jobs` operator
+commands also check before using the pool
+(`PgDatabase::require_row_security`) and exit with status 1. The pool is
+refused when either role
 
 - is a superuser or has `BYPASSRLS`;
 - has `CREATEROLE` (before PostgreSQL 16 it can grant itself membership in a
@@ -110,6 +114,18 @@ pool (`PgDatabase::require_row_security`), and exit with status 1 when either
 - owns, or is a member of the owner of, a table with row-level security (an
   owner can `ALTER TABLE ... NO FORCE ROW LEVEL SECURITY` and read every
   tenant), so never grant the migration role to the runtime role;
+- holds `TRUNCATE`, `REFERENCES` (on the table or on any of its columns) or
+  `TRIGGER` on a table with row-level security, itself, through `PUBLIC`,
+  through a role it inherits or through a membership that only allows
+  `SET ROLE`: none of the three is subject to row-level security
+  (`TRUNCATE` empties every tenant's rows, a foreign key probes them and a
+  trigger sees them). The usual cause is a `GRANT ALL`; the fix is
+  `REVOKE TRUNCATE, REFERENCES, TRIGGER ON ALL TABLES IN SCHEMA public FROM`
+  each of them;
+- holds any privilege on a partition that has no row-level security of its
+  own but belongs to a partitioned table with it (querying the partition
+  directly skips the parent's policies): enable and force row-level
+  security, with the same policies, on every partition;
 
 or when the two differ: a role setting (`?options=-c%20role%3D...`,
 `ALTER ROLE ... SET role`) makes the session act as another role, and
@@ -131,12 +147,42 @@ privileges, and migrate with FORGE_MIGRATION_DATABASE_URL (docs/database.md,
 "Database roles")
 ```
 
-There is no override variable. The check runs as soon as the pool exists,
-before telemetry starts and before any `App::compose` hook receives the pool.
-Development and test are not checked, so local tools may connect as an
-administrator; `routes` and `openapi` do not connect. Owning a table without
-row-level security is allowed (no policy protects it anyway). MySQL, MariaDB
-and SQLite have no row-level security and nothing is checked.
+A membership counts whatever its `INHERIT` and `SET` options (`WITH INHERIT
+FALSE, SET FALSE` is refused too: it fails closed). There is no override
+variable. An eager pool (`Database::connect_with`) is checked once it is
+connected; a lazy pool (`Database::connect_lazy_with`, the application's)
+checks every connection it opens before its first use, and `serve` checks
+as soon as the pool exists, before telemetry starts and before any
+`App::compose` hook receives the pool. `PoolSettings::with_environment`
+names the environment; `PoolSettings` without one is checked (it fails
+closed). `PoolSettings::allow_row_security_bypass()` is the only opt-out
+(Forge-Go's `postgres.AllowRowSecurityBypass()`), for a pool that must
+connect as such a role on purpose: Forge uses it only for the pools that
+connect with `FORGE_MIGRATION_DATABASE_URL` (`migrate`, `rollback`, and
+application commands such as `setup` and `seed`), because the migration role
+owns every table by design and `setup` creates principals the runtime role
+may only read. Development and test are not checked, so local tools may
+connect as an administrator; `routes` and `openapi` connect only if
+something queries, and then every connection is checked. Owning a table, or
+holding any privilege on one, without row-level security is allowed (no
+policy protects it anyway). MySQL, MariaDB and SQLite have no row-level
+security and nothing is checked.
+
+**Session settings never come from the environment.** SQLx reads `PGOPTIONS`
+and `PGAPPNAME` into every connection, and `PGOPTIONS='-c
+forge.tenant_id=<uuid>'` would give every pooled session a default tenant, so
+a query outside a tenant transaction would read that tenant's rows instead of
+none. SQLx cannot drop `PGOPTIONS` once read (it even prepends it to the
+URL's own `options`), so every pool except the migrator's refuses to open
+while `PGOPTIONS` is set, naming the variable, never its value; put session
+settings in the URL's `options` parameter instead. `application_name` is the
+URL's, else `forge`, never `PGAPPNAME`. SQLx never reads `PGTZ`: every
+session is in UTC. The migrator keeps the driver's behavior
+(`PoolSettings::with_environment_session(true)`), so this still works:
+
+```sh
+PGOPTIONS='-c lock_timeout=5s' forge migrate
+```
 
 **Provisioning in production.** Create the equivalent of `init.sql` once, as
 an administrator, then migrate with the migration role and serve with the
@@ -177,17 +223,18 @@ FORGE_ENV=production FORGE_DATABASE_URL='postgres://shop_runtime:PASSWORD@db.int
 
 | API | Notes |
 | --- | --- |
-| `connect(&SecretString)`, `connect_with(url, PoolSettings)` | eager; an unreachable server is the retryable `DbError::Unavailable` after the acquire timeout |
-| `connect_lazy(..)`, `connect_lazy_with(..)` | no I/O until first use; call inside a Tokio runtime |
+| `connect(&SecretString)`, `connect_with(url, PoolSettings)` | eager; an unreachable server is the retryable `DbError::Unavailable` after the acquire timeout; a PostgreSQL pool is checked for row-level security once connected unless its settings name development or test or opt out |
+| `connect_lazy(..)`, `connect_lazy_with(..)` | no I/O until first use; call inside a Tokio runtime; a PostgreSQL pool checks each new connection (a refused one ends in `DbError::PoolTimeout`, the reason is logged) |
 | `pool()`, `scheme()`, `ping()`, `close()` | `Database` is `Clone` (shared pool) and its `Debug` never contains the URL |
 | `begin()` | `DbTransaction<B>`; query with `.execute(tx.connection())`; dropping rolls back |
 | `migrate(&Migrator) -> Vec<i64>` | versions applied, ascending |
 | `rollback(&Migrator) -> Option<i64>` | reverts the latest applied migration; `IrreversibleMigration` without a down migration |
-| `require_row_security(Environment)` (PostgreSQL) | outside development and test, `DbError::RowSecurityBypass` when the pool's role could bypass row-level security ([Database roles](#database-roles)); the `forge::App` lifecycle calls it |
+| `require_row_security(Environment)` (PostgreSQL) | outside development and test, `DbError::RowSecurityBypass` when the pool's role could bypass row-level security ([Database roles](#database-roles)), checked on a connection of its own; the `forge::App` lifecycle calls it |
 | `expect_rows(result, n)` | `DbError::Conflict` unless exactly `n` rows were affected; accepts every backend's query result (optimistic locking) |
 
-Defaults: 10 connections, 5 second acquire timeout, no statement timeout
-(`PoolSettings`). `PoolSettings::with_statement_timeout` bounds every
+Defaults: 10 connections (none kept open), 5 second acquire timeout,
+connections replaced after 30 minutes and closed after 10 idle minutes, no
+statement timeout, no environment (checked) (`PoolSettings`). `PoolSettings::with_statement_timeout` bounds every
 statement on the server, set on each new connection; `PoolSettings::from_config`
 is the serving pool of the configuration (below).
 
@@ -199,13 +246,17 @@ is the serving pool of the configuration (below).
 | Key | Default | Effect |
 | --- | --- | --- |
 | `FORGE_DATABASE_MAX_CONNS` | `10` | Pool size, `1` to `1000`; in-serve jobs share it. |
+| `FORGE_DATABASE_MIN_CONNS` | `0` | Connections kept open, `0` to `FORGE_DATABASE_MAX_CONNS` (SQLx `min_connections`); `routes` and `openapi` keep none. |
 | `FORGE_DATABASE_CONNECT_TIMEOUT` | `5s` | The acquire timeout: waiting for a free connection and opening one. |
+| `FORGE_DATABASE_MAX_CONN_LIFETIME` | `30m` | A connection older than this is replaced (SQLx `max_lifetime`). Positive. |
+| `FORGE_DATABASE_MAX_CONN_IDLE_TIME` | `5m` | An idle connection above the minimum is closed after this long (SQLx `idle_timeout`). Positive. |
 | `FORGE_DATABASE_STATEMENT_TIMEOUT` | `30s` | `SET statement_timeout` (PostgreSQL), `SET SESSION max_statement_time` (MariaDB, every statement), `SET SESSION max_execution_time` (MySQL, read-only `SELECT` only) on each new connection; nothing on SQLite. `1ms` to `596h`. |
 | `FORGE_DATABASE_ALLOW_PLAINTEXT` | `false` | Lifts the production TLS rule. |
 
 Migrations, `setup`, `seed` and the `db` commands connect with the default
 `PoolSettings`, without the statement timeout, so long schema changes are not
-cancelled. In production both URLs must verify the server certificate
+cancelled; they connect with the migration credential and opt out of the
+row-level security check (its role owns the schema). In production both URLs must verify the server certificate
 (`sslmode=verify-full`, `ssl-mode=VERIFY_IDENTITY`, a Unix
 socket, or SQLite) unless `FORGE_DATABASE_ALLOW_PLAINTEXT=true`
 ([database TLS](deployment.md#database-tls)).
@@ -213,6 +264,7 @@ socket, or SQLite) unless `FORGE_DATABASE_ALLOW_PLAINTEXT=true`
 ```sh
 export FORGE_DATABASE_URL='postgres://app_runtime:PASSWORD@db.internal:5432/shop?sslmode=verify-full'
 export FORGE_DATABASE_MAX_CONNS=20 FORGE_DATABASE_CONNECT_TIMEOUT=2s FORGE_DATABASE_STATEMENT_TIMEOUT=10s
+export FORGE_DATABASE_MIN_CONNS=2 FORGE_DATABASE_MAX_CONN_LIFETIME=1h FORGE_DATABASE_MAX_CONN_IDLE_TIME=2m
 cargo run
 ```
 

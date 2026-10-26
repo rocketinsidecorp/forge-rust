@@ -15,7 +15,7 @@ the work is finished and waiting for its review; **Planned** means not started.
 | HTML + JSON CRUD generator | `rails g scaffold` | Done | Done (HTML pages); In review (the JSON API under `/v1/<plural>` behind bearer tokens that `forge generate scaffold` now writes next to its pages, [ADR 0045](adr/0045-json-resources-and-bearer-api-authentication.md)) |
 | Authentication pages, password reset | `rails g authentication` | Done | Done |
 | First tenant and owner, seeds | `db:seed` | Done (`forge setup`, `forge seed`) | In review (`forge setup`, `forge seed`; the application commands `setup` and `seed` are Done) |
-| Multi-tenancy with database enforcement | (gems) | Done (PostgreSQL RLS; `app_migrator`/`app_runtime` roles, staging and production refuse a serving role that could bypass RLS, tests run as the runtime role; Forge-Go ADR 0046) | Done (PostgreSQL RLS; `app_migrator`/`app_runtime` roles, [ADR 0011](adr/0011-postgresql-runtime-migration-roles-and-rls-context.md)); In review (production refuses a serving role that could bypass RLS, generated repository tests run as a per-test runtime role and prove it cannot run DDL, [ADR 0044](adr/0044-refused-row-level-security-bypass-and-runtime-role-tests.md); see follow-ups) |
+| Multi-tenancy with database enforcement | (gems) | Done (PostgreSQL RLS; `app_migrator`/`app_runtime` roles, staging and production refuse a serving role that could bypass RLS, including one holding `TRUNCATE`/`REFERENCES`/`TRIGGER` on an RLS table or a privilege on an unprotected partition, every pool checked unless `AllowRowSecurityBypass()`, `PGOPTIONS` stripped from the serving pool, tests run as the runtime role; Forge-Go ADR 0046, QG9) | Done (PostgreSQL RLS; `app_migrator`/`app_runtime` roles, [ADR 0011](adr/0011-postgresql-runtime-migration-roles-and-rls-context.md); production refuses a serving role that could bypass RLS, generated repository tests run as a per-test runtime role and prove it cannot run DDL, [ADR 0044](adr/0044-refused-row-level-security-bypass-and-runtime-role-tests.md); the same `TRUNCATE`/`REFERENCES`/`TRIGGER` and partition rules, every PostgreSQL pool checked unless `PoolSettings::allow_row_security_bypass()`, no environment fails closed, lazy pools check each connection, and no pool but the migrator's opens while `PGOPTIONS` is set, [forge-rust#85](https://github.com/rocketinsidecorp/forge-rust/issues/85); see follow-ups) |
 | TOTP MFA | (gems) | Done | Done (`FORGE_AUTH_MFA_KEY`, `/session/mfa`, `/mfa`, [ADR 0040](adr/0040-totp-multi-factor-authentication.md), [MFA](mfa.md)) |
 | Persistent jobs, cron, outbox | Solid Queue | Done | Done (framework crates); In review (`forge new` wires the job queue into PostgreSQL applications: `jobs` feature, `.jobs(WorkerMode::InServe)`, `jobs_configure`) |
 | Batch claims, `LISTEN/NOTIFY` wake-up, one replica per scheduled tick | Solid Queue (`batch_size`, `polling_interval`, recurring tasks run once) | Done (`WorkerOptions.BatchSize` 10, `queuepostgres.WithNotify`, `DispatcherOptions.BatchSize` 10, `jobs.SchedulerOptions.Ticks` with `forge_job_schedules`; Forge-Go ADR 0047) | Done (ticks recorded once in `forge_job_schedules`); In review (`WorkerSettings::batch` 10, never above the free slots; `App::jobs_notify(true)` or `FORGE_JOBS_NOTIFY=true` (`PgJobStore::notify` in the library) announces due jobs on `forge_jobs` and `Jobs::run` listens; `DispatcherSettings::batch` 10; [ADR 0046](adr/0046-job-wake-up-and-claim-batches.md), [forge-rust#80](https://github.com/rocketinsidecorp/forge-rust/issues/80); see follow-ups) |
@@ -37,7 +37,7 @@ the work is finished and waiting for its review; **Planned** means not started.
 | Catch-all route segment | `get "files/*path"` | Done (`GET /files/{key...}`, `http.ServeMux`) | In review (`{name...}` as the last segment: the rest of the path, possibly empty; static and `{name}` routes win; like Forge-Go's router, every path holding `%2F`, `%5C`, a raw backslash or a `.`/`..` segment (spelled or `%2e`-encoded) answers `400` before routing, and so does a catch-all value starting with `/` or holding `//` (which `ServeMux` cleans); the OpenAPI document names it `{name}` like Forge-Go's; a path that stops before the catch-all, `/files`, is `404` where `ServeMux` redirects to `/files/`) |
 | Handler panic answered with `500` | `ShowExceptions` | Done (`recoverer`: JSON error body with the request id) | In review (text body `internal server error`, `x-request-id`, logged with the request id) |
 | HSTS behind TLS | `config.force_ssl` | Done (`Strict-Transport-Security` unless `FORGE_HTTP_TRANSPORT=plain`) | In review (same header and rule, `FORGE_HTTP_TRANSPORT=plain\|trusted-proxy`, see follow-ups) |
-| Verified database TLS in production, pool limits | `sslmode` in `database.yml`, `pool` | Done (`sslmode=verify-full\|verify-ca`, MySQL `tls=true`, `FORGE_DATABASE_ALLOW_PLAINTEXT`, `FORGE_DATABASE_MAX_CONNS\|MIN_CONNS\|MAX_CONN_LIFETIME\|MAX_CONN_IDLE_TIME\|CONNECT_TIMEOUT\|STATEMENT_TIMEOUT`) | In review (stricter TLS rule: `sslmode=verify-full`, SQLx's MySQL spelling `ssl-mode=VERIFY_IDENTITY`; `verify-ca` refused, see follow-ups; `FORGE_DATABASE_ALLOW_PLAINTEXT`, `FORGE_DATABASE_MAX_CONNS\|CONNECT_TIMEOUT\|STATEMENT_TIMEOUT`; see follow-ups) |
+| Verified database TLS in production, pool limits | `sslmode` in `database.yml`, `pool` | Done (`sslmode=verify-full\|verify-ca`, MySQL `tls=true`, `FORGE_DATABASE_ALLOW_PLAINTEXT`, `FORGE_DATABASE_MAX_CONNS\|MIN_CONNS\|MAX_CONN_LIFETIME\|MAX_CONN_IDLE_TIME\|CONNECT_TIMEOUT\|STATEMENT_TIMEOUT`) | Done (stricter TLS rule: `sslmode=verify-full`, SQLx's MySQL spelling `ssl-mode=VERIFY_IDENTITY`; `verify-ca` refused, see follow-ups; `FORGE_DATABASE_ALLOW_PLAINTEXT`, `FORGE_DATABASE_MAX_CONNS\|MIN_CONNS\|MAX_CONN_LIFETIME\|MAX_CONN_IDLE_TIME\|CONNECT_TIMEOUT\|STATEMENT_TIMEOUT`, the pool keys since [forge-rust#85](https://github.com/rocketinsidecorp/forge-rust/issues/85); see follow-ups) |
 | Bound on buffered request bodies | — | Not needed (bodies are streamed through `MaxBytesReader`) | In review (`FORGE_MAX_IN_FLIGHT_BODY_BYTES`, 256 MiB for all bodies at once, `503` with `Retry-After`) |
 | Cache | Solid Cache | Done | Done |
 | File storage with signed URLs | Active Storage | Done (disk) | Done (disk) |
@@ -51,7 +51,7 @@ the work is finished and waiting for its review; **Planned** means not started.
 | Encrypted credentials, attribute encryption | `credentials:edit`, AR Encryption | Done (`forge credentials`, `encryption`) | Done (`forge credentials init\|edit\|show\|rotate-key`, `forge::credentials`, `forge::encryption`, [ADR 0041](adr/0041-encrypted-credentials-and-attribute-encryption.md), [credentials](credentials.md), [encryption](encryption.md)) |
 | i18n | I18n | Done (`config/locales/*.json`, `t`, CLDR plurals, `forge new --locale`, `forge i18n check`, Forge-Go ADR 0042) | Done (`config/locales/*.json`, `layout.i18n.t`, CLDR plurals, `forge new --locale`, `forge i18n check`, [ADR 0037](adr/0037-internationalization.md), [i18n](i18n.md)) |
 | OpenAPI from typed routes | — | Done (Forge-Go ADR 0043) | Done (`#[derive(OpenApiSchema)]`, `forge::openapi::typed`/`describe`, `GET /openapi.json`, `FORGE_OPENAPI_ENABLED`, `forge openapi`, [ADR 0039](adr/0039-openapi-from-typed-routes.md), [OpenAPI](openapi.md)) |
-| List the application's routes | `rails routes` | Done (`forge routes [NAME]`, runs the composed application since [forge-go#66](https://github.com/rocketinsidecorp/forge-go/pull/66): every HTML and JSON route, the `/v1/<plural>` routes of resources included, with its resource action and source line; a source scan only when the application cannot be built or configured) | Done (`forge routes`, runs the composed application: every HTML and JSON route with its source line, [CLI](cli.md#application-lifecycle-commands)); no `NAME` argument yet (see follow-ups) |
+| List the application's routes | `rails routes` | Done (`forge routes [NAME]`, runs the composed application since [forge-go#66](https://github.com/rocketinsidecorp/forge-go/pull/66): every HTML and JSON route, the `/v1/<plural>` routes of resources included, with its resource action and source line; a source scan only when the application cannot be built or configured) | Done (`forge routes [NAME]`, runs the composed application: every HTML and JSON route with its source line, `NAME` the binary (`--bin NAME`) like `forge dev [NAME]`, [CLI](cli.md#application-lifecycle-commands), [forge-rust#85](https://github.com/rocketinsidecorp/forge-rust/issues/85)) |
 | Controller, model, mailer and job generators | `rails g` | Done (Forge-Go ADR 0041) | Done (`forge generate model\|controller\|mailer\|job --queue`, [ADR 0038](adr/0038-generators-and-destroy.md), [generators](generators.md)) |
 | One page generator | — | Done (`forge generate view [DIR/]NAME`, `forge destroy view`) | In review (same command and arguments: `templates/DIR/NAME.html`, plus the Askama view model and a rendering test; refuses `--api` applications instead of adding a views base, [generators](generators.md#view)) |
 | Model plus JSON API generator | `rails g resource` | Done (`forge generate resource`, `forge destroy resource`: model + `/v1/<plural>` JSON routes behind bearer tokens) | In review (`forge generate resource`, `forge destroy resource`: the model + `/v1/<plural>` JSON CRUD behind bearer tokens, `<plural>:read`/`<plural>:write`, OpenAPI `bearerAuth`, generated `401`/`403`/cross-tenant/validation tests, [generators](generators.md#resource); see follow-ups) |
@@ -60,6 +60,12 @@ the work is finished and waiting for its review; **Planned** means not started.
 | Continuous fuzzing, SBOM, signed images | — | Done (`scripts/fuzz.sh`, `scripts/sbom.sh`, `release.yml`, Forge-Go ADR 0044) | Done (`scripts/fuzz.sh`, `scripts/sbom.sh`, signed forge-proxy image, SHA/digest pins enforced by `crates/forge/tests/supply_chain.rs`, [ADR 0043](adr/0043-continuous-fuzzing-sbom-signed-images.md), [supply chain](supply-chain.md)) |
 | Published benchmarks | — | Done (`go test -bench`, `scripts/bench.sh`, [BENCHMARKS.md](https://github.com/rocketinsidecorp/forge-go/blob/main/docs/BENCHMARKS.md)) | Done (`cargo bench -p forge-bench`, `scripts/bench.sh`, [benchmarks](benchmarks.md)) |
 | Getting Started guide | Rails Guides | Done (Forge-Go docs/GETTING_STARTED.md) | Done ([getting started](getting-started.md)) |
+| HTTP timeouts and request head bound | Puma `first_data_timeout`, `persistent_timeout` | Done (`FORGE_HTTP_READ_HEADER_TIMEOUT`, `FORGE_HTTP_READ_TIMEOUT`, `FORGE_HTTP_WRITE_TIMEOUT`, `FORGE_HTTP_IDLE_TIMEOUT`, `FORGE_HTTP_MAX_HEADER_BYTES`) | Done (same names, defaults and duration syntax; `FORGE_REQUEST_TIMEOUT_SECS` is the deprecated spelling of `FORGE_HTTP_WRITE_TIMEOUT`; the servers differ where Go's net/http and hyper do, see [deployment](deployment.md#renamed-variables); [forge-rust#85](https://github.com/rocketinsidecorp/forge-rust/issues/85)) |
+| Format check for CI | `rubocop` | Done (`forge format --check`: lists files, writes nothing, exits 1) | Done (`forge format --check`: `cargo fmt --all -- --check --files-with-diff`, [forge-rust#85](https://github.com/rocketinsidecorp/forge-rust/issues/85)) |
+| Metrics listener on a kernel-chosen port | — | Done (`FORGE_TELEMETRY_METRICS_ADDR=127.0.0.1:0`, bound address logged) | Done (same; [forge-rust#85](https://github.com/rocketinsidecorp/forge-rust/issues/85)) |
+| Stale scheduler ticks skipped, not replayed | Solid Queue recurring tasks | Done (`SchedulerOptions.MaxLateness`, default one interval, skipped ticks reported) | Done (`Schedule::max_lateness`, default one interval: the gap to the next tick; skipped ticks logged as a warning; decision D14, [forge-rust#85](https://github.com/rocketinsidecorp/forge-rust/issues/85)) |
+| Undecodable cached values counted and logged | — | Done (`cache.DecodeFailures()`, warn once per key with an HMAC-SHA256 key prefix) | Done (`forge_cache::decode_failures()`, the same log, [forge-rust#85](https://github.com/rocketinsidecorp/forge-rust/issues/85)) |
+| Generated Dockerfile pinned to the framework's own images | — | Done (`TestDockerfilesPinBaseImagesByDigest`) | Done (the supply-chain gate requires forge-proxy's exact references, [forge-rust#85](https://github.com/rocketinsidecorp/forge-rust/issues/85)) |
 
 ## Parity follow-ups
 
@@ -121,9 +127,34 @@ the work is finished and waiting for its review; **Planned** means not started.
   acquire timeout (waiting for a free connection and opening one), where
   pgx bounds each dial; it does not set SQLite's `busy_timeout` (fixed at
   5s). (4) `FORGE_DATABASE_MIN_CONNS`, `MAX_CONN_LIFETIME` and
-  `MAX_CONN_IDLE_TIME` are not ported yet (SQLx's defaults apply: no
-  minimum, 30 min lifetime, 10 min idle); add them when a deployment needs
-  them.
+  `MAX_CONN_IDLE_TIME` have Forge-Go's names, defaults (0, 30m, 5m) and
+  bounds since [forge-rust#85](https://github.com/rocketinsidecorp/forge-rust/issues/85),
+  as SQLx's `min_connections`, `max_lifetime` and `idle_timeout`; the
+  `routes`/`openapi` pool keeps no connection open, as Forge-Go's lazy pool
+  does.
+
+- RLS and environment hardening ([forge-rust#85](https://github.com/rocketinsidecorp/forge-rust/issues/85),
+  2026-10-26, port of Forge-Go QG9): the role query has Forge-Go's two new
+  predicates and reason texts (`TRUNCATE`, `REFERENCES` on the table or a
+  column, or `TRIGGER` on a table with row-level security, by any
+  membership, `PUBLIC` included; any privilege on a partition without
+  row-level security of such a table). Every PostgreSQL pool is checked
+  unless its `PoolSettings` name development or test (no environment fails
+  closed, as Forge-Go's empty `Database.Environment`), with
+  `PoolSettings::allow_row_security_bypass()` as the only opt-out
+  (`AllowRowSecurityBypass()`); an eager pool checks once, a lazy pool
+  every connection (`postgres.Lazy`). Differences: (1) SQLx cannot drop
+  `PGOPTIONS` once read (and prepends it to the URL's `options`), so where
+  Forge-Go strips it from the serving pool Forge-Rust refuses to open any
+  pool but the migrator's while it is set; `PGAPPNAME` is replaced by the
+  URL's `application_name`, else `forge`, as in Forge-Go; SQLx never reads
+  `PGTZ`. (2) Forge-Go's `seed` and `setup` open the runtime pool and are
+  checked; Forge-Rust's application commands connect with
+  `FORGE_MIGRATION_DATABASE_URL` (ADR 0026: `setup` creates principals the
+  runtime role may only read), whose role owns the schema, so they opt out
+  like the migrator. (3) A refused lazy connection surfaces as a pool
+  timeout in Forge-Rust (SQLx retries `after_connect` errors), with the
+  reason logged; `require_row_security` reports it directly.
 
 - RLS defense in depth (forge-rust#70, 2026-10-26, port of Forge-Go QG1
   and its ADR 0046): `PgDatabase::require_row_security` is Forge-Go's
@@ -389,11 +420,10 @@ the work is finished and waiting for its review; **Planned** means not started.
   (literal paths only), where Forge-Rust fails with the reason; Forge-Rust's
   `ACTION` column is always `-` because it has no `Resources` router (Forge-Go
   fills it for `Resources` routes; porting `Resources` to Rust is a separate
-  item). **Forge-Rust follow-up:** Forge-Go's `forge routes [NAME]` takes the
-  binary (`cmd/NAME`) to run when an application has several; Forge-Rust's
-  `forge routes` takes no `NAME` argument yet, unlike its `forge dev [NAME]`
-  and `forge build [NAME]`. Add the optional `NAME` (the Cargo `--bin`) with
-  Forge-Go's meaning.
+  item). `forge routes [NAME]` takes the binary to run when an application
+  has several, with Forge-Go's meaning (Forge-Go's `cmd/NAME`, Forge-Rust's
+  Cargo `--bin NAME`, like its `forge dev [NAME]` and `forge build [NAME]`;
+  [forge-rust#85](https://github.com/rocketinsidecorp/forge-rust/issues/85)).
 
 - Supply chain ([ADR 0043](adr/0043-continuous-fuzzing-sbom-signed-images.md),
   [supply chain](supply-chain.md)): the workflows, pins, tag guard,

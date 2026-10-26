@@ -123,7 +123,11 @@ from env files, Kubernetes manifests and unit files.
 | --- | --- | --- |
 | `FORGE_ENV` | `development` | `development`, `test` or `production`. Selects safety-sensitive defaults such as the log format. |
 | `FORGE_HTTP_ADDR` | `127.0.0.1:3000` | Listen socket address. The container image sets `0.0.0.0:3000`. |
-| `FORGE_REQUEST_TIMEOUT_SECS` | `30` | Maximum time for one request, including reading the request body. A response write that makes no progress for this long (at least 30 seconds) ends the connection. |
+| `FORGE_HTTP_READ_HEADER_TIMEOUT` | `5s` | Time a client has to send a request head: from the connection's start for its first request, from the first byte of each later one; the connection is then closed. |
+| `FORGE_HTTP_READ_TIMEOUT` | `15s` | Time to send a request body; a slower body is answered `408`. |
+| `FORGE_HTTP_WRITE_TIMEOUT` | `30s` | Deadline of a request once its head is read: reading the body and the handler; past it the client gets `504`. A response write that makes no progress for this long (at least 30 seconds) ends the connection. Was `FORGE_REQUEST_TIMEOUT_SECS`, in seconds. |
+| `FORGE_HTTP_IDLE_TIMEOUT` | `60s` | How long a kept-alive connection may wait for its next request. Keep it above your load balancer's idle timeout. |
+| `FORGE_HTTP_MAX_HEADER_BYTES` | `1048576` | Largest request head (request line and headers) in bytes; a larger one is answered `431` and the connection closed. |
 | `FORGE_HTTP_SHUTDOWN_TIMEOUT` | `15s` | Drain deadline for in-flight requests after SIGTERM/SIGINT, a positive duration (`15s`, `1m`). |
 | `FORGE_HTTP_MAX_BODY_BYTES` | `1048576` | Maximum request body size in bytes. |
 | `FORGE_MAX_CONNECTIONS` | `10000` | Maximum concurrent connections. Extra connections wait for a slot (backpressure) instead of being served without bound. |
@@ -135,6 +139,9 @@ from env files, Kubernetes manifests and unit files.
 | `FORGE_DATABASE_URL` | none | Least-privilege PostgreSQL runtime connection URL. Treated as a secret and redacted from ordinary diagnostics. In `production` it must verify the server certificate (see [database TLS](#database-tls)). |
 | `FORGE_MIGRATION_DATABASE_URL` | none | PostgreSQL schema-owner/migration URL used only by `migrate`, `rollback` and application commands such as `setup` and `seed`. Treated as a secret and redacted. Same TLS rule as `FORGE_DATABASE_URL`. |
 | `FORGE_DATABASE_MAX_CONNS` | `10` | Connections of the serving pool (`serve`, `jobs work`), `1` to `1000`. Background jobs in `serve` share it. |
+| `FORGE_DATABASE_MIN_CONNS` | `0` | Connections the serving pool keeps open, `0` to `FORGE_DATABASE_MAX_CONNS`. |
+| `FORGE_DATABASE_MAX_CONN_LIFETIME` | `30m` | Age at which a pooled connection is replaced. |
+| `FORGE_DATABASE_MAX_CONN_IDLE_TIME` | `5m` | Idle time after which a connection above the minimum is closed. |
 | `FORGE_DATABASE_CONNECT_TIMEOUT` | `5s` | How long a query waits for a pooled connection, opening one included; a positive duration (`500ms`, `5s`, `1m`). Beyond it the query fails with a retryable error. |
 | `FORGE_DATABASE_STATEMENT_TIMEOUT` | `30s` | Server-side bound of every statement of the serving pool, `1ms` to `596h`: `statement_timeout` on PostgreSQL, `max_statement_time` on MariaDB, `max_execution_time` (read-only `SELECT` only) on MySQL, none on SQLite. Migrations, `setup`, `seed` and the `db` commands run without it. |
 | `FORGE_DATABASE_ALLOW_PLAINTEXT` | `false` | `true` lets `production` use database URLs that do not verify the server certificate. Only for a database reached over a trusted private network. |
@@ -187,6 +194,7 @@ unit files:
 | --- | --- | --- |
 | `FORGE_BIND` | `FORGE_HTTP_ADDR` | unchanged: a socket address |
 | `FORGE_MAX_BODY_BYTES` | `FORGE_HTTP_MAX_BODY_BYTES` | unchanged: bytes |
+| `FORGE_REQUEST_TIMEOUT_SECS` | `FORGE_HTTP_WRITE_TIMEOUT` | seconds (`30`) become a duration (`30s`) |
 | `FORGE_SHUTDOWN_GRACE_SECS` | `FORGE_HTTP_SHUTDOWN_TIMEOUT` | seconds (`15`) become a duration (`15s`) |
 | `FORGE_CACHE_DEFAULT_TTL_SECS` | `FORGE_CACHE_DEFAULT_TTL` | seconds (`3600`) become a duration (`1h`); `1ms` is now the minimum, as in Forge-Go |
 | `FORGE_STORAGE_LINK_TTL_SECS` | `FORGE_STORAGE_LINK_TTL` | seconds (`900`) become a duration (`15m`) |
@@ -200,15 +208,24 @@ in one of them only:
 
 | Forge-Rust only | Why |
 | --- | --- |
-| `FORGE_REQUEST_TIMEOUT_SECS` | one per-request deadline; Forge-Go splits it into `FORGE_HTTP_READ_TIMEOUT` and `FORGE_HTTP_WRITE_TIMEOUT` |
 | `FORGE_MAX_CONNECTIONS`, `FORGE_MAX_IN_FLIGHT_BODY_BYTES` | connection and buffered-body backpressure; Forge-Go streams bodies |
 | `FORGE_LOG`, `FORGE_LOG_FORMAT` | `tracing` filter and output format; Forge-Go's `slog` output has no such settings |
+
+The HTTP timeouts and the header bound (`FORGE_HTTP_READ_HEADER_TIMEOUT`,
+`FORGE_HTTP_READ_TIMEOUT`, `FORGE_HTTP_WRITE_TIMEOUT`,
+`FORGE_HTTP_IDLE_TIMEOUT`, `FORGE_HTTP_MAX_HEADER_BYTES`) and the pool keys
+(`FORGE_DATABASE_MIN_CONNS`, `FORGE_DATABASE_MAX_CONN_LIFETIME`,
+`FORGE_DATABASE_MAX_CONN_IDLE_TIME`) have Forge-Go's names, defaults and
+duration syntax (forge-rust#85). Where the servers differ: Go's
+`ReadTimeout` also covers the head and `WriteTimeout` ends the connection,
+while Forge-Rust bounds the head with `FORGE_HTTP_READ_HEADER_TIMEOUT`, the
+body with `FORGE_HTTP_READ_TIMEOUT` (`408`), and the body plus the handler
+with `FORGE_HTTP_WRITE_TIMEOUT` (`504`), and ends a stalled response write
+separately (no progress for that long, at least 30 seconds).
 
 | Forge-Go only | Forge-Rust |
 | --- | --- |
 | `FORGE_HTTP_TLS_CERT_FILE`, `FORGE_HTTP_TLS_KEY_FILE` | TLS is terminated in front (`forge-proxy` or a load balancer); `FORGE_HTTP_TRANSPORT=tls` is refused |
-| `FORGE_HTTP_READ_HEADER_TIMEOUT`, `FORGE_HTTP_READ_TIMEOUT`, `FORGE_HTTP_WRITE_TIMEOUT`, `FORGE_HTTP_IDLE_TIMEOUT`, `FORGE_HTTP_MAX_HEADER_BYTES` | fixed header limits plus `FORGE_REQUEST_TIMEOUT_SECS` |
-| `FORGE_DATABASE_MIN_CONNS`, `FORGE_DATABASE_MAX_CONN_LIFETIME`, `FORGE_DATABASE_MAX_CONN_IDLE_TIME` | not configurable yet (SQLx pool defaults) |
 
 ### Database TLS
 
@@ -242,12 +259,18 @@ credential, then start the application with only `FORGE_DATABASE_URL`
 runtime database role should be `NOSUPERUSER`, `NOCREATEDB`, `NOCREATEROLE`,
 `NOBYPASSRLS`, and should not own application schemas. In production `serve`,
 `jobs work` and the `jobs` operator commands refuse to start (exit 1, the
-message names the role) when it is a superuser, has `BYPASSRLS`,
+message names the role), and every other pool on `FORGE_DATABASE_URL`
+refuses its connections, when it is a superuser, has `BYPASSRLS`,
 `CREATEROLE` or `REPLICATION`, is a member of such a role or of
 `pg_execute_server_program`, `pg_write_server_files` or
 `pg_read_server_files`, owns (or can `SET ROLE` to the owner of) a table with
-row-level security, or when the URL switches it to another role
-(`options=-c role=...`); see
+row-level security, holds `TRUNCATE`, `REFERENCES` or `TRIGGER` on such a
+table (directly, through `PUBLIC` or through a role it belongs to; usually a
+`GRANT ALL`), holds a privilege on a partition without row-level security of
+such a table, or when the URL switches it to another role
+(`options=-c role=...`). Do not export `PGOPTIONS` to the application: every
+pool but the migrator's refuses to open while it is set (it would give every
+session a default tenant); see
 [Database roles](database.md#database-roles), [ADR
 0011](adr/0011-postgresql-runtime-migration-roles-and-rls-context.md) and
 [ADR 0044](adr/0044-refused-row-level-security-bypass-and-runtime-role-tests.md).
