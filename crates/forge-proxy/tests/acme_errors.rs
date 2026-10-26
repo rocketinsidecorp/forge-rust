@@ -403,11 +403,13 @@ async fn clients_refuse_unusable_keys_urls_and_trust_anchors() {
 
 #[tokio::test]
 async fn network_failures_are_reported_by_stage() {
-    // Nothing listens.
-    let closed = {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-        format!("http://{}", listener.local_addr().expect("addr"))
-    };
+    // Nothing listens: the port is bound and never listening, so connecting
+    // is refused and nobody else can take it while the test runs.
+    let refusing = tokio::net::TcpSocket::new_v4().expect("socket");
+    refusing
+        .bind("127.0.0.1:0".parse().expect("address"))
+        .expect("bind");
+    let closed = format!("http://{}", refusing.local_addr().expect("addr"));
     let error = client(&closed)
         .issue(HOST, &generate_p256().expect("key"), &Challenges::default())
         .await
