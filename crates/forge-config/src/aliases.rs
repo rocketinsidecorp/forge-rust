@@ -32,6 +32,9 @@ pub const HTTP_ADDR_KEY: &str = "FORGE_HTTP_ADDR";
 /// The canonical name of the request body bound (`FORGE_MAX_BODY_BYTES`
 /// before).
 pub const HTTP_MAX_BODY_BYTES_KEY: &str = "FORGE_HTTP_MAX_BODY_BYTES";
+/// The canonical name of the per-request deadline, a duration
+/// (`FORGE_REQUEST_TIMEOUT_SECS` before, in seconds).
+pub const HTTP_WRITE_TIMEOUT_KEY: &str = "FORGE_HTTP_WRITE_TIMEOUT";
 /// The canonical name of the shutdown drain deadline, a duration
 /// (`FORGE_SHUTDOWN_GRACE_SECS` before, in seconds).
 pub const HTTP_SHUTDOWN_TIMEOUT_KEY: &str = "FORGE_HTTP_SHUTDOWN_TIMEOUT";
@@ -56,6 +59,11 @@ pub const DEPRECATED_KEYS: &[DeprecatedKey] = &[
         deprecated: "FORGE_MAX_BODY_BYTES",
         canonical: HTTP_MAX_BODY_BYTES_KEY,
         value_change: "",
+    },
+    DeprecatedKey {
+        deprecated: "FORGE_REQUEST_TIMEOUT_SECS",
+        canonical: HTTP_WRITE_TIMEOUT_KEY,
+        value_change: SECONDS_TO_DURATION,
     },
     DeprecatedKey {
         deprecated: "FORGE_SHUTDOWN_GRACE_SECS",

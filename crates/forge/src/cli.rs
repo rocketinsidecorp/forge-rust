@@ -394,7 +394,13 @@ Commands:
 Environment:
   FORGE_ENV                   development | test | production (default: development)
   FORGE_HTTP_ADDR             listen socket address (default: 127.0.0.1:3000)
-  FORGE_REQUEST_TIMEOUT_SECS  per-request deadline in seconds (default: 30)
+  FORGE_HTTP_WRITE_TIMEOUT    deadline of a request once its head is read: body and handler,
+                              then 504 (default: 30s; was FORGE_REQUEST_TIMEOUT_SECS, seconds)
+  FORGE_HTTP_READ_HEADER_TIMEOUT time to send a request head, from the connection's start or
+                              the next request's first byte (default: 5s)
+  FORGE_HTTP_READ_TIMEOUT     time to send a request body, then 408 (default: 15s)
+  FORGE_HTTP_IDLE_TIMEOUT     wait of a kept-alive connection for its next request (default: 60s)
+  FORGE_HTTP_MAX_HEADER_BYTES largest request head in bytes, then 431 (default: 1048576)
   FORGE_HTTP_SHUTDOWN_TIMEOUT connection drain period on shutdown, a duration (default: 15s)
   FORGE_HTTP_MAX_BODY_BYTES   maximum request body size in bytes (default: 1048576)
   FORGE_MAX_CONNECTIONS       maximum concurrent connections (default: 10000)

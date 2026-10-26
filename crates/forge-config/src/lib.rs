@@ -27,8 +27,8 @@ mod telemetry;
 
 pub use aliases::{
     CACHE_DEFAULT_TTL_KEY, DEPRECATED_KEYS, DeprecatedKey, DeprecationNotices, HTTP_ADDR_KEY,
-    HTTP_MAX_BODY_BYTES_KEY, HTTP_SHUTDOWN_TIMEOUT_KEY, STORAGE_LINK_TTL_KEY, deprecated_keys_in,
-    deprecation_warning,
+    HTTP_MAX_BODY_BYTES_KEY, HTTP_SHUTDOWN_TIMEOUT_KEY, HTTP_WRITE_TIMEOUT_KEY,
+    STORAGE_LINK_TTL_KEY, deprecated_keys_in, deprecation_warning,
 };
 pub use mail::{
     AuthConfig, DEFAULT_SESSION_IDLE_TIMEOUT, MAIL_KEYS, MFA_KEY_BYTES, MFA_KEY_KEY, MailConfig,
@@ -44,6 +44,22 @@ pub use telemetry::{
 
 const DEFAULT_BIND: &str = "127.0.0.1:3000";
 const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 30;
+/// Forge-Go's `FORGE_HTTP_READ_HEADER_TIMEOUT` default.
+const DEFAULT_READ_HEADER_TIMEOUT: Duration = Duration::from_secs(5);
+/// Forge-Go's `FORGE_HTTP_READ_TIMEOUT` default.
+const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(15);
+/// Forge-Go's `FORGE_HTTP_IDLE_TIMEOUT` default.
+const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+/// Forge-Go's `FORGE_HTTP_MAX_HEADER_BYTES` default (1 MiB).
+const DEFAULT_MAX_HEADER_BYTES: usize = 1 << 20;
+/// Names of the HTTP timeouts and header bound Forge-Go has too.
+pub const HTTP_READ_HEADER_TIMEOUT_KEY: &str = "FORGE_HTTP_READ_HEADER_TIMEOUT";
+/// See [`ServerConfig::read_timeout`].
+pub const HTTP_READ_TIMEOUT_KEY: &str = "FORGE_HTTP_READ_TIMEOUT";
+/// See [`ServerConfig::idle_timeout`].
+pub const HTTP_IDLE_TIMEOUT_KEY: &str = "FORGE_HTTP_IDLE_TIMEOUT";
+/// See [`ServerConfig::max_header_bytes`].
+pub const HTTP_MAX_HEADER_BYTES_KEY: &str = "FORGE_HTTP_MAX_HEADER_BYTES";
 const DEFAULT_SHUTDOWN_GRACE_SECS: u64 = 15;
 /// The longest duration Forge-Go parses (an `int64` of nanoseconds, about
 /// 2562047h).
@@ -110,9 +126,13 @@ const KEY_PREFIX: &str = "FORGE_";
 pub const KNOWN_KEYS: &[&str] = &[
     "FORGE_ENV",
     HTTP_ADDR_KEY,
-    "FORGE_REQUEST_TIMEOUT_SECS",
+    HTTP_WRITE_TIMEOUT_KEY,
     HTTP_SHUTDOWN_TIMEOUT_KEY,
     HTTP_MAX_BODY_BYTES_KEY,
+    HTTP_READ_HEADER_TIMEOUT_KEY,
+    HTTP_READ_TIMEOUT_KEY,
+    HTTP_IDLE_TIMEOUT_KEY,
+    HTTP_MAX_HEADER_BYTES_KEY,
     "FORGE_MAX_CONNECTIONS",
     MAX_IN_FLIGHT_BODY_BYTES_KEY,
     TRUSTED_PROXIES_KEY,
@@ -315,9 +335,32 @@ impl FromStr for HttpTransport {
 pub struct ServerConfig {
     /// Address on which the process accepts connections.
     pub bind: SocketAddr,
-    /// Maximum time allowed for one request.
+    /// Maximum time allowed for one request once its head is read: reading
+    /// the body and the handler; past it the client gets `504`
+    /// (`FORGE_HTTP_WRITE_TIMEOUT`, Forge-Go's name, default 30 s;
+    /// `FORGE_REQUEST_TIMEOUT_SECS` before, in seconds). A response write
+    /// that makes no progress for this long, at least 30 seconds, ends the
+    /// connection.
     #[serde(with = "duration_seconds")]
     pub request_timeout: Duration,
+    /// How long a client has to send a request's head
+    /// (`FORGE_HTTP_READ_HEADER_TIMEOUT`, default 5 s): from the connection's
+    /// start for its first request, from the first byte of each later one.
+    #[serde(with = "duration_seconds", default = "default_read_header_timeout")]
+    pub read_header_timeout: Duration,
+    /// How long reading a request body may take (`FORGE_HTTP_READ_TIMEOUT`,
+    /// default 15 s); past it the client gets `408`.
+    #[serde(with = "duration_seconds", default = "default_read_timeout")]
+    pub read_timeout: Duration,
+    /// How long a kept-alive connection may wait for its next request
+    /// (`FORGE_HTTP_IDLE_TIMEOUT`, default 60 s).
+    #[serde(with = "duration_seconds", default = "default_idle_timeout")]
+    pub idle_timeout: Duration,
+    /// Largest request head, the request line and headers, in bytes
+    /// (`FORGE_HTTP_MAX_HEADER_BYTES`, default 1 MiB); a larger one is
+    /// answered `431` and the connection closed.
+    #[serde(default = "default_max_header_bytes")]
+    pub max_header_bytes: usize,
     /// Time allowed for in-flight work during shutdown.
     #[serde(with = "duration_seconds")]
     pub shutdown_grace: Duration,
@@ -356,6 +399,10 @@ impl Default for ServerConfig {
                 .parse()
                 .unwrap_or_else(|error| unreachable!("valid built-in bind address: {error}")),
             request_timeout: Duration::from_secs(DEFAULT_REQUEST_TIMEOUT_SECS),
+            read_header_timeout: DEFAULT_READ_HEADER_TIMEOUT,
+            read_timeout: DEFAULT_READ_TIMEOUT,
+            idle_timeout: DEFAULT_IDLE_TIMEOUT,
+            max_header_bytes: DEFAULT_MAX_HEADER_BYTES,
             shutdown_grace: Duration::from_secs(DEFAULT_SHUTDOWN_GRACE_SECS),
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             max_connections: DEFAULT_MAX_CONNECTIONS,
@@ -368,6 +415,22 @@ impl Default for ServerConfig {
 
 fn default_max_in_flight_body_bytes() -> usize {
     DEFAULT_MAX_IN_FLIGHT_BODY_BYTES
+}
+
+const fn default_read_header_timeout() -> Duration {
+    DEFAULT_READ_HEADER_TIMEOUT
+}
+
+const fn default_read_timeout() -> Duration {
+    DEFAULT_READ_TIMEOUT
+}
+
+const fn default_idle_timeout() -> Duration {
+    DEFAULT_IDLE_TIMEOUT
+}
+
+const fn default_max_header_bytes() -> usize {
+    DEFAULT_MAX_HEADER_BYTES
 }
 
 /// Shortest IPv4 prefix a trusted proxy network may have. Shorter prefixes
@@ -1210,9 +1273,45 @@ impl AppConfig {
         )? {
             config.server.bind = bind;
         }
-        if let Some(value) = lookup("FORGE_REQUEST_TIMEOUT_SECS") {
-            config.server.request_timeout =
-                Duration::from_secs(parse_positive("FORGE_REQUEST_TIMEOUT_SECS", &value)?);
+        if let Some(timeout) = aliases::read_aliased(
+            &lookup,
+            HTTP_WRITE_TIMEOUT_KEY,
+            |value| {
+                parse_duration_within(
+                    HTTP_WRITE_TIMEOUT_KEY,
+                    value,
+                    Duration::from_millis(1)..=GO_MAX_DURATION,
+                    "a positive duration such as 30s",
+                )
+            },
+            |value| {
+                Ok(Duration::from_secs(parse_positive(
+                    "FORGE_REQUEST_TIMEOUT_SECS",
+                    &value,
+                )?))
+            },
+        )? {
+            config.server.request_timeout = timeout;
+        }
+        for (key, target) in [
+            (
+                HTTP_READ_HEADER_TIMEOUT_KEY,
+                &mut config.server.read_header_timeout,
+            ),
+            (HTTP_READ_TIMEOUT_KEY, &mut config.server.read_timeout),
+            (HTTP_IDLE_TIMEOUT_KEY, &mut config.server.idle_timeout),
+        ] {
+            if let Some(value) = lookup(key) {
+                *target = parse_duration_within(
+                    key,
+                    value,
+                    Duration::from_millis(1)..=GO_MAX_DURATION,
+                    "a positive duration such as 15s",
+                )?;
+            }
+        }
+        if let Some(value) = lookup(HTTP_MAX_HEADER_BYTES_KEY) {
+            config.server.max_header_bytes = parse_positive(HTTP_MAX_HEADER_BYTES_KEY, &value)?;
         }
         if let Some(grace) = aliases::read_aliased(
             &lookup,
@@ -2261,9 +2360,13 @@ mod tests {
         let values = [
             "production",
             "0.0.0.0:8080",
-            "5",
+            "5s",
             "5s",
             "10",
+            "2s",
+            "10s",
+            "90s",
+            "65536",
             "10",
             "100",
             "172.18.0.0/16, fd00:1::/64",
@@ -2383,6 +2486,83 @@ mod tests {
         );
         let error = load(&[(JOBS_NOTIFY_KEY, "on")]).expect_err("not a boolean");
         assert!(error.to_string().contains(JOBS_NOTIFY_KEY), "{error}");
+    }
+
+    #[test]
+    fn http_timeouts_and_header_bound_take_forge_gos_names_defaults_and_bounds() {
+        let config = load(&[]).expect("defaults are valid");
+        assert_eq!(config.server.read_header_timeout, Duration::from_secs(5));
+        assert_eq!(config.server.read_timeout, Duration::from_secs(15));
+        assert_eq!(config.server.request_timeout, Duration::from_secs(30));
+        assert_eq!(config.server.idle_timeout, Duration::from_secs(60));
+        assert_eq!(config.server.max_header_bytes, 1 << 20);
+
+        let config = load(&[
+            (HTTP_READ_HEADER_TIMEOUT_KEY, "2s"),
+            (HTTP_READ_TIMEOUT_KEY, "1m"),
+            (HTTP_WRITE_TIMEOUT_KEY, "1m30s"),
+            (HTTP_IDLE_TIMEOUT_KEY, "2m"),
+            (HTTP_MAX_HEADER_BYTES_KEY, "16384"),
+        ])
+        .expect("valid");
+        assert_eq!(config.server.read_header_timeout, Duration::from_secs(2));
+        assert_eq!(config.server.read_timeout, Duration::from_secs(60));
+        assert_eq!(config.server.request_timeout, Duration::from_secs(90));
+        assert_eq!(config.server.idle_timeout, Duration::from_secs(120));
+        assert_eq!(config.server.max_header_bytes, 16384);
+
+        // The old spelling of the write timeout is read, in seconds, and
+        // must agree with the new one when both are set.
+        let old = load(&[("FORGE_REQUEST_TIMEOUT_SECS", "12")]).expect("deprecated spelling");
+        assert_eq!(old.server.request_timeout, Duration::from_secs(12));
+        assert!(
+            load(&[
+                ("FORGE_REQUEST_TIMEOUT_SECS", "12"),
+                (HTTP_WRITE_TIMEOUT_KEY, "12s")
+            ])
+            .is_ok()
+        );
+        assert!(matches!(
+            load(&[
+                ("FORGE_REQUEST_TIMEOUT_SECS", "12"),
+                (HTTP_WRITE_TIMEOUT_KEY, "13s")
+            ]),
+            Err(ConfigError::ConflictingAlias { .. })
+        ));
+
+        for (key, value) in [
+            (HTTP_READ_HEADER_TIMEOUT_KEY, "0"),
+            (HTTP_READ_HEADER_TIMEOUT_KEY, "5"),
+            (HTTP_READ_TIMEOUT_KEY, "0s"),
+            (HTTP_READ_TIMEOUT_KEY, "-1s"),
+            (HTTP_WRITE_TIMEOUT_KEY, "30"),
+            (HTTP_WRITE_TIMEOUT_KEY, "0s"),
+            (HTTP_IDLE_TIMEOUT_KEY, "soon"),
+            (HTTP_MAX_HEADER_BYTES_KEY, "0"),
+            (HTTP_MAX_HEADER_BYTES_KEY, "-1"),
+            (HTTP_MAX_HEADER_BYTES_KEY, "1MiB"),
+        ] {
+            match load(&[(key, value)]) {
+                Err(ConfigError::InvalidValue { key: refused, .. }) => {
+                    assert_eq!(refused, key, "{key}={value}");
+                }
+                other => panic!("{key}={value} must be refused, got {other:?}"),
+            }
+        }
+        // A configuration serialized before these fields existed keeps the
+        // defaults.
+        let mut json: serde_json::Value =
+            serde_json::to_value(ServerConfig::default()).expect("serializes");
+        for field in [
+            "read_header_timeout",
+            "read_timeout",
+            "idle_timeout",
+            "max_header_bytes",
+        ] {
+            json.as_object_mut().expect("object").remove(field);
+        }
+        let back: ServerConfig = serde_json::from_value(json).expect("deserializes");
+        assert_eq!(back, ServerConfig::default());
     }
 
     #[test]
