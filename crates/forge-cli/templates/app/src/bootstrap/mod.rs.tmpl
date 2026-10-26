@@ -44,12 +44,7 @@ pub fn run() -> ExitCode {
 %%if sqlite%%
         .sqlite(sqlx::migrate!())
 %%end%%
-%%if views%%
         .compose(compose)
-%%end%%
-%%if !views%%
-        .routes(crate::adapters::http::routes)
-%%end%%
 %%if postgresql%%
         .compose(jobs_configure)
 %%end%%
@@ -61,6 +56,19 @@ pub fn run() -> ExitCode {
 %%end%%
         .run()
 }
+%%if !views%%
+
+/// Wires the HTTP adapter: the routes. `forge generate resource` and `forge
+/// generate controller --api` print the lines that wire each generated layer
+/// at the end of this function, with routes closed (`DenyAll`): this
+/// application has no sign-in, so nobody is let in until you implement the
+/// access trait of `src/adapters/http/api_access.rs` (or `access.rs`) with the
+/// authentication of your API clients.
+fn compose(composition: &mut forge::Composition<'_>) -> Result<(), forge::ComposeError> {
+    crate::adapters::http::routes(composition.router())?;
+    Ok(())
+}
+%%end%%
 %%if views%%
 
 /// Wires the HTTP adapter: the translations of `config/locales`, the site

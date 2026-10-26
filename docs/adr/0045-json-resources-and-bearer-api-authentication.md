@@ -84,8 +84,8 @@ claimed the JSON CRUD generator anyway.
   benchmarked once the load generator drives a bearer token.
 - Forge-Go's `/auth/mfa/complete`, `/auth/recovery/*` and `/auth/cookie/*`
   JSON routes remain follow-ups, as do bearer authentication of `--api`
-  applications (which have no `fn compose`) and reading global resources
-  with tenant roles, which Forge-Go allows.
+  applications (whose resources are wired `DenyAll`: they have no identity)
+  and reading global resources with tenant roles, which Forge-Go allows.
 - `GET /v1/auth/session` lists the membership's `roles`, where Forge-Go
   lists permissions from its table.
 - Token format differs from Forge-Go's (64 hex digits, not 43 base64url

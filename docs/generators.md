@@ -78,7 +78,8 @@ name: a model, resource and scaffold of one plural collide instead of
 mixing layers.
 
 A model also works in a `forge new --api` application: it has no views and
-the model needs none (a scaffold is refused there, because it writes pages).
+the model needs none (a scaffold is refused there, because it writes pages;
+see [In an API-only application](#in-an-api-only-application)).
 Every application with a database has the `forge` dev-dependency with
 `testing` that the repository tests need; one generated before that is told to
 add `"testing"` to the features of that dev-dependency.
@@ -150,7 +151,8 @@ and the `DenyAll` default.
 The site's CSRF layer lets requests with a bearer header or a JSON body
 through without a CSRF token, after its cross-site check, as Forge-Go's
 does: a cross-site page cannot send either. A resource needs `fn compose`,
-so `forge new --api` applications are refused.
+which `forge new` generates, with `--api` too
+([API-only applications](#in-an-api-only-application)).
 
 Differences from Forge-Go: Forge-Rust has no permission table, so no
 migration registers `PLURAL:read`/`PLURAL:write`: the use cases declare
@@ -192,8 +194,8 @@ The pages extend the application layout (CSRF meta tag, flash, translations)
 and show a title and text you replace; `--api` handlers answer a small JSON
 document (`NAMEBody`) and are described in the OpenAPI document by
 `operation` (summary `NAME ACTION`, tag `NAME`, the permission and the access
-policy's `503`; [OpenAPI](openapi.md)). Controllers are wired in `fn compose`, so they need a
-full-stack application.
+policy's `503`; [OpenAPI](openapi.md)). Controllers are wired in `fn compose`: HTML ones need a
+full-stack application, `--api` ones also work in a `forge new --api` one.
 
 `routes` mounts every route behind a guard:
 
@@ -251,6 +253,41 @@ no Forge-Rust generator does). `forge destroy view NAME` removes the three
 files while they are unchanged, and refuses a page that the `DIR` controller
 renders (`forge destroy view pages/about_us` after `forge generate
 controller pages about_us`) unless `--force`.
+
+## In an API-only application
+
+An application created with `forge new --api` has no views, layout, assets,
+translations or browser middleware, and no generator adds them to it (as in
+Forge-Go). It has `fn compose` in `src/bootstrap/mod.rs`, like a full-stack
+application, so the generators that write JSON layers work in it and print
+their wiring for it. The ones that write pages refuse it with the reason and
+write nothing, `--dry-run` included:
+
+| Generator | In a `forge new --api` application |
+| --------- | ---------------------------------- |
+| `generate view` | refused: pages need the layout, assets and browser middleware |
+| `generate scaffold` | refused: it writes HTML pages; `generate resource` writes the JSON API alone |
+| `generate controller NAME ACTION...` | refused; with `--api` it writes JSON endpoints under `/v1/NAME` |
+| `generate authentication [--api-auth]` | refused: the sign-in pages need views and CSRF, and the JSON APIs sit beside them |
+| `generate resource`, `model`, `controller --api`, `mailer`, `job`, `migration` | as in a full-stack application; nothing under `templates/`, `assets/` or `config/locales/` |
+
+```sh
+forge new shop --api -d sqlite3 --skip-docker && cd shop
+forge generate resource product name:string --global           # JSON under /v1/products
+forge generate controller status_checks index --api            # JSON under /v1/status_checks
+forge generate scaffold product name:string --global           # refused
+forge generate view about                                      # refused
+```
+
+The printed wiring goes at the end of `fn compose`, before `Ok(())`. An
+API-only application has no Forge identity wiring (on PostgreSQL it has the
+identity, audit and session tables, but no sign-in, no sessions and no bearer
+tokens), so every route is wired with the `DenyAll` guard and answers `403`:
+replace it with the authentication of your API clients by implementing
+`ApiGlobalAccess` or `ApiTenantAccess` (`src/adapters/http/api_access.rs`, for
+resources) or `GlobalAccess` (`src/adapters/http/access.rs`, for controllers).
+Forge-Rust recognizes the application by the absence of
+`src/adapters/http/views/mod.rs`.
 
 ## Mailer
 

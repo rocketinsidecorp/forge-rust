@@ -326,8 +326,7 @@ fn a_resource_is_the_model_plus_the_json_api_and_collides_with_the_others() {
 }
 
 /// In a `forge new --api-auth` application a tenant-scoped resource is wired
-/// with the bearer tokens; a resource needs `fn compose`, which `--api`
-/// applications lack.
+/// with the bearer tokens; a resource needs `fn compose`.
 #[test]
 fn a_resource_takes_bearer_tokens_with_api_auth_and_needs_compose() {
     let parent = tempfile::tempdir().unwrap_or_else(|error| panic!("{error}"));
@@ -372,14 +371,145 @@ fn a_resource_takes_bearer_tokens_with_api_auth_and_needs_compose() {
     );
     assert!(!global.wiring.contains("pub mod api_access;"));
 
-    let (_api_parent, api) = application(Database::Postgresql, false, Locale::En);
+    // An application written before `--api` had `compose` is told to add it.
+    let (_old_parent, old) = application(Database::Postgresql, false, Locale::En);
+    let bootstrap = fs::read_to_string(old.join("src/bootstrap/mod.rs")).unwrap_or_default();
+    fs::write(
+        old.join("src/bootstrap/mod.rs"),
+        bootstrap.replace("\nfn compose(", "\nfn composed("),
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
     let refused = refused(scaffold::generate(
-        &api,
+        &old,
         &resource("product", &["name:string"], Scope::Tenant, Layers::Resource),
         VERSION,
     ));
     assert!(refused.contains("no `fn compose`"), "{refused}");
     assert!(refused.contains("the resource"), "{refused}");
+}
+
+/// `forge new --api` has `fn compose` (like the full-stack application), so
+/// `forge generate resource` and `controller --api` work: they write JSON
+/// layers only and print wiring that keeps every route closed (`DenyAll`),
+/// because an `--api` application has no identity.
+#[test]
+fn api_applications_get_resources_and_api_controllers_wired_deny_all() {
+    for database in [Database::Postgresql, Database::Mysql, Database::Sqlite3] {
+        for scope in [Scope::Tenant, Scope::Global] {
+            let (_parent, api) = application(database, false, Locale::En);
+            let bootstrap =
+                fs::read_to_string(api.join("src/bootstrap/mod.rs")).unwrap_or_default();
+            assert!(bootstrap.contains("\nfn compose("), "{database:?}");
+            let before = tree(&api);
+            let outcome = scaffold::generate(
+                &api,
+                &resource("product", &["name:string"], scope, Layers::Resource),
+                VERSION,
+            )
+            .unwrap_or_else(|error| panic!("{database:?} {scope:?}: {error}"));
+
+            let created = tree(&api)
+                .into_keys()
+                .filter(|path| !before.contains_key(path))
+                .collect::<Vec<_>>();
+            assert_eq!(created.len(), outcome.created.len(), "{created:?}");
+            for path in &created {
+                assert!(
+                    !path.starts_with("templates/")
+                        && !path.starts_with("config/locales/")
+                        && !path.contains("views")
+                        && path != scaffold::ACCESS_PATH
+                        && path != "src/adapters/http/products.rs",
+                    "{database:?}: an API application gets no page file: {path}"
+                );
+            }
+            for path in [
+                "src/adapters/http/products_api.rs",
+                scaffold::API_ACCESS_PATH,
+                "tests/products_api.rs",
+            ] {
+                assert!(created.iter().any(|created| created == path), "{path}");
+            }
+            let wiring = &outcome.wiring;
+            assert!(wiring.contains("at the end of `fn compose`"), "{wiring}");
+            assert!(wiring.contains("api_access::DenyAll"), "{wiring}");
+            assert!(!wiring.contains("BearerTenantAccess::new"), "{wiring}");
+            assert!(
+                !wiring.contains("composition.router(),\n        &site"),
+                "{wiring}"
+            );
+            assert!(!wiring.contains("--api-auth"), "{database:?}: {wiring}");
+        }
+    }
+}
+
+#[test]
+fn an_api_controller_is_wired_deny_all_in_an_api_application() {
+    for database in [Database::Postgresql, Database::Sqlite3] {
+        let (_parent, api) = application(database, false, Locale::En);
+        let before = tree(&api);
+        let options = ControllerOptions {
+            api: true,
+            ..controller("status_checks", &["index", "show_all"])
+        };
+        let outcome = controller::generate(&api, &options)
+            .unwrap_or_else(|error| panic!("{database:?}: {error}"));
+
+        let paths: Vec<&str> = outcome
+            .files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect();
+        assert_eq!(
+            paths,
+            [
+                scaffold::ACCESS_PATH,
+                "src/adapters/http/status_checks_controller.rs",
+                "tests/status_checks_controller_http.rs"
+            ],
+            "{database:?}"
+        );
+        assert!(!tree(&api).contains_key("templates/status_checks/index.html"));
+        assert!(
+            outcome.wiring.contains("at the end of `fn compose`"),
+            "{}",
+            outcome.wiring
+        );
+        assert!(
+            outcome.wiring.contains("access::DenyAll"),
+            "{}",
+            outcome.wiring
+        );
+        assert!(!outcome.wiring.contains("&site"), "{}", outcome.wiring);
+        let after = tree(&api);
+        assert_eq!(
+            after
+                .keys()
+                .filter(|path| !before.contains_key(*path))
+                .count(),
+            paths.len()
+        );
+    }
+    // Pages are still refused: they need views.
+    let (_parent, api) = application(Database::Postgresql, false, Locale::En);
+    let before = tree(&api);
+    let refusal = refused(controller::generate(&api, &controller("pages", &["index"])));
+    assert!(refusal.contains("forge new --api"), "{refusal}");
+    assert!(refusal.contains("Pass --api"), "{refusal}");
+    assert_eq!(tree(&api), before, "a refusal writes nothing");
+    // Without `fn compose` nothing mounts the routes.
+    let bootstrap = fs::read_to_string(api.join("src/bootstrap/mod.rs")).unwrap_or_default();
+    fs::write(
+        api.join("src/bootstrap/mod.rs"),
+        bootstrap.replace("\nfn compose(", "\nfn composed("),
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
+    let options = ControllerOptions {
+        api: true,
+        ..controller("status_checks", &["index"])
+    };
+    let refusal = refused(controller::generate(&api, &options));
+    assert!(refusal.contains("no `fn compose`"), "{refusal}");
 }
 
 #[test]

@@ -103,10 +103,11 @@ with the same commands, flags and safety rules this port keeps.
 
 ### Deviations from Forge-Go
 
-- Controllers need a full-stack application (they are wired in `fn compose`;
-  `forge new --api` applications have no composition hook), and guarded
-  controllers need a database application (the access policy reads the
-  session stores). `--public` works without a database.
+- HTML controllers need a full-stack application (they render pages, and
+  are wired in `fn compose`); `--api` controllers also work in a
+  `forge new --api` application, whose `fn compose` mounts them with
+  `DenyAll`. Guarded controllers need a database application (the access
+  policy reads the session stores). `--public` works without a database.
 - A guarded controller declares (or reuses) a constant instead of writing a
   permission migration, because Forge-Rust permissions live in code
   (`RbacPolicy`), not in a `forge_permissions` table; there is therefore no
