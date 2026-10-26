@@ -283,7 +283,7 @@ fn execute(
                 DevelopmentEnvironment::load(current_dir, &|key| env::var_os(key).is_some(), true)?;
             CargoCommand::Test(args).run_with(current_dir, environment.added())
         }
-        Command::Format => CargoCommand::Format.run(current_dir),
+        Command::Format { check } => CargoCommand::Format { check }.run(current_dir),
         Command::Lint => CargoCommand::Lint.run(current_dir),
         Command::Build { name } => CargoCommand::Build(name).run(current_dir),
         Command::Version => {
@@ -341,7 +341,7 @@ fn execute(
         Command::Deploy(args) => run_deploy(current_dir, args),
         Command::Logs(args) => run_logs(current_dir, args),
         Command::App { command } => run_app(current_dir, command),
-        Command::Routes => lifecycle(current_dir, |app| app.routes()),
+        Command::Routes { name } => lifecycle_of(current_dir, name, |app| app.routes()),
         Command::Db { command } => {
             let command = match command {
                 DbCommand::Create => Db::Create,
@@ -732,7 +732,23 @@ fn lifecycle(
     current_dir: &std::path::Path,
     command: impl FnOnce(&mut Lifecycle<'_, CargoApplication>) -> Result<(), CliError>,
 ) -> Result<(), CliError> {
-    let project = Project::discover(current_dir)?;
+    lifecycle_of(current_dir, None, command)
+}
+
+/// [`lifecycle`] with the application binary `name` (`--bin NAME`) when
+/// the package has several, like `forge dev [NAME]`.
+fn lifecycle_of(
+    current_dir: &std::path::Path,
+    name: Option<String>,
+    command: impl FnOnce(&mut Lifecycle<'_, CargoApplication>) -> Result<(), CliError>,
+) -> Result<(), CliError> {
+    let mut project = Project::discover(current_dir)?;
+    if let Some(name) = name {
+        if !valid_binary_name(&name) {
+            return Err(CliError::Usage(format!("invalid binary name {name:?}")));
+        }
+        project.name = name;
+    }
     let files =
         DevelopmentEnvironment::load(&project.root, &|key| env::var_os(key).is_some(), true)?;
     let stdin = io::stdin();
