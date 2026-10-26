@@ -184,6 +184,18 @@ mod tests {
     }
 
     #[test]
+    fn a_value_json_cannot_hold_is_refused_without_echoing_it() {
+        // JSON object keys must be strings: a map keyed by bytes cannot be encoded.
+        let value = Json(std::collections::BTreeMap::from([(
+            vec![1_u8, 2],
+            "sk_live_secret".to_owned(),
+        )]));
+        let error = value.to_plaintext().expect_err("not JSON");
+        assert!(matches!(error, EncryptionError::Encoding(_)), "{error}");
+        assert!(!error.to_string().contains("sk_live"), "{error}");
+    }
+
+    #[test]
     fn json_plaintext_matches_serde_json_across_buffer_growth() {
         let long = Json(vec!["é\"x".repeat(300); 40]);
         let plaintext = long.to_plaintext().expect("encode");

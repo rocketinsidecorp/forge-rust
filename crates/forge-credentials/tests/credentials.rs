@@ -130,6 +130,55 @@ fn tampered_truncated_and_foreign_files_are_refused() {
 }
 
 #[test]
+fn oversized_and_badly_encoded_files_are_refused_without_decrypting() {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+    let key = new_key(generate_key().unwrap()).unwrap();
+    let keys = [key.clone()];
+    let file = seal("production", &document(), &key).unwrap();
+    let envelope: serde_json::Value = serde_json::from_slice(&file).unwrap();
+    let reseal = |value: &serde_json::Value| serde_json::to_vec(value).unwrap();
+    let refused = |bytes: &[u8], needle: &str| {
+        let error = unseal("production", bytes, &keys).unwrap_err();
+        assert!(matches!(error, CredentialsError::Format(_)), "{error}");
+        assert!(error.to_string().contains(needle), "{error}");
+        assert!(!error.to_string().contains(SECRET), "{error}");
+    };
+
+    // A file past the limit is refused before it is parsed, by every reader.
+    let huge = vec![b' '; forge_credentials::MAX_FILE_BYTES + 1];
+    refused(&huge, "file is too large");
+    assert!(matches!(
+        forge_credentials::key_id(&huge),
+        Err(CredentialsError::Format(_))
+    ));
+    // Nonce and ciphertext must be unpadded URL-safe base64.
+    for field in ["nonce", "ciphertext"] {
+        let mut other = envelope.clone();
+        other[field] = "not base64!".into();
+        refused(&reseal(&other), "invalid encoding");
+        let mut padded = envelope.clone();
+        let text = padded[field].as_str().unwrap().to_owned();
+        padded[field] = format!("{text}==").into();
+        refused(&reseal(&padded), "invalid encoding");
+    }
+    // A ciphertext that decodes past the largest document plus its tag.
+    let mut other = envelope.clone();
+    let oversized = vec![0_u8; forge_credentials::MAX_PLAINTEXT_BYTES + 65];
+    other["ciphertext"] = URL_SAFE_NO_PAD.encode(oversized).into();
+    refused(&reseal(&other), "invalid encoding");
+    // The largest one that can be genuine reaches the cipher and fails there.
+    let mut other = envelope.clone();
+    let largest = vec![0_u8; forge_credentials::MAX_PLAINTEXT_BYTES + 64];
+    other["ciphertext"] = URL_SAFE_NO_PAD.encode(largest).into();
+    assert!(matches!(
+        unseal("production", &reseal(&other), &keys),
+        Err(CredentialsError::Decrypt)
+    ));
+}
+
+#[test]
 fn documents_are_validated_before_sealing() {
     let key = new_key(generate_key().unwrap()).unwrap();
     let duplicate = format!("{{\"a\": \"{SECRET}\", \"a\": \"x\"}}");
@@ -242,6 +291,27 @@ fn init_creates_a_private_key_and_a_skeleton_and_never_overwrites() {
 }
 
 #[cfg(unix)]
+#[test]
+fn init_refuses_an_unusable_environment_name_before_touching_the_disk() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("config/credentials");
+    for environment in [
+        "",
+        "Production",
+        "../production",
+        "prod uction",
+        "1production",
+    ] {
+        let error = init(&dir, environment).unwrap_err();
+        assert!(
+            matches!(error.source, CredentialsError::InvalidEnvironment),
+            "{environment:?}: {error}"
+        );
+        assert!(error.created.is_empty(), "{environment:?}");
+    }
+    assert!(!dir.exists(), "nothing was created for a refused name");
+}
+
 #[test]
 fn exposed_or_linked_key_files_are_refused() {
     use std::os::unix::fs::PermissionsExt as _;

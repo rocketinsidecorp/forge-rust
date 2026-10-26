@@ -262,8 +262,12 @@ mod tests {
     use forge_core::Timestamp;
     use serde::{Deserialize, Serialize};
 
-    use super::{MAX_CATCH_UP_WALK, Schedule};
-    use crate::{Cron, Job};
+    use super::{MAX_CATCH_UP_WALK, Schedule, fire};
+    use crate::{
+        Cron, Job,
+        postgres::{PgJobStore, migrator},
+        testing::RlsTestDatabase,
+    };
 
     #[derive(Serialize, Deserialize)]
     struct Tick;
@@ -303,5 +307,48 @@ mod tests {
         let hourly = Schedule::new("hourly", Cron::parse("0 * * * *").expect("cron"), &Tick)
             .expect("schedule");
         assert_eq!(hourly.skipped_between(last, at("2026-10-26T13:00:00Z")), 2);
+    }
+
+    async fn queued_ticks(db: &RlsTestDatabase) -> i64 {
+        sqlx::query_scalar("SELECT count(*) FROM forge_jobs WHERE job_name = $1")
+            .bind(Tick::NAME)
+            .fetch_one(db.admin().pool())
+            .await
+            .expect("count")
+    }
+
+    #[tokio::test]
+    #[ignore = "needs FORGE_TEST_DATABASE_URL"]
+    async fn a_tick_is_settled_unless_the_database_says_to_try_again() {
+        let db = RlsTestDatabase::create(&[migrator()])
+            .await
+            .expect("needs FORGE_TEST_DATABASE_URL");
+        let store = PgJobStore::new(db.runtime().clone());
+        let every_minute = Cron::parse("* * * * *").expect("cron");
+        let schedule = Schedule::new("settled", every_minute.clone(), &Tick).expect("schedule");
+        let now = store.database_now().await.expect("database clock");
+        let current = every_minute.latest_at_or_before(now).expect("tick");
+        let micros = |tick: Timestamp, offset: i64| {
+            Timestamp::from_unix_micros(tick.unix_micros() + offset).expect("timestamp")
+        };
+
+        // Fired: one job, and the tick is settled.
+        assert!(fire(&store, &schedule, current).await);
+        assert_eq!(queued_ticks(&db).await, 1);
+        // Handled by another scheduler: settled, and no second job.
+        assert!(fire(&store, &schedule, current).await);
+        assert_eq!(queued_ticks(&db).await, 1);
+        // Older than the allowed lateness: settled without a job.
+        assert!(fire(&store, &schedule, micros(current, -7_200_000_000)).await);
+        assert_eq!(queued_ticks(&db).await, 1);
+        // Later than the database clock (a fast replica): not settled, no job.
+        assert!(!fire(&store, &schedule, micros(current, 3_600_000_000)).await);
+        assert_eq!(queued_ticks(&db).await, 1);
+
+        // An unreachable database is not settled either, and the clock fails.
+        db.runtime().close().await;
+        assert!(!fire(&store, &schedule, micros(current, 60_000_000)).await);
+        assert!(store.database_now().await.is_err());
+        db.cleanup().await.expect("cleanup");
     }
 }
