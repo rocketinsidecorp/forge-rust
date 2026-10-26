@@ -53,9 +53,9 @@ impl Database<Postgres> {
     ///
     /// `serve`, `jobs work` and the `jobs` operator commands of an
     /// application declared with `forge::App::postgres` call it before using
-    /// the pool. Serve as a `NOSUPERUSER NOBYPASSRLS
-    /// NOCREATEROLE` runtime role that owns no table and migrate as a
-    /// separate role (`FORGE_MIGRATION_DATABASE_URL`, ADR 0011).
+    /// the pool. Serve as a `NOSUPERUSER NOBYPASSRLS NOCREATEROLE` runtime
+    /// role that owns no table and migrate as a separate role
+    /// (`FORGE_MIGRATION_DATABASE_URL`, ADR 0011).
     ///
     /// The role query runs in a `READ ONLY` transaction with `SET LOCAL
     /// search_path = pg_catalog`; the connection's own `search_path` is back
@@ -92,8 +92,9 @@ async fn refuse_row_security_bypass(database: &Database<Postgres>) -> Result<(),
             })
         })
         .collect::<Result<Vec<_>, sqlx::Error>>()?;
-    // Read only: nothing to keep. A failed rollback leaves the connection to
-    // the pool, which discards a connection still in a transaction.
+    // Read only: nothing to keep, and a failed rollback says nothing about
+    // the role. SQLx then queues another rollback for the connection's next
+    // use, so the pinned search_path never reaches a later query.
     drop(transaction.rollback().await);
     judge(&rows)
 }
