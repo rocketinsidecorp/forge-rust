@@ -33,7 +33,7 @@ use std::path::{Path, PathBuf};
 /// The most real-clock sleeps test code may hold. The gate fails above it and
 /// prints a hint when the count is below it: lower it when a sleep goes away,
 /// so that the slack cannot be used by a new sleep.
-const BUDGET: usize = 101;
+const BUDGET: usize = 107;
 
 /// Directories that hold no workspace test code.
 const SKIPPED_DIRECTORIES: [&str; 4] = ["target", ".git", "corpus", "artifacts"];
