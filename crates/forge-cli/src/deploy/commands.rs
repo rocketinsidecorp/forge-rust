@@ -121,6 +121,13 @@ impl Commands {
         format!("{}/{role}.env", self.env_dir())
     }
 
+    /// Holds the whole environment of the migrate container when
+    /// `migrate.env` is set. The dot cannot occur in a role or accessory
+    /// name, so the file never collides with a role's env file.
+    pub(crate) fn migrate_env_file(&self) -> String {
+        format!("{}/migrate.step.env", self.env_dir())
+    }
+
     fn accessory_env_file(&self, name: &str) -> String {
         format!("{}/accessory-{name}.env", self.env_dir())
     }
@@ -245,6 +252,56 @@ impl Commands {
         )
     }
 
+    /// The environment of the migrate container: the global and
+    /// migrate-role environment plus `migrate.env`. Config validation keeps
+    /// the names of `migrate.env` out of every other env block, so the
+    /// layers never overlap and the merge is a union; it is written as one
+    /// file because Docker does not define which of two `--env-file`
+    /// entries for one name applies.
+    pub(crate) fn migrate_env(&self) -> (BTreeMap<String, String>, Vec<String>) {
+        let (mut clear, mut secret) = self.role_env(&self.cfg.migrate.role);
+        if let Some(overlay) = &self.cfg.migrate.env {
+            clear.extend(overlay.clear.clone());
+            for name in &overlay.secret {
+                if !secret.contains(name) {
+                    secret.push(name.clone());
+                }
+            }
+            secret.sort();
+        }
+        (clear, secret)
+    }
+
+    /// Whether the migrate container has its own env file.
+    pub(crate) fn has_migrate_env(&self) -> bool {
+        self.cfg.migrate.env.is_some()
+    }
+
+    /// Writes the migrate container's env file with the same handling as a
+    /// role's: 0600, atomic, content over stdin only.
+    pub(crate) fn upload_migrate_env(&self, secrets: &Secrets) -> RemoteCommand {
+        let (clear, secret) = self.migrate_env();
+        let note = format!(
+            "migrate env file: {} clear, {} secret ({}), values not shown",
+            clear.len(),
+            secret.len(),
+            secret.join(", ")
+        );
+        self.upload(
+            &self.migrate_env_file(),
+            env_content(&clear, &secret, secrets),
+            note,
+        )
+    }
+
+    /// Deletes the migrate env file, and the temporary copy an interrupted
+    /// upload may have left, once the step is over, so the schema owner's
+    /// credential rests on the host only while it is used.
+    pub(crate) fn remove_migrate_env(&self) -> RemoteCommand {
+        let file = self.migrate_env_file();
+        RemoteCommand::new(join(&["rm", "-f", &file, &format!("{file}.tmp")]))
+    }
+
     fn role_volumes(&self, role: &str) -> Vec<String> {
         let mut volumes = self.cfg.volumes.clone();
         if let Some(role) = self.cfg.servers.get(role) {
@@ -255,6 +312,11 @@ impl Commands {
 
     pub(crate) fn migrate(&self, version: &str, suffix: &str) -> RemoteCommand {
         let role = &self.cfg.migrate.role;
+        let env_file = if self.has_migrate_env() {
+            self.migrate_env_file()
+        } else {
+            self.env_file(role)
+        };
         let mut argv = vec![
             "docker".to_owned(),
             "run".to_owned(),
@@ -264,7 +326,7 @@ impl Commands {
             "--network".to_owned(),
             NETWORK_NAME.to_owned(),
             "--env-file".to_owned(),
-            self.env_file(role),
+            env_file,
         ];
         argv.extend(volume_args(&self.role_volumes(role)));
         argv.push(self.image_ref(version));

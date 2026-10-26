@@ -51,16 +51,15 @@ env:
     # FORGE_HTTP_TRUSTED_PROXIES: "172.18.0.0/16"
   # Names of secrets from .forge/secrets. They reach containers through an
   # env file written 0600 on the host, never through the command line.
-  # `migrate` runs with the same env file, so the role's containers also
-  # hold FORGE_MIGRATION_DATABASE_URL. To keep the schema-owner credential
-  # out of them, drop it here, set migrate.enabled: false and run
-  # migrations as a separate job (docs/deployment.md). In production both
-  # URLs must verify the server certificate: ?sslmode=verify-full
-  # (PostgreSQL) or ?ssl-mode=VERIFY_IDENTITY (MySQL/MariaDB), unless
-  # FORGE_DATABASE_ALLOW_PLAINTEXT is "true" for a trusted private network.
+  # Every container of every role gets these, so keep the schema-owner
+  # credential (FORGE_MIGRATION_DATABASE_URL) out of this list: it belongs
+  # under migrate.env below, which only the migrate step receives. In
+  # production both URLs must verify the server certificate:
+  # ?sslmode=verify-full (PostgreSQL) or ?ssl-mode=VERIFY_IDENTITY
+  # (MySQL/MariaDB), unless FORGE_DATABASE_ALLOW_PLAINTEXT is "true" for a
+  # trusted private network.
   secret:
     - FORGE_DATABASE_URL
-    - FORGE_MIGRATION_DATABASE_URL
 
 # SQLite applications keep their database on a volume:
 # volumes:
@@ -90,6 +89,15 @@ proxy:
 # Runs "<image> migrate" once, on the first web host, before any switch.
 migrate:
   enabled: true
+  # Gives the migrate step alone the schema owner's credential
+  # (FORGE_MIGRATION_DATABASE_URL, a secret from .forge/secrets, required by
+  # "migrate"). It is added to the web role's environment for that one
+  # container, written 0600 on the migrate host and removed after the step;
+  # the serving containers never receive it. Listing it under env or
+  # servers.*.env as well is a configuration error.
+  env:
+    secret:
+      - FORGE_MIGRATION_DATABASE_URL
 
 # accessories:
 #   db:

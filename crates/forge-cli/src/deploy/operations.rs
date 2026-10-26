@@ -4,6 +4,7 @@
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use forge_proxy::clock::Timestamp;
 use serde::Serialize;
@@ -59,6 +60,35 @@ pub(crate) struct Boot {
 }
 
 type Plan = BTreeMap<String, Vec<Boot>>;
+
+/// How long deleting the migrate env file may take, signal or not.
+const MIGRATE_ENV_CLEANUP: Duration = Duration::from_secs(30);
+
+/// Deletes the migrate env file, and the temporary copy of an interrupted
+/// upload, when dropped, and records a failed removal as a warning. It is
+/// created before the upload so that every way out of the migrate step
+/// (success, a failed migration, a failed or interrupted upload, a signal,
+/// a panic) removes the schema owner's credential from the host; the
+/// removal itself ignores cancellation but is bounded.
+struct MigrateEnvCleanup<'a> {
+    deployer: &'a Deployer,
+    host: &'a str,
+    warnings: &'a mut Vec<String>,
+}
+
+impl Drop for MigrateEnvCleanup<'_> {
+    fn drop(&mut self) {
+        let cancel = Cancel::detached(MIGRATE_ENV_CLEANUP);
+        let command = self.deployer.cmds.remove_migrate_env();
+        if let Err(error) = self.deployer.run(&cancel, self.host, &command) {
+            self.warnings.push(format!(
+                "{}: could not remove {}, delete it by hand: {error}",
+                self.host,
+                self.deployer.cmds.migrate_env_file()
+            ));
+        }
+    }
+}
 
 /// The running containers of `role`, except `except`.
 fn running(containers: &[Container], role: &str, except: &str) -> Vec<Container> {
@@ -231,6 +261,42 @@ impl Deployer {
         (Some(report), result)
     }
 
+    /// Runs the one-off migrate container on `host`. With `migrate.env` it
+    /// first writes that container's own env file and always removes it
+    /// afterwards, even when the upload, the migration or the command was
+    /// cancelled: an upload that was interrupted (Ctrl-C, a dropped
+    /// connection) may already have left the file or its temporary copy on
+    /// the host, so the removal is armed first. A failed removal is a
+    /// warning, since the migration itself already finished.
+    fn migrate_step(
+        &self,
+        cancel: &Cancel,
+        warnings: &mut Vec<String>,
+        host: &str,
+        version: &str,
+    ) -> Result<(), DeployError> {
+        let _cleanup = self.cmds.has_migrate_env().then(|| MigrateEnvCleanup {
+            deployer: self,
+            host,
+            warnings,
+        });
+        if self.cmds.has_migrate_env() {
+            self.run(cancel, host, &self.cmds.upload_migrate_env(&self.secrets))
+                .map_err(|error| {
+                    error
+                        .context("migration env file")
+                        .with_code(EXIT_MIGRATION_FAILED)
+                })?;
+        }
+        self.run(cancel, host, &self.cmds.migrate(version, &self.suffix()))
+            .map(|_| ())
+            .map_err(|error| {
+                error
+                    .context("migration failed; nothing was switched")
+                    .with_code(EXIT_MIGRATION_FAILED)
+            })
+    }
+
     /// Builds (unless skipped), distributes and migrates `version`, then
     /// switches every host to it. All or nothing: previous containers keep
     /// running until every host passed its health gate; if any host fails,
@@ -280,12 +346,7 @@ impl Deployer {
             if self.config.migrate.enabled == Some(true) {
                 let host = self.config.servers[&self.config.migrate.role].hosts[0].clone();
                 self.logf(&host, &format!("migrating with {image}"));
-                self.run(cancel, &host, &self.cmds.migrate(version, &self.suffix()))
-                    .map_err(|error| {
-                        error
-                            .context("migration failed; nothing was switched")
-                            .with_code(EXIT_MIGRATION_FAILED)
-                    })?;
+                self.migrate_step(cancel, &mut report.warnings, &host, version)?;
             }
             let inventories = self.inventories(cancel, &hosts)?;
             let mut plan: Plan = BTreeMap::new();

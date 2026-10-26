@@ -301,6 +301,9 @@ fn run_container(state: &mut State, rest: &[&str]) -> ExitCode {
         }
     };
     if one_off {
+        // What the one-off container's environment held, by container name
+        // (the migrate step's env file, for the tests).
+        state.env_seen.insert(container.name.clone(), env_content);
         let mut record = vec![(*image).to_owned()];
         record.extend(args.iter().map(|a| (*a).to_owned()));
         state.one_offs.push(record);
@@ -502,6 +505,12 @@ fn logs(dir: &Path, args: &[String]) -> ExitCode {
             })
         })
         .unwrap_or_default();
+    // A follower records its pid before it prints anything: a test that sees
+    // the output and stops following must find the pid of every follower.
+    if follow {
+        let pid = std::process::id();
+        let _ = std::fs::write(dir.join(format!("logs-{pid}.pid")), pid.to_string());
+    }
     let mut out = std::io::stdout();
     let _ = writeln!(out, "2026-10-19T10:00:00Z booted {name}");
     let _ = writeln!(out, "2026-10-19T10:00:01Z connecting to {secret}");
@@ -510,8 +519,6 @@ fn logs(dir: &Path, args: &[String]) -> ExitCode {
     if !follow {
         return ExitCode::SUCCESS;
     }
-    let pid = std::process::id();
-    let _ = std::fs::write(dir.join(format!("logs-{pid}.pid")), pid.to_string());
     loop {
         std::thread::sleep(std::time::Duration::from_secs(3600));
     }

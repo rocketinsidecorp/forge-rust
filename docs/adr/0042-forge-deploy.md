@@ -117,7 +117,8 @@ configuration, and no new crate unless strictly necessary.
 
 8. **`forge new` is unchanged.** As in Forge-Go, `forge deploy init` writes
    the configuration (with `app_port: 3000`, Forge-Rust's port, and
-   `FORGE_MIGRATION_DATABASE_URL`, which `migrate` needs) instead of every new
+   `FORGE_MIGRATION_DATABASE_URL`, which `migrate` needs, under `migrate.env`
+   so no serving container receives it) instead of every new
    application carrying hosts and registry placeholders.
 
 ## Dependencies
@@ -141,11 +142,13 @@ in the graph: `regex-automata` (forge-cli; RE2-compatible patterns and
   itself.
 - `forge-proxy` is HTTP/1.1 only and opens one application connection per
   request (no pool outlives a switch). HTTP/2 would need the `h2` crate.
-- `migrate` runs with the migrate role's env file, as in Forge-Go; for
-  Forge-Rust's separate migration credential this means the role's
-  containers hold it too unless migrations run elsewhere
-  (`migrate.enabled: false`). A per-command environment would be a schema
-  change for both frameworks (tracked as a follow-up).
+- `migrate` runs with the migrate role's env file plus `migrate.env`, as in
+  Forge-Go (its issue #57, here #73): the schema owner's
+  `FORGE_MIGRATION_DATABASE_URL` goes to the one-off container alone, in its
+  own `0600` file on the migrate host that is removed when the step ends,
+  and a name in `migrate.env` may not appear in `env` or `servers.*.env`.
+  Without `migrate.env` the container gets the role's env file, which has no
+  migration credential, and `migrate` requires one.
 - The YAML reader refuses valid YAML features Forge-Go's decoder accepts
   (anchors, block scalars); such files must be rewritten in the common
   forms. Floats in integer fields are truncated as yaml.v3 does.
