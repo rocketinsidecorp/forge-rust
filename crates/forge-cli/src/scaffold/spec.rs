@@ -31,15 +31,18 @@ pub(crate) enum FieldType {
 }
 
 impl FieldType {
-    pub(crate) const NAMES: &'static str = "string, text, integer, boolean, timestamp, uuid";
+    pub(crate) const NAMES: &'static str = "string, text, integer, boolean, timestamp, uuid \
+        (also int, bool, time and datetime)";
 
+    /// The canonical names (D22), plus Forge-Go's `int`, `bool` and `time`
+    /// and Rails' `datetime`.
     fn parse(name: &str) -> Option<Self> {
         Some(match name {
             "string" => Self::String,
             "text" => Self::Text,
-            "integer" => Self::Integer,
-            "boolean" => Self::Boolean,
-            "timestamp" => Self::Timestamp,
+            "integer" | "int" => Self::Integer,
+            "boolean" | "bool" => Self::Boolean,
+            "timestamp" | "time" | "datetime" => Self::Timestamp,
             "uuid" => Self::Uuid,
             _ => return None,
         })
@@ -132,22 +135,6 @@ const RUST_KEYWORDS: &[&str] = &[
     "use", "where", "while", "abstract", "become", "box", "do", "final", "macro", "override",
     "priv", "try", "typeof", "unsized", "virtual", "yield", "union",
 ];
-
-/// SQL keywords reserved by the SQL standard and by PostgreSQL, MySQL or
-/// SQLite in common use. Generated SQL quotes every identifier anyway; the
-/// list keeps schemas readable and portable.
-const SQL_KEYWORDS: &str = "\
-    add all alter analyze and any array asc asymmetric authorization \
-    between binary both by case cast check collate column constraint create \
-    cross current_date current_role current_time current_timestamp \
-    current_user database default deferrable delete desc distinct drop \
-    except exists explain fetch foreign from full grant group having ilike \
-    index inner insert intersect interval into is join key leading left \
-    like limit localtime localtimestamp natural not null offset on only or \
-    order outer overlaps primary range rank references rename replace \
-    returning revoke right row rows schema select session_user set similar \
-    some symmetric table then to trailing trigger unique update user using \
-    values variadic verbose view when window with";
 
 /// PascalCase names that generated modules import or that the prelude
 /// defines; an entity with one of these names would not compile.
@@ -318,6 +305,35 @@ pub(crate) fn parse(
     Ok(resource)
 }
 
+/// Parses the `field:type[?]` arguments of `forge generate migration`, for
+/// the columns of `table`.
+pub(crate) fn parse_columns(table: &str, fields: &[String]) -> Result<Vec<Field>, InvalidScaffold> {
+    check_name("table name", table)?;
+    if table.starts_with("forge_") || table.starts_with("sqlite_") || table.starts_with("_sqlx") {
+        return invalid(format!(
+            "table `{table}` uses a prefix reserved for Forge, SQLx and SQLite internals"
+        ));
+    }
+    if fields.len() > MAX_FIELDS {
+        return invalid(format!("at most {MAX_FIELDS} fields are supported"));
+    }
+    let mut parsed: Vec<Field> = Vec::with_capacity(fields.len());
+    for declaration in fields {
+        let field = parse_field(declaration)?;
+        if parsed.iter().any(|existing| existing.name == field.name) {
+            return invalid(format!("field `{}` is declared more than once", field.name));
+        }
+        parsed.push(field);
+    }
+    check_identifier_lengths(&Resource {
+        singular: table.to_owned(),
+        plural: table.to_owned(),
+        fields: parsed.clone(),
+        scope: Scope::Global,
+    })?;
+    Ok(parsed)
+}
+
 /// Accepts `snake_case` or `PascalCase` and returns `snake_case`.
 fn resource_name(name: &str) -> Result<String, InvalidScaffold> {
     let snake = if name.starts_with(|c: char| c.is_ascii_uppercase()) {
@@ -367,12 +383,8 @@ fn check_name(what: &str, name: &str) -> Result<(), InvalidScaffold> {
     if RUST_KEYWORDS.contains(&name) {
         return invalid(format!("{what} `{name}` is a Rust keyword"));
     }
-    if SQL_KEYWORDS
-        .split_whitespace()
-        .any(|keyword| keyword == name)
-    {
-        return invalid(format!("{what} `{name}` is an SQL keyword"));
-    }
+    // SQL keywords (`order`, `group`) are fine: generated SQL quotes every
+    // identifier, as Forge-Go's does.
     Ok(())
 }
 
@@ -584,7 +596,6 @@ mod tests {
             "post_",
             "café",
             "type",
-            "select",
             "tenant",
             "site",
             "Request",
@@ -606,6 +617,38 @@ mod tests {
         }
     }
 
+    /// Generated SQL quotes every identifier, so SQL keywords are names like
+    /// any other, as in Forge-Go (`forge generate resource order` makes the
+    /// table `orders`); field types take Forge-Go's and Rails' spellings.
+    #[test]
+    fn accepts_sql_keywords_and_type_aliases() {
+        let order = parse(
+            "order",
+            &[
+                "select:string".to_owned(),
+                "group:int".to_owned(),
+                "public:bool?".to_owned(),
+                "at:time".to_owned(),
+                "on:datetime?".to_owned(),
+            ],
+            Scope::Global,
+            None,
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(order.plural, "orders");
+        let kinds: Vec<FieldType> = order.fields.iter().map(|field| field.kind).collect();
+        assert_eq!(
+            kinds,
+            [
+                FieldType::String,
+                FieldType::Integer,
+                FieldType::Boolean,
+                FieldType::Timestamp,
+                FieldType::Timestamp
+            ]
+        );
+    }
+
     #[test]
     fn rejects_invalid_fields() {
         for declarations in [
@@ -618,7 +661,6 @@ mod tests {
             &["version:integer"][..],
             &["created_at:timestamp"][..],
             &["csrf_token:string"][..],
-            &["order:integer"][..],
             &["match:string"][..],
             &["Title:string"][..],
             &["title:string", "title:text"][..],

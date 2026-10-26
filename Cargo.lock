@@ -698,6 +698,7 @@ dependencies = [
  "forge-proxy",
  "getrandom 0.4.3",
  "regex-automata",
+ "ring",
  "rustix",
  "serde",
  "serde_json",

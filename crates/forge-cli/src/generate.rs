@@ -58,6 +58,17 @@ impl Database {
         }
     }
 
+    /// The `-d` value of the README Quickstart's `forge new` line.
+    fn quickstart_flag(self) -> &'static str {
+        match self {
+            Self::Postgresql => "postgresql",
+            Self::Mysql => "mysql",
+            Self::Mariadb => "mariadb",
+            Self::Sqlite3 => "sqlite3",
+            Self::Disabled => "none",
+        }
+    }
+
     fn label(self) -> &'static str {
         match self {
             Self::Postgresql => "PostgreSQL",
@@ -724,8 +735,85 @@ fn existing_migration_versions(migrations: &Path) -> Result<Vec<u128>, CliError>
     Ok(versions)
 }
 
+#[cfg(test)]
 pub(crate) fn create_migration(root: &Path, name: &str) -> Result<(PathBuf, PathBuf), CliError> {
     create_migration_at(root, name, SystemTime::now())
+}
+
+/// What `forge generate migration` wrote.
+#[derive(Debug)]
+pub(crate) struct Migration {
+    pub(crate) up: PathBuf,
+    pub(crate) down: PathBuf,
+    /// The statements were inferred from the name and fields; `Some(true)`
+    /// for `remove_COLUMNS_from_TABLE`, which drops data.
+    pub(crate) inferred: Option<bool>,
+}
+
+/// `forge generate migration NAME [field:type...]` (D26): as in Rails,
+/// `add_COLUMNS_to_TABLE` with fields writes one `ALTER TABLE ... ADD
+/// COLUMN` per field in the application's dialect (and `DROP COLUMN` in
+/// down), `remove_COLUMNS_from_TABLE` the reverse. Any other name, or no
+/// fields, writes the blank pair to fill in.
+pub(crate) fn generate_migration(
+    root: &Path,
+    name: &str,
+    fields: &[String],
+) -> Result<Migration, CliError> {
+    let normalized = normalize_migration_name(name)?;
+    let refused = |reason: String| crate::generators::generate_error("migration", reason);
+    let change = column_change(&normalized);
+    let Some((table, remove)) = change.filter(|_| !fields.is_empty()) else {
+        if !fields.is_empty() {
+            return Err(refused(
+                "fields need a migration named add_COLUMNS_to_TABLE or remove_COLUMNS_from_TABLE \
+                 (for example add_sku_to_products sku:string); for a new table use `forge \
+                 generate model`"
+                    .to_owned(),
+            ));
+        }
+        let (up, down) = create_migration_at(root, name, SystemTime::now())?;
+        return Ok(Migration {
+            up,
+            down,
+            inferred: None,
+        });
+    };
+    let columns = crate::scaffold::parse_columns(table, fields)
+        .map_err(|invalid| refused(invalid.to_string()))?;
+    let backend = crate::scaffold::application_backend(root).ok_or_else(|| {
+        refused(
+            "the migration's statements depend on the database, and Cargo.toml selects none \
+             (the sqlx features \"postgres\", \"mysql\" or \"sqlite\")"
+                .to_owned(),
+        )
+    })?;
+    let (up_sql, down_sql) =
+        crate::scaffold::column_migration(table, &columns, backend, remove, &normalized)
+            .map_err(refused)?;
+    let (up, down) = write_migration(root, &normalized, SystemTime::now(), &up_sql, &down_sql)?;
+    Ok(Migration {
+        up,
+        down,
+        inferred: Some(remove),
+    })
+}
+
+/// The table and direction a migration name infers: `add_X_to_TABLE` or
+/// `remove_X_from_TABLE`.
+fn column_change(name: &str) -> Option<(&str, bool)> {
+    fn table<'a>(rest: &'a str, separator: &str) -> Option<&'a str> {
+        rest.get(1..)
+            .and_then(|tail| tail.find(separator))
+            .map(|index| &rest[index + 1 + separator.len()..])
+            .filter(|table| table.starts_with(|c: char| c.is_ascii_lowercase()))
+    }
+    if let Some(rest) = name.strip_prefix("add_") {
+        return table(rest, "_to_").map(|table| (table, false));
+    }
+    name.strip_prefix("remove_")
+        .and_then(|rest| table(rest, "_from_"))
+        .map(|table| (table, true))
 }
 
 fn create_migration_at(
@@ -734,6 +822,22 @@ fn create_migration_at(
     now: SystemTime,
 ) -> Result<(PathBuf, PathBuf), CliError> {
     let normalized = normalize_migration_name(name)?;
+    write_migration(
+        root,
+        &normalized,
+        now,
+        &format!("-- {normalized}: apply migration\n\n"),
+        &format!("-- {normalized}: revert migration\n\n"),
+    )
+}
+
+fn write_migration(
+    root: &Path,
+    normalized: &str,
+    now: SystemTime,
+    up_sql: &str,
+    down_sql: &str,
+) -> Result<(PathBuf, PathBuf), CliError> {
     let version = next_migration_version(root, now)?;
     let migrations = root.join("migrations");
     fs::create_dir_all(&migrations).map_err(|source| CliError::CreateDirectory {
@@ -745,8 +849,8 @@ fn create_migration_at(
     let up = migrations.join(format!("{stem}.up.sql"));
     let down = migrations.join(format!("{stem}.down.sql"));
 
-    write_new_file(&up, &format!("-- {normalized}: apply migration\n\n"))?;
-    if let Err(error) = write_new_file(&down, &format!("-- {normalized}: revert migration\n\n")) {
+    write_new_file(&up, up_sql)?;
+    if let Err(error) = write_new_file(&down, down_sql) {
         let _ = fs::remove_file(&up);
         return Err(error);
     }
@@ -991,6 +1095,20 @@ fn write_application(
             "%%DATABASE_MIGRATION_URL_CONTAINER%%",
             urls.migration_container.as_str(),
         ),
+        // The README Quickstart's `forge new` line and its JSON API note.
+        ("%%QUICKSTART_DATABASE%%", options.database.quickstart_flag()),
+        (
+            "%%QUICKSTART_NEW_FLAGS%%",
+            if options.api_auth { " --api-auth" } else { "" },
+        ),
+        (
+            "%%QUICKSTART_BEARER%%",
+            if options.api_auth {
+                " or a bearer token from `POST /auth/login`"
+            } else {
+                ""
+            },
+        ),
     ];
 
     let enabled = |group: Group| match group {
@@ -1029,6 +1147,11 @@ fn write_application(
             }
         }
     }
+    // The routes seam the generators own (D21): `compose` calls it.
+    write_file(
+        &root.join(crate::wiring::ROUTES_FILE),
+        crate::wiring::initial_routes(options.views),
+    )?;
     for file in BINARY_FILES {
         if enabled(file.group) {
             write_file(&root.join(file.path), file.content)?;
@@ -2333,7 +2456,8 @@ mod tests {
                 bootstrap.contains(
                     "fn compose(composition: &mut forge::Composition<'_>) -> \
                      Result<(), forge::ComposeError> {\n    \
-                     crate::adapters::http::routes(composition.router())?;\n    Ok(())\n}"
+                     crate::adapters::http::routes(composition.router())?;\n    \
+                     routes_gen::generated_routes(composition)?;\n    Ok(())\n}"
                 ),
                 "{database:?}"
             );

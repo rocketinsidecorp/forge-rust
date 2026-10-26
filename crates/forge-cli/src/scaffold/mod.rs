@@ -22,10 +22,13 @@ pub(crate) use render::File;
 pub(crate) use render::{ACCESS_PATH, API_ACCESS_PATH};
 use render::{Api, Broadcast, STREAMS_PATH};
 pub(crate) use spec::Scope;
-pub(crate) use spec::{pascal_case, sentence_case};
+pub(crate) use render::column_migration;
+pub(crate) use spec::{parse_columns, pascal_case, sentence_case};
 
 use crate::CliError;
+use crate::destroy::Unwire;
 use crate::generate::write_new_file;
+use crate::wiring::{self, Block, Registration};
 use crate::generators::{self, Planned, Role};
 use spec::Resource;
 
@@ -64,6 +67,9 @@ pub(crate) struct ScaffoldOptions {
     pub(crate) scope: Scope,
     pub(crate) plural: Option<String>,
     pub(crate) broadcast: bool,
+    /// `--public`: a global resource anyone may use (applications without
+    /// Forge identity only).
+    pub(crate) public: bool,
     pub(crate) dry_run: bool,
     pub(crate) layers: Layers,
 }
@@ -73,13 +79,18 @@ pub(crate) struct ScaffoldOptions {
 pub(crate) struct Outcome {
     /// Files created, relative to the application root, in write order.
     pub(crate) created: Vec<String>,
+    /// The files existed already, identical: nothing was created.
+    pub(crate) identical: bool,
     /// Whether the shared access module already existed and was reused.
     pub(crate) reused_access: bool,
     /// Whether the shared streams module already existed and was reused.
     pub(crate) reused_streams: bool,
     /// Whether the shared API access module already existed and was reused.
     pub(crate) reused_api_access: bool,
-    /// The wiring instructions to print.
+    /// The module declarations and routes the generator registered.
+    pub(crate) edits: Vec<wiring::Edit>,
+    /// What to print after the files: the notes, or the wiring to add by
+    /// hand in an application without the seam.
     pub(crate) wiring: String,
 }
 
@@ -98,6 +109,24 @@ struct Application {
     /// The application's default locale (`DEFAULT_LOCALE` of
     /// [`LOCALES_MODULE`]).
     default_locale: String,
+    /// Forge identity: the sign-in pages of `forge new` (full-stack
+    /// PostgreSQL) or `forge generate authentication`.
+    identity: bool,
+    /// The access module's `SessionTenantAccess` also authorizes the JSON
+    /// API (it is written now, or was written with that impl).
+    session_access: bool,
+}
+
+impl Application {
+    /// Whether the tenant-scoped JSON API takes the pages' session cookie:
+    /// PostgreSQL, sign-in pages, no bearer tokens.
+    fn session_api(&self) -> bool {
+        self.backend == Backend::Postgresql
+            && self.identity
+            && !self.bearer_sessions
+            && !self.api_only
+            && self.session_access
+    }
 }
 
 /// The language of the text the scaffold writes.
@@ -147,6 +176,8 @@ struct Plan {
     application: Application,
     broadcast: Broadcast,
     files: Vec<Planned>,
+    /// Every file already exists as the generator would write it.
+    identical: bool,
 }
 
 /// Generates the scaffold (or model) in the application at `root`.
@@ -156,46 +187,81 @@ pub(crate) fn generate(
     options: &ScaffoldOptions,
     migration: &str,
 ) -> Result<Outcome, CliError> {
+    let layers = options.layers;
+    if options.public && !wiring::has_seam(root) {
+        return Err(fail(
+            layers,
+            format!(
+                "--public needs the routes seam ({}, which `compose` calls in applications \
+                 `forge new` creates now); without it the routes are wired by hand, so mount \
+                 them with your own access policy instead",
+                wiring::ROUTES_FILE
+            ),
+        ));
+    }
     let plan = plan(root, options, Some(migration), Purpose::Generate)?;
-    let wiring = match options.layers {
-        Layers::Scaffold => wiring(
-            root,
-            &plan.resource,
-            &plan.application,
-            !plan.application.access_exists,
-            !plan.application.api_access_exists,
-            plan.broadcast,
-        )?,
-        Layers::Resource => resource_wiring(
-            root,
-            &plan.resource,
-            &plan.application,
-            !plan.application.api_access_exists,
-        )?,
-        Layers::Model => model_wiring(root, &plan.resource, plan.application.backend)?,
+    let wiring = plan_wiring(&plan, options, true);
+    let (text, edits) = if wiring::has_seam(root) {
+        let edits = wiring::plan(root, &wiring.registration(), false, &|reason| {
+            fail(layers, reason)
+        })?;
+        (wiring.seam_notes(root)?, edits)
+    } else {
+        (wiring.printed(root)?, Vec::new())
     };
-    if !options.dry_run {
-        generators::write(root, &plan.files)?;
+    if !options.dry_run && plan.identical {
+        wiring::apply(root, &edits)?;
+    } else if !options.dry_run {
+        generators::write_and_wire(root, &plan.files, &edits)?;
     }
     let scaffold = options.layers == Layers::Scaffold;
     Ok(Outcome {
         created: plan.files.iter().map(|file| file.path.clone()).collect(),
+        identical: plan.identical,
         reused_access: scaffold && plan.application.access_exists,
         reused_streams: scaffold && options.broadcast && plan.application.streams_exists,
         reused_api_access: options.layers.api() && plan.application.api_access_exists,
-        wiring,
+        edits,
+        wiring: text,
     })
+}
+
+/// The wiring of `plan`: for a generation, with the shared modules it
+/// writes; for a destroy, only what the generation owns.
+fn plan_wiring(plan: &Plan, options: &ScaffoldOptions, generating: bool) -> Wiring {
+    let application = &plan.application;
+    match options.layers {
+        Layers::Scaffold => wiring(
+            &plan.resource,
+            application,
+            generating && !application.access_exists,
+            generating && !application.api_access_exists,
+            Broadcast {
+                enabled: options.broadcast,
+                streams_module: generating && plan.broadcast.streams_module,
+            },
+            options.public,
+        ),
+        Layers::Resource => resource_wiring(
+            &plan.resource,
+            application,
+            generating && !application.api_access_exists,
+            options.public,
+        ),
+        Layers::Model => model_wiring(&plan.resource, application.backend),
+    }
 }
 
 /// What `forge destroy scaffold|model` removes: the files the generator
 /// writes from `options`, found where they are (the migrations at the
-/// version they have), without the shared access and streams modules, plus
-/// what to take out of the composition root and, when a bigger or
+/// version they have), without the shared access and streams modules; what
+/// to take out of the module declarations and the routes seam (or, without
+/// the seam, the printed wiring to take out by hand); and, when a bigger or
 /// dependent generation still needs the files, why.
 pub(crate) fn plan_destroy(
     root: &Path,
     options: &ScaffoldOptions,
-) -> Result<(Vec<Planned>, String, Option<String>), CliError> {
+) -> Result<(Vec<Planned>, Unwire, Option<String>), CliError> {
     let plan = plan(root, options, None, Purpose::Destroy)?;
     let plural = &plan.resource.plural;
     let mut owned_elsewhere = None;
@@ -232,20 +298,19 @@ pub(crate) fn plan_destroy(
             options.layers.name()
         ));
     }
-    let unwire = match options.layers {
-        Layers::Scaffold => wiring(
-            root,
-            &plan.resource,
-            &plan.application,
-            false,
-            false,
-            Broadcast {
-                enabled: options.broadcast,
-                streams_module: false,
-            },
-        )?,
-        Layers::Resource => resource_wiring(root, &plan.resource, &plan.application, false)?,
-        Layers::Model => model_wiring(root, &plan.resource, plan.application.backend)?,
+    let wiring = plan_wiring(&plan, options, false);
+    let layers = options.layers;
+    let unwire = if wiring::has_seam(root) && owned_elsewhere.is_none() {
+        Unwire::Edits(wiring::plan(root, &wiring.registration(), true, &|reason| {
+            CliError::Destroy(format!("refusing to destroy, nothing was removed: {reason}"))
+        })?)
+    } else if wiring::has_seam(root) {
+        // --force removes the files only; the bigger generation keeps its
+        // registrations.
+        let _ = layers;
+        Unwire::Edits(Vec::new())
+    } else {
+        Unwire::Printed(wiring.printed(root)?)
     };
     Ok((plan.files, unwire, owned_elsewhere))
 }
@@ -265,7 +330,14 @@ fn plan(
     )
     .map_err(|invalid| fail(layers, invalid.to_string()))?;
     let broadcast_requested = layers == Layers::Scaffold && options.broadcast;
-    let application = inspect(root, &resource, broadcast_requested, layers, purpose)?;
+    let application = inspect(
+        root,
+        &resource,
+        broadcast_requested,
+        options.public,
+        layers,
+        purpose,
+    )?;
     let broadcast = Broadcast {
         enabled: broadcast_requested,
         streams_module: broadcast_requested
@@ -357,19 +429,52 @@ fn plan(
         files = migrations;
         generators::refuse_symlinks(root, files.iter().map(|file| file.path.as_str()))
             .map_err(|reason| fail(layers, reason))?;
-    } else {
-        refuse_collisions(root, &resource, &files, layers)?;
-        refuse_second_permission_owner(root, &resource, layers)?;
     }
     for file in files.iter_mut().filter(|file| file.path.ends_with(".rs")) {
         file.content = rustfmt(root, &file.path, &file.content)?;
+    }
+    let identical = purpose == Purpose::Generate && rerun(root, &migration_name, &mut files);
+    if purpose == Purpose::Generate && !identical {
+        refuse_collisions(root, &resource, &files, layers)?;
+        refuse_second_permission_owner(root, &resource, layers)?;
     }
     Ok(Plan {
         resource,
         application,
         broadcast,
         files,
+        identical,
     })
+}
+
+/// Whether every file of the generation already exists with the content it
+/// would get (the migration pair at the version it has): running the
+/// generator again with the same arguments, which changes nothing. Points
+/// the planned migrations at the existing ones when so.
+fn rerun(root: &Path, migration_name: &str, files: &mut [Planned]) -> bool {
+    let (ups, downs) = generators::existing_migrations(root, migration_name);
+    let ([up], [down]) = (ups.as_slice(), downs.as_slice()) else {
+        return false;
+    };
+    let mut candidate = files.to_vec();
+    for file in &mut candidate {
+        if file.role == Role::Migration {
+            file.path = if file.path.ends_with(".up.sql") {
+                up.clone()
+            } else {
+                down.clone()
+            };
+        }
+    }
+    let identical = generators::refuse_symlinks(root, candidate.iter().map(|file| file.path.as_str()))
+        .is_ok()
+        && candidate.iter().all(|file| {
+            fs::read(root.join(&file.path)).is_ok_and(|current| current == file.content.as_bytes())
+        });
+    if identical {
+        files.clone_from_slice(&candidate);
+    }
+    identical
 }
 
 /// Refuses a resource whose permissions another module already declares:
@@ -397,65 +502,6 @@ fn refuse_second_permission_owner(
              generated afterwards reuses the {kind}'s permission)"
         ),
     ))
-}
-
-/// The wiring printed by `forge generate model`: the module declarations
-/// and how to build the use cases.
-fn model_wiring(root: &Path, resource: &Resource, backend: Backend) -> Result<String, CliError> {
-    let singular = &resource.singular;
-    let plural = &resource.plural;
-    let type_name = spec::pascal_case(singular);
-    let (database, prefix) = match backend {
-        Backend::Postgresql => ("postgres", "Pg"),
-        Backend::MySql => ("mysql", "MySql"),
-        Backend::Sqlite => ("sqlite", "Sqlite"),
-    };
-    let declarations = [
-        ("src/domain/entities/mod.rs", singular.clone()),
-        (
-            "src/application/ports/mod.rs",
-            format!("{singular}_repository"),
-        ),
-        ("src/application/use_cases/mod.rs", plural.clone()),
-        ("src/infrastructure/database/mod.rs", plural.clone()),
-    ];
-    let mut out = String::from(
-        "\nForge did not edit any existing file. Wire the model by hand:\n\n  \
-         1. Declare the new modules (each in the listed file, keeping `mod` lines sorted):\n\n",
-    );
-    for (file, module) in &declarations {
-        out.push_str(&format!("       {file:<38} pub mod {module};\n"));
-    }
-    out.push_str(&format!(
-        "\n  2. Build the use cases where you need them, for example in `fn compose` of\n  \
-         src/bootstrap/mod.rs, and pass `{plural}` to the code that uses it:\n\n"
-    ));
-    let code = format!(
-        "    let {plural} = crate::application::use_cases::{plural}::{type_name}Service::new(\n        \
-         std::sync::Arc::new(\n            \
-         crate::infrastructure::database::{plural}::{prefix}{type_name}Repository::new(\n                \
-         composition.{database}()?.clone(),\n            \
-         ),\n        \
-         ),\n    \
-         );\n"
-    );
-    out.push_str(&format_statements(root, &code)?);
-    out.push_str(&format!(
-        "\n  The service offers list, find, create, update and delete with optimistic\n  \
-         locking; `{plural}:read` and `{plural}:write` are its permissions\n  \
-         (crate::application::use_cases::{plural}::READ_PERMISSION, WRITE_PERMISSION).\n"
-    ));
-    if resource.scope == Scope::Tenant {
-        out.push_str(&format!(
-            "  {type_name} is tenant-scoped: every use case takes the authorized TenantContext.\n"
-        ));
-    }
-    out.push_str(
-        "\n  Then apply the migration (`forge migrate`) and run `forge test` (repository\n  \
-         tests on a database server need `cargo test -- --include-ignored` and\n  \
-         FORGE_TEST_* URLs, see docs/database.md).\n",
-    );
-    Ok(out)
 }
 
 /// Formats generated Rust with the application's pinned `rustfmt` (edition
@@ -519,10 +565,11 @@ fn inspect(
     root: &Path,
     resource: &Resource,
     broadcast: bool,
+    public: bool,
     layers: Layers,
     purpose: Purpose,
 ) -> Result<Application, CliError> {
-    inspect_application(root, resource, broadcast, layers, purpose).map_err(|error| match error {
+    inspect_application(root, resource, broadcast, public, layers, purpose).map_err(|error| match error {
         CliError::Scaffold(reason) => fail(layers, reason),
         other => other,
     })
@@ -539,6 +586,7 @@ fn inspect_application(
     root: &Path,
     resource: &Resource,
     broadcast: bool,
+    public: bool,
     layers: Layers,
     purpose: Purpose,
 ) -> Result<Application, CliError> {
@@ -576,12 +624,8 @@ fn inspect_application(
              `forge new <name> -d <database>`",
         );
     };
-    let backend = if sqlx.contains("\"postgres\"") {
-        Backend::Postgresql
-    } else if sqlx.contains("\"mysql\"") {
-        Backend::MySql
-    } else if sqlx.contains("\"sqlite\"") {
-        Backend::Sqlite
+    let backend = if let Some(backend) = backend_of(&sqlx) {
+        backend
     } else {
         return unsupported(
             "could not tell the database backend from the sqlx features in Cargo.toml \
@@ -644,10 +688,38 @@ fn inspect_application(
             );
         }
     }
-    let access_exists = match read(root, ACCESS_PATH) {
+    let identity = root.join("src/adapters/http/authentication.rs").is_file();
+    let public = options_public(public, layers, purpose, resource, identity)?;
+    let access_source = read(root, ACCESS_PATH);
+    let session_access = access_source.as_deref().map_or(scaffold, |access| {
+        access.contains("impl ApiTenantAccess for SessionTenantAccess")
+    });
+    if scaffold && generating && access_source.is_none() {
+        let security = read(root, "src/infrastructure/security/mod.rs").unwrap_or_default();
+        if !security.contains("pub fn tenant_from_request") {
+            return unsupported(TENANT_COOKIE_MISSING);
+        }
+    }
+    let access_exists = match access_source {
         None => false,
         Some(_) if !scaffold || !generating => true,
         Some(access) => {
+            if resource.scope == Scope::Tenant && !access.contains("tenant_from_request(") {
+                return unsupported(format!(
+                    "{ACCESS_PATH} predates tenant-scoped pages at /<plural>: its \
+                     SessionTenantAccess reads the tenant from `/tenants/{{tenant_id}}/...` only. \
+                     Move the file aside so the scaffold writes the current one (and see \
+                     \"Tenant-scoped routes\" in docs/generators.md for the tenant cookie), \
+                     then run the scaffold again"
+                ));
+            }
+            if public && !access.contains("pub struct Public") {
+                return unsupported(format!(
+                    "{ACCESS_PATH} has no `Public` access policy, which --public wires. Add \
+                     `pub struct Public;` implementing GlobalAccess with `Ok(None)`, or move \
+                     the file aside so the scaffold writes the current one"
+                ));
+            }
             for item in [
                 "pub trait GlobalAccess",
                 "pub trait TenantAccess",
@@ -710,6 +782,13 @@ fn inspect_application(
         None => false,
         Some(_) if !api || !generating => true,
         Some(access) => {
+            if public && !access.contains("pub struct Public") {
+                return unsupported(format!(
+                    "{API_ACCESS_PATH} has no `Public` access policy, which --public wires. Add \
+                     `pub struct Public;` implementing ApiGlobalAccess with `Ok(())`, or move \
+                     the file aside so the generator writes the current one"
+                ));
+            }
             for item in [
                 "pub trait ApiTenantAccess",
                 "pub trait ApiGlobalAccess",
@@ -734,7 +813,69 @@ fn inspect_application(
         bearer_sessions: root.join(BEARER_SESSIONS_MODULE).is_file(),
         api_only: !root.join("src/adapters/http/views/mod.rs").is_file(),
         default_locale: application_default_locale(root),
+        identity,
+        session_access,
     })
+}
+
+/// The backend the `sqlx` dependency line of Cargo.toml selects.
+fn backend_of(sqlx: &str) -> Option<Backend> {
+    if sqlx.contains("\"postgres\"") {
+        Some(Backend::Postgresql)
+    } else if sqlx.contains("\"mysql\"") {
+        Some(Backend::MySql)
+    } else if sqlx.contains("\"sqlite\"") {
+        Some(Backend::Sqlite)
+    } else {
+        None
+    }
+}
+
+/// The database backend of the application at `root`, from the features
+/// of its `sqlx` dependency.
+pub(crate) fn application_backend(root: &Path) -> Option<Backend> {
+    read(root, "Cargo.toml")?
+        .lines()
+        .find(|line| line.trim_start().starts_with("sqlx ="))
+        .and_then(backend_of)
+}
+
+/// Why an application's security module cannot serve a new access module.
+pub(crate) const TENANT_COOKIE_MISSING: &str = "src/infrastructure/security/mod.rs has no \
+    `tenant_from_request`, which the access module's SessionTenantAccess uses to find the \
+    tenant of tenant-scoped pages at /<plural>: add `TENANT_COOKIE_NAME`, \
+    `tenant_set_cookie`, `tenant_remove_cookie` and `tenant_from_request` as `forge new` \
+    writes them (set the cookie at sign-in), then run the generator again";
+
+/// Checks `--public`: only for global resources of applications without
+/// Forge identity.
+fn options_public(
+    public: bool,
+    layers: Layers,
+    purpose: Purpose,
+    resource: &Resource,
+    identity: bool,
+) -> Result<bool, CliError> {
+    if !public || purpose == Purpose::Destroy {
+        return Ok(public);
+    }
+    if layers == Layers::Model {
+        return unsupported("--public applies to the routes of a scaffold or resource");
+    }
+    if resource.scope == Scope::Tenant {
+        return unsupported(
+            "--public applies to --global resources: tenant-scoped rows always need a \
+             signed-in member of the tenant",
+        );
+    }
+    if identity {
+        return unsupported(
+            "--public is refused in an application with Forge identity (the sign-in pages): \
+             generate the resource --tenant-scoped, and the owner `forge setup` creates may use \
+             it after signing in",
+        );
+    }
+    Ok(true)
 }
 
 /// Fails, before anything is written, when a file to create exists or the
@@ -809,21 +950,202 @@ pub(crate) fn write_all(root: &Path, files: &[File]) -> Result<(), CliError> {
     result
 }
 
-/// The module declarations and composition-root lines that wire the
-/// resource, printed after generation.
-fn wiring(
-    root: &Path,
-    resource: &Resource,
-    application: &Application,
-    new_access: bool,
-    new_api_access: bool,
-    broadcast: Broadcast,
-) -> Result<String, CliError> {
-    let backend = application.backend;
+/// The `protect` guard of tenant-scoped routes in an application with the
+/// PostgreSQL identity stores: the session cookie, the CSRF token on
+/// changes, an active membership in the session's tenant, and an RBAC grant
+/// of the permission to the `owner` role, which `forge setup` gives the
+/// first member. Declaring `fn protect` with this signature in
+/// src/bootstrap/mod.rs replaces it (to grant other roles, for example).
+const PROTECT_GUARD: &str = "    /// The guard of tenant-scoped routes: sign-in, the CSRF token on changes, a
+    /// membership in the session's tenant, and the `owner` role (`forge setup`)
+    /// granted `permissions`. Declare `fn protect` with this signature in
+    /// src/bootstrap/mod.rs to grant other roles; the generators then use yours.
+    pub(super) fn protect(
+        composition: &mut forge::Composition<'_>,
+        permissions: &[&str],
+    ) -> Result<
+        std::sync::Arc<
+            impl crate::adapters::http::access::TenantAccess
+            + crate::adapters::http::api_access::ApiTenantAccess
+            + 'static,
+        >,
+        forge::ComposeError,
+    > {
+        let mut policy = forge::security::RbacPolicy::new();
+        let owner = forge::security::Role::new(\"owner\").map_err(forge::ComposeError::other)?;
+        for permission in permissions {
+            let permission =
+                forge::security::Permission::new(*permission).map_err(forge::ComposeError::other)?;
+            policy.allow(owner.clone(), permission);
+        }
+        let pool = composition.postgres()?.pool().clone();
+        // Sessions end after FORGE_AUTH_SESSION_IDLE_TIMEOUT without a request.
+        let sessions = crate::infrastructure::auth::PostgresSessionStore::new(pool.clone())
+            .with_idle_timeout(
+                forge::auth::SessionIdleTimeout::new(composition.config().auth.session_idle_timeout)
+                    .map_err(forge::ComposeError::other)?,
+            );
+        Ok(std::sync::Arc::new(
+            crate::adapters::http::access::SessionTenantAccess::new(
+                std::sync::Arc::new(sessions),
+                std::sync::Arc::new(crate::infrastructure::tenancy::PgMembershipStore::new(pool)),
+                policy,
+            ),
+        ))
+    }
+";
+
+/// The `public` guard of `--public` routes: everyone is let in. Declaring
+/// `fn public` with this signature in src/bootstrap/mod.rs puts the
+/// application's own authentication in front instead.
+const PUBLIC_GUARD: &str = "    /// The guard of --public routes: lets everyone in, signed in or not. Declare
+    /// `fn public` with this signature in src/bootstrap/mod.rs to put your own
+    /// authentication in front; the generators then use yours.
+    pub(super) fn public(
+        _permissions: &[&str],
+    ) -> std::sync::Arc<
+        impl crate::adapters::http::access::GlobalAccess
+        + crate::adapters::http::api_access::ApiGlobalAccess
+        + 'static,
+    > {
+        std::sync::Arc::new(crate::adapters::http::access::Public)
+    }
+";
+
+/// The `site` argument as the seam passes it (`&Arc<Site>` already).
+const SITE_ARGUMENT: &str = "        site,\n";
+
+/// What a generation wires: the module declarations and the statements that
+/// build its service and mount its routes.
+struct Wiring {
+    layers: Layers,
+    plural: String,
+    declarations: Vec<(&'static str, String)>,
+    /// The access policy, before the live-update transport.
+    access: String,
+    /// The live-update transport, once for every broadcasting resource.
+    streams: Option<String>,
+    /// The service and its routes (for a model, how to build the service).
+    service: String,
+    /// What to know once it is wired.
+    notes: String,
+}
+
+impl Wiring {
+    /// What the seam registers.
+    fn registration(&self) -> Registration {
+        Registration {
+            modules: self
+                .declarations
+                .iter()
+                .map(|(file, module)| ((*file).to_owned(), module.clone()))
+                .collect(),
+            routes: (self.layers != Layers::Model).then(|| {
+                Block::scoped(
+                    self.layers.name(),
+                    &self.plural,
+                    &format!("{}{}", self.access, self.service),
+                )
+            }),
+            shared: [
+                Block::shared("guard", "protect", PROTECT_GUARD),
+                Block::shared("guard", "public", PUBLIC_GUARD),
+            ]
+            .into_iter()
+            .chain(
+                    self.streams
+                        .iter()
+                        .map(|code| Block::shared("streams", "streams", code)),
+                )
+                .collect(),
+        }
+    }
+
+    /// The wiring printed for an application without the seam.
+    fn printed(&self, root: &Path) -> Result<String, CliError> {
+        let model = self.layers == Layers::Model;
+        let what = if model { "model" } else { "resource" };
+        let mut out = format!(
+            "\nForge did not edit any existing file. Wire the {what} by hand:\n\n  \
+             1. Declare the new modules (each in the listed file, keeping `mod` lines sorted):\n\n"
+        );
+        for (file, module) in &self.declarations {
+            out.push_str(&format!("       {file:<38} pub mod {module};\n"));
+        }
+        if model {
+            out.push_str(&format!(
+                "\n  2. Build the use cases where you need them, for example in `fn compose` of\n  \
+                 src/bootstrap/mod.rs, and pass `{}` to the code that uses it:\n\n",
+                self.plural
+            ));
+        } else {
+            out.push_str(
+                "\n  2. In src/bootstrap/mod.rs, at the end of `fn compose`, before `Ok(())`:\n\n",
+            );
+        }
+        // Pasted into `compose`, a guard is a function inside it.
+        let guard = [("protect(", PROTECT_GUARD), ("public(", PUBLIC_GUARD)]
+            .into_iter()
+            .find(|(call, _)| self.access.contains(call))
+            .map(|(_, guard)| guard.replace("pub(super) fn", "fn"))
+            .unwrap_or_default();
+        let code = format!(
+            "{guard}{}{}{}",
+            self.access,
+            self.streams.as_deref().unwrap_or_default(),
+            self.service
+        )
+        .replace(SITE_ARGUMENT, "        &site,\n");
+        out.push_str(&format_statements(root, &code)?);
+        out.push_str(&self.notes);
+        if model {
+            out.push_str(
+                "\n  Then apply the migration (`forge migrate`) and run `forge test` (repository\n  \
+                 tests on a database server need `cargo test -- --include-ignored` and\n  \
+                 FORGE_TEST_* URLs, see docs/database.md).\n",
+            );
+        } else {
+            out.push_str(
+                "\n  Then apply the migration (`cargo run -- migrate` with FORGE_MIGRATION_DATABASE_URL)\n  \
+                 and run `cargo test` (repository tests on a database server need\n  \
+                 `cargo test -- --include-ignored` and FORGE_TEST_* URLs, see docs/database.md).\n",
+            );
+        }
+        Ok(out)
+    }
+
+    /// What is printed once the modules are declared and the routes are in
+    /// the seam.
+    fn seam_notes(&self, root: &Path) -> Result<String, CliError> {
+        let mut out = String::new();
+        if self.layers == Layers::Model {
+            out.push_str(&format!(
+                "\n  Build the use cases where you need them, for example in `compose`\n  \
+                 (src/bootstrap/mod.rs), and pass `{}` to the code that uses it:\n\n",
+                self.plural
+            ));
+            out.push_str(&format_statements(root, &self.service)?);
+        }
+        out.push_str(&self.notes);
+        out.push_str("\n  Then: forge migrate, and forge dev (or forge test).\n");
+        Ok(out)
+    }
+}
+
+/// The backend's `Composition` accessor and repository prefix.
+fn backend_names(backend: Backend) -> (&'static str, &'static str) {
+    match backend {
+        Backend::Postgresql => ("postgres", "Pg"),
+        Backend::MySql => ("mysql", "MySql"),
+        Backend::Sqlite => ("sqlite", "Sqlite"),
+    }
+}
+
+/// The model's module declarations.
+fn model_declarations(resource: &Resource) -> Vec<(&'static str, String)> {
     let singular = &resource.singular;
     let plural = &resource.plural;
-    let type_name = spec::pascal_case(singular);
-    let mut declarations = vec![
+    vec![
         ("src/domain/entities/mod.rs", singular.clone()),
         (
             "src/application/ports/mod.rs",
@@ -831,7 +1153,81 @@ fn wiring(
         ),
         ("src/application/use_cases/mod.rs", plural.clone()),
         ("src/infrastructure/database/mod.rs", plural.clone()),
-    ];
+    ]
+}
+
+/// The statement that builds the service `<plural>` on the repository.
+fn service_statement(resource: &Resource, backend: Backend) -> String {
+    let plural = &resource.plural;
+    let type_name = spec::pascal_case(&resource.singular);
+    let (database, prefix) = backend_names(backend);
+    format!(
+        "    let {plural} = crate::application::use_cases::{plural}::{type_name}Service::new(\n        \
+         std::sync::Arc::new(\n            \
+         crate::infrastructure::database::{plural}::{prefix}{type_name}Repository::new(\n                \
+         composition.{database}()?.clone(),\n            \
+         ),\n        \
+         ),\n    \
+         );\n"
+    )
+}
+
+/// `forge generate model`: the module declarations and how to build the
+/// use cases.
+fn model_wiring(resource: &Resource, backend: Backend) -> Wiring {
+    let plural = &resource.plural;
+    let type_name = spec::pascal_case(&resource.singular);
+    let mut notes = format!(
+        "\n  The service offers list, find, create, update and delete with optimistic\n  \
+         locking; `{plural}:read` and `{plural}:write` are its permissions\n  \
+         (crate::application::use_cases::{plural}::READ_PERMISSION, WRITE_PERMISSION).\n"
+    );
+    if resource.scope == Scope::Tenant {
+        notes.push_str(&format!(
+            "  {type_name} is tenant-scoped: every use case takes the authorized TenantContext.\n"
+        ));
+    }
+    Wiring {
+        layers: Layers::Model,
+        plural: plural.clone(),
+        declarations: model_declarations(resource),
+        access: String::new(),
+        streams: None,
+        service: service_statement(resource, backend),
+        notes,
+    }
+}
+
+/// The RBAC policy that grants the `owner` role, which `forge setup` gives
+/// the first member, both permissions of the resource.
+fn owner_policy(plural: &str) -> String {
+    format!(
+        "    let mut policy = forge::security::RbacPolicy::new();\n    \
+         let owner = forge::security::Role::new(\"owner\").map_err(forge::ComposeError::other)?;\n    \
+         for permission in [\n        \
+         crate::application::use_cases::{plural}::READ_PERMISSION,\n        \
+         crate::application::use_cases::{plural}::WRITE_PERMISSION,\n    \
+         ] {{\n        \
+         let permission =\n            \
+         forge::security::Permission::new(permission).map_err(forge::ComposeError::other)?;\n        \
+         policy.allow(owner.clone(), permission);\n    \
+         }}\n"
+    )
+}
+
+/// `forge generate scaffold`: the module declarations, the access policy,
+/// the pages and the JSON API.
+fn wiring(
+    resource: &Resource,
+    application: &Application,
+    new_access: bool,
+    new_api_access: bool,
+    broadcast: Broadcast,
+    public: bool,
+) -> Wiring {
+    let backend = application.backend;
+    let plural = &resource.plural;
+    let mut declarations = model_declarations(resource);
     if new_access {
         declarations.push(("src/adapters/http/mod.rs", "access".to_owned()));
     }
@@ -845,60 +1241,53 @@ fn wiring(
     declarations.push(("src/adapters/http/mod.rs", format!("{plural}_api")));
     declarations.push(("src/adapters/http/views/mod.rs", plural.clone()));
 
-    let (database, prefix) = match backend {
-        Backend::Postgresql => ("postgres", "Pg"),
-        Backend::MySql => ("mysql", "MySql"),
-        Backend::Sqlite => ("sqlite", "Sqlite"),
-    };
     let tenant = resource.scope == Scope::Tenant;
-    let mut code = String::new();
-    let access = if !tenant {
-        code.push_str(&format!(
+    let session_api = tenant && application.session_api();
+    let mut access = String::new();
+    let pages_access = if !tenant && public {
+        access.push_str(&format!(
+            "    // {plural}: global and public (--public): anyone who can reach the server may\n    \
+             // read and change them, without signing in (forms still need their CSRF token).\n    \
+             let access = public(&[\n        \
+             crate::application::use_cases::{plural}::READ_PERMISSION,\n        \
+             crate::application::use_cases::{plural}::WRITE_PERMISSION,\n    \
+             ]);\n"
+        ));
+        "access.clone()"
+    } else if !tenant {
+        access.push_str(&format!(
             "    // {plural}: global. DenyAll refuses every request until you decide who may\n    \
              // use them: implement GlobalAccess (src/adapters/http/access.rs).\n"
         ));
         "std::sync::Arc::new(crate::adapters::http::access::DenyAll)"
     } else if backend == Backend::Postgresql {
-        code.push_str(&format!(
-            "    // {plural}: tenant-scoped, under /tenants/{{tenant_id}}/{plural}. RBAC denies\n    \
-             // every role `policy` does not name: the `owner` role (`setup` gives it to\n    \
-             // the first member) may read and write; grant other tenant roles here.\n    \
-             let mut policy = forge::security::RbacPolicy::new();\n    \
-             let owner = forge::security::Role::new(\"owner\").map_err(forge::ComposeError::other)?;\n    \
-             for permission in [\n        \
-             crate::application::use_cases::{plural}::READ_PERMISSION,\n        \
-             crate::application::use_cases::{plural}::WRITE_PERMISSION,\n    \
-             ] {{\n        \
-             let permission =\n            \
-             forge::security::Permission::new(permission).map_err(forge::ComposeError::other)?;\n        \
-             policy.allow(owner.clone(), permission);\n    \
-             }}\n    \
-             let pool = composition.postgres()?.pool().clone();\n    \
-             // Sessions end after FORGE_AUTH_SESSION_IDLE_TIMEOUT without a request.\n    \
-             let sessions = crate::infrastructure::auth::PostgresSessionStore::new(pool.clone())\n        \
-             .with_idle_timeout(\n            \
-             forge::auth::SessionIdleTimeout::new(composition.config().auth.session_idle_timeout)\n                \
-             .map_err(forge::ComposeError::other)?,\n        \
-             );\n    \
-             let access = crate::adapters::http::access::SessionTenantAccess::new(\n        \
-             std::sync::Arc::new(sessions),\n        \
-             std::sync::Arc::new(crate::infrastructure::tenancy::PgMembershipStore::new(pool)),\n        \
-             policy,\n    \
-             );\n"
+        access.push_str(&format!(
+            "    // {plural}: tenant-scoped, at /{plural} of the tenant the session signed in to,\n    \
+             // for roles granted these permissions (the guard grants the owner role).\n    \
+             let access = protect(\n        \
+             composition,\n        \
+             &[\n            \
+             crate::application::use_cases::{plural}::READ_PERMISSION,\n            \
+             crate::application::use_cases::{plural}::WRITE_PERMISSION,\n        \
+             ],\n    \
+             )?;\n"
         ));
-        "std::sync::Arc::new(access)"
+        if session_api {
+            "access.clone()"
+        } else {
+            "access"
+        }
     } else {
-        code.push_str(&format!(
-            "    // {plural}: tenant-scoped, under /tenants/{{tenant_id}}/{plural}. {} has no\n    \
-             // Forge session or membership persistence yet (ADR 0021), so DenyAll\n    \
-             // refuses every request until you provide SessionStore and\n    \
-             // MembershipStore implementations for SessionTenantAccess.\n",
+        access.push_str(&format!(
+            "    // {plural}: tenant-scoped. {} has no Forge session or membership persistence\n    \
+             // yet (ADR 0021), so DenyAll refuses every request until you provide\n    \
+             // SessionStore and MembershipStore implementations for SessionTenantAccess.\n",
             backend.label()
         ));
         "std::sync::Arc::new(crate::adapters::http::access::DenyAll)"
     };
-    if broadcast.streams_module {
-        let fanout = if backend == Backend::Postgresql {
+    let streams = broadcast.enabled.then(|| {
+        if backend == Backend::Postgresql {
             "    // Live updates (--broadcast), once for every broadcasting resource. On\n    \
              // PostgreSQL every replica hears every change (LISTEN/NOTIFY); production\n    \
              // needs FORGE_STREAMS_KEY (`openssl rand -base64 32`, the same everywhere).\n    \
@@ -914,185 +1303,113 @@ fn wiring(
                  crate::adapters::http::streams::Streams::register(composition, forge::Fanout::InProcess)?;\n",
                 backend.label()
             )
-        };
-        code.push_str(&fanout);
-    }
+        }
+    });
     let streams_argument = if broadcast.enabled {
         "        &streams,\n"
     } else {
         ""
     };
-    code.push_str(&format!(
-        "    let {plural} = crate::application::use_cases::{plural}::{type_name}Service::new(\n        \
-         std::sync::Arc::new(\n            \
-         crate::infrastructure::database::{plural}::{prefix}{type_name}Repository::new(\n                \
-         composition.{database}()?.clone(),\n            \
-         ),\n        \
-         ),\n    \
-         );\n    \
-         crate::adapters::http::{plural}::routes(\n        \
-         composition.router(),\n        \
-         &site,\n        \
-         {plural},\n        \
-         {access},\n\
+    let mut service = service_statement(resource, backend);
+    // The JSON API shares the service.
+    service.push_str(&format!(
+        "    crate::adapters::http::{plural}::routes(\n        \
+         composition.router(),\n\
+         {SITE_ARGUMENT}        \
+         {plural}.clone(),\n        \
+         {pages_access},\n\
          {streams_argument}    \
          )?;\n"
     ));
-    // The JSON API shares the service; with bearer tokens it also shares the
-    // policy, so the pages' access policy takes a copy.
-    code = code.replace(
-        &format!("        {plural},\n"),
-        &format!("        {plural}.clone(),\n"),
-    );
-    let bearer = tenant && backend == Backend::Postgresql && application.bearer_sessions;
-    if bearer {
-        code = code.replace(
-            "        policy,\n    );\n",
-            "        policy.clone(),\n    );\n",
-        );
-    }
-    code.push_str(&api_statements(resource, application, true));
+    service.push_str(&api_statements(resource, application, true, public));
 
-    let mut out = String::from(
-        "\nForge did not edit any existing file. Wire the resource by hand:\n\n  \
-         1. Declare the new modules (each in the listed file, keeping `mod` lines sorted):\n\n",
-    );
-    for (file, module) in &declarations {
-        out.push_str(&format!("       {file:<38} pub mod {module};\n"));
-    }
-    out.push_str(
-        "\n  2. In src/bootstrap/mod.rs, at the end of `fn compose`, before `Ok(())`:\n\n",
-    );
-    out.push_str(&format_statements(root, &code)?);
-    out.push_str(&format!(
+    let mut notes = format!(
         "\n  Every route asks the access policy for `{plural}:read` or `{plural}:write`\n  \
          first; src/adapters/http/access.rs explains the deny-by-default choice for the\n  \
          pages, src/adapters/http/api_access.rs for the JSON API under /v1/{plural}.\n"
-    ));
-    out.push_str(&api_note(resource, application));
+    );
+    notes.push_str(&api_note(resource, application));
     if broadcast.enabled {
-        out.push_str(&format!(
+        notes.push_str(&format!(
             "  Live updates: create, update and delete publish to the `{plural}` channel{}, and\n  \
              the index page subscribes; a stream is served only to callers the same policy\n  \
              grants `{plural}:read` (src/adapters/http/streams.rs).\n",
-            if resource.scope == Scope::Tenant {
-                " of the tenant"
-            } else {
-                ""
-            }
+            if tenant { " of the tenant" } else { "" }
         ));
     }
     if backend == Backend::Postgresql && tenant {
-        out.push_str(&format!(
+        notes.push_str(&format!(
             "  Permissions match exactly: index and show need `{plural}:read`, new, create,\n  \
-             edit, update and delete need `{plural}:write`. Signed-out browsers are sent\n  \
-             to /session/new (the sign-in pages of `forge new` or\n  \
-             `forge generate authentication`). To allow a read-only tenant role, add after\n  \
-             `let mut policy`, for example:\n\n"
+             edit, update and delete need `{plural}:write`, which the `owner` role has.\n  \
+             Signed-out browsers are sent to /session/new (the sign-in pages of `forge new`\n  \
+             or `forge generate authentication`); the pages use the tenant of the session.\n"
         ));
-        let example = format!(
-            "    let viewer = forge::security::Role::new(\"viewer\").map_err(forge::ComposeError::other)?;\n    \
-             let read = forge::security::Permission::new(\n        \
-             crate::application::use_cases::{plural}::READ_PERMISSION,\n    \
-             )\n    \
-             .map_err(forge::ComposeError::other)?;\n    \
-             policy.allow(viewer, read);\n"
-        );
-        out.push_str(&format_statements(root, &example)?);
     }
-    out.push_str(
-        "\n  Then apply the migration (`cargo run -- migrate` with FORGE_MIGRATION_DATABASE_URL)\n  \
-         and run `cargo test` (repository tests on a database server need\n  \
-         `cargo test -- --include-ignored` and FORGE_TEST_* URLs, see docs/database.md).\n",
-    );
-    Ok(out)
+    if !tenant && public {
+        notes.push_str(&format!(
+            "  WARNING: --public serves /{plural} and /v1/{plural} to anyone who can reach the\n  \
+             server, without signing in.\n"
+        ));
+    }
+    Wiring {
+        layers: Layers::Scaffold,
+        plural: plural.clone(),
+        declarations,
+        access,
+        streams,
+        service,
+        notes,
+    }
 }
 
-/// The wiring printed by `forge generate resource`: the module declarations,
-/// the use cases and the JSON routes.
+/// `forge generate resource`: the module declarations, the use cases and
+/// the JSON routes.
 fn resource_wiring(
-    root: &Path,
     resource: &Resource,
     application: &Application,
     new_api_access: bool,
-) -> Result<String, CliError> {
-    let singular = &resource.singular;
+    public: bool,
+) -> Wiring {
     let plural = &resource.plural;
-    let type_name = spec::pascal_case(singular);
-    let mut declarations = vec![
-        ("src/domain/entities/mod.rs", singular.clone()),
-        (
-            "src/application/ports/mod.rs",
-            format!("{singular}_repository"),
-        ),
-        ("src/application/use_cases/mod.rs", plural.clone()),
-        ("src/infrastructure/database/mod.rs", plural.clone()),
-    ];
+    let mut declarations = model_declarations(resource);
     if new_api_access {
         declarations.push(("src/adapters/http/mod.rs", "api_access".to_owned()));
     }
     declarations.push(("src/adapters/http/mod.rs", format!("{plural}_api")));
-    let (database, prefix) = match application.backend {
-        Backend::Postgresql => ("postgres", "Pg"),
-        Backend::MySql => ("mysql", "MySql"),
-        Backend::Sqlite => ("sqlite", "Sqlite"),
-    };
-    let mut code = format!(
-        "    let {plural} = crate::application::use_cases::{plural}::{type_name}Service::new(\n        \
-         std::sync::Arc::new(\n            \
-         crate::infrastructure::database::{plural}::{prefix}{type_name}Repository::new(\n                \
-         composition.{database}()?.clone(),\n            \
-         ),\n        \
-         ),\n    \
-         );\n"
-    );
-    code.push_str(&api_statements(resource, application, false));
-    let mut out = String::from(
-        "\nForge did not edit any existing file. Wire the resource by hand:\n\n  \
-         1. Declare the new modules (each in the listed file, keeping `mod` lines sorted):\n\n",
-    );
-    for (file, module) in &declarations {
-        out.push_str(&format!("       {file:<38} pub mod {module};\n"));
-    }
-    out.push_str(
-        "\n  2. In src/bootstrap/mod.rs, at the end of `fn compose`, before `Ok(())`:\n\n",
-    );
-    out.push_str(&format_statements(root, &code)?);
-    out.push_str(&format!(
+    let mut service = service_statement(resource, application.backend);
+    service.push_str(&api_statements(resource, application, false, public));
+    let mut notes = format!(
         "\n  Every route of /v1/{plural} asks the access policy for `{plural}:read` or\n  \
          `{plural}:write` first; src/adapters/http/api_access.rs explains the\n  \
          deny-by-default choice.\n"
-    ));
-    out.push_str(&api_note(resource, application));
-    if resource.scope == Scope::Tenant
-        && application.backend == Backend::Postgresql
-        && application.bearer_sessions
-    {
-        out.push_str(
-            "  To allow a read-only tenant role, add after `let mut policy`, for example:\n\n",
-        );
-        let example = format!(
-            "    let viewer = forge::security::Role::new(\"viewer\").map_err(forge::ComposeError::other)?;\n    \
-             let read = forge::security::Permission::new(\n        \
-             crate::application::use_cases::{plural}::READ_PERMISSION,\n    \
-             )\n    \
-             .map_err(forge::ComposeError::other)?;\n    \
-             policy.allow(viewer, read);\n"
-        );
-        out.push_str(&format_statements(root, &example)?);
-    }
-    out.push_str(
-        "\n  Then apply the migration (`cargo run -- migrate` with FORGE_MIGRATION_DATABASE_URL)\n  \
-         and run `cargo test` (repository tests on a database server need\n  \
-         `cargo test -- --include-ignored` and FORGE_TEST_* URLs, see docs/database.md).\n",
     );
-    Ok(out)
+    notes.push_str(&api_note(resource, application));
+    if resource.scope == Scope::Global && public {
+        notes.push_str(&format!(
+            "  WARNING: --public serves /v1/{plural} to anyone who can reach the server,\n  \
+             without signing in.\n"
+        ));
+    }
+    Wiring {
+        layers: Layers::Resource,
+        plural: plural.clone(),
+        declarations,
+        access: String::new(),
+        streams: None,
+        service,
+        notes,
+    }
 }
 
 /// The statements that mount the JSON API of `resource` on the service
-/// `<plural>` (moved into the routes). `policy_defined`: a tenant `policy`
-/// with the resource's grants is already in scope (the scaffold's).
-fn api_statements(resource: &Resource, application: &Application, policy_defined: bool) -> String {
+/// `<plural>` (moved into the routes). `pages`: the scaffold's statements
+/// come first, with the tenant `policy` and the pages' `access`.
+fn api_statements(
+    resource: &Resource,
+    application: &Application,
+    pages: bool,
+    public: bool,
+) -> String {
     let plural = &resource.plural;
     let tenant = resource.scope == Scope::Tenant;
     let backend = application.backend;
@@ -1106,6 +1423,16 @@ fn api_statements(resource: &Resource, application: &Application, policy_defined
         )
     };
     let deny = "std::sync::Arc::new(crate::adapters::http::api_access::DenyAll)";
+    if !tenant && public {
+        return format!(
+            "    // {plural} JSON API (/v1/{plural}): global and public (--public).\n{}",
+            routes(if pages {
+                "access"
+            } else {
+                "std::sync::Arc::new(crate::adapters::http::api_access::Public)"
+            })
+        );
+    }
     if !tenant {
         return format!(
             "    // {plural} JSON API (/v1/{plural}): global. DenyAll refuses every request until\n    \
@@ -1133,6 +1460,13 @@ fn api_statements(resource: &Resource, application: &Application, policy_defined
         );
     }
     if !application.bearer_sessions {
+        if pages && application.session_api() {
+            return format!(
+                "    // {plural} JSON API (/v1/{plural}): the same session cookie and policy as the\n    \
+                 // pages; changes send the session's CSRF token in X-CSRF-Token.\n{}",
+                routes("access")
+            );
+        }
         return format!(
             "    // {plural} JSON API (/v1/{plural}): tenant-scoped, for bearer tokens. This\n    \
              // application issues none yet, so DenyAll refuses every request: run\n    \
@@ -1141,30 +1475,13 @@ fn api_statements(resource: &Resource, application: &Application, policy_defined
             routes(deny)
         );
     }
-    let mut code = String::new();
-    if policy_defined {
-        code.push_str(&format!(
-            "    // {plural} JSON API (/v1/{plural}): the bearer token of POST /auth/login names\n    \
-             // the tenant; the same RBAC policy as the pages.\n"
-        ));
-    } else {
-        code.push_str(&format!(
-            "    // {plural} JSON API (/v1/{plural}): tenant-scoped. The bearer token of\n    \
-             // POST /auth/login names the tenant; RBAC denies every role `policy` does\n    \
-             // not name: the `owner` role (`setup` gives it to the first member) may read\n    \
-             // and write; grant other tenant roles here.\n    \
-             let mut policy = forge::security::RbacPolicy::new();\n    \
-             let owner = forge::security::Role::new(\"owner\").map_err(forge::ComposeError::other)?;\n    \
-             for permission in [\n        \
-             crate::application::use_cases::{plural}::READ_PERMISSION,\n        \
-             crate::application::use_cases::{plural}::WRITE_PERMISSION,\n    \
-             ] {{\n        \
-             let permission =\n            \
-             forge::security::Permission::new(permission).map_err(forge::ComposeError::other)?;\n        \
-             policy.allow(owner.clone(), permission);\n    \
-             }}\n"
-        ));
-    }
+    let mut code = format!(
+        "    // {plural} JSON API (/v1/{plural}): tenant-scoped. The bearer token of\n    \
+         // POST /auth/login names the tenant; RBAC denies every role `policy` does\n    \
+         // not name: the `owner` role (`forge setup` gives it to the first member) may\n    \
+         // read and write.\n"
+    );
+    code.push_str(&owner_policy(plural));
     code.push_str(
         "    let pool = composition.postgres()?.pool().clone();\n    \
          // Tokens end after FORGE_AUTH_SESSION_IDLE_TIMEOUT without a request.\n    \
@@ -1185,16 +1502,21 @@ fn api_statements(resource: &Resource, application: &Application, policy_defined
     code
 }
 
-/// What the printed JSON API wiring needs to work, after the statements.
+/// What the JSON API wiring needs to work, after the statements.
 fn api_note(resource: &Resource, application: &Application) -> String {
     let plural = &resource.plural;
-    if resource.scope == Scope::Tenant
-        && application.backend == Backend::Postgresql
-        && application.bearer_sessions
-    {
+    if resource.scope != Scope::Tenant || application.backend != Backend::Postgresql {
+        return String::new();
+    }
+    if application.bearer_sessions {
         format!(
             "  The JSON API takes the bearer tokens of POST /auth/login:\n\n    \
              curl -s http://127.0.0.1:3000/v1/{plural} -H \"Authorization: Bearer $TOKEN\"\n\n"
+        )
+    } else if application.session_api() {
+        format!(
+            "  The JSON API at /v1/{plural} takes the session cookie of the sign-in pages;\n  \
+             changes send its CSRF token (the __Host-forge_csrf cookie) in X-CSRF-Token.\n"
         )
     } else {
         String::new()

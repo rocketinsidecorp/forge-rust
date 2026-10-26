@@ -3,7 +3,9 @@ use super::*;
 fn plan(files: Vec<Planned>) -> DestroyPlan {
     DestroyPlan {
         files,
-        unwire: "\nForge did not edit any existing file. Wire it:\n\n  pub mod pages;\n".to_owned(),
+        unwire: Unwire::Printed(
+            "\nForge did not edit any existing file. Wire it:\n\n  pub mod pages;\n".to_owned(),
+        ),
         owned_elsewhere: None,
     }
 }

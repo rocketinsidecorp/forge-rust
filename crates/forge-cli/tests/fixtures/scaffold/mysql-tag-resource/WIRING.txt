@@ -1,35 +1,112 @@
 
-Forge did not edit any existing file. Wire the resource by hand:
-
-  1. Declare the new modules (each in the listed file, keeping `mod` lines sorted):
-
-       src/domain/entities/mod.rs             pub mod tag;
-       src/application/ports/mod.rs           pub mod tag_repository;
-       src/application/use_cases/mod.rs       pub mod tags;
-       src/infrastructure/database/mod.rs     pub mod tags;
-       src/adapters/http/mod.rs               pub mod api_access;
-       src/adapters/http/mod.rs               pub mod tags_api;
-
-  2. In src/bootstrap/mod.rs, at the end of `fn compose`, before `Ok(())`:
-
-    let tags = crate::application::use_cases::tags::TagService::new(std::sync::Arc::new(
-        crate::infrastructure::database::tags::MySqlTagRepository::new(
-            composition.mysql()?.clone(),
-        ),
-    ));
-    // tags JSON API (/v1/tags): global. DenyAll refuses every request until
-    // you decide who may use it: implement ApiGlobalAccess
-    // (src/adapters/http/api_access.rs).
-    crate::adapters::http::tags_api::routes(
-        composition.router(),
-        tags,
-        std::sync::Arc::new(crate::adapters::http::api_access::DenyAll),
-    )?;
-
   Every route of /v1/tags asks the access policy for `tags:read` or
   `tags:write` first; src/adapters/http/api_access.rs explains the
   deny-by-default choice.
 
-  Then apply the migration (`cargo run -- migrate` with FORGE_MIGRATION_DATABASE_URL)
-  and run `cargo test` (repository tests on a database server need
-  `cargo test -- --include-ignored` and FORGE_TEST_* URLs, see docs/database.md).
+  Then: forge migrate, and forge dev (or forge test).
+
+declare src/domain/entities/mod.rs (pub mod tag;)
+//! Entities: domain objects with identity and invariants.
+
+pub mod tag;
+
+declare src/application/ports/mod.rs (pub mod tag_repository;)
+//! Ports: traits implemented by adapters and infrastructure.
+
+pub mod tag_repository;
+
+declare src/application/use_cases/mod.rs (pub mod tags;)
+//! Use cases: orchestration and transaction boundaries.
+
+pub mod tags;
+
+declare src/infrastructure/database/mod.rs (pub mod tags;)
+//! Database pools, migrations and transactions.
+
+pub mod tags;
+
+declare src/adapters/http/mod.rs (pub mod api_access; pub mod tags_api;)
+//! HTTP adapter. Handlers stay thin: decode the request, call a use case and
+//! map the result to a response, usually an HTML page rendered from a view
+//! model in `views` (or a `303` redirect after a form submission).
+
+pub mod api_access;
+pub mod status;
+pub mod tags_api;
+pub mod views;
+
+use std::sync::Arc;
+
+use forge::ComposeError;
+use forge::http::{Method, Request, Response, Router};
+use forge::i18n::Translator;
+
+use self::views::{Site, welcome::WelcomeIndex};
+
+/// Whether the welcome page links to the sign-in pages.
+const SIGN_IN: bool = false;
+
+/// Loads the site and registers the digested assets and the request layers
+/// every HTML page relies on (the request's locale, Content-Security-Policy,
+/// CSRF protection with the `_method` override, flash messages). Every page
+/// renders its layout from the returned site; `translator` is
+/// `views::locales::translator(config)`.
+pub fn site(router: &mut Router, translator: Translator) -> Result<Arc<Site>, ComposeError> {
+    let site = Arc::new(Site::load(translator)?);
+    site.register(router).map_err(ComposeError::other)?;
+    Ok(site)
+}
+
+/// Registers the application's routes. Forge adds `/health`, `/health/live`
+/// and `/health/ready` itself.
+pub fn routes(router: &mut Router, site: &Arc<Site>) -> Result<(), ComposeError> {
+    let index_site = Arc::clone(site);
+    router.route(Method::GET, "/", move |request: Request| {
+        let site = Arc::clone(&index_site);
+        async move { index(&site, &request) }
+    })?;
+    status::routes(router)?;
+    Ok(())
+}
+
+fn index(site: &Site, request: &Request) -> Response {
+    forge::web::html(&WelcomeIndex {
+        layout: site.layout(request),
+        logo: site.logo(),
+        application: env!("CARGO_PKG_NAME"),
+        sign_in: SIGN_IN,
+    })
+}
+
+wire src/bootstrap/routes_gen.rs (resource tags)
+// forge:checksum 5ce68ff31131b35a476e7dc805242b02496a26cb1167f33f0ca7a25858c22406
+//! Routes the generators mount. `forge generate scaffold`, `forge generate
+//! resource` and `forge generate controller` write this file, and `forge
+//! destroy` takes their blocks back out; each block starts with a `forge:`
+//! comment. Do not edit it: the generators refuse to change it once its
+//! checksum no longer matches. Mount your own routes in `compose`
+//! (src/bootstrap/mod.rs), which calls this function once.
+
+/// Mounts the routes of the generated resources and controllers.
+pub(super) fn generated_routes(
+    composition: &mut forge::Composition<'_>,
+    _site: &std::sync::Arc<crate::adapters::http::views::Site>,
+) -> Result<(), forge::ComposeError> {
+    // forge:resource tags
+    {
+        let tags = crate::application::use_cases::tags::TagService::new(std::sync::Arc::new(
+            crate::infrastructure::database::tags::MySqlTagRepository::new(
+                composition.mysql()?.clone(),
+            ),
+        ));
+        // tags JSON API (/v1/tags): global. DenyAll refuses every request until
+        // you decide who may use it: implement ApiGlobalAccess
+        // (src/adapters/http/api_access.rs).
+        crate::adapters::http::tags_api::routes(
+            composition.router(),
+            tags,
+            std::sync::Arc::new(crate::adapters::http::api_access::DenyAll),
+        )?;
+    }
+    Ok(())
+}

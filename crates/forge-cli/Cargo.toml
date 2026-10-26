@@ -37,6 +37,10 @@ forge-encryption = { path = "../forge-encryption" }
 forge-proxy = { path = "../forge-proxy" }
 # Random container-name suffixes and ssh control directory names.
 getrandom.workspace = true
+# SHA-256 of the checksum line of src/bootstrap/routes_gen.rs, which detects
+# hand edits of the generators' routes seam: the ring already in the graph
+# through forge-encryption and rustls (no new package in Cargo.lock).
+ring.workspace = true
 # Validation patterns and `forge logs --grep`, with Forge-Go's RE2 syntax.
 regex-automata.workspace = true
 # `forge i18n check` loads config/locales with the translator's own parser

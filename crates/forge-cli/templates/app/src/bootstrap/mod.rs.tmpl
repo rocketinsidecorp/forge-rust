@@ -17,15 +17,14 @@
 //! shutdown. Register jobs in `jobs_configure`.
 %%end%%
 
+mod routes_gen;
 %%if database%%
 pub mod seeds;
 %%end%%
 %%if authentication%%
 pub mod setup;
 %%end%%
-%%if database%%
 
-%%end%%
 use std::process::ExitCode;
 
 /// Runs the command selected on the command line (serve by default).
@@ -59,13 +58,14 @@ pub fn run() -> ExitCode {
 %%if !views%%
 
 /// Wires the HTTP adapter: the routes. `forge generate resource` and `forge
-/// generate controller --api` print the lines that wire each generated layer
-/// at the end of this function, with routes closed (`DenyAll`): this
-/// application has no sign-in, so nobody is let in until you implement the
-/// access trait of `src/adapters/http/api_access.rs` (or `access.rs`) with the
-/// authentication of your API clients.
+/// generate controller --api` mount theirs in `routes_gen.rs`, called last,
+/// with routes closed (`DenyAll`): this application has no sign-in, so nobody
+/// is let in until you implement the access trait of
+/// `src/adapters/http/api_access.rs` (or `access.rs`) with the authentication
+/// of your API clients.
 fn compose(composition: &mut forge::Composition<'_>) -> Result<(), forge::ComposeError> {
     crate::adapters::http::routes(composition.router())?;
+    routes_gen::generated_routes(composition)?;
     Ok(())
 }
 %%end%%
@@ -73,8 +73,8 @@ fn compose(composition: &mut forge::Composition<'_>) -> Result<(), forge::Compos
 
 /// Wires the HTTP adapter: the translations of `config/locales`, the site
 /// (digested assets and the HTML request layers) and the routes. `forge
-/// generate scaffold` prints the lines that wire each generated resource at
-/// the end of this function.
+/// generate scaffold`, `resource` and `controller` mount theirs in
+/// `routes_gen.rs`, which this function calls last.
 fn compose(composition: &mut forge::Composition<'_>) -> Result<(), forge::ComposeError> {
     let translator = crate::adapters::http::views::locales::translator(composition.config())
         .map_err(forge::ComposeError::other)?;
@@ -213,6 +213,8 @@ fn compose(composition: &mut forge::Composition<'_>) -> Result<(), forge::Compos
     )?;
 %%end%%
 %%end%%
+    // The routes the generators mount (src/bootstrap/routes_gen.rs).
+    routes_gen::generated_routes(composition, &site)?;
     Ok(())
 }
 %%end%%

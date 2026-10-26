@@ -36,6 +36,7 @@ mod process;
 mod project;
 mod scaffold;
 mod view;
+mod wiring;
 
 use std::env;
 use std::io::{self, IsTerminal as _};
@@ -149,129 +150,14 @@ fn execute(
             }
             Ok(())
         }
-        Command::Generate { generator } => match generator {
-            GenerateCommand::Authentication { api_auth, dry_run } => {
-                let outcome = authentication::generate(current_dir, api_auth, dry_run)?;
-                let verb = if dry_run { "would create" } else { "create" };
-                for path in &outcome.created {
-                    writeln!(output, "  {verb:<12} {path}").map_err(CliError::Output)?;
-                }
-                write!(output, "{}", outcome.wiring).map_err(CliError::Output)
-            }
-            GenerateCommand::Migration { name } => {
-                let (up, down) = generate::create_migration(current_dir, &name)?;
-                writeln!(
-                    output,
-                    "Created migration files:\n  {}\n  {}",
-                    up.display(),
-                    down.display()
-                )
-                .map_err(CliError::Output)
-            }
-            GenerateCommand::Scaffold {
-                name,
-                fields,
-                tenant_scoped,
-                global: _,
-                plural,
-                broadcast,
-                dry_run,
-            } => {
-                let options = ScaffoldOptions {
-                    name,
-                    fields,
-                    scope: if tenant_scoped {
-                        Scope::Tenant
-                    } else {
-                        Scope::Global
-                    },
-                    plural,
-                    broadcast,
-                    dry_run,
-                    layers: Layers::Scaffold,
-                };
-                let version = generate::migration_version(current_dir)?;
-                let outcome = scaffold::generate(current_dir, &options, &version)?;
-                let verb = if dry_run { "would create" } else { "create" };
-                for path in &outcome.created {
-                    writeln!(output, "  {verb:<12} {path}").map_err(CliError::Output)?;
-                }
-                if outcome.reused_access {
-                    writeln!(output, "  {:<12} src/adapters/http/access.rs", "reuse")
-                        .map_err(CliError::Output)?;
-                }
-                if outcome.reused_streams {
-                    writeln!(output, "  {:<12} src/adapters/http/streams.rs", "reuse")
-                        .map_err(CliError::Output)?;
-                }
-                if outcome.reused_api_access {
-                    writeln!(output, "  {:<12} {}", "reuse", scaffold::API_ACCESS_PATH)
-                        .map_err(CliError::Output)?;
-                }
-                write!(output, "{}", outcome.wiring).map_err(CliError::Output)
-            }
-            GenerateCommand::Resource { resource } => {
-                let options = resource_options(resource, Layers::Resource, false);
-                let version = generate::migration_version(current_dir)?;
-                let outcome = scaffold::generate(current_dir, &options, &version)?;
-                let verb = if options.dry_run {
-                    "would create"
-                } else {
-                    "create"
-                };
-                for path in &outcome.created {
-                    writeln!(output, "  {verb:<12} {path}").map_err(CliError::Output)?;
-                }
-                if outcome.reused_api_access {
-                    writeln!(output, "  {:<12} {}", "reuse", scaffold::API_ACCESS_PATH)
-                        .map_err(CliError::Output)?;
-                }
-                write!(output, "{}", outcome.wiring).map_err(CliError::Output)
-            }
-            GenerateCommand::Model { resource } => {
-                let options = resource_options(resource, Layers::Model, false);
-                let version = generate::migration_version(current_dir)?;
-                let outcome = scaffold::generate(current_dir, &options, &version)?;
-                let verb = if options.dry_run {
-                    "would create"
-                } else {
-                    "create"
-                };
-                for path in &outcome.created {
-                    writeln!(output, "  {verb:<12} {path}").map_err(CliError::Output)?;
-                }
-                write!(output, "{}", outcome.wiring).map_err(CliError::Output)
-            }
-            GenerateCommand::Controller { controller } => {
-                let options = controller_options(controller);
-                let outcome = controller::generate(current_dir, &options)?;
-                generators::report(output, options.dry_run, &outcome.files)?;
-                if outcome.reused_access {
-                    writeln!(output, "  {:<12} {}", "reuse", scaffold::ACCESS_PATH)
-                        .map_err(CliError::Output)?;
-                }
-                write!(output, "{}", outcome.wiring).map_err(CliError::Output)
-            }
-            GenerateCommand::View { view } => {
-                let options = view_options(view);
-                let outcome = view::generate(current_dir, &options)?;
-                generators::report(output, options.dry_run, &outcome.files)?;
-                write!(output, "{}", outcome.wiring).map_err(CliError::Output)
-            }
-            GenerateCommand::Mailer { mailer } => {
-                let options = mailer_options(mailer);
-                let outcome = mailer::generate(current_dir, &options)?;
-                generators::report(output, options.dry_run, &outcome.files)?;
-                write!(output, "{}", outcome.wiring).map_err(CliError::Output)
-            }
-            GenerateCommand::Job { job } => {
-                let options = job_options(job);
-                let outcome = job::generate(current_dir, &options)?;
-                generators::report(output, options.dry_run, &outcome.files)?;
-                write!(output, "{}", outcome.wiring).map_err(CliError::Output)
-            }
-        },
-        Command::Destroy { generator } => run_destroy(current_dir, generator, output),
+        Command::Generate { generator } => {
+            let _lock = generate_lock(current_dir)?;
+            generate_command(generator, current_dir, output)
+        }
+        Command::Destroy { generator } => {
+            let _lock = generate_lock(current_dir)?;
+            run_destroy(current_dir, generator, output)
+        }
         Command::Check => CargoCommand::Check.run(current_dir),
         Command::Test { args } => {
             // Like Forge-Go's `forge test`: the development environment
@@ -556,6 +442,175 @@ fn run_app(current_dir: &std::path::Path, command: AppCommand) -> Result<(), Cli
     .map_err(CliError::from)
 }
 
+/// Serializes generators and `forge destroy` in an application (a directory
+/// with a Cargo.toml); anywhere else the generator refuses on its own.
+fn generate_lock(root: &std::path::Path) -> Result<Option<wiring::GenerateLock>, CliError> {
+    if root.join("Cargo.toml").is_file() {
+        wiring::GenerateLock::acquire(root).map(Some)
+    } else {
+        Ok(None)
+    }
+}
+
+/// `forge generate GENERATOR ARGUMENTS...`.
+fn generate_command(
+    generator: GenerateCommand,
+    current_dir: &std::path::Path,
+    output: &mut dyn io::Write,
+) -> Result<(), CliError> {
+    match generator {
+            GenerateCommand::Authentication { api_auth, dry_run } => {
+                let outcome = authentication::generate(current_dir, api_auth, dry_run)?;
+                let verb = if dry_run { "would create" } else { "create" };
+                for path in &outcome.created {
+                    writeln!(output, "  {verb:<12} {path}").map_err(CliError::Output)?;
+                }
+                write!(output, "{}", outcome.wiring).map_err(CliError::Output)
+            }
+            GenerateCommand::Migration { name, fields } => {
+                let migration = generate::generate_migration(current_dir, &name, &fields)?;
+                let relative = |path: &std::path::Path| {
+                    path.strip_prefix(current_dir)
+                        .unwrap_or(path)
+                        .display()
+                        .to_string()
+                };
+                let (up, down) = (relative(&migration.up), relative(&migration.down));
+                writeln!(output, "  create  {up}\n  create  {down}").map_err(CliError::Output)?;
+                match migration.inferred {
+                    None => writeln!(
+                        output,
+                        "\n  WARNING: fill in {up} and {down} before forge migrate or forge test; \
+                         an empty migration is refused.\n  (add_COLUMNS_to_TABLE and \
+                         remove_COLUMNS_from_TABLE with field:type arguments write the \
+                         statements.)"
+                    ),
+                    Some(true) => writeln!(
+                        output,
+                        "\n  WARNING: forge migrate drops these columns and every value in \
+                         them; forge rollback brings the columns back, not their values. Back \
+                         up the data first if you need it."
+                    ),
+                    Some(false) => Ok(()),
+                }
+                .map_err(CliError::Output)
+            }
+            GenerateCommand::Scaffold {
+                name,
+                fields,
+                tenant_scoped,
+                global: _,
+                plural,
+                broadcast,
+                public,
+                dry_run,
+            } => {
+                let options = ScaffoldOptions {
+                    name,
+                    fields,
+                    scope: if tenant_scoped {
+                        Scope::Tenant
+                    } else {
+                        Scope::Global
+                    },
+                    plural,
+                    broadcast,
+                    public,
+                    dry_run,
+                    layers: Layers::Scaffold,
+                };
+                let version = generate::migration_version(current_dir)?;
+                let outcome = scaffold::generate(current_dir, &options, &version)?;
+                let verb = created_verb(outcome.identical, dry_run);
+                for path in &outcome.created {
+                    writeln!(output, "  {verb:<12} {path}").map_err(CliError::Output)?;
+                }
+                if outcome.reused_access {
+                    writeln!(output, "  {:<12} src/adapters/http/access.rs", "reuse")
+                        .map_err(CliError::Output)?;
+                }
+                if outcome.reused_streams {
+                    writeln!(output, "  {:<12} src/adapters/http/streams.rs", "reuse")
+                        .map_err(CliError::Output)?;
+                }
+                if outcome.reused_api_access {
+                    writeln!(output, "  {:<12} {}", "reuse", scaffold::API_ACCESS_PATH)
+                        .map_err(CliError::Output)?;
+                }
+                wiring::report(output, dry_run, &outcome.edits)?;
+                write!(output, "{}", outcome.wiring).map_err(CliError::Output)
+            }
+            GenerateCommand::Resource { resource } => {
+                let options = resource_options(resource, Layers::Resource, false);
+                let version = generate::migration_version(current_dir)?;
+                let outcome = scaffold::generate(current_dir, &options, &version)?;
+                let verb = created_verb(outcome.identical, options.dry_run);
+                for path in &outcome.created {
+                    writeln!(output, "  {verb:<12} {path}").map_err(CliError::Output)?;
+                }
+                if outcome.reused_api_access {
+                    writeln!(output, "  {:<12} {}", "reuse", scaffold::API_ACCESS_PATH)
+                        .map_err(CliError::Output)?;
+                }
+                wiring::report(output, options.dry_run, &outcome.edits)?;
+                write!(output, "{}", outcome.wiring).map_err(CliError::Output)
+            }
+            GenerateCommand::Model { resource } => {
+                let options = resource_options(resource, Layers::Model, false);
+                let version = generate::migration_version(current_dir)?;
+                let outcome = scaffold::generate(current_dir, &options, &version)?;
+                let verb = created_verb(outcome.identical, options.dry_run);
+                for path in &outcome.created {
+                    writeln!(output, "  {verb:<12} {path}").map_err(CliError::Output)?;
+                }
+                wiring::report(output, options.dry_run, &outcome.edits)?;
+                write!(output, "{}", outcome.wiring).map_err(CliError::Output)
+            }
+            GenerateCommand::Controller { controller } => {
+                let options = controller_options(controller);
+                let outcome = controller::generate(current_dir, &options)?;
+                generators::report(output, options.dry_run, &outcome.files)?;
+                if outcome.reused_access {
+                    writeln!(output, "  {:<12} {}", "reuse", scaffold::ACCESS_PATH)
+                        .map_err(CliError::Output)?;
+                }
+                wiring::report(output, options.dry_run, &outcome.edits)?;
+                write!(output, "{}", outcome.wiring).map_err(CliError::Output)
+            }
+            GenerateCommand::View { view } => {
+                let options = view_options(view);
+                let outcome = view::generate(current_dir, &options)?;
+                generators::report(output, options.dry_run, &outcome.files)?;
+                wiring::report(output, options.dry_run, &outcome.edits)?;
+                write!(output, "{}", outcome.wiring).map_err(CliError::Output)
+            }
+            GenerateCommand::Mailer { mailer } => {
+                let options = mailer_options(mailer);
+                let outcome = mailer::generate(current_dir, &options)?;
+                generators::report(output, options.dry_run, &outcome.files)?;
+                write!(output, "{}", outcome.wiring).map_err(CliError::Output)
+            }
+            GenerateCommand::Job { job } => {
+                let options = job_options(job);
+                let outcome = job::generate(current_dir, &options)?;
+                generators::report(output, options.dry_run, &outcome.files)?;
+                write!(output, "{}", outcome.wiring).map_err(CliError::Output)
+            }
+        
+    }
+}
+
+/// How a generator reports a file: written, to be written, or already there.
+fn created_verb(identical: bool, dry_run: bool) -> &'static str {
+    if identical {
+        "identical"
+    } else if dry_run {
+        "would create"
+    } else {
+        "create"
+    }
+}
+
 fn resource_options(resource: ResourceArgs, layers: Layers, broadcast: bool) -> ScaffoldOptions {
     ScaffoldOptions {
         name: resource.name,
@@ -567,6 +622,7 @@ fn resource_options(resource: ResourceArgs, layers: Layers, broadcast: bool) -> 
         },
         plural: resource.plural,
         broadcast,
+        public: resource.public,
         dry_run: resource.dry_run,
         layers,
     }
@@ -601,7 +657,6 @@ fn job_options(arguments: JobArgs) -> JobOptions {
     JobOptions {
         name: arguments.name,
         fields: arguments.fields,
-        queue: arguments.queue,
         dry_run: arguments.dry_run,
     }
 }
@@ -689,7 +744,7 @@ fn run_destroy(
             (
                 DestroyPlan {
                     files,
-                    unwire,
+                    unwire: destroy::Unwire::Printed(unwire),
                     owned_elsewhere: None,
                 },
                 destroy_flags(options.dry_run, flags),
@@ -701,7 +756,7 @@ fn run_destroy(
             (
                 DestroyPlan {
                     files,
-                    unwire,
+                    unwire: destroy::Unwire::Printed(unwire),
                     owned_elsewhere: None,
                 },
                 destroy_flags(options.dry_run, flags),

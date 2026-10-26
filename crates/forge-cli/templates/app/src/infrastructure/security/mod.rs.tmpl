@@ -20,6 +20,7 @@ use forge::auth::{
 };
 use forge::http::{Method, Request, header};
 use forge::security::PrincipalId;
+use forge::tenancy::TenantId;
 use sha2::{Digest, Sha256};
 
 /// Name of the host-only session cookie.
@@ -27,6 +28,15 @@ use sha2::{Digest, Sha256};
 /// The __Host- prefix requires Secure, Path=/ and no Domain attribute in
 /// conforming browsers.
 pub const SESSION_COOKIE_NAME: &str = "__Host-forge_session";
+
+/// Name of the host-only cookie that names the tenant the session signed in
+/// to, set next to the session cookie.
+///
+/// It only selects which membership tenant-scoped routes without a
+/// `{tenant_id}` (`/products`) check on every request, like that path
+/// segment does: a principal without an active membership in the tenant it
+/// names is refused, so it grants nothing by itself.
+pub const TENANT_COOKIE_NAME: &str = "__Host-forge_tenant";
 
 /// Header expected on cookie-authenticated state-changing requests.
 pub const CSRF_HEADER_NAME: &str = "x-csrf-token";
@@ -430,6 +440,56 @@ pub fn session_remove_cookie() -> String {
         .to_string()
 }
 
+/// Serializes the host-only tenant cookie, set at sign-in with the session
+/// cookie.
+#[must_use]
+pub fn tenant_set_cookie(tenant: TenantId) -> String {
+    Cookie::build((TENANT_COOKIE_NAME, tenant.to_string()))
+        .path("/")
+        .secure(true)
+        .http_only(true)
+        .same_site(SameSite::Lax)
+        .build()
+        .to_string()
+}
+
+/// Serializes a cookie that immediately removes the tenant cookie.
+#[must_use]
+pub fn tenant_remove_cookie() -> String {
+    Cookie::build(TENANT_COOKIE_NAME)
+        .path("/")
+        .secure(true)
+        .http_only(true)
+        .same_site(SameSite::Lax)
+        .removal()
+        .build()
+        .to_string()
+}
+
+/// The tenant the request's tenant cookie names: `None` without one, an
+/// error for a malformed value or for two of them.
+pub fn tenant_from_request(request: &Request) -> Result<Option<TenantId>, SecurityMechanismError> {
+    let mut tenant = None;
+    for value in request.headers().get_all(header::COOKIE).iter() {
+        let value = value
+            .to_str()
+            .map_err(|_| SecurityMechanismError::InvalidTenantCookie)?;
+        for cookie in Cookie::split_parse(value).filter_map(Result::ok) {
+            if cookie.name() != TENANT_COOKIE_NAME {
+                continue;
+            }
+            let parsed = cookie
+                .value()
+                .parse::<TenantId>()
+                .map_err(|_| SecurityMechanismError::InvalidTenantCookie)?;
+            if tenant.replace(parsed).is_some() {
+                return Err(SecurityMechanismError::InvalidTenantCookie);
+            }
+        }
+    }
+    Ok(tenant)
+}
+
 /// Extracts and validates the session bearer from a raw Cookie header.
 ///
 /// Malformed cookie pairs are ignored; an invalid value for the Forge session
@@ -620,6 +680,9 @@ pub enum SecurityMechanismError {
     /// CSRF header contained a malformed token.
     #[error("invalid CSRF token")]
     InvalidCsrfToken,
+    /// The tenant cookie was malformed or sent twice.
+    #[error("invalid tenant cookie")]
+    InvalidTenantCookie,
 }
 
 #[cfg(test)]
@@ -730,5 +793,60 @@ mod tests {
             session_from_cookie_header("__Host-forge_session=short"),
             Err(SecurityMechanismError::InvalidSessionCookie)
         );
+    }
+
+    fn with_cookies(cookies: &[&str]) -> Request {
+        let mut headers = forge::http::HeaderMap::new();
+        for cookie in cookies {
+            headers.append(
+                header::COOKIE,
+                result_ok(
+                    forge::http::HeaderValue::from_str(cookie),
+                    "cookie header value",
+                ),
+            );
+        }
+        Request::new_for_test(
+            Method::GET,
+            result_ok("/".parse(), "path"),
+            headers,
+            String::new().into(),
+            result_ok("127.0.0.1:4000".parse(), "address"),
+            forge::core::Id::<Request>::new().into_uuid(),
+        )
+    }
+
+    #[test]
+    fn the_tenant_cookie_names_one_well_formed_tenant() {
+        let tenant = TenantId::new();
+        let set = tenant_set_cookie(tenant);
+        assert!(
+            set.starts_with(&format!("{TENANT_COOKIE_NAME}={tenant}")),
+            "{set}"
+        );
+        for attribute in ["Path=/", "Secure", "HttpOnly", "SameSite=Lax"] {
+            assert!(set.contains(attribute), "{set}");
+        }
+        assert!(tenant_remove_cookie().contains("Max-Age=0"));
+
+        let named = format!("a=1; {TENANT_COOKIE_NAME}={tenant}");
+        assert_eq!(
+            tenant_from_request(&with_cookies(&[&named])),
+            Ok(Some(tenant))
+        );
+        assert_eq!(tenant_from_request(&with_cookies(&["a=1"])), Ok(None));
+        for cookies in [
+            vec![format!("{TENANT_COOKIE_NAME}=not-a-tenant")],
+            vec![
+                named.clone(),
+                format!("{TENANT_COOKIE_NAME}={}", TenantId::new()),
+            ],
+        ] {
+            let cookies: Vec<&str> = cookies.iter().map(String::as_str).collect();
+            assert_eq!(
+                tenant_from_request(&with_cookies(&cookies)),
+                Err(SecurityMechanismError::InvalidTenantCookie)
+            );
+        }
     }
 }

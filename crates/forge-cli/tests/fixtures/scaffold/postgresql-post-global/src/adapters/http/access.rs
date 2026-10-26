@@ -9,10 +9,13 @@
 //! - Tenant-scoped resources use a [`TenantAccess`]. [`SessionTenantAccess`]
 //!   authenticates the `__Host-forge_session` cookie, enforces the
 //!   session-bound CSRF token on unsafe methods, loads the membership of the
-//!   tenant in the route (`/tenants/{tenant_id}/...`) and evaluates the RBAC
-//!   policy, producing an authorized [`TenantContext`]. The printed wiring
-//!   grants the `owner` role (the role `setup` gives the first member) every
-//!   permission of the resource; other roles are denied until granted.
+//!   tenant the session signed in to (the `__Host-forge_tenant` cookie, or
+//!   the `{tenant_id}` of a route that has one) and evaluates the RBAC
+//!   policy, producing an authorized [`TenantContext`]. The generated wiring
+//!   grants the `owner` role (the role `forge setup` gives the first member)
+//!   every permission of the resource; other roles are denied until granted.
+//!   It authorizes the JSON API under `/v1` the same way
+//!   ([`ApiTenantAccess`]), with the CSRF token in `X-CSRF-Token`.
 //! - Global resources use a [`GlobalAccess`]. Their rows are shared by every
 //!   tenant, so tenant roles cannot authorize them. Implement
 //!   [`GlobalAccess`] with your own rule (for example signed-in operators)
@@ -20,7 +23,9 @@
 //!   the explicit decision to open the routes. It returns the signed-in
 //!   principal it admitted (`None` only for anonymous callers of a public
 //!   resource), so live-update streams limit each person's connections
-//!   rather than every caller behind one address.
+//!   rather than every caller behind one address. [`Public`] lets everyone
+//!   in: `forge generate scaffold --global --public` wires it in
+//!   applications without Forge identity, and only there.
 //!
 //! A refused request without a valid session answers `401`. In applications
 //! with the sign-in pages (`forge new` on PostgreSQL, or
@@ -35,9 +40,12 @@ use async_trait::async_trait;
 use forge::auth::{SessionStore, UnixTimestamp};
 use forge::http::{Request, Response, StatusCode};
 use forge::security::{Permission, PrincipalId, RbacPolicy};
-use forge::tenancy::{MembershipStore, TenantContext, TenantId};
+use forge::tenancy::{BearerDenied, MembershipStore, TenantContext, TenantId};
 
-use crate::infrastructure::security::{RequestAuthError, authenticate_request, enforce_csrf};
+use crate::adapters::http::api_access::{ApiGlobalAccess, ApiTenantAccess};
+use crate::infrastructure::security::{
+    RequestAuthError, authenticate_request, enforce_csrf, tenant_from_request,
+};
 
 /// Why a request was refused. The response never says which proof failed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -119,13 +127,37 @@ impl TenantAccess for DenyAll {
     }
 }
 
+/// Lets every request in, signed in or not: the explicit choice of
+/// `--public` for a global resource of an application without Forge
+/// identity. Forms still need their CSRF token.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Public;
+
+#[async_trait]
+impl GlobalAccess for Public {
+    async fn authorize(
+        &self,
+        _: &Request,
+        _: &Permission,
+    ) -> Result<Option<PrincipalId>, AccessDenied> {
+        Ok(None)
+    }
+}
+
+#[async_trait]
+impl ApiGlobalAccess for Public {
+    async fn authorize(&self, _: &Request, _: &Permission) -> Result<(), BearerDenied> {
+        Ok(())
+    }
+}
+
 /// Session, membership and RBAC authorization for tenant-scoped routes.
 ///
 /// For each request: the session cookie must name a live session, unsafe
-/// methods must present that session's CSRF token, the route's `{tenant_id}`
-/// must be a tenant where the principal has an active membership, and the
-/// policy must grant one of the membership's roles the permission. Anything
-/// else is refused.
+/// methods must present that session's CSRF token, the tenant (the route's
+/// `{tenant_id}`, else the tenant cookie set at sign-in) must be one where
+/// the principal has an active membership, and the policy must grant one of
+/// the membership's roles the permission. Anything else is refused.
 #[derive(Clone)]
 pub struct SessionTenantAccess {
     sessions: Arc<dyn SessionStore>,
@@ -167,9 +199,13 @@ impl TenantAccess for SessionTenantAccess {
         enforce_csrf(self.sessions.as_ref(), request, principal)
             .await
             .map_err(denied)?;
-        let tenant_id: TenantId = request
-            .path_param_as("tenant_id")
-            .map_err(|_| AccessDenied::Forbidden)?;
+        let tenant_id: TenantId = match request.path_param_as("tenant_id") {
+            Ok(tenant_id) => tenant_id,
+            Err(forge::http::PathParamError::Missing { .. }) => tenant_from_request(request)
+                .map_err(|_| AccessDenied::Forbidden)?
+                .ok_or(AccessDenied::Forbidden)?,
+            Err(_) => return Err(AccessDenied::Forbidden),
+        };
         let membership = self
             .memberships
             .find(tenant_id, principal.principal_id())
@@ -178,6 +214,25 @@ impl TenantAccess for SessionTenantAccess {
             .ok_or(AccessDenied::Forbidden)?;
         TenantContext::authorize(principal, &membership, &self.policy, permission)
             .map_err(|_| AccessDenied::Forbidden)
+    }
+}
+
+/// The JSON API under `/v1` with the pages' session: the same proofs, with
+/// the JSON API's refusals.
+#[async_trait]
+impl ApiTenantAccess for SessionTenantAccess {
+    async fn authorize(
+        &self,
+        request: &Request,
+        permission: &Permission,
+    ) -> Result<TenantContext, BearerDenied> {
+        TenantAccess::authorize(self, request, permission)
+            .await
+            .map_err(|denied| match denied {
+                AccessDenied::Unauthenticated => BearerDenied::MissingCredentials,
+                AccessDenied::Forbidden => BearerDenied::Forbidden,
+                AccessDenied::Unavailable => BearerDenied::Unavailable,
+            })
     }
 }
 
@@ -370,7 +425,8 @@ mod tests {
                     let access = Arc::clone(&access);
                     let permission = permission.clone();
                     async move {
-                        match access.authorize(&request, &permission).await {
+                        match TenantAccess::authorize(access.as_ref(), &request, &permission).await
+                        {
                             Ok(context) => {
                                 Response::new(StatusCode::OK, context.tenant_id().to_string())
                             }

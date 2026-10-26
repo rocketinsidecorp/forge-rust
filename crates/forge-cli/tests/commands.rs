@@ -66,7 +66,7 @@ fn fails(root: &Path, arguments: &[&str]) -> String {
 }
 
 #[test]
-fn every_generator_lists_its_files_and_prints_its_wiring() {
+fn every_generator_lists_its_files_and_registers_its_wiring() {
     let (_parent, root) = application();
 
     let scaffold = succeeds(
@@ -84,7 +84,15 @@ fn every_generator_lists_its_files_and_prints_its_wiring() {
         scaffold.contains("  create       src/adapters/http/posts.rs\n"),
         "{scaffold}"
     );
-    assert!(scaffold.contains("Forge did not edit any existing file. Wire the resource by hand"));
+    assert!(
+        scaffold.contains("  wire         src/bootstrap/routes_gen.rs  (scaffold posts)\n"),
+        "{scaffold}"
+    );
+    assert!(
+        scaffold.contains("  declare      src/domain/entities/mod.rs  (pub mod post;)\n"),
+        "{scaffold}"
+    );
+    assert!(!scaffold.contains("by hand"), "{scaffold}");
     assert!(root.join("templates/posts/index.html").is_file());
     assert!(root.join("src/adapters/http/access.rs").is_file());
 
@@ -151,7 +159,7 @@ fn every_generator_lists_its_files_and_prints_its_wiring() {
         "{controller}"
     );
     assert!(
-        controller.contains("Wire the controller by hand"),
+        controller.contains("  wire         src/bootstrap/routes_gen.rs  (controller pages)\n"),
         "{controller}"
     );
 
@@ -581,4 +589,65 @@ fn write_executable(path: &Path, body: &str) {
         "writing {} failed: {status}",
         path.display()
     );
+}
+
+/// `forge g` and `forge d` are `generate` and `destroy` (D25); `generate
+/// migration` infers ALTER TABLE from add_X_to_TABLE (D26), warns about a
+/// blank pair and a column drop, and reports files as Forge-Go does.
+#[test]
+fn g_and_d_aliases_and_inferred_migrations() {
+    let (_parent, root) = application();
+
+    let created = succeeds(&root, &["g", "scaffold", "order", "total:int", "--tenant-scoped"]);
+    assert!(
+        created.contains("  wire         src/bootstrap/routes_gen.rs  (scaffold orders)\n"),
+        "{created}"
+    );
+    let again = succeeds(&root, &["g", "scaffold", "order", "total:integer", "--tenant-scoped"]);
+    assert!(again.contains("  identical    src/adapters/http/orders.rs\n"), "{again}");
+    assert!(!again.contains("  create"), "{again}");
+
+    let added = succeeds(&root, &["g", "migration", "add_sku_to_orders", "sku:string"]);
+    let up = added
+        .lines()
+        .find_map(|line| line.strip_prefix("  create  "))
+        .expect("the up file is listed");
+    assert!(up.starts_with("migrations/") && up.ends_with("_add_sku_to_orders.up.sql"), "{added}");
+    let sql = std::fs::read_to_string(root.join(up)).expect("up migration");
+    assert!(
+        sql.contains("ALTER TABLE \"orders\" ADD COLUMN \"sku\" text NOT NULL DEFAULT ''"),
+        "{sql}"
+    );
+    assert!(!added.contains("WARNING"), "{added}");
+
+    let removed = succeeds(&root, &["g", "migration", "remove_sku_from_orders", "sku:string"]);
+    assert!(removed.contains("WARNING: forge migrate drops these columns"), "{removed}");
+
+    let blank = succeeds(&root, &["g", "migration", "backfill_orders"]);
+    assert!(
+        blank.contains("WARNING: fill in migrations/") && blank.contains("an empty migration is refused"),
+        "{blank}"
+    );
+    let refused = fails(&root, &["g", "migration", "create_widgets", "name:string"]);
+    assert!(refused.contains("forge generate model"), "{refused}");
+    let refused = fails(&root, &["g", "migration", "add_at_to_orders", "at:timestamp"]);
+    assert!(refused.contains("at:timestamp?"), "{refused}");
+
+    let destroyed = succeeds(&root, &["d", "scaffold", "order", "total:int", "--tenant-scoped"]);
+    assert!(
+        destroyed.contains("  unwire       src/bootstrap/routes_gen.rs  (scaffold orders)\n"),
+        "{destroyed}"
+    );
+    assert!(!root.join("src/adapters/http/orders.rs").exists());
+}
+
+/// `forge generate job` needs no --queue (every Forge-Rust job is a queue
+/// job), and accepts it, as Forge-Go spells it.
+#[test]
+fn a_job_needs_no_queue_flag() {
+    let (_parent, root) = application();
+    let job = succeeds(&root, &["generate", "job", "cleanup"]);
+    assert!(job.contains("src/adapters/jobs/cleanup.rs"), "{job}");
+    let queued = succeeds(&root, &["generate", "job", "send_welcome", "--queue"]);
+    assert!(queued.contains("src/adapters/jobs/send_welcome.rs"), "{queued}");
 }

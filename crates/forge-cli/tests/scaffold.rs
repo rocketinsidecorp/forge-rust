@@ -144,6 +144,12 @@ fn command(
 /// line goes into the sorted block of its file, the statements go at the
 /// end of the function the wiring names (`fn compose` or `fn jobs_configure`).
 fn apply_wiring(root: &Path, printed: &str) {
+    if !printed.contains("by hand:") {
+        // The generator registered its modules (and routes) itself: there
+        // is nothing to paste.
+        assert!(printed.contains("  declare      "), "{printed}");
+        return;
+    }
     let mut declarations = Vec::new();
     let mut statements = Vec::new();
     let mut commands = Vec::new();
@@ -260,6 +266,10 @@ fn declare(root: &Path, file: &str, declaration: String) {
 /// Applies only the module declarations of printed wiring (a model's: its
 /// use cases are built where the application needs them).
 fn declare_modules(root: &Path, printed: &str) {
+    if !printed.contains("by hand:") {
+        assert!(printed.contains("  declare      "), "{printed}");
+        return;
+    }
     let mut declared = 0;
     for line in printed.lines() {
         if let Some((file, module)) = line.trim().split_once(" pub mod ") {
@@ -306,11 +316,11 @@ fn scaffolded(database: &str) -> (tempfile::TempDir, PathBuf) {
         let output = run(&root, forge, &arguments, &[]);
         let printed = String::from_utf8_lossy(&output.stdout).into_owned();
         assert_eq!(
-            String::from_utf8_lossy(&dry.stdout).replace("would create", "create      "),
-            printed.replace(
+            listing(&String::from_utf8_lossy(&dry.stdout)),
+            listing(&printed.replace(
                 &version_of(&printed),
                 &version_of(&String::from_utf8_lossy(&dry.stdout))
-            ),
+            )),
             "--dry-run lists exactly what is created"
         );
         apply_wiring(&root, &printed);
@@ -333,6 +343,21 @@ fn scaffolded(database: &str) -> (tempfile::TempDir, PathBuf) {
         &[],
     );
     (parent, root)
+}
+
+/// A generator's report with `--dry-run`'s "would" taken out and spaces
+/// collapsed, to compare it with the report of the real run.
+fn listing(printed: &str) -> String {
+    printed
+        .lines()
+        .map(|line| {
+            line.split_whitespace()
+                .filter(|word| *word != "would")
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// The migration version in a scaffold's output.
@@ -539,6 +564,7 @@ fn mysql_application_with_scaffolds_passes_its_gates() {
 #[ignore = "slow: builds generated applications; run with --ignored"]
 fn postgresql_application_with_scaffolds_passes_its_gates_and_migrations_revert() {
     let (_parent, root) = scaffolded("postgresql");
+    an_application_guard_is_never_silently_ignored(&root);
     let server = std::env::var_os("FORGE_TEST_DATABASE_URL").is_some();
     let tests = test_output(&root, server);
     assert!(
@@ -821,6 +847,68 @@ fn run_the_job_workers(root: &Path, binary: &str, url: &str) {
         !output.contains("claiming jobs failed"),
         "the runtime role cannot claim jobs:\n{output}"
     );
+}
+
+/// The application's own `protect`, declared after the scaffolds were
+/// generated: while the seam still has its generated one, the name is
+/// ambiguous and the build fails; running the generator again drops the
+/// generated guard and the application's is used. It grants the owner (the
+/// browser test signs in as one) and a `viewer` role.
+const OWN_PROTECT: &str = r#"
+/// The application's guard of tenant-scoped routes: the owner and viewers.
+fn protect(
+    composition: &mut forge::Composition<'_>,
+    permissions: &[&str],
+) -> Result<std::sync::Arc<crate::adapters::http::access::SessionTenantAccess>, forge::ComposeError>
+{
+    let mut policy = forge::security::RbacPolicy::new();
+    for role in ["owner", "viewer"] {
+        let role = forge::security::Role::new(role).map_err(forge::ComposeError::other)?;
+        for permission in permissions {
+            let permission = forge::security::Permission::new(*permission)
+                .map_err(forge::ComposeError::other)?;
+            policy.allow(role.clone(), permission);
+        }
+    }
+    let pool = composition.postgres()?.pool().clone();
+    let sessions = crate::infrastructure::auth::PostgresSessionStore::new(pool.clone())
+        .with_idle_timeout(
+            forge::auth::SessionIdleTimeout::new(composition.config().auth.session_idle_timeout)
+                .map_err(forge::ComposeError::other)?,
+        );
+    Ok(std::sync::Arc::new(
+        crate::adapters::http::access::SessionTenantAccess::new(
+            std::sync::Arc::new(sessions),
+            std::sync::Arc::new(crate::infrastructure::tenancy::PgMembershipStore::new(pool)),
+            policy,
+        ),
+    ))
+}
+"#;
+
+fn an_application_guard_is_never_silently_ignored(root: &Path) {
+    let forge = env!("CARGO_BIN_EXE_forge");
+    let bootstrap = root.join("src/bootstrap/mod.rs");
+    let mut source = fs::read_to_string(&bootstrap).unwrap_or_else(|error| panic!("{error}"));
+    source.push_str(OWN_PROTECT);
+    fs::write(&bootstrap, source).unwrap_or_else(|error| panic!("{error}"));
+
+    let ambiguous = run_unchecked(root, "cargo", &["check", "--locked"], &[], None);
+    let stderr = String::from_utf8_lossy(&ambiguous.stderr);
+    assert!(!ambiguous.status.success(), "{stderr}");
+    assert!(stderr.contains("`protect` is ambiguous"), "{stderr}");
+
+    let mut arguments = vec!["generate", "scaffold"];
+    arguments.extend_from_slice(EVENT);
+    let rewired = stdout(&run(root, forge, &arguments, &[]));
+    assert!(
+        rewired.contains("  wire         src/bootstrap/routes_gen.rs  (scaffold events)"),
+        "{rewired}"
+    );
+    let seam = fs::read_to_string(root.join("src/bootstrap/routes_gen.rs"))
+        .unwrap_or_else(|error| panic!("{error}"));
+    assert!(!seam.contains("fn protect("), "{seam}");
+    run(root, "cargo", &["check", "--locked", "--quiet"], &[]);
 }
 
 /// The application server; killed when dropped.
@@ -1132,13 +1220,14 @@ fn sign_in_use_a_tenant_scaffold_and_sign_out(root: &Path, binary: &str, url: &s
     );
 
     let mut browser = Browser::default();
-    let events = format!("/tenants/{tenant}/events");
+    // Tenant-scoped pages are at /events, for the tenant signed in to.
+    let events = "/events".to_owned();
     let sent = browser.request(port, "GET", &events, None);
     assert_eq!(sent.status, 303, "{}", sent.body);
     let sign_in = sent.header("location").unwrap_or_default().to_owned();
     assert_eq!(
         sign_in,
-        format!("/session/new?return_to=%2Ftenants%2F{tenant}%2Fevents")
+        "/session/new?return_to=%2Fevents"
     );
     let page = browser.request(port, "GET", &sign_in, None);
     assert_eq!(page.status, 200);
@@ -2018,7 +2107,7 @@ fn postgresql_application_lists_every_route_with_forge_routes() {
         );
     }
     assert!(
-        listed("GET", "/tenants/{tenant_id}/articles"),
+        listed("GET", "/articles"),
         "the scaffold's pages are listed:\n{table}"
     );
     for (method, path) in [
@@ -2138,13 +2227,19 @@ fn postgresql_application_generates_and_destroys_every_generator() {
         assert_eq!(before, source_tree(&root), "--dry-run writes nothing");
         let printed = stdout(&run(&root, forge, &command, &[]));
         assert_eq!(
-            planned.replace("would create", "create      "),
-            printed.replace(&version_of(&printed), &version_of(&planned)),
+            listing(&planned),
+            listing(&printed.replace(&version_of(&printed), &version_of(&planned))),
             "--dry-run lists exactly what {generator} creates"
         );
-        // Generating again refuses and writes nothing.
+        // Generating again writes nothing: the resource generators find
+        // every file identical, the others refuse.
         let again = run_unchecked(&root, forge, &command, &[], None);
-        assert!(!again.status.success(), "{generator} {arguments:?} twice");
+        if ["model", "resource", "scaffold"].contains(&generator) {
+            assert!(again.status.success(), "{generator} {arguments:?} twice");
+            assert!(!stdout(&again).contains("  create"), "{}", stdout(&again));
+        } else {
+            assert!(!again.status.success(), "{generator} {arguments:?} twice");
+        }
         if generator == "model" || generator == "view" {
             declare_modules(&root, &printed);
         } else {

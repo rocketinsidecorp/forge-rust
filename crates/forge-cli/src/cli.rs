@@ -88,15 +88,17 @@ pub(crate) enum Command {
         )]
         locale: Locale,
     },
-    /// Generate application artifacts.
+    /// Generate application artifacts (alias: g, as in Rails).
+    #[command(visible_alias = "g")]
     Generate {
         #[command(subcommand)]
         generator: GenerateCommand,
     },
-    /// Remove what a generator created (like `rails destroy`): give the
+    /// Remove what a generator created (like `rails destroy`; alias: d): give the
     /// arguments the generator was run with. Only files that still match
     /// what the generator writes are removed; migrations are kept unless
     /// --migrations.
+    #[command(visible_alias = "d")]
     Destroy {
         #[command(subcommand)]
         generator: DestroyCommand,
@@ -616,10 +618,16 @@ pub(crate) enum GenerateCommand {
         #[command(flatten)]
         view: ViewArgs,
     },
-    /// Create a reversible SQL migration in migrations/.
+    /// Create a reversible SQL migration in migrations/. As in Rails,
+    /// add_COLUMNS_to_TABLE with field:type arguments writes the ALTER TABLE
+    /// statements (remove_COLUMNS_from_TABLE the reverse); any other name
+    /// writes a blank pair to fill in.
     Migration {
-        /// Human-readable migration name.
+        /// Migration name, for example add_sku_to_products.
         name: String,
+        /// Columns as name:type (the model field types; `?` for optional).
+        #[arg(value_name = "FIELD:TYPE")]
+        fields: Vec<String>,
     },
     /// Create a model through the inner rings: migration, entity,
     /// repository port, use cases, repository adapter and its tests (like
@@ -651,7 +659,7 @@ pub(crate) enum GenerateCommand {
         #[command(flatten)]
         mailer: MailerArgs,
     },
-    /// Create a typed job for the persistent PostgreSQL queue (--queue): the
+    /// Create a typed job for the persistent PostgreSQL queue: the
     /// payload, its handler, registration, enqueue function and tests (like
     /// `rails generate job`).
     Job {
@@ -674,14 +682,20 @@ pub(crate) enum GenerateCommand {
         /// timestamp, uuid; append `?` for an optional field.
         #[arg(required = true, value_name = "FIELD:TYPE")]
         fields: Vec<String>,
-        /// Rows belong to a tenant: routes under /tenants/{tenant_id}/,
-        /// tenant predicates and (PostgreSQL) row-level security.
+        /// Rows belong to a tenant: routes at /PLURAL for the tenant the
+        /// session signed in to, tenant predicates and (PostgreSQL)
+        /// row-level security.
         #[arg(long)]
         tenant_scoped: bool,
         /// Rows are shared by every tenant; routes stay closed until the
-        /// application chooses who may use them.
+        /// application chooses who may use them (or --public).
         #[arg(long)]
         global: bool,
+        /// With --global, in an application without Forge identity (no
+        /// sign-in pages: SQLite, MySQL, --api): serve the pages and the JSON
+        /// API to anyone who can reach the server, without signing in.
+        #[arg(long, requires = "global")]
+        public: bool,
         /// Plural name when the English rules get it wrong.
         #[arg(long, value_name = "PLURAL")]
         plural: Option<String>,
@@ -713,6 +727,11 @@ pub(crate) struct ResourceArgs {
     /// Rows are shared by every tenant.
     #[arg(long)]
     pub(crate) global: bool,
+    /// With --global, in an application without Forge identity: serve the
+    /// JSON API to anyone who can reach the server, without signing in
+    /// (`generate resource` only).
+    #[arg(long, requires = "global")]
+    pub(crate) public: bool,
     /// Plural name when the English rules get it wrong.
     #[arg(long, value_name = "PLURAL")]
     pub(crate) plural: Option<String>,
@@ -776,8 +795,9 @@ pub(crate) struct JobArgs {
     /// optional).
     #[arg(value_name = "FIELD:TYPE")]
     pub(crate) fields: Vec<String>,
-    /// A job of the persistent PostgreSQL queue (`forge::jobs`). Required:
-    /// Forge-Rust schedules are queue jobs too (docs/jobs.md).
+    /// A job of the persistent PostgreSQL queue (`forge::jobs`), as
+    /// Forge-Go spells it. Optional: every Forge-Rust job is a queue job, and
+    /// a recurring job is one with a `Schedule` (docs/jobs.md).
     #[arg(long)]
     pub(crate) queue: bool,
     /// List the files without writing (or removing) anything.
