@@ -1,7 +1,8 @@
 //! Forge-Go's `i18n` tests, ported: the same catalog, the same expectations.
 
+use std::cell::RefCell;
 use std::io;
-use std::sync::{Arc, Mutex};
+use std::sync::Once;
 
 use forge_i18n::{
     Args, Category, DateTime, LoadError, Operands, Options, Translator, plural_rule_for,
@@ -48,40 +49,45 @@ fn load(options: Options) -> Translator {
     }
 }
 
-/// Collects the `tracing` output of a closure.
+/// Collects the `tracing` output a closure writes on this thread.
+///
+/// One process-wide subscriber writes into a per-thread buffer. A scoped
+/// subscriber (`with_default`) is not used: callsite interest is cached
+/// process-wide, and a parallel test that hits a callsite with no subscriber
+/// in scope can leave it cached as uninteresting, so the capture comes back
+/// empty. With a global subscriber every callsite is always interesting.
 fn logs_of(run: impl FnOnce()) -> String {
-    #[derive(Clone, Default)]
-    struct Buffer(Arc<Mutex<Vec<u8>>>);
-    impl io::Write for Buffer {
+    thread_local! {
+        static CAPTURE: RefCell<Option<Vec<u8>>> = const { RefCell::new(None) };
+    }
+    struct ThreadBuffer;
+    impl io::Write for ThreadBuffer {
         fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-            self.0
-                .lock()
-                .map_err(|_| io::Error::other("poisoned"))?
-                .extend_from_slice(bytes);
+            CAPTURE.with(|capture| {
+                if let Some(buffer) = capture.borrow_mut().as_mut() {
+                    buffer.extend_from_slice(bytes);
+                }
+            });
             Ok(bytes.len())
         }
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
     }
-    let buffer = Buffer::default();
-    let writer = buffer.clone();
-    let subscriber = tracing_subscriber::fmt()
-        .with_writer(move || writer.clone())
-        .with_ansi(false)
-        .without_time()
-        .finish();
-    tracing::subscriber::with_default(subscriber, || {
-        // Callsite interest is cached process-wide; a callsite first seen by
-        // a parallel test while no capturing subscriber existed may be
-        // cached as uninteresting. Rebuild it now that this one is set.
-        tracing::callsite::rebuild_interest_cache();
-        run();
+    static INSTALL: Once = Once::new();
+    INSTALL.call_once(|| {
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(|| ThreadBuffer)
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        // Nothing else in this test binary installs a global subscriber.
+        let _ = tracing::subscriber::set_global_default(subscriber);
     });
-    let bytes = buffer
-        .0
-        .lock()
-        .map(|bytes| bytes.clone())
+    CAPTURE.with(|capture| *capture.borrow_mut() = Some(Vec::new()));
+    run();
+    let bytes = CAPTURE
+        .with(|capture| capture.borrow_mut().take())
         .unwrap_or_default();
     String::from_utf8_lossy(&bytes).into_owned()
 }
