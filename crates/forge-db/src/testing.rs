@@ -177,7 +177,6 @@ pub(crate) fn provision_file() -> Result<Provision, DbError> {
     })
 }
 
-#[cfg(any(feature = "postgres", feature = "mysql"))]
 /// The pool settings of every test database: the test environment, so an
 /// administrator may connect (no row-level security check).
 #[must_use]
@@ -185,6 +184,7 @@ pub fn test_settings() -> crate::PoolSettings {
     crate::PoolSettings::default().with_environment(forge_config::Environment::Test)
 }
 
+#[cfg(any(feature = "postgres", feature = "mysql"))]
 /// Runs one administrative statement on a dedicated connection.
 ///
 /// `sql` embeds only an identifier generated locally from UUID hex, never
