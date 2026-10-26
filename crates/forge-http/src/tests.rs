@@ -957,9 +957,11 @@ fn test_config(request_timeout: Duration) -> ServerConfig {
 }
 
 /// Reads until the server closes the connection; returns what arrived and
-/// how long it took.
-fn read_to_close(stream: &mut StdTcpStream) -> (String, Duration) {
-    let started = std::time::Instant::now();
+/// how long it took since `started`. The server's timers start at events the
+/// client sees later (accepting the connection, answering a request), so a
+/// caller takes `started` before the event that arms the timer: the elapsed
+/// time then never undercounts the timer, however late the client runs.
+fn read_to_close(stream: &mut StdTcpStream, started: std::time::Instant) -> (String, Duration) {
     let mut received = Vec::new();
     let _ = stream.read_to_end(&mut received);
     (
@@ -986,17 +988,19 @@ async fn heads_are_due_within_the_read_header_timeout_and_idle_connections_withi
     let addr = server.addr;
     tokio::task::spawn_blocking(move || {
         // Nothing at all: closed after the read-header timeout, not idle.
+        let started = std::time::Instant::now();
         let mut silent = connect(addr);
-        let (text, waited) = read_to_close(&mut silent);
+        let (text, waited) = read_to_close(&mut silent, started);
         assert!(text.is_empty(), "{text}");
         assert!(waited >= header && waited < idle, "{waited:?}");
 
         // A head that never ends: closed after the read-header timeout.
+        let started = std::time::Instant::now();
         let mut stalled = connect(addr);
         stalled
             .write_all(b"GET /health/live HTTP/1.1\r\nHost: localhost\r\n")
             .expect("partial head");
-        let (text, waited) = read_to_close(&mut stalled);
+        let (text, waited) = read_to_close(&mut stalled, started);
         assert!(!text.contains(" 200 "), "{text}");
         assert!(waited >= header && waited < idle, "{waited:?}");
 
@@ -1020,14 +1024,17 @@ async fn heads_are_due_within_the_read_header_timeout_and_idle_connections_withi
         );
         kept.set_read_timeout(Some(CLIENT_TIMEOUT))
             .expect("read timeout must be settable");
+        // The idle timer starts once this request is answered, so counting
+        // from before it was sent never undercounts it.
+        let started = std::time::Instant::now();
         kept.write_all(b"GET /health/live HTTP/1.1\r\nHost: localhost\r\n\r\n")
             .expect("second request after an idle wait");
         let second = read_until(&mut kept, r#"{"status":"live"}"#);
         assert!(second.starts_with("HTTP/1.1 200 "), "{second}");
         // Then idle until the idle timeout closes it.
-        let (text, waited) = read_to_close(&mut kept);
+        let (text, waited) = read_to_close(&mut kept, started);
         assert!(text.is_empty(), "{text}");
-        assert!(waited >= idle - header, "{waited:?}");
+        assert!(waited >= idle, "{waited:?}");
     })
     .await
     .expect("client task must not panic");
@@ -1061,7 +1068,7 @@ async fn a_pipelined_head_after_a_slow_handler_gets_its_own_deadline() {
         stream
             .write_all(b"Connection: close\r\n\r\n")
             .expect("the rest of the second head");
-        let (second, _) = read_to_close(&mut stream);
+        let (second, _) = read_to_close(&mut stream, std::time::Instant::now());
         assert!(
             second.contains("HTTP/1.1 200 ") && second.ends_with(r#"{"status":"live"}"#),
             "the pipelined head was cut: {second:?}"
