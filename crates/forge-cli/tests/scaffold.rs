@@ -486,6 +486,7 @@ fn postgresql_application_with_scaffolds_passes_its_gates_and_migrations_revert(
     for test in [
         "postgres_round_trip_locking_and_pages ... ok",
         "postgres_row_level_security_isolates_tenants ... ok",
+        "postgres_runtime_role_cannot_change_the_schema ... ok",
         "every_wrong_field_gets_the_same_answer ... ok",
         "two_factor_sign_in_takes_a_code_once_and_a_backup_code_once ... ok",
         "a_challenge_cookie_carried_to_another_browser_is_refused ... ok",
@@ -587,6 +588,13 @@ fn postgresql_application_with_scaffolds_passes_its_gates_and_migrations_revert(
             assert!(seeded.contains("Seed data loaded."), "{seeded}");
         }
         run_the_job_workers(&root, &binary, &runtime_url);
+        production_refuses_a_role_that_bypasses_row_level_security(
+            &root,
+            &binary,
+            &url,
+            &runtime_url,
+            &runtime_password,
+        );
         sign_in_use_a_tenant_scaffold_and_sign_out(&root, &binary, &url);
         database
             .cleanup()
@@ -621,6 +629,54 @@ async fn drop_role(role: &str) {
     .execute(&mut connection)
     .await
     .unwrap_or_else(|error| panic!("drop role {role}: {error}"));
+}
+
+/// In production the application refuses a database role that could bypass
+/// row-level security (here the test server's superuser) before it uses the
+/// pool, naming the role and the fix but never the URL, and accepts the
+/// runtime role (ADR 0044). `jobs status` stands for `serve` and `jobs work`,
+/// which run the same check but do not exit by themselves.
+fn production_refuses_a_role_that_bypasses_row_level_security(
+    root: &Path,
+    binary: &str,
+    superuser_url: &str,
+    runtime_url: &str,
+    runtime_password: &str,
+) {
+    fn production(url: &str) -> [(&str, &str); 3] {
+        [
+            ("FORGE_ENV", "production"),
+            // The test server has no TLS; this is about the role.
+            ("FORGE_DATABASE_ALLOW_PLAINTEXT", "true"),
+            ("FORGE_DATABASE_URL", url),
+        ]
+    }
+    let refused = run_unchecked(
+        root,
+        binary,
+        &["jobs", "status"],
+        &production(superuser_url),
+        None,
+    );
+    let text = String::from_utf8_lossy(&refused.stderr).into_owned()
+        + &String::from_utf8_lossy(&refused.stdout);
+    assert_eq!(refused.status.code(), Some(1), "{text}");
+    assert!(
+        text.contains("bypasses row-level security") && text.contains("is a superuser"),
+        "{text}"
+    );
+    let credentials = superuser_url
+        .split_once("://")
+        .and_then(|(_, rest)| rest.split_once('@'))
+        .map_or("", |(credentials, _)| credentials);
+    assert!(
+        credentials.is_empty() || !text.contains(credentials),
+        "the refusal prints the URL: {text}"
+    );
+
+    let served = run(root, binary, &["jobs", "status"], &production(runtime_url));
+    assert_eq!(String::from_utf8_lossy(&served.stdout), "no jobs\n");
+    assert!(!String::from_utf8_lossy(&served.stderr).contains(runtime_password));
 }
 
 const OWNER_PASSWORD: &str = "correct horse battery";
