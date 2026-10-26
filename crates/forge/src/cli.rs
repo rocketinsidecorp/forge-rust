@@ -420,6 +420,8 @@ Environment:
                                (default: 5s)
   FORGE_DATABASE_STATEMENT_TIMEOUT server-side bound of every statement, 1ms-596h; not
                                for migrations and commands (default: 30s)
+  FORGE_JOBS_NOTIFY            true | false: enqueues announce due jobs and job workers
+                               LISTEN for them (default: App::jobs_notify, off)
   FORGE_SETUP_PASSWORD         owner password for setup when not typed or piped (never for serve)
   FORGE_RATE_LIMIT_MAX_KEYS   live buckets of the in-memory rate limiter (default: 100000)
   FORGE_CACHE_MAX_ENTRIES     entry bound of every cache (default: 10000)

@@ -14,7 +14,9 @@ use tokio::task::JoinSet;
 use tracing::{error, info, warn};
 
 use crate::{
-    JobHandler, JobsError, Schedule, name,
+    JobHandler, JobsError, Schedule,
+    listener::{self, Wakes},
+    name,
     postgres::{PgJobStore, Pruning},
     scheduler,
     worker::{Chain, ErasedHandler, QueueWorker, Typed},
@@ -43,6 +45,11 @@ pub struct WorkerSettings {
     /// Concurrent attempts per queue unless configured with
     /// [`Jobs::concurrency`] (default 5).
     pub default_concurrency: u16,
+    /// Most jobs one claim leases in a single round trip (1 to
+    /// [`MAX_CLAIM_BATCH`], default 10; Forge-Go's `BatchSize`). A claim
+    /// never asks for more than the queue's free slots, so every claimed job
+    /// starts at once; a full batch is followed by another claim at once.
+    pub batch: u16,
 }
 
 impl Default for WorkerSettings {
@@ -53,6 +60,7 @@ impl Default for WorkerSettings {
             drain_timeout: Duration::from_secs(20),
             cancel_grace: Duration::from_secs(5),
             default_concurrency: 5,
+            batch: 10,
         }
     }
 }
@@ -93,6 +101,13 @@ impl WorkerSettings {
         self
     }
 
+    /// Sets the most jobs one claim leases.
+    #[must_use]
+    pub const fn batch(mut self, jobs: u16) -> Self {
+        self.batch = jobs;
+        self
+    }
+
     pub(crate) fn heartbeat_interval(&self) -> Duration {
         self.lease / 3
     }
@@ -117,6 +132,9 @@ impl WorkerSettings {
                 "lease must be between 3 seconds and 1 day",
             ));
         }
+        if !(1..=MAX_CLAIM_BATCH).contains(&self.batch) {
+            return Err(JobsError::InvalidSetting("batch must be between 1 and 100"));
+        }
         validate_concurrency(self.default_concurrency)
     }
 }
@@ -133,6 +151,9 @@ fn validate_concurrency(workers: u16) -> Result<(), JobsError> {
 
 /// Upper bound of per-queue concurrency.
 pub const MAX_CONCURRENCY: u16 = 256;
+
+/// Upper bound of [`WorkerSettings::batch`] (Forge-Go's `MaxClaimBatch`).
+pub const MAX_CLAIM_BATCH: u16 = 100;
 
 /// Registered handlers, queues and schedules, and the entry point that runs
 /// them.
@@ -309,6 +330,14 @@ impl Jobs {
     /// schedules exist) and the pruning loop until `shutdown` is cancelled,
     /// then drains them (see [`WorkerSettings`]) and returns.
     ///
+    /// When the store [notifies](PgJobStore::notify), it also
+    /// holds one `LISTEN` connection (outside the store's pool) and an idle
+    /// queue worker claims as soon as a job of its queue is announced, at
+    /// most once per 10 ms; on every (re)subscription each queue claims
+    /// once. The connection reconnects after a jittered 0.5 to 1 s, doubling
+    /// to 15 to 30 s, while polling continues: announcements are hints,
+    /// never needed for correctness.
+    ///
     /// Every loop is a task owned by this future; none outlives it. If a loop
     /// panics, the others are stopped gracefully and the panic is reported as
     /// [`JobsError::TaskFailed`].
@@ -343,6 +372,9 @@ impl Jobs {
         if !queues.is_empty() || !schedules.is_empty() || pruning.is_some() {
             store.check_worker_grants().await?;
         }
+        // A notifying store also wakes idle workers when a job of their
+        // queue is announced (ADR 0046).
+        let mut wakes = (!queues.is_empty() && store.notifies()).then(Wakes::new);
 
         let stop = shutdown.child();
         let mut tasks: JoinSet<()> = JoinSet::new();
@@ -359,9 +391,14 @@ impl Jobs {
                 store: store.clone(),
                 settings,
                 telemetry: telemetry.clone(),
+                wake: wakes.as_mut().map(|wakes| wakes.register(queue)),
             };
             let handle = tasks.spawn(worker.run(stop.clone()));
             names.insert(handle.id(), "queue worker");
+        }
+        if let Some(wakes) = wakes {
+            let handle = tasks.spawn(listener::run(store.clone(), wakes, stop.clone()));
+            names.insert(handle.id(), "job announcement listener");
         }
         if !schedules.is_empty() {
             let handle = tasks.spawn(scheduler::run(store.clone(), schedules, stop.clone()));
@@ -438,6 +475,17 @@ mod tests {
     }
 
     #[test]
+    fn claims_ask_for_a_batch_of_ten_never_more_than_the_free_slots() {
+        let defaults = WorkerSettings::default();
+        assert_eq!(defaults.batch, 10);
+        assert_eq!(crate::worker::claim_size(5, defaults.batch), 5);
+        assert_eq!(crate::worker::claim_size(256, defaults.batch), 10);
+        assert_eq!(crate::worker::claim_size(1, 100), 1);
+        assert_eq!(crate::worker::claim_size(0, 10), 0);
+        assert_eq!(defaults.batch(3).batch, 3);
+    }
+
+    #[test]
     fn registration_rejects_duplicates_and_bad_settings() {
         let mut jobs = Jobs::new();
         assert!(jobs.is_empty());
@@ -476,6 +524,10 @@ mod tests {
         assert!(fast.validate().is_err());
         fast.settings(WorkerSettings::default().default_concurrency(0));
         assert!(fast.validate().is_err());
+        for (batch, valid) in [(0, false), (1, true), (MAX_CLAIM_BATCH, true), (101, false)] {
+            fast.settings(WorkerSettings::default().batch(batch));
+            assert_eq!(fast.validate().is_ok(), valid, "batch {batch}");
+        }
         assert!(format!("{jobs:?}").contains("test.ping"));
     }
 }

@@ -261,6 +261,30 @@ impl App {
         self
     }
 
+    /// Announces enqueued jobs and lets the job workers listen for them
+    /// (`LISTEN/NOTIFY`, ADR 0046), with the meaning of Forge-Go's
+    /// `queuepostgres.WithNotify()`; default off. Implies [`App::jobs`] with
+    /// [`WorkerMode::InServe`] unless it was declared.
+    ///
+    /// When on, every connection of the application's pool sets
+    /// `forge.jobs_notify = on`, so each due job enqueued through it
+    /// (`forge::jobs::postgres::enqueue`, schedule ticks) sends
+    /// `NOTIFY forge_jobs` when its transaction commits, and the job runtime
+    /// (`serve` with [`WorkerMode::InServe`], `jobs work`) holds one `LISTEN`
+    /// connection: an idle worker claims a new job within milliseconds
+    /// instead of at its next poll. `FORGE_JOBS_NOTIFY=true|false` overrides
+    /// it per deployment.
+    #[cfg(feature = "jobs")]
+    #[must_use]
+    pub fn jobs_notify(mut self, on: bool) -> Self {
+        let mut declaration = self
+            .jobs
+            .unwrap_or(JobsDeclaration::new(WorkerMode::InServe));
+        declaration.notify = on;
+        self.jobs = Some(declaration);
+        self
+    }
+
     /// Declares the transactional outbox (feature `events`, ADR 0025).
     ///
     /// Implies [`App::jobs`] with [`WorkerMode::InServe`] unless it was
@@ -442,14 +466,22 @@ impl App {
         } = self;
         let declaration = declarations.pop();
         #[cfg(feature = "jobs")]
-        let (jobs_slot, run_jobs_in_serve) = jobs_for_serve(jobs);
+        let (mut jobs_slot, run_jobs_in_serve) = jobs_for_serve(jobs);
         #[cfg(not(feature = "jobs"))]
         let jobs_slot: JobsSlot = ();
 
-        let config = match load_config() {
+        #[cfg_attr(not(feature = "jobs"), allow(unused_mut))]
+        let mut config = match load_config() {
             Ok(config) => config,
             Err(error) => return config_error(&error),
         };
+        #[cfg(feature = "jobs")]
+        {
+            resolve_jobs_notify(&mut config, jobs.as_ref());
+            if let Some(parts) = jobs_slot.as_mut() {
+                parts.notify = config.jobs.notify == Some(true);
+            }
+        }
         let telemetry = match process_telemetry::build(&config, name, version) {
             Ok(telemetry) => telemetry,
             Err(error) => return config_error(&error),
@@ -899,10 +931,11 @@ impl App {
         command: JobsCommand,
         load_config: impl FnOnce() -> Result<AppConfig, ConfigError>,
     ) -> ExitCode {
-        let config = match load_config() {
+        let mut config = match load_config() {
             Ok(config) => config,
             Err(error) => return config_error(&error),
         };
+        resolve_jobs_notify(&mut config, self.jobs.as_ref());
         // Only `jobs work` runs long enough to export telemetry.
         let telemetry = if command == JobsCommand::Work {
             match process_telemetry::build(&config, self.name, self.version) {
@@ -974,7 +1007,10 @@ impl App {
                 self.registrations,
                 self.compose_hooks,
                 database,
-                Some(JobsParts::new(jobs)),
+                Some(JobsParts::new(JobsDeclaration {
+                    notify: config.jobs.notify == Some(true),
+                    ..jobs
+                })),
                 &shutdown,
                 telemetry.as_ref(),
             )
@@ -1021,6 +1057,14 @@ impl App {
             }
         }
     }
+}
+
+/// Settles `FORGE_JOBS_NOTIFY` over `App::jobs_notify` (ADR 0046) into
+/// `config.jobs.notify`, which the pool ([`open_pool`]) and the job store
+/// follow. Without `App::jobs` nothing is announced.
+#[cfg(feature = "jobs")]
+fn resolve_jobs_notify(config: &mut AppConfig, jobs: Option<&JobsDeclaration>) {
+    config.jobs.notify = Some(jobs.is_some_and(|jobs| jobs.notifies(&config.jobs)));
 }
 
 /// The registry handed to `serve`'s composition hooks and whether `serve`
@@ -1296,13 +1340,16 @@ fn open_pool(
     config: &AppConfig,
 ) -> Result<Option<DatabaseHandle>, ExitCode> {
     match declared {
-        Some((declaration, url)) => match declaration.connect_lazy(url, &config.database) {
-            Ok(database) => Ok(Some(database)),
-            Err(error) => {
-                error!(app = name, error = %ErrorChain(&error), "failed to create the database pool");
-                Err(ExitCode::FAILURE)
+        Some((declaration, url)) => {
+            match declaration.connect_lazy(url, &config.database, config.jobs.notify == Some(true))
+            {
+                Ok(database) => Ok(Some(database)),
+                Err(error) => {
+                    error!(app = name, error = %ErrorChain(&error), "failed to create the database pool");
+                    Err(ExitCode::FAILURE)
+                }
             }
-        },
+        }
         None => Ok(None),
     }
 }
@@ -2525,6 +2572,44 @@ mod tests {
         }
 
         #[test]
+        fn forge_jobs_notify_overrides_the_code_choice_and_needs_app_jobs() {
+            // App::jobs_notify declares jobs (InServe) unless they were declared.
+            let declaration = App::new("demo").jobs_notify(true).jobs.expect("declared");
+            assert!(declaration.notify && declaration.mode == WorkerMode::InServe);
+            let declaration = App::new("demo")
+                .jobs(WorkerMode::Dedicated)
+                .jobs_notify(true)
+                .jobs
+                .expect("declared");
+            assert!(declaration.notify && declaration.mode == WorkerMode::Dedicated);
+            assert!(!JobsParts::new(JobsDeclaration::new(WorkerMode::InServe)).notify);
+            assert!(JobsParts::new(declaration).notify);
+
+            let off = JobsDeclaration::new(WorkerMode::InServe);
+            for (code, env, declared, expected) in [
+                (false, None, true, false),
+                (true, None, true, true),
+                (false, Some(true), true, true),
+                (true, Some(false), true, false),
+                // Without App::jobs nothing announces, whatever the variable.
+                (true, Some(true), false, false),
+            ] {
+                let mut config = AppConfig::default();
+                config.jobs.notify = env;
+                let declaration = JobsDeclaration {
+                    notify: code,
+                    ..off
+                };
+                resolve_jobs_notify(&mut config, declared.then_some(&declaration));
+                assert_eq!(
+                    config.jobs.notify,
+                    Some(expected),
+                    "{code} {env:?} {declared}"
+                );
+            }
+        }
+
+        #[test]
         fn declarations_select_mode_and_framework_schemas() {
             let app = App::new("demo").jobs(WorkerMode::Dedicated);
             let declaration = app.jobs.expect("declared");
@@ -2679,7 +2764,12 @@ mod tests {
             // The runtime `serve`/`jobs work` build from composition hooks.
             let greeted = Arc::new(AtomicUsize::new(0));
             let heard = Arc::new(AtomicUsize::new(0));
-            let config = config_with(&[("FORGE_DATABASE_URL", url.as_str())]).expect("config");
+            // FORGE_JOBS_NOTIFY: the pool announces and the runtime listens.
+            let mut config = config_with(&[
+                ("FORGE_DATABASE_URL", url.as_str()),
+                (forge_config::JOBS_NOTIFY_KEY, "true"),
+            ])
+            .expect("config");
             let runtime_url = config.database.url.clone().expect("url");
             let hook_greeted = Arc::clone(&greeted);
             let hook_heard = Arc::clone(&heard);
@@ -2706,6 +2796,8 @@ mod tests {
             {
                 declaration.events = true;
             }
+            resolve_jobs_notify(&mut config, Some(&declaration));
+            declaration.notify = config.jobs.notify == Some(true);
             let Built {
                 database,
                 jobs: slot,
@@ -2730,6 +2822,16 @@ mod tests {
             )
             .expect("composition");
             let background = background_for(slot, database.as_ref(), None).expect("background");
+            #[allow(irrefutable_let_patterns)]
+            let Some(DatabaseHandle::Postgres(pool)) = database.as_ref() else {
+                panic!("a PostgreSQL pool");
+            };
+            let setting: Option<String> =
+                sqlx::query_scalar("SELECT current_setting('forge.jobs_notify', true)")
+                    .fetch_one(pool.pool())
+                    .await
+                    .expect("setting");
+            assert_eq!(setting.as_deref(), Some("on"));
 
             let store = PgJobStore::new(test.database().clone());
             store
@@ -2747,6 +2849,21 @@ mod tests {
             let shutdown = Cancellation::new();
             let running = tokio::spawn(background.run(shutdown.clone()));
             let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+            while sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM pg_stat_activity
+                 WHERE datname = current_database() AND query = 'LISTEN \"forge_jobs\"'",
+            )
+            .fetch_one(test.database().pool())
+            .await
+            .expect("listeners")
+                != 1
+            {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the runtime did not listen"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
             let expected_events = usize::from(cfg!(feature = "events"));
             while greeted.load(Ordering::SeqCst) == 0
                 || heard.load(Ordering::SeqCst) < expected_events

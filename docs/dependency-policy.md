@@ -284,6 +284,14 @@ inside the driver, bounded in practice (the listener runs no statement after
 `LISTEN`, so the channel only buffers what arrives during that round trip),
 and the listener's lifetime is owned by the `PgBroker::listen` lifecycle
 worker ([ADR 0031](adr/0031-live-updates-over-server-sent-events.md#accepted-residuals-and-capacity-edges)).
+`forge-jobs` uses the same `PgListener` for its opt-in job wake-up
+([ADR 0046](adr/0046-job-wake-up-and-claim-batches.md)) with no new package:
+the listener task belongs to `Jobs::run`, runs no statement after `LISTEN`,
+and holds its connection on a one-connection pool of its own whose `close()`
+it awaits for at most one second after every subscription. On a healthy
+connection the driver's drop task finishes within that bound; on a silently
+dead network it can outlive `Jobs::run` until TCP gives up or the runtime
+ends, the same accepted residual as the broadcast worker.
 
 ## Rate limiting, cache and storage dependency decision
 

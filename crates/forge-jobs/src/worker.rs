@@ -15,6 +15,7 @@ use async_trait::async_trait;
 use forge_core::Cancellation;
 use forge_telemetry::{Span, jobs::JobInstrumentation};
 use tokio::{
+    sync::mpsc,
     task::{self, AbortHandle, JoinError, JoinSet},
     time::MissedTickBehavior,
 };
@@ -95,13 +96,28 @@ pub(crate) struct QueueWorker {
     pub(crate) store: PgJobStore,
     pub(crate) settings: WorkerSettings,
     pub(crate) telemetry: Option<JobInstrumentation>,
+    /// Enqueue announcements of this queue (ADR 0046), when listening.
+    pub(crate) wake: Option<mpsc::Receiver<()>>,
+}
+
+/// Least time between a claim and one an announcement triggers, so a flood
+/// of notifications cannot turn an idle worker into a busy loop (Forge-Go's
+/// `minWakeGap`).
+const MIN_WAKE_GAP: Duration = Duration::from_millis(10);
+
+/// How many jobs to ask for: at most `batch`, never more than the free
+/// slots.
+pub(crate) fn claim_size(free: usize, batch: u16) -> usize {
+    free.min(usize::from(batch))
 }
 
 impl QueueWorker {
     /// Runs until `shutdown`, then drains: waits for in-flight attempts up to
     /// the drain timeout, cancels the rest cooperatively, aborts what is left
     /// after the cancel grace and releases their leases.
-    pub(crate) async fn run(self, shutdown: Cancellation) {
+    pub(crate) async fn run(mut self, shutdown: Cancellation) {
+        let mut wake = self.wake.take();
+        let mut last_claim: Option<tokio::time::Instant> = None;
         let names: Vec<String> = self
             .handlers
             .keys()
@@ -120,16 +136,21 @@ impl QueueWorker {
 
         while !shutdown.is_cancelled() {
             let free = self.concurrency.saturating_sub(tasks.len());
+            // A full batch may have left due jobs behind: claim again at once.
+            let mut claim_again = false;
             if free > 0 {
+                let want = claim_size(free, self.settings.batch);
                 let token = LeaseToken::new();
                 // The database grants the lease after this instant.
                 let claimed_at = Instant::now();
+                last_claim = Some(tokio::time::Instant::now());
                 match self
                     .store
-                    .claim(self.queue, &names, free, self.settings.lease, token)
+                    .claim(self.queue, &names, want, self.settings.lease, token)
                     .await
                 {
                     Ok(claimed) => {
+                        claim_again = claimed.len() >= want;
                         for job in claimed {
                             self.start(
                                 job,
@@ -146,8 +167,9 @@ impl QueueWorker {
                     }
                 }
             }
-            // Below capacity means the queue had no more due jobs (or the
-            // claim failed): poll again later. At capacity, wait for a slot.
+            // Below capacity after a partial batch means the queue had no
+            // more due jobs (or the claim failed): poll again later, or when
+            // a job of this queue is announced. At capacity, wait for a slot.
             let below_capacity = tasks.len() < self.concurrency;
             tokio::select! {
                 () = shutdown.cancelled() => break,
@@ -156,7 +178,13 @@ impl QueueWorker {
                 }
                 _ = heartbeat.tick() => self.renew(&mut in_flight).await,
                 () = sleep_until_opt(self.next_check(&in_flight)) => self.expire(&mut in_flight),
-                () = tokio::time::sleep(jitter(self.settings.poll_interval)), if below_capacity => {}
+                () = std::future::ready(()), if below_capacity && claim_again => {}
+                () = woken(&mut wake), if below_capacity && !claim_again => {
+                    if let Some(last_claim) = last_claim {
+                        tokio::time::sleep_until(last_claim + MIN_WAKE_GAP).await;
+                    }
+                }
+                () = tokio::time::sleep(jitter(self.settings.poll_interval)), if below_capacity && !claim_again => {}
             }
         }
 
@@ -681,6 +709,18 @@ impl fmt::Display for Chain<'_> {
         }
         Ok(())
     }
+}
+
+/// Resolves when the queue's announcement signal fires; never when the
+/// worker does not listen or the listener has stopped.
+async fn woken(wake: &mut Option<mpsc::Receiver<()>>) {
+    if let Some(receiver) = wake.as_mut()
+        && receiver.recv().await.is_some()
+    {
+        return;
+    }
+    *wake = None;
+    std::future::pending().await
 }
 
 /// Sleeps until `instant`, or forever when there is none.

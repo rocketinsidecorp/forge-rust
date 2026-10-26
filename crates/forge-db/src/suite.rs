@@ -437,7 +437,8 @@ macro_rules! common_suite {
                 let test = fresh().await;
                 let settings = PoolSettings::default()
                     .with_max_connections(2)
-                    .with_statement_timeout(Some(Duration::from_millis(250)));
+                    .with_statement_timeout(Some(Duration::from_millis(250)))
+                    .with_job_announcements(true);
                 let db = Database::<Db>::connect_with(test.url(), settings).await.expect("connect");
                 // Two connections at once: the setting holds on each new one.
                 let mut first = db.pool().acquire().await.expect("first");
@@ -450,6 +451,11 @@ macro_rules! common_suite {
                                 .await
                                 .expect("show");
                             assert_eq!(shown, "250ms");
+                            let notify: String = sqlx::query_scalar("SHOW forge.jobs_notify")
+                                .fetch_one(&mut **connection)
+                                .await
+                                .expect("show");
+                            assert_eq!(notify, "on");
                         }
                         DatabaseScheme::MySql => {
                             let version: String = sqlx::query_scalar("SELECT VERSION()")
@@ -483,6 +489,24 @@ macro_rules! common_suite {
                 }
                 db.ping().await.expect("the pool keeps working");
                 db.pool().close().await;
+                if <Db as Backend>::SCHEME == DatabaseScheme::Postgres {
+                    // Each setting holds without the other; neither is on by default.
+                    for (settings, timeout, notify) in [
+                        (PoolSettings::default().with_job_announcements(true), "0", "on"),
+                        (PoolSettings::default(), "0", ""),
+                    ] {
+                        let db = Database::<Db>::connect_with(test.url(), settings).await.expect("connect");
+                        let shown: (String, String) = sqlx::query_as(
+                            "SELECT current_setting('statement_timeout'), \
+                             coalesce(current_setting('forge.jobs_notify', true), '')",
+                        )
+                        .fetch_one(db.pool())
+                        .await
+                        .expect("settings");
+                        assert_eq!(shown, (timeout.to_owned(), notify.to_owned()));
+                        db.pool().close().await;
+                    }
+                }
                 test.cleanup().await.expect("cleanup");
             }
 

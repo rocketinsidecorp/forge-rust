@@ -123,6 +123,7 @@ pub const KNOWN_KEYS: &[&str] = &[
     "FORGE_DATABASE_CONNECT_TIMEOUT",
     "FORGE_DATABASE_STATEMENT_TIMEOUT",
     "FORGE_DATABASE_ALLOW_PLAINTEXT",
+    JOBS_NOTIFY_KEY,
     SETUP_PASSWORD_KEY,
     "FORGE_RATE_LIMIT_MAX_KEYS",
     "FORGE_CACHE_MAX_ENTRIES",
@@ -166,6 +167,11 @@ pub const KNOWN_KEYS: &[&str] = &[
     "FORGE_TELEMETRY_METRICS_PUBLIC",
     "FORGE_TELEMETRY_METRICS_INTERVAL",
 ];
+
+/// Whether due jobs announce themselves on enqueue and job workers listen
+/// for them (`LISTEN/NOTIFY`, ADR 0046): `true` or `false`. Unset keeps what
+/// the application chose with `App::jobs_notify` (off by default).
+pub const JOBS_NOTIFY_KEY: &str = "FORGE_JOBS_NOTIFY";
 
 /// Whether `GET /openapi.json` is served (ADR 0039): unset serves it in
 /// development and test only, `true` everywhere (with a startup warning in
@@ -1058,6 +1064,19 @@ pub struct AppConfig {
     /// The OpenAPI document route (`FORGE_OPENAPI_ENABLED`, ADR 0039).
     #[serde(default)]
     pub openapi: OpenApiConfig,
+    /// Durable jobs (`FORGE_JOBS_NOTIFY`, ADR 0046).
+    #[serde(default)]
+    pub jobs: JobsConfig,
+}
+
+/// Durable job settings.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct JobsConfig {
+    /// `FORGE_JOBS_NOTIFY`: enqueue announcements and the workers' `LISTEN`,
+    /// with the meaning of Forge-Go's `queuepostgres.WithNotify()`. `None`
+    /// (unset) keeps the application's choice (`App::jobs_notify`, default
+    /// off).
+    pub notify: Option<bool>,
 }
 
 /// The `GET /openapi.json` route.
@@ -1263,6 +1282,9 @@ impl AppConfig {
         }
         if let Some(value) = lookup(OPENAPI_ENABLED_KEY) {
             config.openapi.enabled = Some(telemetry::parse_bool(OPENAPI_ENABLED_KEY, &value)?);
+        }
+        if let Some(value) = lookup(JOBS_NOTIFY_KEY) {
+            config.jobs.notify = Some(telemetry::parse_bool(JOBS_NOTIFY_KEY, &value)?);
         }
         telemetry::apply(&lookup, &mut config.telemetry)?;
         mail::apply(&lookup, &mut config.mail, &mut config.auth)?;
@@ -2205,6 +2227,7 @@ mod tests {
             "2s",
             "15s",
             "false",
+            "true",
             "correct horse battery staple",
             "1000",
             "100",
@@ -2287,6 +2310,27 @@ mod tests {
             .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
             .collect();
         AppConfig::from_lookup(|key| values.get(key).cloned())
+    }
+
+    #[test]
+    fn jobs_notify_is_unset_true_or_false() {
+        assert_eq!(load(&[]).expect("defaults").jobs.notify, None);
+        assert_eq!(
+            load(&[(JOBS_NOTIFY_KEY, "true")])
+                .expect("true")
+                .jobs
+                .notify,
+            Some(true)
+        );
+        assert_eq!(
+            load(&[(JOBS_NOTIFY_KEY, "false")])
+                .expect("false")
+                .jobs
+                .notify,
+            Some(false)
+        );
+        let error = load(&[(JOBS_NOTIFY_KEY, "on")]).expect_err("not a boolean");
+        assert!(error.to_string().contains(JOBS_NOTIFY_KEY), "{error}");
     }
 
     #[test]

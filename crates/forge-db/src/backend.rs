@@ -81,6 +81,22 @@ pub(crate) mod sealed {
             options
         }
 
+        /// Prepares each new connection of a pool built from `settings`:
+        /// the statement bound, and on PostgreSQL the job announcements.
+        /// The default applies only the statement bound.
+        fn connection_setup(
+            options: PoolOptions<Self>,
+            settings: &crate::PoolSettings,
+        ) -> PoolOptions<Self> {
+            match settings.statement_timeout() {
+                Some(timeout) => Self::bound_statements(
+                    options,
+                    crate::database::statement_timeout_millis(timeout),
+                ),
+                None => options,
+            }
+        }
+
         /// Creates an empty, uniquely named database for a test. Server
         /// backends use the administrative URL in the environment variable
         /// `admin_env`; file backends ignore it.

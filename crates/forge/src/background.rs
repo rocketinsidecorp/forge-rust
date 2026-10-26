@@ -34,6 +34,8 @@ pub enum WorkerMode {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct JobsDeclaration {
     pub(crate) mode: WorkerMode,
+    /// `App::jobs_notify`; `FORGE_JOBS_NOTIFY` overrides it when set.
+    pub(crate) notify: bool,
     #[cfg(feature = "events")]
     pub(crate) events: bool,
 }
@@ -42,9 +44,16 @@ impl JobsDeclaration {
     pub(crate) const fn new(mode: WorkerMode) -> Self {
         Self {
             mode,
+            notify: false,
             #[cfg(feature = "events")]
             events: false,
         }
+    }
+
+    /// Whether enqueues announce and workers listen (ADR 0046):
+    /// `FORGE_JOBS_NOTIFY` when set, else `App::jobs_notify`.
+    pub(crate) fn notifies(&self, config: &forge_config::JobsConfig) -> bool {
+        config.notify.unwrap_or(self.notify)
     }
 
     /// The embedded framework schemas `migrate` applies before the
@@ -104,15 +113,17 @@ impl EventsSetup {
 #[derive(Debug, Default)]
 pub(crate) struct JobsParts {
     pub(crate) jobs: Jobs,
+    /// Whether the job store announces enqueued jobs and the workers listen.
+    pub(crate) notify: bool,
     #[cfg(feature = "events")]
     pub(crate) events: Option<EventsSetup>,
 }
 
 impl JobsParts {
     pub(crate) fn new(declaration: JobsDeclaration) -> Self {
-        let _ = declaration;
         Self {
             jobs: Jobs::new(),
+            notify: declaration.notify,
             #[cfg(feature = "events")]
             events: declaration.events.then(EventsSetup::default),
         }
@@ -156,6 +167,7 @@ impl JobsParts {
             #[cfg(feature = "events")]
             dispatcher,
             database,
+            notify: self.notify,
         }
     }
 }
@@ -166,6 +178,7 @@ pub(crate) struct Background {
     #[cfg(feature = "events")]
     dispatcher: Option<forge_events::Dispatcher>,
     database: PgDatabase,
+    notify: bool,
 }
 
 impl fmt::Debug for Background {
@@ -199,7 +212,7 @@ impl Background {
         if self.jobs.is_empty() {
             info!("no job handler is registered yet");
         }
-        let store = PgJobStore::new(self.database.clone());
+        let store = PgJobStore::new(self.database.clone()).notify(self.notify);
         let jobs = async {
             let result = self.jobs.run(store, stop.clone()).await;
             if result.is_err() {
