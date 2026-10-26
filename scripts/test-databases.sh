@@ -7,8 +7,8 @@
 #   scripts/test-databases.sh                      # cargo test ...
 #   scripts/test-databases.sh llvm-cov --no-report # the same set, measured
 #
-# The slow generated-application suite (forge-cli --test scaffold) is left to
-# CI's `scaffold` job, and the benchmark harnesses (forge-bench,
+# The slow generated-application suites (forge-cli --test scaffold and
+# --test readme_quickstart) are left to CI's `scaffold` job, and the benchmark harnesses (forge-bench,
 # forge-loadgen) to the `test` and `benchmarks` jobs. Every other test file of
 # forge-cli is picked up automatically.
 set -euo pipefail
@@ -26,7 +26,7 @@ cargo "${runner[@]}" --workspace --all-targets --all-features --locked \
 cli_tests=()
 for file in crates/forge-cli/tests/*.rs; do
 	name="$(basename "$file" .rs)"
-	if [ "$name" != scaffold ]; then
+	if [ "$name" != scaffold ] && [ "$name" != readme_quickstart ]; then
 		cli_tests+=(--test "$name")
 	fi
 done
