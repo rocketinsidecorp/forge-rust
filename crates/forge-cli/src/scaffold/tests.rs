@@ -76,7 +76,10 @@ fn event() -> ScaffoldOptions {
 fn wired(outcome: &Outcome) -> String {
     let mut text = outcome.wiring.clone();
     for edit in &outcome.edits {
-        text.push_str(&format!("\n{} {} ({})\n", edit.verb, edit.path, edit.detail));
+        text.push_str(&format!(
+            "\n{} {} ({})\n",
+            edit.verb, edit.path, edit.detail
+        ));
         text.push_str(edit.content.as_deref().unwrap_or_default());
     }
     text
@@ -480,25 +483,13 @@ fn wiring_is_printed_and_never_written_without_the_seam() {
     assert_every_session_store_has_the_idle_timeout(&wired(&second));
     // RBAC matches exactly: the owner `setup` creates gets both permissions,
     // and nothing else is granted.
-    assert!(
-        wired(&second)
-            .contains("let mut policy = forge::security::RbacPolicy::new();")
-    );
-    assert!(
-        wired(&second)
-            .contains("forge::security::Role::new(\"owner\")")
-    );
-    assert!(
-        wired(&second)
-            .contains("policy.allow(owner.clone(), permission);")
-    );
+    assert!(wired(&second).contains("let mut policy = forge::security::RbacPolicy::new();"));
+    assert!(wired(&second).contains("forge::security::Role::new(\"owner\")"));
+    assert!(wired(&second).contains("policy.allow(owner.clone(), permission);"));
     // Other roles: the application declares its own `protect`.
     assert!(wired(&second).contains("Declare `fn protect` with this signature"));
     assert!(wired(&second).contains("use_cases::events::READ_PERMISSION"));
-    assert!(
-        wired(&second)
-            .contains("use_cases::events::WRITE_PERMISSION")
-    );
+    assert!(wired(&second).contains("use_cases::events::WRITE_PERMISSION"));
 }
 
 #[test]
@@ -622,7 +613,11 @@ fn refuses_to_overwrite_anything_and_writes_nothing() {
     // The same arguments again change nothing, whatever the version.
     let again = ok_at(&root, &post(), "1760832000000000001");
     assert!(again.identical);
-    assert!(again.edits.iter().all(|edit| edit.content.is_none()), "{:?}", again.edits);
+    assert!(
+        again.edits.iter().all(|edit| edit.content.is_none()),
+        "{:?}",
+        again.edits
+    );
     assert_eq!(tree(&root), after);
     // Other arguments for the same resource are refused.
     let mut other = post();

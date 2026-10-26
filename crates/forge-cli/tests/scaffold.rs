@@ -1225,10 +1225,7 @@ fn sign_in_use_a_tenant_scaffold_and_sign_out(root: &Path, binary: &str, url: &s
     let sent = browser.request(port, "GET", &events, None);
     assert_eq!(sent.status, 303, "{}", sent.body);
     let sign_in = sent.header("location").unwrap_or_default().to_owned();
-    assert_eq!(
-        sign_in,
-        "/session/new?return_to=%2Fevents"
-    );
+    assert_eq!(sign_in, "/session/new?return_to=%2Fevents");
     let page = browser.request(port, "GET", &sign_in, None);
     assert_eq!(page.status, 200);
     assert!(

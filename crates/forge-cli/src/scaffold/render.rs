@@ -242,9 +242,8 @@ pub(crate) fn column_migration(
         let mut definition = renderer.column(field);
         if !field.optional {
             let zero = match (field.kind, backend) {
-                (FieldType::String, _) | (FieldType::Text, Backend::Postgresql | Backend::Sqlite) => {
-                    "''"
-                }
+                (FieldType::String, _)
+                | (FieldType::Text, Backend::Postgresql | Backend::Sqlite) => "''",
                 // MySQL takes a TEXT default only as an expression.
                 (FieldType::Text, Backend::MySql) => "('')",
                 (FieldType::Integer, _) | (FieldType::Boolean, Backend::Sqlite) => "0",
@@ -284,7 +283,10 @@ pub(crate) fn column_migration(
             format!("-- Reverts {name}: the columns come back, their values do not.\n{adds}"),
         )
     } else {
-        (format!("-- {name}\n{adds}"), format!("-- Reverts {name}.\n{drops}"))
+        (
+            format!("-- {name}\n{adds}"),
+            format!("-- Reverts {name}.\n{drops}"),
+        )
     })
 }
 

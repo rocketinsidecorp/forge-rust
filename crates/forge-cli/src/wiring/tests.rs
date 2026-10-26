@@ -46,9 +46,15 @@ fn read(root: &Path, path: &str) -> String {
 fn products() -> Registration {
     Registration {
         modules: vec![
-            ("src/domain/entities/mod.rs".to_owned(), "product".to_owned()),
+            (
+                "src/domain/entities/mod.rs".to_owned(),
+                "product".to_owned(),
+            ),
             ("src/adapters/http/mod.rs".to_owned(), "products".to_owned()),
-            ("src/adapters/http/mod.rs".to_owned(), "products_api".to_owned()),
+            (
+                "src/adapters/http/mod.rs".to_owned(),
+                "products_api".to_owned(),
+            ),
         ],
         routes: Some(Block::scoped(
             "scaffold",
@@ -78,7 +84,10 @@ fn the_initial_seam_is_formatted_signed_and_has_no_blocks() {
         assert_eq!(parse_routes(&seam), Ok(Vec::new()));
         assert_eq!(rustfmt(root, ROUTES_FILE, &seam).expect("rustfmt"), seam);
         assert_eq!(render_routes(root, views, &[]).expect("render"), seam);
-        assert!(seam.contains("_composition: &mut forge::Composition<'_>"), "{seam}");
+        assert!(
+            seam.contains("_composition: &mut forge::Composition<'_>"),
+            "{seam}"
+        );
         assert_eq!(seam.contains("_site:"), views, "{seam}");
     }
 }
@@ -112,9 +121,14 @@ fn declarations_are_added_in_sorted_order_and_the_seam_gets_the_block() {
     let seam = read(root, ROUTES_FILE);
     assert_eq!(rustfmt(root, ROUTES_FILE, &seam).expect("rustfmt"), seam);
     let streams = seam.find("// forge:streams streams").expect("shared block");
-    let scaffold = seam.find("// forge:scaffold products").expect("entry block");
+    let scaffold = seam
+        .find("// forge:scaffold products")
+        .expect("entry block");
     assert!(streams < scaffold, "{seam}");
-    assert!(seam.contains("    composition: &mut forge::Composition<'_>,"), "{seam}");
+    assert!(
+        seam.contains("    composition: &mut forge::Composition<'_>,"),
+        "{seam}"
+    );
     assert!(seam.contains("    site: &std::sync::Arc<"), "{seam}");
 }
 
@@ -180,8 +194,15 @@ fn destroy_takes_the_declarations_and_the_block_back_out() {
     .iter()
     .map(|path| read(root, path))
     .collect();
-    assert_eq!(after, initial, "the shared streams block went with its last user");
-    assert!(plan(root, &products(), true, &fail).expect("plan").is_empty());
+    assert_eq!(
+        after, initial,
+        "the shared streams block went with its last user"
+    );
+    assert!(
+        plan(root, &products(), true, &fail)
+            .expect("plan")
+            .is_empty()
+    );
 }
 
 #[test]
@@ -198,7 +219,11 @@ fn a_shared_block_stays_while_another_block_uses_it() {
     wire(root, &products(), false);
     wire(root, &posts, false);
     let seam = read(root, ROUTES_FILE);
-    assert_eq!(seam.matches("// forge:streams streams").count(), 1, "{seam}");
+    assert_eq!(
+        seam.matches("// forge:streams streams").count(),
+        1,
+        "{seam}"
+    );
 
     wire(root, &products(), true);
 
@@ -243,7 +268,10 @@ fn the_same_block_with_other_code_is_refused() {
         .expect_err("refused")
         .to_string();
 
-    assert!(error.contains("already wires the scaffold products"), "{error}");
+    assert!(
+        error.contains("already wires the scaffold products"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -286,7 +314,10 @@ fn an_unformatted_mod_file_gets_only_the_line() {
 #[test]
 fn declared_module_reads_top_level_mod_items_only() {
     assert_eq!(declared_module("pub mod products;"), Some("products"));
-    assert_eq!(declared_module("pub(crate) mod products;"), Some("products"));
+    assert_eq!(
+        declared_module("pub(crate) mod products;"),
+        Some("products")
+    );
     assert_eq!(declared_module("#[cfg(test)] mod tests {"), Some("tests"));
     assert_eq!(declared_module("mod products {"), Some("products"));
     assert_eq!(declared_module("    pub mod nested;"), None);
@@ -323,8 +354,14 @@ fn guards_are_module_level_functions_behind_an_ambiguity_tripwire() {
     let root = directory.path();
     wire(root, &guarded(), false);
     let seam = read(root, ROUTES_FILE);
-    assert!(seam.contains("#[allow(unused_imports)]\nuse super::*;\nuse guards::*;"), "{seam}");
-    assert!(seam.contains("\nmod guards {\n    // forge:guard protect\n    pub(super) fn protect("), "{seam}");
+    assert!(
+        seam.contains("#[allow(unused_imports)]\nuse super::*;\nuse guards::*;"),
+        "{seam}"
+    );
+    assert!(
+        seam.contains("\nmod guards {\n    // forge:guard protect\n    pub(super) fn protect("),
+        "{seam}"
+    );
     assert!(!seam.contains("forge:streams"), "{seam}");
     assert_eq!(parse_routes(&seam).map(|blocks| blocks.len()), Ok(2));
 }
@@ -354,10 +391,23 @@ fn a_guard_the_application_declares_replaces_the_generated_one() {
 
     // In another file of src/bootstrap too; the generated one comes back
     // when the application's is gone.
-    fs::write(&bootstrap, read(root, "src/bootstrap/mod.rs").replace("fn protect(\n", "fn unused(\n"))
-        .expect("write");
-    fs::write(root.join("src/bootstrap/guards.rs"), "pub(super) fn protect<'a>() {}\n").expect("write");
-    assert_eq!(plan(root, &guarded(), false, &fail).expect("plan").last().map(|edit| edit.verb), Some("identical"));
+    fs::write(
+        &bootstrap,
+        read(root, "src/bootstrap/mod.rs").replace("fn protect(\n", "fn unused(\n"),
+    )
+    .expect("write");
+    fs::write(
+        root.join("src/bootstrap/guards.rs"),
+        "pub(super) fn protect<'a>() {}\n",
+    )
+    .expect("write");
+    assert_eq!(
+        plan(root, &guarded(), false, &fail)
+            .expect("plan")
+            .last()
+            .map(|edit| edit.verb),
+        Some("identical")
+    );
     fs::remove_file(root.join("src/bootstrap/guards.rs")).expect("remove");
     wire(root, &guarded(), false);
     assert!(read(root, ROUTES_FILE).contains("pub(super) fn protect("));
@@ -369,8 +419,13 @@ fn a_seam_needing_a_guard_it_cannot_define_is_refused() {
     let root = directory.path();
     let mut unguarded = guarded();
     unguarded.shared.clear();
-    let error = plan(root, &unguarded, false, &fail).expect_err("refused").to_string();
-    assert!(error.contains("needs protect, which it does not define"), "{error}");
+    let error = plan(root, &unguarded, false, &fail)
+        .expect_err("refused")
+        .to_string();
+    assert!(
+        error.contains("needs protect, which it does not define"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -381,19 +436,29 @@ fn a_structure_the_generators_never_write_is_refused_behind_a_valid_checksum() {
     let seam = read(root, ROUTES_FILE);
     let unsigned = |text: &str| {
         let first = text.lines().next().unwrap_or_default().to_owned();
-        text.replacen(&first, &format!("{CHECKSUM_PREFIX}{CHECKSUM_PLACEHOLDER}"), 1)
+        text.replacen(
+            &first,
+            &format!("{CHECKSUM_PREFIX}{CHECKSUM_PLACEHOLDER}"),
+            1,
+        )
     };
     for edited in [
         // An item after the function.
         format!("{seam}\nfn mine() {{}}\n"),
         // A statement before the first block.
-        seam.replacen("    // forge:streams", "    let mine = 1;\n    // forge:streams", 1),
+        seam.replacen(
+            "    // forge:streams",
+            "    let mine = 1;\n    // forge:streams",
+            1,
+        ),
         // A marker without a name.
         seam.replacen("// forge:scaffold products", "// forge:scaffold", 1),
     ] {
         let signed = sign(&unsigned(&edited));
         fs::write(root.join(ROUTES_FILE), &signed).expect("write");
-        let error = plan(root, &products(), false, &fail).expect_err("refused").to_string();
+        let error = plan(root, &products(), false, &fail)
+            .expect_err("refused")
+            .to_string();
         assert!(error.contains("edited by hand"), "{error}\n{signed}");
         assert_eq!(read(root, ROUTES_FILE), signed);
     }
@@ -412,8 +477,13 @@ fn symlinked_seams_and_mod_files_are_refused() {
         let kept = read(root, path);
         fs::remove_file(&original).expect("remove");
         std::os::unix::fs::symlink(&target, &original).expect("symlink");
-        let error = plan(root, &products(), false, &fail).expect_err("refused").to_string();
-        assert!(error.contains("symlink") || error.contains("link"), "{path}: {error}");
+        let error = plan(root, &products(), false, &fail)
+            .expect_err("refused")
+            .to_string();
+        assert!(
+            error.contains("symlink") || error.contains("link"),
+            "{path}: {error}"
+        );
         fs::remove_file(&original).expect("remove link");
         fs::write(&original, kept).expect("restore");
     }
@@ -436,7 +506,11 @@ fn a_missing_seam_is_written_fresh() {
     let root = directory.path();
     fs::remove_file(root.join(ROUTES_FILE)).expect("remove");
     let mut registration = products();
-    registration.routes = Some(Block::scoped("resource", "products", "        let _ = composition;\n"));
+    registration.routes = Some(Block::scoped(
+        "resource",
+        "products",
+        "        let _ = composition;\n",
+    ));
     registration.shared.clear();
     let edits = wire(root, &registration, false);
     assert_eq!(edits.last().map(|edit| edit.verb), Some("wire"));
@@ -465,7 +539,9 @@ fn report_lists_each_edit_and_dry_runs_say_would() {
     report(&mut output, true, &edits).expect("report");
     assert_eq!(
         String::from_utf8(output).expect("utf-8"),
-        format!("  would wire   {ROUTES_FILE}  (scaffold products)\n  identical    {ROUTES_FILE}\n")
+        format!(
+            "  would wire   {ROUTES_FILE}  (scaffold products)\n  identical    {ROUTES_FILE}\n"
+        )
     );
 }
 

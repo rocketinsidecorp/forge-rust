@@ -153,7 +153,11 @@ pub(crate) fn plan_destroy(
             root,
             &parts.registration(options),
             true,
-            &|reason| CliError::Destroy(format!("refusing to destroy, nothing was removed: {reason}")),
+            &|reason| {
+                CliError::Destroy(format!(
+                    "refusing to destroy, nothing was removed: {reason}"
+                ))
+            },
         )?)
     } else {
         Unwire::Printed(parts.printed(root)?)

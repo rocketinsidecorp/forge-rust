@@ -1096,7 +1096,10 @@ fn write_application(
             urls.migration_container.as_str(),
         ),
         // The README Quickstart's `forge new` line and its JSON API note.
-        ("%%QUICKSTART_DATABASE%%", options.database.quickstart_flag()),
+        (
+            "%%QUICKSTART_DATABASE%%",
+            options.database.quickstart_flag(),
+        ),
         (
             "%%QUICKSTART_NEW_FLAGS%%",
             if options.api_auth { " --api-auth" } else { "" },

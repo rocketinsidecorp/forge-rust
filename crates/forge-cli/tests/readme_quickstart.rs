@@ -100,15 +100,8 @@ struct Dev(Child);
 impl Drop for Dev {
     fn drop(&mut self) {
         use rustix::process::{Pid, Signal, kill_process_group};
+        // forge dev and the application it runs share the group: both stop.
         if let Some(pid) = i32::try_from(self.0.id()).ok().and_then(Pid::from_raw) {
-            let _ = kill_process_group(pid, Signal::TERM);
-            let deadline = Instant::now() + Duration::from_secs(10);
-            while Instant::now() < deadline {
-                if matches!(self.0.try_wait(), Ok(Some(_))) {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(100));
-            }
             let _ = kill_process_group(pid, Signal::KILL);
         }
         let _ = self.0.wait();
@@ -132,8 +125,14 @@ impl Dev {
             .unwrap_or_else(|error| panic!("forge dev: {error}"));
         let (lines, reported) = mpsc::channel::<String>();
         for stream in [
-            child.stdout.take().map(|out| Box::new(out) as Box<dyn std::io::Read + Send>),
-            child.stderr.take().map(|err| Box::new(err) as Box<dyn std::io::Read + Send>),
+            child
+                .stdout
+                .take()
+                .map(|out| Box::new(out) as Box<dyn std::io::Read + Send>),
+            child
+                .stderr
+                .take()
+                .map(|err| Box::new(err) as Box<dyn std::io::Read + Send>),
         ]
         .into_iter()
         .flatten()
@@ -199,10 +198,24 @@ fn run_quickstart(
     let root = parent.join("shop");
     let readme = fs::read_to_string(root.join("README.md")).unwrap_or_default();
     let lines = quickstart(&readme);
-    let expected_new = format!("forge new shop{}", new_flags.iter().map(|flag| format!(" {flag}")).collect::<String>());
+    let expected_new = format!(
+        "forge new shop{}",
+        new_flags
+            .iter()
+            .map(|flag| format!(" {flag}"))
+            .collect::<String>()
+    );
     assert_eq!(lines.first(), Some(&expected_new), "{lines:?}");
-    assert_eq!(lines.get(1).map(String::as_str), Some("cd shop"), "{lines:?}");
-    assert_eq!(lines.last().map(String::as_str), Some("forge dev"), "{lines:?}");
+    assert_eq!(
+        lines.get(1).map(String::as_str),
+        Some("cd shop"),
+        "{lines:?}"
+    );
+    assert_eq!(
+        lines.last().map(String::as_str),
+        Some("forge dev"),
+        "{lines:?}"
+    );
     for line in &lines[2..lines.len() - 1] {
         if line.starts_with("docker compose up -d --wait") {
             database(&root);
@@ -223,7 +236,10 @@ fn run_quickstart(
         );
         assert!(output.status.success(), "{line}:\n{printed}");
         for manual in ["by hand", "Wire the", "paste"] {
-            assert!(!printed.contains(manual), "{line} asks for a manual edit:\n{printed}");
+            assert!(
+                !printed.contains(manual),
+                "{line} asks for a manual edit:\n{printed}"
+            );
         }
     }
     let (dev, port) = Dev::start(&root, &["dev"]);
@@ -309,7 +325,10 @@ impl Client {
             if !name.eq_ignore_ascii_case("set-cookie") {
                 continue;
             }
-            let Some((cookie, content)) = value.split(';').next().and_then(|pair| pair.split_once('='))
+            let Some((cookie, content)) = value
+                .split(';')
+                .next()
+                .and_then(|pair| pair.split_once('='))
             else {
                 continue;
             };
@@ -406,7 +425,10 @@ fn crud(client: &mut Client) {
     );
     assert_eq!(created.status, 303, "{}", created.body);
     let show = created.header("location").unwrap_or_default().to_owned();
-    assert!(show.starts_with("/products/") && show.len() == "/products/".len() + 36, "{show}");
+    assert!(
+        show.starts_with("/products/") && show.len() == "/products/".len() + 36,
+        "{show}"
+    );
     let page = client.page(&show);
     assert_eq!(page.status, 200);
     assert!(page.body.contains("Lamp"), "{}", page.body);
@@ -450,7 +472,11 @@ fn json_api(client: &mut Client, needs_csrf: bool) {
     }
     let created = client.json("POST", "/v1/products", chair, true);
     assert_eq!(created.status, 201, "{}", created.body);
-    assert!(created.body.contains("\"name\":\"Chair\""), "{}", created.body);
+    assert!(
+        created.body.contains("\"name\":\"Chair\""),
+        "{}",
+        created.body
+    );
     let listed = client.send("GET", "/v1/products", &[("Accept", "application/json")], "");
     assert_eq!(listed.status, 200, "{}", listed.body);
     assert!(listed.body.starts_with("{\"items\":["), "{}", listed.body);

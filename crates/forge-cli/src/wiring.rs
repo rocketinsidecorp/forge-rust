@@ -140,7 +140,13 @@ pub(crate) fn plan(
 ) -> Result<Vec<Edit>, CliError> {
     let mut edits = plan_modules(root, &registration.modules, remove, fail)?;
     if let Some(block) = &registration.routes {
-        edits.extend(plan_routes(root, block, &registration.shared, remove, fail)?);
+        edits.extend(plan_routes(
+            root,
+            block,
+            &registration.shared,
+            remove,
+            fail,
+        )?);
     }
     Ok(edits)
 }
@@ -463,7 +469,9 @@ fn undeclare(source: &str, name: &str) -> Result<Option<String>, String> {
     out.remove(index);
     // Never leave two blank lines in a row, or one at the end.
     if index > 0
-        && out.get(index - 1).is_some_and(|line| line.trim().is_empty())
+        && out
+            .get(index - 1)
+            .is_some_and(|line| line.trim().is_empty())
         && out.get(index).is_none_or(|line| line.trim().is_empty())
     {
         out.remove(index - 1);
@@ -537,7 +545,8 @@ fn parse_routes(source: &str) -> Result<Vec<Block>, String> {
     let mut open = false;
     for line in source.lines() {
         let signature = line == ") -> Result<(), forge::ComposeError> {"
-            || (line.starts_with(&format!("pub(super) fn {ROUTES_FUNCTION}(")) && line.ends_with('{'));
+            || (line.starts_with(&format!("pub(super) fn {ROUTES_FUNCTION}("))
+                && line.ends_with('{'));
         if signature || line == "mod guards {" {
             region = true;
             open = false;
@@ -682,7 +691,9 @@ fn with_shared(
         }
     }
     for guard in GUARDS {
-        let defined = shared.iter().any(|block| block.kind == "guard" && block.name == *guard);
+        let defined = shared
+            .iter()
+            .any(|block| block.kind == "guard" && block.name == *guard);
         if calls(&used, guard) && !defined && !overridden(guard) {
             return Err(format!(
                 "{ROUTES_FILE} needs {guard}, which it does not define: restore the file from \
@@ -725,12 +736,13 @@ fn bootstrap_declarations(root: &Path) -> Vec<String> {
 fn declares_fn(source: &str, name: &str) -> bool {
     source.lines().any(|line| {
         let code = line.split("//").next().unwrap_or_default();
-        code.match_indices(&format!("fn {name}")).any(|(start, found)| {
-            let rest = code[start + found.len()..].trim_start();
-            let before = code[..start].chars().next_back();
-            (rest.starts_with('(') || rest.starts_with('<'))
-                && !before.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
-        })
+        code.match_indices(&format!("fn {name}"))
+            .any(|(start, found)| {
+                let rest = code[start + found.len()..].trim_start();
+                let before = code[..start].chars().next_back();
+                (rest.starts_with('(') || rest.starts_with('<'))
+                    && !before.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+            })
     })
 }
 

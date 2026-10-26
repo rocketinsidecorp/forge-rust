@@ -598,21 +598,36 @@ fn write_executable(path: &Path, body: &str) {
 fn g_and_d_aliases_and_inferred_migrations() {
     let (_parent, root) = application();
 
-    let created = succeeds(&root, &["g", "scaffold", "order", "total:int", "--tenant-scoped"]);
+    let created = succeeds(
+        &root,
+        &["g", "scaffold", "order", "total:int", "--tenant-scoped"],
+    );
     assert!(
         created.contains("  wire         src/bootstrap/routes_gen.rs  (scaffold orders)\n"),
         "{created}"
     );
-    let again = succeeds(&root, &["g", "scaffold", "order", "total:integer", "--tenant-scoped"]);
-    assert!(again.contains("  identical    src/adapters/http/orders.rs\n"), "{again}");
+    let again = succeeds(
+        &root,
+        &["g", "scaffold", "order", "total:integer", "--tenant-scoped"],
+    );
+    assert!(
+        again.contains("  identical    src/adapters/http/orders.rs\n"),
+        "{again}"
+    );
     assert!(!again.contains("  create"), "{again}");
 
-    let added = succeeds(&root, &["g", "migration", "add_sku_to_orders", "sku:string"]);
+    let added = succeeds(
+        &root,
+        &["g", "migration", "add_sku_to_orders", "sku:string"],
+    );
     let up = added
         .lines()
         .find_map(|line| line.strip_prefix("  create  "))
         .expect("the up file is listed");
-    assert!(up.starts_with("migrations/") && up.ends_with("_add_sku_to_orders.up.sql"), "{added}");
+    assert!(
+        up.starts_with("migrations/") && up.ends_with("_add_sku_to_orders.up.sql"),
+        "{added}"
+    );
     let sql = std::fs::read_to_string(root.join(up)).expect("up migration");
     assert!(
         sql.contains("ALTER TABLE \"orders\" ADD COLUMN \"sku\" text NOT NULL DEFAULT ''"),
@@ -620,20 +635,33 @@ fn g_and_d_aliases_and_inferred_migrations() {
     );
     assert!(!added.contains("WARNING"), "{added}");
 
-    let removed = succeeds(&root, &["g", "migration", "remove_sku_from_orders", "sku:string"]);
-    assert!(removed.contains("WARNING: forge migrate drops these columns"), "{removed}");
+    let removed = succeeds(
+        &root,
+        &["g", "migration", "remove_sku_from_orders", "sku:string"],
+    );
+    assert!(
+        removed.contains("WARNING: forge migrate drops these columns"),
+        "{removed}"
+    );
 
     let blank = succeeds(&root, &["g", "migration", "backfill_orders"]);
     assert!(
-        blank.contains("WARNING: fill in migrations/") && blank.contains("an empty migration is refused"),
+        blank.contains("WARNING: fill in migrations/")
+            && blank.contains("an empty migration is refused"),
         "{blank}"
     );
     let refused = fails(&root, &["g", "migration", "create_widgets", "name:string"]);
     assert!(refused.contains("forge generate model"), "{refused}");
-    let refused = fails(&root, &["g", "migration", "add_at_to_orders", "at:timestamp"]);
+    let refused = fails(
+        &root,
+        &["g", "migration", "add_at_to_orders", "at:timestamp"],
+    );
     assert!(refused.contains("at:timestamp?"), "{refused}");
 
-    let destroyed = succeeds(&root, &["d", "scaffold", "order", "total:int", "--tenant-scoped"]);
+    let destroyed = succeeds(
+        &root,
+        &["d", "scaffold", "order", "total:int", "--tenant-scoped"],
+    );
     assert!(
         destroyed.contains("  unwire       src/bootstrap/routes_gen.rs  (scaffold orders)\n"),
         "{destroyed}"
@@ -649,5 +677,8 @@ fn a_job_needs_no_queue_flag() {
     let job = succeeds(&root, &["generate", "job", "cleanup"]);
     assert!(job.contains("src/adapters/jobs/cleanup.rs"), "{job}");
     let queued = succeeds(&root, &["generate", "job", "send_welcome", "--queue"]);
-    assert!(queued.contains("src/adapters/jobs/send_welcome.rs"), "{queued}");
+    assert!(
+        queued.contains("src/adapters/jobs/send_welcome.rs"),
+        "{queued}"
+    );
 }

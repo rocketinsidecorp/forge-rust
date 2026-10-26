@@ -87,7 +87,10 @@ fn assert_back_but_shared(
 fn wired(notes: &str, edits: &[crate::wiring::Edit]) -> String {
     let mut text = notes.to_owned();
     for edit in edits {
-        text.push_str(&format!("\n{} {} ({})\n", edit.verb, edit.path, edit.detail));
+        text.push_str(&format!(
+            "\n{} {} ({})\n",
+            edit.verb, edit.path, edit.detail
+        ));
         text.push_str(edit.content.as_deref().unwrap_or_default());
     }
     text
@@ -214,7 +217,11 @@ fn a_model_is_the_scaffold_without_its_http_layer_byte_for_byte() {
         "{}",
         wired(&model.wiring, &model.edits)
     );
-    assert!(!wired(&model.wiring, &model.edits).contains("adapters::http"), "{}", wired(&model.wiring, &model.edits));
+    assert!(
+        !wired(&model.wiring, &model.edits).contains("adapters::http"),
+        "{}",
+        wired(&model.wiring, &model.edits)
+    );
 
     // A scaffold of the same plural collides; destroying the model while a
     // scaffold's pages exist is refused.
@@ -299,8 +306,7 @@ fn a_resource_is_the_model_plus_the_json_api_and_collides_with_the_others() {
         wired(&outcome.wiring, &outcome.edits)
     );
     assert!(
-        wired(&outcome.wiring, &outcome.edits)
-            .contains("forge generate authentication --api-auth")
+        wired(&outcome.wiring, &outcome.edits).contains("forge generate authentication --api-auth")
     );
     assert!(!wired(&outcome.wiring, &outcome.edits).contains("BearerTenantAccess::new"));
 
@@ -475,7 +481,10 @@ fn api_applications_get_resources_and_api_controllers_wired_deny_all() {
                 assert!(created.iter().any(|created| created == path), "{path}");
             }
             let wiring = &wired(&outcome.wiring, &outcome.edits);
-            assert!(wiring.contains("wire src/bootstrap/routes_gen.rs"), "{wiring}");
+            assert!(
+                wiring.contains("wire src/bootstrap/routes_gen.rs"),
+                "{wiring}"
+            );
             assert!(wiring.contains("api_access::DenyAll"), "{wiring}");
             assert!(!wiring.contains("BearerTenantAccess::new"), "{wiring}");
             assert!(
@@ -524,7 +533,11 @@ fn an_api_controller_is_wired_deny_all_in_an_api_application() {
             "{}",
             wired(&outcome.wiring, &outcome.edits)
         );
-        assert!(!wired(&outcome.wiring, &outcome.edits).contains("&site"), "{}", wired(&outcome.wiring, &outcome.edits));
+        assert!(
+            !wired(&outcome.wiring, &outcome.edits).contains("&site"),
+            "{}",
+            wired(&outcome.wiring, &outcome.edits)
+        );
         let after = tree(&api);
         assert_eq!(
             after
@@ -695,7 +708,9 @@ fn destroying_a_scaffold_keeps_shared_files_migrations_and_translations() {
     let http = after.remove("src/adapters/http/mod.rs").unwrap_or_default();
     let kept: String = http
         .lines()
-        .filter(|line| !["pub mod access;", "pub mod api_access;", "pub mod streams;"].contains(line))
+        .filter(|line| {
+            !["pub mod access;", "pub mod api_access;", "pub mod streams;"].contains(line)
+        })
         .map(|line| format!("{line}\n"))
         .collect();
     assert_eq!(Some(&kept), before.get("src/adapters/http/mod.rs"));
@@ -892,7 +907,11 @@ fn controllers_are_validated_and_need_a_full_stack_application() {
     let mut public = controller("pages", &["index"]);
     public.public = true;
     let outcome = controller::generate(&plain, &public).unwrap_or_else(|error| panic!("{error}"));
-    assert!(wired(&outcome.wiring, &outcome.edits).contains("WARNING"), "{}", wired(&outcome.wiring, &outcome.edits));
+    assert!(
+        wired(&outcome.wiring, &outcome.edits).contains("WARNING"),
+        "{}",
+        wired(&outcome.wiring, &outcome.edits)
+    );
     assert!(!plain.join(scaffold::ACCESS_PATH).exists());
 }
 

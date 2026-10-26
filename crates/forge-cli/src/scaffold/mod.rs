@@ -19,17 +19,17 @@ use std::process::{Command, Stdio};
 
 pub(crate) use render::Backend;
 pub(crate) use render::File;
+pub(crate) use render::column_migration;
 pub(crate) use render::{ACCESS_PATH, API_ACCESS_PATH};
 use render::{Api, Broadcast, STREAMS_PATH};
 pub(crate) use spec::Scope;
-pub(crate) use render::column_migration;
 pub(crate) use spec::{parse_columns, pascal_case, sentence_case};
 
 use crate::CliError;
 use crate::destroy::Unwire;
 use crate::generate::write_new_file;
-use crate::wiring::{self, Block, Registration};
 use crate::generators::{self, Planned, Role};
+use crate::wiring::{self, Block, Registration};
 use spec::Resource;
 
 /// Which layers of a resource a generator writes.
@@ -301,9 +301,16 @@ pub(crate) fn plan_destroy(
     let wiring = plan_wiring(&plan, options, false);
     let layers = options.layers;
     let unwire = if wiring::has_seam(root) && owned_elsewhere.is_none() {
-        Unwire::Edits(wiring::plan(root, &wiring.registration(), true, &|reason| {
-            CliError::Destroy(format!("refusing to destroy, nothing was removed: {reason}"))
-        })?)
+        Unwire::Edits(wiring::plan(
+            root,
+            &wiring.registration(),
+            true,
+            &|reason| {
+                CliError::Destroy(format!(
+                    "refusing to destroy, nothing was removed: {reason}"
+                ))
+            },
+        )?)
     } else if wiring::has_seam(root) {
         // --force removes the files only; the bigger generation keeps its
         // registrations.
@@ -466,11 +473,12 @@ fn rerun(root: &Path, migration_name: &str, files: &mut [Planned]) -> bool {
             };
         }
     }
-    let identical = generators::refuse_symlinks(root, candidate.iter().map(|file| file.path.as_str()))
-        .is_ok()
-        && candidate.iter().all(|file| {
-            fs::read(root.join(&file.path)).is_ok_and(|current| current == file.content.as_bytes())
-        });
+    let identical =
+        generators::refuse_symlinks(root, candidate.iter().map(|file| file.path.as_str())).is_ok()
+            && candidate.iter().all(|file| {
+                fs::read(root.join(&file.path))
+                    .is_ok_and(|current| current == file.content.as_bytes())
+            });
     if identical {
         files.clone_from_slice(&candidate);
     }
@@ -569,9 +577,11 @@ fn inspect(
     layers: Layers,
     purpose: Purpose,
 ) -> Result<Application, CliError> {
-    inspect_application(root, resource, broadcast, public, layers, purpose).map_err(|error| match error {
-        CliError::Scaffold(reason) => fail(layers, reason),
-        other => other,
+    inspect_application(root, resource, broadcast, public, layers, purpose).map_err(|error| {
+        match error {
+            CliError::Scaffold(reason) => fail(layers, reason),
+            other => other,
+        }
     })
 }
 
@@ -956,7 +966,8 @@ pub(crate) fn write_all(root: &Path, files: &[File]) -> Result<(), CliError> {
 /// of the permission to the `owner` role, which `forge setup` gives the
 /// first member. Declaring `fn protect` with this signature in
 /// src/bootstrap/mod.rs replaces it (to grant other roles, for example).
-const PROTECT_GUARD: &str = "    /// The guard of tenant-scoped routes: sign-in, the CSRF token on changes, a
+const PROTECT_GUARD: &str =
+    "    /// The guard of tenant-scoped routes: sign-in, the CSRF token on changes, a
     /// membership in the session's tenant, and the `owner` role (`forge setup`)
     /// granted `permissions`. Declare `fn protect` with this signature in
     /// src/bootstrap/mod.rs to grant other roles; the generators then use yours.
@@ -998,7 +1009,8 @@ const PROTECT_GUARD: &str = "    /// The guard of tenant-scoped routes: sign-in,
 /// The `public` guard of `--public` routes: everyone is let in. Declaring
 /// `fn public` with this signature in src/bootstrap/mod.rs puts the
 /// application's own authentication in front instead.
-const PUBLIC_GUARD: &str = "    /// The guard of --public routes: lets everyone in, signed in or not. Declare
+const PUBLIC_GUARD: &str =
+    "    /// The guard of --public routes: lets everyone in, signed in or not. Declare
     /// `fn public` with this signature in src/bootstrap/mod.rs to put your own
     /// authentication in front; the generators then use yours.
     pub(super) fn public(
@@ -1053,11 +1065,11 @@ impl Wiring {
             ]
             .into_iter()
             .chain(
-                    self.streams
-                        .iter()
-                        .map(|code| Block::shared("streams", "streams", code)),
-                )
-                .collect(),
+                self.streams
+                    .iter()
+                    .map(|code| Block::shared("streams", "streams", code)),
+            )
+            .collect(),
         }
     }
 

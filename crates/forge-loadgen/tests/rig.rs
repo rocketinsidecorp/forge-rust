@@ -95,7 +95,7 @@ fn serve(mut stream: TcpStream, app: &App) {
                     respond(&mut stream, "422 Unprocessable Entity", "", "no");
                 }
             }
-            post if post == "POST /posts HTTP/1.1" => {
+            "POST /posts HTTP/1.1" => {
                 if signed_in && body.starts_with(&format!("csrf_token={SESSION}&title=")) {
                     let id = app.created.fetch_add(1, Ordering::Relaxed);
                     respond(
@@ -108,7 +108,7 @@ fn serve(mut stream: TcpStream, app: &App) {
                     respond(&mut stream, "403 Forbidden", "", "no");
                 }
             }
-            get if get == "GET /posts HTTP/1.1" && signed_in => {
+            "GET /posts HTTP/1.1" if signed_in => {
                 let rows: String = (0..app.rows)
                     .map(|id| format!("<tr><td><a href=\"/posts/{id}/edit\">Edit</a></td></tr>"))
                     .collect();

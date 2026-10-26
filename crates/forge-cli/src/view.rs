@@ -197,9 +197,16 @@ pub(crate) fn plan_destroy(
         )
     });
     let unwire = if wiring::has_seam(root) && owned_elsewhere.is_none() {
-        Unwire::Edits(wiring::plan(root, &registration(&names), true, &|reason| {
-            CliError::Destroy(format!("refusing to destroy, nothing was removed: {reason}"))
-        })?)
+        Unwire::Edits(wiring::plan(
+            root,
+            &registration(&names),
+            true,
+            &|reason| {
+                CliError::Destroy(format!(
+                    "refusing to destroy, nothing was removed: {reason}"
+                ))
+            },
+        )?)
     } else if wiring::has_seam(root) {
         Unwire::Edits(Vec::new())
     } else {
