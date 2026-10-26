@@ -959,7 +959,8 @@ fn permissions_are_least_privilege_and_secrets_stay_out_of_pull_requests() {
     }
 }
 
-/// The `FROM` images of a Dockerfile (template), stage names excluded.
+/// The `FROM` images of a Dockerfile (template), stage names and flags such
+/// as `--platform` excluded.
 fn dockerfile_bases(text: &str) -> Vec<String> {
     let mut stages = Vec::new();
     let mut bases = Vec::new();
@@ -971,7 +972,12 @@ fn dockerfile_bases(text: &str) -> Vec<String> {
         {
             continue;
         }
-        let image = words.get(1).copied().unwrap_or_default();
+        let words: Vec<&str> = words
+            .into_iter()
+            .skip(1)
+            .skip_while(|word| word.starts_with("--"))
+            .collect();
+        let image = words.first().copied().unwrap_or_default();
         if !stages.iter().any(|stage| stage == image) {
             bases.push(image.to_owned());
         }
@@ -987,8 +993,10 @@ fn dockerfile_bases(text: &str) -> Vec<String> {
 
 /// What `forge new` generates runs under the same rules: its CI pins every
 /// action by commit and every service by digest and keeps no credentials,
-/// and its Dockerfile pins both base images by digest, the same digests as
-/// forge-proxy's Dockerfile (which the gate ties to rust-toolchain.toml).
+/// and its Dockerfile pins both base images by digest, the very images
+/// (repository, tag and digest) of forge-proxy's Dockerfile, which the gate
+/// ties to rust-toolchain.toml, for every database (no `FROM` depends on a
+/// template condition), so one reviewed update covers both (forge-rust#85).
 #[test]
 fn generated_application_ci_and_dockerfile_are_pinned() {
     let name = "templates/app/github/workflows/ci.yml.tmpl";
@@ -1006,11 +1014,34 @@ fn generated_application_ci_and_dockerfile_are_pinned() {
     );
 
     let proxy = dockerfile_bases(&read("crates/forge-proxy/Dockerfile"));
+    let toolchain = read("rust-toolchain.toml");
+    let rust_version = toolchain
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("channel = "))
+        .map(|channel| channel.trim_matches('"'))
+        .expect("rust-toolchain.toml names its channel");
     for file in [
         "crates/forge-cli/templates/app/Dockerfile.tmpl",
         "examples/hello-forge/Dockerfile",
     ] {
-        let bases = dockerfile_bases(&read(file));
+        let text = read(file);
+        // Every database renders the same two stages: no FROM line sits
+        // inside a template condition.
+        let mut depth = 0_usize;
+        for line in text.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("%%if ") {
+                depth += 1;
+            } else if trimmed == "%%end%%" {
+                depth = depth.saturating_sub(1);
+            } else if trimmed.to_ascii_uppercase().starts_with("FROM ") {
+                assert_eq!(
+                    depth, 0,
+                    "{file}: `{trimmed}` depends on a template condition"
+                );
+            }
+        }
+        let bases = dockerfile_bases(&text);
         assert_eq!(
             bases.len(),
             2,
@@ -1021,15 +1052,20 @@ fn generated_application_ci_and_dockerfile_are_pinned() {
                 has_digest(image),
                 "{file}: `{image}` must be pinned by digest"
             );
-            let digest = image.rsplit_once('@').map(|(_, digest)| digest);
+            // The image as Docker resolves it: RUST_VERSION is the toolchain.
+            let resolved = image.replace("${RUST_VERSION}", rust_version);
             assert!(
-                proxy
-                    .iter()
-                    .any(|pinned| pinned.rsplit_once('@').map(|(_, digest)| digest) == digest),
-                "{file}: `{image}` must use the digest of crates/forge-proxy/Dockerfile ({proxy:?})"
+                proxy.contains(&resolved),
+                "{file}: `{image}` must be one of the images crates/forge-proxy/Dockerfile pins ({proxy:?})"
             );
         }
     }
+    // The template's RUST_VERSION is rendered from the toolchain too.
+    assert!(
+        read("crates/forge-cli/templates/app/Dockerfile.tmpl")
+            .contains("ARG RUST_VERSION=%%RUST_VERSION%%"),
+        "the generated Dockerfile builds with the application's toolchain"
+    );
 
     // The generated Compose file runs the database images CI tests with,
     // pinned to the same digests; only the application's own image is local.
