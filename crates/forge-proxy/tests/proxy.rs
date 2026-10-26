@@ -776,7 +776,17 @@ async fn access_log_omits_the_query() {
         .await
         .expect("deploy");
     get(front.addr, TEST_HOST, "/reset?token=s3cr3t").await;
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // The access log line is written after the response was sent: wait for
+    // it instead of for a duration.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while !logs.text().contains("\"msg\":\"request\"") {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no request logged: {}",
+            logs.text()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     let text = logs.text();
     let entry: serde_json::Value = text
         .lines()
