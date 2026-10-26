@@ -298,11 +298,15 @@ pub(crate) fn finish_report(
         io.print(&format!("{encoded}\n"));
         return result;
     }
-    result?;
-    if let Some(report) = report {
+    // Warnings are printed on failure too: one may name a file the operator
+    // must delete by hand (a migrate env file that could not be removed).
+    if let Some(report) = &report {
         for warning in &report.warnings {
             io.print(&format!("warning: {warning}\n"));
         }
+    }
+    result?;
+    if let Some(report) = report {
         let summary = if common.dry_run {
             "dry run: nothing was changed"
         } else {

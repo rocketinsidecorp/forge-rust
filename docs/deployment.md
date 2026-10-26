@@ -797,6 +797,14 @@ their own env and are not checked. An empty `migrate.env` block, an explicit
 `env:` with no value (`null`, `~`) and `migrate.env` with `migrate.enabled:
 false` are errors.
 
+Moving the credential out of `env` into `migrate.env` does not reach the
+containers already deployed: the stopped ones kept for `forge deploy rollback`
+were created from the old env file and still hold it, and rolling back to a
+version deployed before the change starts one of them again. They age out as
+later deploys push them past `retain` (`forge deploy prune` removes them then);
+to drop them sooner, `docker rm` the stopped containers of those versions on
+each host, and do not roll back past the change.
+
 The merged environment is written to its own file,
 `~/.forge/SERVICE/env/migrate.step.env` (mode `0600`, `umask 077`, atomic
 rename, content over stdin, as for the role files), on the first host of the

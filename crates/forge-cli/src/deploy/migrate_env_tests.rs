@@ -12,7 +12,7 @@ use super::init::{CONFIG_TEMPLATE, SECRETS_TEMPLATE};
 use super::runner::{Cancel, RunError};
 use super::secrets::Secrets;
 use super::tests::{
-    Fixture, PLAN_SECRETS, VALID_CONFIG, check_golden, parse, plan_fixture_for, remote,
+    Fixture, PLAN_SECRETS, VALID_CONFIG, check_golden, common, io, parse, plan_fixture_for, remote,
 };
 use crate::process::Shutdown;
 
@@ -176,6 +176,43 @@ fn migrate_env_removal_failure_is_a_warning() {
     assert_eq!(
         warnings[0],
         "192.0.2.10: could not remove .forge/shop/env/migrate.step.env, delete it by hand: ssh: connection reset"
+    );
+}
+
+/// A failed deploy still prints the removal warning in text mode: it names
+/// the file the operator must delete by hand.
+#[test]
+fn a_removal_failure_is_printed_even_when_the_migration_fails() {
+    let fixture = fixture(false, &migrate_env_config());
+    fixture.runner.fail_with(|host, command| {
+        if command.script == REMOVE_SCRIPT {
+            return Some(RunError::Other("ssh: connection reset".to_owned()));
+        }
+        command
+            .script
+            .contains("docker run --rm")
+            .then(|| remote(host, 1, "migration 0002 failed"))
+    });
+    let (io, out, _) = io();
+    let outcome = fixture.deployer.deploy(&Cancel::never(), "v3", true);
+    let result = super::cli::finish_report(
+        &common(std::path::Path::new("/nonexistent")),
+        &io,
+        outcome,
+        "deployed v3",
+    );
+    let error = result.expect_err("migration fails");
+    assert_eq!(error.exit_code(), EXIT_MIGRATION_FAILED, "{error}");
+    let printed = out.text();
+    assert!(
+        printed.contains(
+            "warning: 192.0.2.10: could not remove .forge/shop/env/migrate.step.env, delete it by hand"
+        ),
+        "the removal warning was not printed:\n{printed}"
+    );
+    assert!(
+        !printed.contains("deployed v3"),
+        "a failed deploy printed its summary:\n{printed}"
     );
 }
 
