@@ -139,28 +139,41 @@ async fn contract(make: &Make) {
 
     // A window ends: the counters start over.
     let short = make(config(Duration::from_millis(400)));
-    let expiring = key("expiring@example.com", 5, 1);
-    let started = std::time::Instant::now();
-    for _ in 0..3 {
-        assert!(allowed(short.as_ref(), &expiring).await);
-    }
-    let decision = short.attempt(&expiring).await.expect("decides");
     // The refusal only holds inside the window (it opens at the first
     // attempt, after `started`): a store that took the whole window to answer
-    // four attempts (a loaded CI runner) may rightly have opened a new one.
-    if started.elapsed() < Duration::from_millis(400) {
+    // four attempts (a loaded CI runner) may rightly have opened a new one. It
+    // is asserted on the first attempt, each on a fresh pair, whose attempts
+    // finished inside the window; if none does, the test fails, so the
+    // assertion cannot be skipped silently.
+    let mut asserted = false;
+    for attempt in 0..5_u8 {
+        let expiring = key(&format!("expiring{attempt}@example.com"), 5 + attempt, 1);
+        let started = std::time::Instant::now();
+        for _ in 0..3 {
+            assert!(allowed(short.as_ref(), &expiring).await);
+        }
+        let decision = short.attempt(&expiring).await.expect("decides");
+        if started.elapsed() >= Duration::from_millis(400) {
+            continue;
+        }
         match decision {
             ThrottleDecision::Throttled { retry_after } => {
                 assert!(retry_after <= Duration::from_millis(400), "{retry_after:?}");
             }
             ThrottleDecision::Allowed => panic!("the pair is exhausted"),
         }
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert!(matches!(
+            short.attempt(&expiring).await.expect("decides"),
+            ThrottleDecision::Allowed
+        ));
+        asserted = true;
+        break;
     }
-    tokio::time::sleep(Duration::from_millis(600)).await;
-    assert!(matches!(
-        short.attempt(&expiring).await.expect("decides"),
-        ThrottleDecision::Allowed
-    ));
+    assert!(
+        asserted,
+        "no attempt finished its four attempts inside the 400 ms window in 5 tries"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
