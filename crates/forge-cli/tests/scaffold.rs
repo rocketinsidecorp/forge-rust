@@ -979,6 +979,7 @@ fn sign_in_use_a_tenant_scaffold_and_sign_out(root: &Path, binary: &str, url: &s
             ("FORGE_DATABASE_URL", url),
             ("FORGE_BIND", &bind),
             ("FORGE_AUTH_MFA_KEY", MFA_KEY),
+            ("FORGE_AUTH_SESSION_IDLE_TIMEOUT", "5m"),
         ],
     );
     let _server = Server(
@@ -1087,7 +1088,64 @@ fn sign_in_use_a_tenant_scaffold_and_sign_out(root: &Path, binary: &str, url: &s
     let refused = stale.request(port, "GET", &events, None);
     assert_eq!(refused.status, 303);
 
+    // FORGE_AUTH_SESSION_IDLE_TIMEOUT=5m reaches the scaffold's own session
+    // store: a session last used four minutes ago opens the tenant page, one
+    // unused for six minutes is sent to sign in (the two-hour default would
+    // still accept it).
+    let mut idle = Browser::default();
+    let signed_in = password_sign_in(&mut idle, port);
+    assert_eq!(signed_in.status, 303, "{}", signed_in.body);
+    let token = idle.cookie("__Host-forge_session").unwrap_or_default();
+    session_last_used(url, &token, 4 * 60);
+    let recent = idle.request(port, "GET", &events, None);
+    assert_eq!(recent.status, 200, "{}", recent.body);
+    session_last_used(url, &token, 6 * 60);
+    let expired = idle.request(port, "GET", &events, None);
+    assert_eq!(expired.status, 303, "{}", expired.body);
+    assert!(
+        expired
+            .header("location")
+            .is_some_and(|location| location.starts_with("/session/new")),
+        "{:?}",
+        expired.header("location")
+    );
+
     two_factor_enrol_sign_in_and_recover(port);
+}
+
+/// Moves the last use of the session whose cookie is `token` to `seconds`
+/// before the database clock (the store keys sessions by the SHA-256 of the
+/// cookie value).
+fn session_last_used(url: &str, token: &str, seconds: u32) {
+    let url = url.to_owned();
+    let token = token.to_owned();
+    let updated = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap_or_else(|error| panic!("{error}"));
+        runtime.block_on(async {
+            use forge_db::sqlx::Connection as _;
+
+            let mut connection = forge_db::sqlx::PgConnection::connect(&url)
+                .await
+                .unwrap_or_else(|error| panic!("connection: {error}"));
+            forge_db::sqlx::query(
+                "UPDATE forge_sessions
+                 SET last_seen_at = now() - make_interval(secs => $2)
+                 WHERE credential_digest = sha256(convert_to($1, 'UTF8'))",
+            )
+            .bind(token)
+            .bind(f64::from(seconds))
+            .execute(&mut connection)
+            .await
+            .unwrap_or_else(|error| panic!("{error}"))
+            .rows_affected()
+        })
+    })
+    .join()
+    .unwrap_or_else(|_| panic!("session_last_used thread panicked"));
+    assert_eq!(updated, 1, "the session exists");
 }
 
 /// `FORGE_AUTH_MFA_KEY` of the served application: 32 bytes of 0x07.

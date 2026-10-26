@@ -94,6 +94,7 @@ export FORGE_AUTH_SESSION_IDLE_TIMEOUT=30m   # shorter, for example
 (cd /tmp && forge new shop-new -d postgresql --skip-docker --skip-ci --skip-lockfile)
 cp /tmp/shop-new/migrations/00000000000000000006_forge_session_idle_timeout.*.sql migrations/
 diff -u src/infrastructure/auth/mod.rs /tmp/shop-new/src/infrastructure/auth/mod.rs   # PostgresSessionStore
+grep -n 'PostgresSessionStore::new' src/bootstrap/mod.rs   # each one, scaffold wiring included, gets .with_idle_timeout(..)
 forge migrate
 ```
 
@@ -154,10 +155,14 @@ and generated applications should port four files; see
        policy.allow(owner.clone(), permission);
    }
    let pool = composition.postgres()?.pool().clone();
+   // Sessions end after FORGE_AUTH_SESSION_IDLE_TIMEOUT without a request.
+   let sessions = crate::infrastructure::auth::PostgresSessionStore::new(pool.clone())
+       .with_idle_timeout(
+           forge::auth::SessionIdleTimeout::new(composition.config().auth.session_idle_timeout)
+               .map_err(forge::ComposeError::other)?,
+       );
    let access = crate::adapters::http::access::SessionTenantAccess::new(
-       std::sync::Arc::new(crate::infrastructure::auth::PostgresSessionStore::new(
-           pool.clone(),
-       )),
+       std::sync::Arc::new(sessions),
        std::sync::Arc::new(crate::infrastructure::tenancy::PgMembershipStore::new(pool)),
        policy,
    );

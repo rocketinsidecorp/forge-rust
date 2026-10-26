@@ -445,10 +445,14 @@ wire <<'EOF'
         policy.allow(owner.clone(), permission);
     }
     let pool = composition.postgres()?.pool().clone();
+    // Sessions end after FORGE_AUTH_SESSION_IDLE_TIMEOUT without a request.
+    let sessions = crate::infrastructure::auth::PostgresSessionStore::new(pool.clone())
+        .with_idle_timeout(
+            forge::auth::SessionIdleTimeout::new(composition.config().auth.session_idle_timeout)
+                .map_err(forge::ComposeError::other)?,
+        );
     let access = crate::adapters::http::access::SessionTenantAccess::new(
-        std::sync::Arc::new(crate::infrastructure::auth::PostgresSessionStore::new(
-            pool.clone(),
-        )),
+        std::sync::Arc::new(sessions),
         std::sync::Arc::new(crate::infrastructure::tenancy::PgMembershipStore::new(pool)),
         policy,
     );
@@ -796,7 +800,28 @@ upgrade count as used then, so nobody is signed out:
 cp /tmp/shop-new/migrations/00000000000000000006_forge_session_idle_timeout.*.sql migrations/
 diff -u src/infrastructure/auth/mod.rs /tmp/shop-new/src/infrastructure/auth/mod.rs   # PostgresSessionStore
 diff -u src/bootstrap/mod.rs /tmp/shop-new/src/bootstrap/mod.rs                       # the idle_timeout lines
+grep -n 'PostgresSessionStore::new' src/bootstrap/mod.rs                      # every store must get .with_idle_timeout
 PGOPTIONS='-c lock_timeout=5s' forge migrate   # or: cargo run -- migrate
+```
+
+Every `PostgresSessionStore` built in `fn compose` must get the timeout, not
+only the sign-in pages' one: each tenant-scoped scaffold's wiring builds its
+own store for `SessionTenantAccess`, and a store left at
+`PostgresSessionStore::new(pool.clone())` would keep the two-hour default
+whatever `FORGE_AUTH_SESSION_IDLE_TIMEOUT` says. Wiring printed by `forge
+generate scaffold` before the idle timeout becomes:
+
+```rust
+let sessions = crate::infrastructure::auth::PostgresSessionStore::new(pool.clone())
+    .with_idle_timeout(
+        forge::auth::SessionIdleTimeout::new(composition.config().auth.session_idle_timeout)
+            .map_err(forge::ComposeError::other)?,
+    );
+let access = crate::adapters::http::access::SessionTenantAccess::new(
+    std::sync::Arc::new(sessions),
+    std::sync::Arc::new(crate::infrastructure::tenancy::PgMembershipStore::new(pool)),
+    policy,
+);
 ```
 
 `ALTER TABLE ... ADD COLUMN` rewrites nothing (the default `now()` is stored

@@ -1582,6 +1582,14 @@ mod tests {
             )
             .contains("DROP COLUMN IF EXISTS last_seen_at")
         );
+        // The composition passes the configured idle timeout to the store.
+        let bootstrap = read(&root, "src/bootstrap/mod.rs");
+        if bootstrap.contains("PostgresSessionStore::new(") {
+            assert!(bootstrap.contains(".with_idle_timeout(idle_timeout)"));
+            assert!(bootstrap.contains(
+                "SessionIdleTimeout::new(composition.config().auth.session_idle_timeout)"
+            ));
+        }
         let session_store = read(&root, "src/infrastructure/auth/mod.rs");
         assert!(session_store.contains("pub fn with_idle_timeout"));
         assert!(session_store.contains("last_seen_at"));

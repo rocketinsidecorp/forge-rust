@@ -777,10 +777,14 @@ fn wiring(
              policy.allow(owner.clone(), permission);\n    \
              }}\n    \
              let pool = composition.postgres()?.pool().clone();\n    \
+             // Sessions end after FORGE_AUTH_SESSION_IDLE_TIMEOUT without a request.\n    \
+             let sessions = crate::infrastructure::auth::PostgresSessionStore::new(pool.clone())\n        \
+             .with_idle_timeout(\n            \
+             forge::auth::SessionIdleTimeout::new(composition.config().auth.session_idle_timeout)\n                \
+             .map_err(forge::ComposeError::other)?,\n        \
+             );\n    \
              let access = crate::adapters::http::access::SessionTenantAccess::new(\n        \
-             std::sync::Arc::new(crate::infrastructure::auth::PostgresSessionStore::new(\n            \
-             pool.clone(),\n        \
-             )),\n        \
+             std::sync::Arc::new(sessions),\n        \
              std::sync::Arc::new(crate::infrastructure::tenancy::PgMembershipStore::new(pool)),\n        \
              policy,\n    \
              );\n"
