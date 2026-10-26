@@ -180,6 +180,13 @@ fn validate(options: &ControllerOptions) -> Result<(), CliError> {
              names; name it `{stem}`"
         )));
     }
+    if crate::wiring::SEAM_NAMES.contains(&name.as_str()) {
+        return Err(fail(format!(
+            "controller name `{name}` names a guard, shared block or part of the generated routes \
+             seam (src/bootstrap/routes_gen.rs: {}); choose another name",
+            crate::wiring::SEAM_NAMES.join(", ")
+        )));
+    }
     if RESERVED_NAMES.contains(&name.as_str()) {
         return Err(fail(format!(
             "controller name `{name}` is a path, module or template directory the application \
@@ -517,7 +524,10 @@ fn plan(root: &Path, options: &ControllerOptions, destroy: bool) -> Result<Plan,
 /// mount its routes (with the seam's `site`), and what to know after.
 struct Parts {
     declarations: Vec<(&'static str, String)>,
+    /// The statements as the seam passes `site` (its `&Arc<Site>`).
     code: String,
+    /// The statements as `compose` passes it (`&site`).
+    printed_code: String,
     notes: String,
 }
 
@@ -546,11 +556,7 @@ impl Parts {
         out.push_str(
             "\n  2. In src/bootstrap/mod.rs, at the end of `fn compose`, before `Ok(())`:\n\n",
         );
-        let code = self
-            .code
-            .replace("composition.router(), site", "composition.router(), &site")
-            .replace("        site,\n", "        &site,\n");
-        out.push_str(&scaffold::format_statements(root, &code)?);
+        out.push_str(&scaffold::format_statements(root, &self.printed_code)?);
         out.push_str(&self.notes);
         Ok(out)
     }
@@ -571,22 +577,26 @@ fn wiring(options: &ControllerOptions, plan: &Plan, generating: bool) -> Parts {
             format!("{name}_controller"),
         ));
     }
-    let site = if options.api { "" } else { "site, " };
-    let code = if options.public {
-        format!(
-            "    // {name} controller: public (--public), anyone may call its routes.\n    \
+    let code_for = |site: &str| {
+        let site = if options.api { "" } else { site };
+        if options.public {
+            format!(
+                "    // {name} controller: public (--public), anyone may call its routes.\n    \
              crate::adapters::http::{name}_controller::routes(composition.router(), {site})?;\n"
-        )
-    } else {
-        format!(
-            "    // {name} controller: DenyAll refuses every request until you decide who may\n    \
+            )
+        } else {
+            format!(
+                "    // {name} controller: DenyAll refuses every request until you decide who may\n    \
              // read `{name}:read`: implement GlobalAccess (src/adapters/http/access.rs).\n    \
              crate::adapters::http::{name}_controller::routes(\n        \
              composition.router(),\n        \
              {site}std::sync::Arc::new(crate::adapters::http::access::DenyAll),\n    \
              )?;\n"
-        )
+            )
+        }
     };
+    let code = code_for("site, ");
+    let printed_code = code_for("&site, ");
     let routes: Vec<String> = options
         .actions
         .iter()
@@ -613,6 +623,7 @@ fn wiring(options: &ControllerOptions, plan: &Plan, generating: bool) -> Parts {
     Parts {
         declarations,
         code,
+        printed_code,
         notes,
     }
 }

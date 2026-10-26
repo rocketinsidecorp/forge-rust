@@ -32,6 +32,27 @@ pub(crate) const ROUTES_FILE: &str = "src/bootstrap/routes_gen.rs";
 /// The function [`ROUTES_FILE`] declares and `compose` calls.
 pub(crate) const ROUTES_FUNCTION: &str = "generated_routes";
 
+/// Names the seam itself uses: its guards and shared blocks (Forge-Go's
+/// too), its function, module and parameters. A resource, plural or
+/// controller of one of these names would shadow or collide with them, so
+/// the generators refuse it.
+pub(crate) const SEAM_NAMES: &[&str] = &[
+    "composition",
+    "generated_routes",
+    "guards",
+    "middleware",
+    "protect",
+    "protect_cookie",
+    "protect_platform_write",
+    "public",
+    "renderer",
+    "repository",
+    "routes_gen",
+    "signer",
+    "site",
+    "streams",
+];
+
 /// The composition root that calls the seam.
 const BOOTSTRAP_FILE: &str = "src/bootstrap/mod.rs";
 
@@ -148,7 +169,38 @@ pub(crate) fn plan(
             fail,
         )?);
     }
+    for edit in &edits {
+        refuse_stale_temporary(root, &edit.path).map_err(fail)?;
+    }
     Ok(edits)
+}
+
+/// Refuses an edit of `path` while a temporary file of an interrupted write
+/// of it is still there (`.NAME.*.tmp` beside it): a run stopped between
+/// writing and renaming, and its leftovers want a look first.
+fn refuse_stale_temporary(root: &Path, path: &str) -> Result<(), String> {
+    let full = root.join(path);
+    let (Some(directory), Some(name)) = (full.parent(), full.file_name()) else {
+        return Ok(());
+    };
+    let prefix = format!(".{}.", name.to_string_lossy());
+    let Ok(entries) = fs::read_dir(directory) else {
+        return Ok(());
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let file = entry.file_name().to_string_lossy().into_owned();
+        if file.starts_with(&prefix) && file.ends_with(".tmp") {
+            let stale = Path::new(path).parent().map_or_else(
+                || file.clone(),
+                |parent| parent.join(&file).display().to_string(),
+            );
+            return Err(format!(
+                "{stale} is left from an interrupted write of {path}; check {path}, remove the \
+                 temporary file and run the command again (nothing was written)"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// The seam `forge new` writes: no blocks. It is written as rustfmt
@@ -246,12 +298,22 @@ impl GenerateLock {
     pub(crate) fn acquire(root: &Path) -> Result<Self, CliError> {
         let path = root.join(LOCK_FILE);
         let refused = |reason: String| CliError::Refused(reason);
-        if let Some(directory) = path.parent() {
-            fs::create_dir_all(directory).map_err(|source| CliError::CreateDirectory {
-                path: directory.to_path_buf(),
-                source,
-            })?;
+        let directory = root.join(".forge");
+        // The lock is taken in the application, never through a link.
+        if fs::symlink_metadata(&directory).is_ok_and(|metadata| !metadata.is_dir()) {
+            return Err(refused(
+                ".forge is a symlink or a file, not a directory: generators take their lock in \
+                 .forge/ and refuse to do it elsewhere, so nothing was written"
+                    .to_owned(),
+            ));
         }
+        // An existing .forge/ (deploy secrets live there too) is kept as it is.
+        fs::create_dir_all(&directory).map_err(|error| {
+            refused(format!(
+                "could not create .forge/ for the generators' lock ({error}), so nothing was \
+                 written"
+            ))
+        })?;
         match fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -267,7 +329,10 @@ impl GenerateLock {
                  ({LOCK_FILE} exists), so nothing was written. Run the command again when it \
                  ends; if none is running, remove {LOCK_FILE}"
             ))),
-            Err(source) => Err(CliError::WriteFile { path, source }),
+            // Never an unlocked run.
+            Err(error) => Err(refused(format!(
+                "could not take the generators' lock {LOCK_FILE} ({error}), so nothing was written"
+            ))),
         }
     }
 }

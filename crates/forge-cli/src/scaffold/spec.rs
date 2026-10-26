@@ -251,6 +251,13 @@ pub(crate) fn parse(
         }
     };
     for name in [&singular, &plural] {
+        if crate::wiring::SEAM_NAMES.contains(&name.as_str()) {
+            return invalid(format!(
+                "`{name}` names a guard, shared block or part of the generated routes seam \
+                 (src/bootstrap/routes_gen.rs: {}); choose another resource name or --plural",
+                crate::wiring::SEAM_NAMES.join(", ")
+            ));
+        }
         if RESERVED_LOCALS.contains(&name.as_str()) {
             return invalid(format!(
                 "`{name}` names a variable of the generated code; choose another resource name \
@@ -614,6 +621,26 @@ mod tests {
             "forge_posts",
         ] {
             let _ = reason("thing", &["a:string"], Some(plural));
+        }
+    }
+
+    /// The seam's own names (its guards, shared blocks, function, module and
+    /// parameters) are never a resource or plural: `--plural protect` would
+    /// shadow the guard of the routes (Forge-Go's review found such a
+    /// collision turning a guard off).
+    #[test]
+    fn rejects_the_names_of_the_routes_seam() {
+        for name in crate::wiring::SEAM_NAMES {
+            let as_name = parse(name, &["a:string".to_owned()], Scope::Global, None)
+                .err()
+                .map(|error| error.to_string())
+                .unwrap_or_default();
+            assert!(!as_name.is_empty(), "{name} is refused as a resource name");
+            let as_plural = parse("thing", &["a:string".to_owned()], Scope::Global, Some(name))
+                .err()
+                .map(|error| error.to_string())
+                .unwrap_or_default();
+            assert!(as_plural.contains("routes seam"), "{name}: {as_plural}");
         }
     }
 

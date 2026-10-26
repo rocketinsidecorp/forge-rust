@@ -966,12 +966,15 @@ pub(crate) fn write_all(root: &Path, files: &[File]) -> Result<(), CliError> {
 /// of the permission to the `owner` role, which `forge setup` gives the
 /// first member. Declaring `fn protect` with this signature in
 /// src/bootstrap/mod.rs replaces it (to grant other roles, for example).
-const PROTECT_GUARD: &str =
+const PROTECT_GUARD_DOC: &str =
     "    /// The guard of tenant-scoped routes: sign-in, the CSRF token on changes, a
     /// membership in the session's tenant, and the `owner` role (`forge setup`)
     /// granted `permissions`. Declare `fn protect` with this signature in
     /// src/bootstrap/mod.rs to grant other roles; the generators then use yours.
-    pub(super) fn protect(
+";
+
+/// The rest of the guard, from `fn`.
+const PROTECT_GUARD_ITEM: &str = "fn protect(
         composition: &mut forge::Composition<'_>,
         permissions: &[&str],
     ) -> Result<
@@ -1009,11 +1012,14 @@ const PROTECT_GUARD: &str =
 /// The `public` guard of `--public` routes: everyone is let in. Declaring
 /// `fn public` with this signature in src/bootstrap/mod.rs puts the
 /// application's own authentication in front instead.
-const PUBLIC_GUARD: &str =
+const PUBLIC_GUARD_DOC: &str =
     "    /// The guard of --public routes: lets everyone in, signed in or not. Declare
     /// `fn public` with this signature in src/bootstrap/mod.rs to put your own
     /// authentication in front; the generators then use yours.
-    pub(super) fn public(
+";
+
+/// The rest of the guard, from `fn`.
+const PUBLIC_GUARD_ITEM: &str = "fn public(
         _permissions: &[&str],
     ) -> std::sync::Arc<
         impl crate::adapters::http::access::GlobalAccess
@@ -1024,8 +1030,29 @@ const PUBLIC_GUARD: &str =
     }
 ";
 
-/// The `site` argument as the seam passes it (`&Arc<Site>` already).
-const SITE_ARGUMENT: &str = "        site,\n";
+/// A guard as a module-level function of the seam's `mod guards`
+/// (`pub(super) `), or as a function inside `compose` for the printed
+/// wiring (`""`).
+fn guard_code(doc: &str, item: &str, visibility: &str) -> String {
+    format!("{doc}    {visibility}{item}")
+}
+
+/// The `site` argument of the pages' `routes`: the seam passes its
+/// `&Arc<Site>` parameter as it is, `compose` borrows its local.
+#[derive(Clone, Copy)]
+enum Site {
+    Seam,
+    Compose,
+}
+
+impl Site {
+    fn argument(self) -> &'static str {
+        match self {
+            Self::Seam => "site",
+            Self::Compose => "&site",
+        }
+    }
+}
 
 /// What a generation wires: the module declarations and the statements that
 /// build its service and mount its routes.
@@ -1037,8 +1064,12 @@ struct Wiring {
     access: String,
     /// The live-update transport, once for every broadcasting resource.
     streams: Option<String>,
-    /// The service and its routes (for a model, how to build the service).
+    /// The guard the access statements call, if any.
+    guard: Option<&'static str>,
+    /// The service and its routes (for a model, how to build the service),
+    /// as the seam and as `compose` pass the site.
     service: String,
+    printed_service: String,
     /// What to know once it is wired.
     notes: String,
 }
@@ -1060,8 +1091,16 @@ impl Wiring {
                 )
             }),
             shared: [
-                Block::shared("guard", "protect", PROTECT_GUARD),
-                Block::shared("guard", "public", PUBLIC_GUARD),
+                Block::shared(
+                    "guard",
+                    "protect",
+                    &guard_code(PROTECT_GUARD_DOC, PROTECT_GUARD_ITEM, "pub(super) "),
+                ),
+                Block::shared(
+                    "guard",
+                    "public",
+                    &guard_code(PUBLIC_GUARD_DOC, PUBLIC_GUARD_ITEM, "pub(super) "),
+                ),
             ]
             .into_iter()
             .chain(
@@ -1096,18 +1135,17 @@ impl Wiring {
             );
         }
         // Pasted into `compose`, a guard is a function inside it.
-        let guard = [("protect(", PROTECT_GUARD), ("public(", PUBLIC_GUARD)]
-            .into_iter()
-            .find(|(call, _)| self.access.contains(call))
-            .map(|(_, guard)| guard.replace("pub(super) fn", "fn"))
-            .unwrap_or_default();
+        let guard = match self.guard {
+            Some("protect") => guard_code(PROTECT_GUARD_DOC, PROTECT_GUARD_ITEM, ""),
+            Some("public") => guard_code(PUBLIC_GUARD_DOC, PUBLIC_GUARD_ITEM, ""),
+            _ => String::new(),
+        };
         let code = format!(
             "{guard}{}{}{}",
             self.access,
             self.streams.as_deref().unwrap_or_default(),
-            self.service
-        )
-        .replace(SITE_ARGUMENT, "        &site,\n");
+            self.printed_service
+        );
         out.push_str(&format_statements(root, &code)?);
         out.push_str(&self.notes);
         if model {
@@ -1205,7 +1243,9 @@ fn model_wiring(resource: &Resource, backend: Backend) -> Wiring {
         declarations: model_declarations(resource),
         access: String::new(),
         streams: None,
+        guard: None,
         service: service_statement(resource, backend),
+        printed_service: service_statement(resource, backend),
         notes,
     }
 }
@@ -1322,18 +1362,29 @@ fn wiring(
     } else {
         ""
     };
-    let mut service = service_statement(resource, backend);
-    // The JSON API shares the service.
-    service.push_str(&format!(
-        "    crate::adapters::http::{plural}::routes(\n        \
-         composition.router(),\n\
-         {SITE_ARGUMENT}        \
-         {plural}.clone(),\n        \
-         {pages_access},\n\
-         {streams_argument}    \
-         )?;\n"
-    ));
-    service.push_str(&api_statements(resource, application, true, public));
+    let service_for = |site: Site| {
+        let mut service = service_statement(resource, backend);
+        // The JSON API shares the service.
+        service.push_str(&format!(
+            "    crate::adapters::http::{plural}::routes(\n        \
+             composition.router(),\n        \
+             {},\n        \
+             {plural}.clone(),\n        \
+             {pages_access},\n\
+             {streams_argument}    \
+             )?;\n",
+            site.argument()
+        ));
+        service.push_str(&api_statements(resource, application, true, public));
+        service
+    };
+    let guard = if !tenant && public {
+        Some("public")
+    } else if tenant && backend == Backend::Postgresql {
+        Some("protect")
+    } else {
+        None
+    };
 
     let mut notes = format!(
         "\n  Every route asks the access policy for `{plural}:read` or `{plural}:write`\n  \
@@ -1369,7 +1420,9 @@ fn wiring(
         declarations,
         access,
         streams,
-        service,
+        guard,
+        service: service_for(Site::Seam),
+        printed_service: service_for(Site::Compose),
         notes,
     }
 }
@@ -1408,6 +1461,8 @@ fn resource_wiring(
         declarations,
         access: String::new(),
         streams: None,
+        guard: None,
+        printed_service: service.clone(),
         service,
         notes,
     }

@@ -185,6 +185,7 @@ fn run_quickstart(
     parent: &Path,
     new_flags: &[&str],
     database: &mut dyn FnMut(&Path),
+    extra: &[&[&str]],
 ) -> (PathBuf, Dev, u16) {
     let forge_path = workspace().join("crates/forge");
     let forge_path = forge_path.to_string_lossy().into_owned();
@@ -241,6 +242,14 @@ fn run_quickstart(
                 "{line} asks for a manual edit:\n{printed}"
             );
         }
+    }
+    // Generators run after the Quickstart's, before `forge dev`.
+    for arguments in extra {
+        let output = forge(&root, arguments)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap_or_else(|error| panic!("{arguments:?}: {error}"));
+        assert!(output.status.success(), "{arguments:?}: {output:?}");
     }
     let (dev, port) = Dev::start(&root, &["dev"]);
     (root, dev, port)
@@ -492,23 +501,32 @@ fn readme_quickstart_postgresql() {
         .unwrap_or_else(|error| panic!("{error}"));
     let parent = tempfile::tempdir().unwrap_or_else(|error| panic!("{error}"));
     let mut databases = Vec::new();
-    let (_root, _dev, port) = run_quickstart(parent.path(), &[], &mut |root| {
-        // `docker compose up -d --wait db`: a database with the migration
-        // and runtime roles of docker/postgres/init.sql.
-        let database = runtime
-            .block_on(RlsTestDatabase::create(std::iter::empty()))
-            .unwrap_or_else(|error| panic!("FORGE_TEST_DATABASE_URL: {error}"));
-        fs::write(
-            root.join(".env.local"),
-            format!(
-                "FORGE_DATABASE_URL={}\nFORGE_MIGRATION_DATABASE_URL={}\n",
-                database.runtime_url().expose(),
-                database.migrator_url().expose()
-            ),
-        )
-        .unwrap_or_else(|error| panic!("{error}"));
-        databases.push(database);
-    });
+    // A global resource next to the Quickstart's: in an application with
+    // Forge identity it stays closed (403) to everyone, the owner too.
+    let notes: &[&str] = &["g", "scaffold", "note", "body:text", "--global"];
+    let migrate: &[&str] = &["migrate"];
+    let (_root, _dev, port) = run_quickstart(
+        parent.path(),
+        &[],
+        &mut |root| {
+            // `docker compose up -d --wait db`: a database with the migration
+            // and runtime roles of docker/postgres/init.sql.
+            let database = runtime
+                .block_on(RlsTestDatabase::create(std::iter::empty()))
+                .unwrap_or_else(|error| panic!("FORGE_TEST_DATABASE_URL: {error}"));
+            fs::write(
+                root.join(".env.local"),
+                format!(
+                    "FORGE_DATABASE_URL={}\nFORGE_MIGRATION_DATABASE_URL={}\n",
+                    database.runtime_url().expose(),
+                    database.migrator_url().expose()
+                ),
+            )
+            .unwrap_or_else(|error| panic!("{error}"));
+            databases.push(database);
+        },
+        &[notes, migrate],
+    );
     assert_eq!(databases.len(), 1, "the Quickstart starts the database");
 
     let mut client = Client::new(port);
@@ -547,15 +565,27 @@ fn readme_quickstart_postgresql() {
 
     crud(&mut client);
     json_api(&mut client, true);
+
+    // Never public by accident: the global resource refuses reads and
+    // writes, through the forms and the JSON API alike.
+    assert_eq!(client.page("/notes").status, 403);
+    let token = client.csrf();
+    let write = client.form("/notes", &[("csrf_token", &token), ("body", "mine")]);
+    assert_eq!(write.status, 403, "{}", write.body);
+    let api = client.json("POST", "/v1/notes", r#"{"body":"mine"}"#, true);
+    assert_eq!(api.status, 403, "{}", api.body);
 }
 
 #[test]
 #[ignore = "slow: builds a generated application"]
 fn readme_quickstart_sqlite3() {
     let parent = tempfile::tempdir().unwrap_or_else(|error| panic!("{error}"));
-    let (_root, _dev, port) = run_quickstart(parent.path(), &["-d", "sqlite3"], &mut |_| {
-        panic!("a SQLite Quickstart starts no database server")
-    });
+    let (_root, _dev, port) = run_quickstart(
+        parent.path(),
+        &["-d", "sqlite3"],
+        &mut |_| panic!("a SQLite Quickstart starts no database server"),
+        &[],
+    );
     let mut client = Client::new(port);
     // --public: no sign-in, the forms still need their CSRF token.
     crud(&mut client);

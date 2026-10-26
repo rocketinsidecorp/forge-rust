@@ -546,6 +546,73 @@ fn report_lists_each_edit_and_dry_runs_say_would() {
 }
 
 #[test]
+fn concurrent_generators_get_the_lock_one_at_a_time() {
+    for _ in 0..100 {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let root = directory.path().to_path_buf();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let root = root.clone();
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    GenerateLock::acquire(&root).ok()
+                })
+            })
+            .collect();
+        let locks: Vec<GenerateLock> = threads
+            .into_iter()
+            .filter_map(|thread| thread.join().expect("thread"))
+            .collect();
+        assert_eq!(locks.len(), 1, "exactly one run holds the lock");
+        drop(locks);
+        assert!(!root.join(LOCK_FILE).exists());
+        assert!(root.join(".forge").is_dir(), ".forge/ itself is kept");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn the_lock_is_never_taken_through_a_symlinked_forge_directory() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let elsewhere = tempfile::tempdir().expect("temporary directory");
+    std::os::unix::fs::symlink(elsewhere.path(), directory.path().join(".forge")).expect("symlink");
+    let error = GenerateLock::acquire(directory.path())
+        .expect_err("refused")
+        .to_string();
+    assert!(error.contains("symlink"), "{error}");
+    assert!(!elsewhere.path().join("generate.lock").exists());
+}
+
+#[test]
+fn a_temporary_file_left_by_an_interrupted_write_is_refused() {
+    let directory = application(true);
+    let root = directory.path();
+    let stale = root.join("src/bootstrap/.routes_gen.rs.0123456789abcdef.tmp");
+    fs::write(&stale, "half").expect("write");
+    let error = plan(root, &products(), false, &fail)
+        .expect_err("refused")
+        .to_string();
+    assert!(error.contains("interrupted write"), "{error}");
+    fs::remove_file(&stale).expect("remove");
+    assert!(plan(root, &products(), false, &fail).is_ok());
+}
+
+#[cfg(unix)]
+#[test]
+fn an_edited_file_keeps_its_mode() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let directory = application(true);
+    let root = directory.path();
+    let path = root.join("src/domain/entities/mod.rs");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("chmod");
+    wire(root, &products(), false);
+    let mode = fs::metadata(&path).expect("metadata").permissions().mode() & 0o777;
+    assert_eq!(mode, 0o644);
+}
+
+#[test]
 fn one_generator_at_a_time_holds_the_lock() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let root = directory.path();
