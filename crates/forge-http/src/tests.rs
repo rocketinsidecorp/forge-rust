@@ -330,15 +330,18 @@ fn reference_is_invalid_path(path: &str) -> bool {
 
 #[test]
 fn the_invalid_path_rule_agrees_with_its_reference_on_every_short_path() {
-    // Every string of up to five characters over the characters that matter:
-    // separators, dots, escape starts, the digits and letters of %2f, %5c and
-    // %2e in both cases, a backslash, and one that matters to none.
-    const ALPHABET: [char; 12] = ['/', '.', '%', '2', '5', 'e', 'E', 'f', 'F', 'c', '\\', 'a'];
+    // Every string of up to five characters (about 800 000 paths) over the
+    // characters that matter: separators, dots, escape starts, the digits and
+    // letters of %2f, %5c and %2e in both cases, a backslash, and characters
+    // that matter to none (an ASCII letter and a multi-byte one).
+    const ALPHABET: [char; 15] = [
+        '/', '.', '%', '2', '5', 'e', 'E', 'f', 'F', 'c', 'C', '\\', 'a', 'z', '\u{e9}',
+    ];
     let mut path = String::new();
     let mut checked = 0_u32;
     let mut digits = Vec::new();
     for length in 0..=5_usize {
-        // An odometer over `length` base-12 digits.
+        // An odometer over `length` base-15 digits.
         digits.clear();
         digits.resize(length, 0_usize);
         loop {
@@ -360,7 +363,7 @@ fn the_invalid_path_rule_agrees_with_its_reference_on_every_short_path() {
             }
         }
     }
-    assert!(checked > 250_000, "{checked}");
+    assert!(checked > 800_000, "{checked}");
     for refused in [
         "/a/./b", "/a/..", "/%2e/x", "/%2E%2e", "/%2e%2E", "/a%2Fb", "/a%5cb", "/a\\b",
     ] {
