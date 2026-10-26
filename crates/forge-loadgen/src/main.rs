@@ -11,8 +11,8 @@
 //! warm-up has passed. Scenarios are measured in rounds, interleaved, so a
 //! slow drift of the host affects every scenario alike.
 //!
-//! Forge-Go's flags are the same, plus `-tenant-id`: a Forge-Rust scaffold
-//! lives under `/tenants/{tenant_id}/...`, and `forge setup` prints the id.
+//! Forge-Go's flags are the same, plus `-tenant-id` (`forge setup` prints
+//! the id): the tenant cookie of the session, when sign-in sets none.
 
 mod http;
 mod report;
@@ -46,7 +46,7 @@ pub struct Config {
 const USAGE: &str = "usage: loadgen -tenant-id UUID [flags]   (the owner's password is read from $BENCH_PASSWORD)
 
   -base URL          base URL of the application (default http://127.0.0.1:8080)
-  -collection NAME   plural name of the scaffolded resource (HTML /tenants/ID/NAME; fields title and body) (default posts)
+  -collection NAME   plural name of the scaffolded resource (HTML /NAME; fields title and body) (default posts)
   -tenant SLUG       tenant slug to sign in to (default bench)
   -tenant-id UUID    id of that tenant, as `setup` prints it (required)
   -email ADDRESS     email of the owner account (default bench@example.com)
