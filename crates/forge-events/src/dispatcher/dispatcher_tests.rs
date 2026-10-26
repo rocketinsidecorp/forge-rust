@@ -5,12 +5,13 @@ use super::*;
 #[test]
 fn defaults_are_the_documented_ones() {
     let settings = DispatcherSettings::default();
-    assert_eq!(settings.batch, 50);
+    assert_eq!(settings.batch, 10);
     assert_eq!(settings.poll_interval, Duration::from_secs(1));
     assert_eq!(settings.publish_timeout, Duration::from_secs(10));
     assert_eq!(settings.max_attempts, 20);
     assert_eq!(settings.backoff, Backoff::DEFAULT);
-    assert_eq!(settings.lease(), Duration::from_secs(530));
+    // Ten 10 s publications plus 30 s.
+    assert_eq!(settings.lease(), Duration::from_secs(130));
 }
 
 #[test]

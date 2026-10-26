@@ -3,6 +3,7 @@
 - Status: Accepted
 - Date: 2026-10-19
 - Refines: [ADR 0006](0006-tokio-and-supervised-concurrency.md), [ADR 0011](0011-postgresql-runtime-migration-roles-and-rls-context.md), [ADR 0021](0021-selectable-database-backends.md)
+- Refined by: [ADR 0046](0046-job-wake-up-and-claim-batches.md) (opt-in `LISTEN/NOTIFY` wake-up, worker claim batches, outbox batch default 10)
 
 ## Context
 

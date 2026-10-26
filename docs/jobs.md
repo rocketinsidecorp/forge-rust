@@ -223,6 +223,66 @@ lease can expire, and aborted after `cancel_grace` if it ignores the
 cancellation, so it never runs alongside a reclaimed copy for long nor keeps
 its concurrency slot until `TIMEOUT`.
 
+**Claim batches.** A claim leases up to `batch` jobs of a queue in one
+statement (`WorkerSettings::batch`, default 10, 1 to 100; Forge-Go's
+`BatchSize`), but never more than the queue's free slots, so every claimed job
+starts at once. A full batch is followed by another claim at once while slots
+remain; `batch(1)` claims one job per round trip.
+
+**Wake-up (`LISTEN/NOTIFY`, opt-in).** `App::jobs_notify(true)` (or
+`FORGE_JOBS_NOTIFY=true`, which overrides it per deployment; Forge-Go's
+`queuepostgres.WithNotify()`) makes every due job announce itself on the
+`forge_jobs` channel (payload: its queue) when its transaction commits, and
+`serve`/`jobs work` hold one `LISTEN` connection: an idle worker claims a new
+job within milliseconds instead of at its next poll. Each announcement wakes
+the queue's worker once (announcements merge while it is busy; at most one
+woken claim per 10 ms), and every (re)subscription claims each queue once.
+Polling stays on, so a lost announcement only delays a job to the next poll;
+jobs due later, retries and released jobs are found by polling. The listener
+reconnects after a jittered 0.5 s to 1 s, doubling to 15 s to 30 s, and logs
+`listening for job announcements` and each disconnect.
+
+```rust
+forge::App::new("shop")
+    .postgres(sqlx::migrate!())
+    .jobs(forge::WorkerMode::InServe)
+    .jobs_notify(true) // enqueues announce due jobs; workers LISTEN
+    // ...
+```
+
+```sh
+FORGE_JOBS_NOTIFY=true cargo run -- serve      # or false; unset keeps App::jobs_notify
+FORGE_JOBS_NOTIFY=true cargo run -- jobs work
+```
+
+```rust
+composition.jobs()?.settings(
+    forge::jobs::WorkerSettings::default()
+        .batch(10)                                         // jobs per claim (1 to 100)
+        .poll_interval(std::time::Duration::from_secs(5)), // the fallback poll
+);
+```
+
+Forge applies the switch itself; it is not a database URL or `PGOPTIONS`
+setting. With it on, every connection of the application's pool sets the
+session setting `forge.jobs_notify = on`, which the `forge_jobs_announce`
+trigger reads, so every enqueue through that pool announces:
+`forge::jobs::postgres::enqueue`, `enqueue_for_tenant` and schedule ticks.
+Without `forge::App`, the same switch is `PgJobStore::notify(true)` (its
+`enqueue`, `enqueue_in`, `enqueue_for_tenant_in` and schedule ticks set the
+setting for their own transaction, and `Jobs::run` on it listens) plus
+`forge::db::PoolSettings::with_job_announcements(true)` on a pool that the
+free `enqueue` functions use.
+
+Costs of the wake-up: one extra connection per job runtime (outside the
+pool's `FORGE_DATABASE_MAX_CONNS`); `LISTEN` needs a direct connection or
+session pooling, not PgBouncer transaction pooling, and behind such a pooler
+the pool's session setting is not reliable either (`PgJobStore::enqueue_in`
+sets it per transaction); and PostgreSQL serializes the commits of
+notifying transactions, which matters only at thousands of enqueues per
+second. Anyone who can `NOTIFY` on the database can wake workers, which then
+claim once. Design: [ADR 0046](adr/0046-job-wake-up-and-claim-batches.md).
+
 ## Failures and dead jobs
 
 | Outcome | Result |
@@ -299,9 +359,17 @@ composition.events()?.publish_to(subscribers);
 
 The dispatcher publishes committed events in id order (best effort; retries
 and concurrent dispatchers can reorder), with a per-event timeout, retries
-with backoff (default 20 attempts) and a dead state. Any broker adapter can
-implement `EventPublisher` instead. Two consequences of `Subscribers` that a
-consumer must design for:
+with backoff (default 20 attempts) and a dead state. It claims
+`DispatcherSettings::batch` events per transaction (default 10, 1 to 1000,
+like Forge-Go's `DispatcherOptions.BatchSize`) and publishes them one after
+another, so a slow subscriber holds up the rest of its batch:
+
+```rust
+composition.events()?.settings(forge::events::DispatcherSettings::default().batch(10));
+```
+
+Any broker adapter can implement `EventPublisher` instead. Two consequences
+of `Subscribers` that a consumer must design for:
 
 - **A retry re-runs every subscriber.** Delivery state is tracked per event,
   not per subscriber: when one subscriber of a type fails, the whole event is
@@ -386,12 +454,12 @@ They run as a non-superuser, non-owner runtime role created per test
 transactional enqueue, many concurrent workers without double execution,
 lease expiry and fencing, retries and dead jobs, timeouts, panics, graceful
 drain, exactly-once schedule ticks across two runtimes, RLS tenant isolation,
-outbox atomicity and consumer idempotency.
+enqueue announcements, the wake-up, listener reconnection and shutdown, claim
+batches, outbox atomicity and consumer idempotency.
 
 ## Limits and follow-ups
 
 - Tenant jobs do not re-check membership at execution time (ADR 0025).
-- Polling only; `LISTEN/NOTIFY` wake-ups are not implemented.
 - No per-key concurrency limits or rate limits yet; use queues and their
   concurrency.
 - `forge new` wires the job queue but not the outbox (`App::events`), and
