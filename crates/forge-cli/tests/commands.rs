@@ -189,6 +189,87 @@ fn every_generator_lists_its_files_and_prints_its_wiring() {
     );
 }
 
+/// Forge-Go re-runs `go mod vendor` after `forge generate`, because what it
+/// generates can import framework packages the vendor directory lacks.
+/// Forge-Rust has no such step (forge-rust#77): `forge new` sets up no
+/// vendoring, and a generator never edits `Cargo.toml`, `Cargo.lock` or
+/// `.cargo/config.toml` and writes only code for crates the manifest already
+/// declares, so an application vendored with `cargo vendor` has nothing to
+/// re-vendor. This keeps that true for every generator.
+#[test]
+fn generators_leave_the_manifest_lockfile_and_vendored_dependencies_alone() {
+    let (_parent, root) = application();
+    let sentinels = [
+        ("Cargo.lock", "# a lockfile\n"),
+        (
+            ".cargo/config.toml",
+            "[source.crates-io]\nreplace-with = \"vendored-sources\"\n",
+        ),
+        ("vendor/example/src/lib.rs", "// vendored\n"),
+    ];
+    for (path, content) in sentinels {
+        let path = root.join(path);
+        fs::create_dir_all(path.parent().expect("a parent")).expect("directory");
+        fs::write(path, content).expect("sentinel");
+    }
+    let guarded = [
+        "Cargo.toml",
+        "Cargo.lock",
+        ".cargo/config.toml",
+        "vendor/example/src/lib.rs",
+    ];
+    let snapshot = || -> Vec<String> {
+        guarded
+            .iter()
+            .map(|path| fs::read_to_string(root.join(path)).expect("guarded file"))
+            .collect()
+    };
+    let before = snapshot();
+
+    for arguments in [
+        &[
+            "generate",
+            "scaffold",
+            "post",
+            "title:string",
+            "--global",
+            "--broadcast",
+        ][..],
+        &[
+            "generate",
+            "scaffold",
+            "note",
+            "body:text",
+            "--tenant-scoped",
+        ],
+        &[
+            "generate",
+            "model",
+            "comment",
+            "body:text",
+            "--tenant-scoped",
+        ],
+        &["generate", "controller", "pages", "index"],
+        &["generate", "mailer", "user", "welcome:name"],
+        &["generate", "job", "send_welcome", "user_id:uuid", "--queue"],
+        &["generate", "migration", "add_things"],
+    ] {
+        let output = forge(&root, arguments);
+        assert!(
+            output.status.success(),
+            "{arguments:?}: {}",
+            stderr(&output)
+        );
+        assert_eq!(snapshot(), before, "{arguments:?} changed a guarded file");
+        assert!(!stdout(&output).contains("vendor"), "{arguments:?}");
+    }
+    // Nothing else appeared under the guarded directories either.
+    let vendored: Vec<_> = fs::read_dir(root.join("vendor"))
+        .expect("vendor directory")
+        .collect();
+    assert_eq!(vendored.len(), 1);
+}
+
 #[test]
 fn destroy_takes_back_what_each_generator_wrote() {
     let (_parent, root) = application();
