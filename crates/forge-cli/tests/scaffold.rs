@@ -1825,14 +1825,21 @@ fn postgresql_application_lists_every_route_with_forge_routes() {
     }
     run(&root, "cargo", &["generate-lockfile", "--quiet"], &[]);
 
-    // The application composes with the configuration `serve` needs.
+    // The application composes with the configuration `serve` needs: without
+    // the generated `.env.development` there is no database URL to use.
+    let env_file = root.join(".env.development");
+    let parked = root.join(".env.development.parked");
+    std::fs::rename(&env_file, &parked).unwrap_or_else(|error| panic!("{error}"));
     let refused = run_unchecked(&root, forge, &["routes"], &[], None);
+    std::fs::rename(&parked, &env_file).unwrap_or_else(|error| panic!("{error}"));
     assert!(!refused.status.success());
     assert!(
         String::from_utf8_lossy(&refused.stderr).contains("FORGE_DATABASE_URL"),
         "{}",
         String::from_utf8_lossy(&refused.stderr)
     );
+    // With the file back, `forge routes` takes the URL from it.
+    stdout(&run(&root, forge, &["routes"], &[]));
     let environment = [(
         "FORGE_DATABASE_URL",
         "postgres://app:secret@127.0.0.1:1/routes",
