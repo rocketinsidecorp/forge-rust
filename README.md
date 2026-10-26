@@ -236,6 +236,8 @@ tokens for API clients, bound to the tenant named at sign-in), and
 
 ```sh
 forge new shop --api-auth && cd shop
+docker compose up -d db
+forge db prepare                                      # create and migrate the database
 forge setup --tenant acme --email owner@example.com   # the owner; password prompted
 forge generate resource product name:string 'summary:text?' price_cents:integer --tenant-scoped
 # add the printed `pub mod` lines, and the statements at the end of `fn compose`
