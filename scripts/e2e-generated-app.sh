@@ -402,13 +402,26 @@ for _ in 1 2 3 4 5; do
   fi
   env "${env_args[@]}" FORGE_HTTP_ADDR="127.0.0.1:0" "$app_bin" >"$app_log" 2>&1 &
   server_pid=$!
-  for _ in $(seq 1 100); do
+  exited=0
+  for _ in $(seq 1 600); do
     port="$(sed -n 's/.*forge::app: listening app=.*address=127\.0\.0\.1:\([0-9][0-9]*\)[^0-9].*/\1/p' "$app_log" | head -n 1)"
     [[ -n "$port" ]] && break
-    kill -0 "$server_pid" 2>/dev/null || break
+    if ! kill -0 "$server_pid" 2>/dev/null; then
+      exited=1
+      break
+    fi
     sleep 0.1
   done
   [[ -n "$port" ]] && break
+  if [[ "$exited" == 0 ]]; then
+    # Alive but silent for 60 s: waiting for it would hang the job.
+    kill -KILL "$server_pid" 2>/dev/null || true
+    wait "$server_pid" 2>/dev/null || true
+    server_pid=""
+    cat "$app_log" >&2
+    fail "the application is running but did not report where it listens within 60 s"
+  fi
+  # It exited before reporting (a lost metrics port race): try another port.
   wait "$server_pid" 2>/dev/null || true
   server_pid=""
 done
