@@ -520,6 +520,7 @@ fn logs(dir: &Path, args: &[String]) -> ExitCode {
         return ExitCode::SUCCESS;
     }
     loop {
+        // real-clock: stands in for a docker follow stream that never ends; the test kills the process
         std::thread::sleep(std::time::Duration::from_secs(3600));
     }
 }

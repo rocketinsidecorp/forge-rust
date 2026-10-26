@@ -222,10 +222,12 @@ pub async fn post_chunked(
             {
                 return;
             }
+            // real-clock: paces the chunks of a real streamed request body
             tokio::time::sleep(pause).await;
         }
         let _ = writer.write_all(b"0\r\n\r\n").await;
         // Keep the write side open until the response arrives.
+        // real-clock: keeps the write side open until the response arrives; the task is aborted afterwards
         tokio::time::sleep(Duration::from_secs(5)).await;
     });
     let mut response = Vec::new();

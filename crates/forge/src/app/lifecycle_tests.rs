@@ -193,6 +193,7 @@ pub(super) fn wait_until_serving(running: &Running, port: u16, path: &str) -> Re
         assert!(!running.is_finished(), "the process exited before serving");
         match request(port, "GET", path) {
             Ok(reply) => return reply,
+            // real-clock: polls a real TCP listener or connection, which a fake clock cannot advance, until a deadline
             Err(_) if StdInstant::now() < deadline => thread::sleep(Duration::from_millis(10)),
             Err(error) => panic!("nothing answered on port {port}: {error}"),
         }

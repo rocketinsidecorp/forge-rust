@@ -668,6 +668,7 @@ async fn acme_obtains_caches_and_reuses_a_certificate() {
             tokio::time::Instant::now() < deadline,
             "no certificate obtained"
         );
+        // real-clock: polls a real TCP listener or connection, which a fake clock cannot advance, until a deadline
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     let mode = |path: &Path| {
@@ -725,6 +726,7 @@ async fn acme_obtains_caches_and_reuses_a_certificate() {
             tokio::time::Instant::now() < deadline,
             "cached certificate not served"
         );
+        // real-clock: polls a real TCP listener or connection, which a fake clock cannot advance, until a deadline
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert_eq!(
@@ -886,6 +888,7 @@ async fn acme_client_interoperates_with_pebble() {
             tokio::time::Instant::now() < deadline,
             "no certificate from Pebble within 120 s"
         );
+        // real-clock: polls a real TCP listener or connection, which a fake clock cannot advance, until a deadline
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
     let mode = |path: &Path| {
@@ -932,6 +935,7 @@ async fn acme_client_interoperates_with_pebble() {
                 "issued certificate not served: {error}"
             ),
         }
+        // real-clock: polls a real TCP listener or connection, which a fake clock cannot advance, until a deadline
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     stop.cancel();

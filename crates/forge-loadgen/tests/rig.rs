@@ -268,6 +268,7 @@ fn an_unreachable_application_is_waited_for_not_measured() {
         .stderr(std::process::Stdio::piped())
         .spawn()
         .unwrap_or_else(|error| panic!("{error}"));
+    // real-clock: observes that the rig process stays alive and silent while it waits for readiness
     thread::sleep(std::time::Duration::from_millis(800));
     // Still waiting for readiness: no report, no crash.
     assert!(

@@ -337,11 +337,54 @@ mod tests {
             .text("Hello Alice\nSecond line")
     }
 
+    /// Whether the header block of `wire` has a header called `name` (names
+    /// are case-insensitive). Only header names count: the `Message-ID` is
+    /// random hex and can spell `bcc` by chance.
+    fn has_header(wire: &str, name: &str) -> bool {
+        let head = wire.split("\r\n\r\n").next().expect("header block");
+        head.split("\r\n")
+            .filter(|line| !line.starts_with([' ', '\t']))
+            .filter_map(|line| line.split_once(':'))
+            .any(|(header, _)| header.trim_end().eq_ignore_ascii_case(name))
+    }
+
+    #[test]
+    fn header_scan_ignores_values_and_continuation_lines() {
+        let wire = "Subject: bcc: nope\r\nX-Id: <bccbccbcc@example.com>\r\n bcc: folded\r\n\r\nBcc: body\r\n";
+        assert!(!has_header(wire, "bcc"));
+        assert!(has_header("To: a\r\nBCC: b\r\n\r\n", "bcc"));
+        assert!(has_header("To: a\r\nbcc : b\r\n\r\n", "bcc"));
+    }
+
+    #[test]
+    fn a_message_id_spelling_bcc_is_not_a_bcc_header() {
+        let id = Uuid::parse_str("0bccbccb-cbcc-7bcc-8bcc-bccbccbccbcc").expect("uuid");
+        let encoded = Encoder::new()
+            .message_id(id)
+            .encode(&message())
+            .expect("valid");
+        let text = String::from_utf8(encoded.data).expect("7-bit");
+        assert!(text.to_ascii_lowercase().contains("bcc"), "{text}");
+        assert!(!has_header(&text, "bcc"), "{text}");
+        assert!(!text.contains("audit@"), "{text}");
+    }
+
+    #[test]
+    fn a_thousand_random_ids_never_leak_the_bcc_recipient() {
+        let message = message();
+        for _ in 0..1000 {
+            let encoded = encode(&message).expect("valid");
+            let text = String::from_utf8(encoded.data).expect("7-bit");
+            assert!(!has_header(&text, "bcc"), "{text}");
+            assert!(!text.contains("audit@"), "{text}");
+        }
+    }
+
     #[test]
     fn bcc_is_envelope_only_and_ids_use_the_sender_domain() {
         let encoded = encode(&message()).expect("valid");
         let text = String::from_utf8(encoded.data).expect("7-bit");
-        assert!(!text.to_ascii_lowercase().contains("bcc"), "{text}");
+        assert!(!has_header(&text, "bcc"), "{text}");
         assert!(!text.contains("audit@"), "{text}");
         assert_eq!(
             encoded.recipients,

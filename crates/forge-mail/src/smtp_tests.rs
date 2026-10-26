@@ -154,6 +154,7 @@ async fn serve(script: Script) -> (SocketAddr, JoinHandle<Transcript>) {
             ServerStream::Plain(BufReader::new(tcp))
         };
         if script.silent {
+            // real-clock: the scripted server goes silent past the client's timeout, on real sockets
             tokio::time::sleep(Duration::from_secs(60)).await;
             return transcript;
         }
@@ -238,6 +239,7 @@ async fn serve(script: Script) -> (SocketAddr, JoinHandle<Transcript>) {
                 stream.send(&format!("{} queued", script.data_reply)).await;
             } else if upper == "QUIT" {
                 if script.hang_on_quit {
+                    // real-clock: the scripted server hangs on QUIT past the client's timeout, on real sockets
                     tokio::time::sleep(Duration::from_secs(60)).await;
                 }
                 if !script.drop_on_quit {

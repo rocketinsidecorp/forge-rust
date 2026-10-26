@@ -100,6 +100,7 @@ async fn a_keep_alive_connection_waits_the_idle_timeout_not_the_header_timeout()
     // Idle for five header timeouts: still open (before the fix the
     // shorter header timeout closed it). A slow runner only stretches the
     // pause, and only past the 3 s idle limit would it fail.
+    // real-clock: the connection must stay idle for real time to show the idle limit does not cut it
     tokio::time::sleep(Duration::from_secs(1)).await;
     request(&mut stream).await;
 
@@ -120,6 +121,7 @@ async fn the_next_request_head_has_the_header_timeout_from_its_first_byte() {
     .await;
     let mut stream = TcpStream::connect(front.addr).await.expect("connect");
     request(&mut stream).await;
+    // real-clock: the connection must stay idle for real time before the next request
     tokio::time::sleep(Duration::from_millis(600)).await;
 
     // A head that starts and never ends is cut at the header timeout, not
@@ -153,6 +155,7 @@ async fn the_first_request_has_the_header_timeout_from_the_connection_start() {
 async fn a_slow_response_is_not_cut_by_the_idle_or_header_timeout() {
     let slow: support::Handler = Arc::new(|_| {
         Box::pin(async {
+            // real-clock: real sockets: the handler must outlive the timeout under test, so a paused clock would skip it instantly
             tokio::time::sleep(Duration::from_millis(900)).await;
             text(Bytes::from_static(b"app"))
         })

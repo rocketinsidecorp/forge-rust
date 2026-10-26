@@ -175,6 +175,7 @@ fn start_sshd(
                 let _ = child.wait();
                 break;
             }
+            // real-clock: polls a child process (an OS resource a fake clock cannot advance) until a deadline
             std::thread::sleep(Duration::from_millis(20));
         }
         last = log.lock().expect("lock").clone();
@@ -703,6 +704,7 @@ fn deploys_over_real_ssh() {
                 "no output from both hosts:\n{}",
                 out.text()
             );
+            // real-clock: polls the logs of a task or process that runs on its own threads, until a deadline
             std::thread::sleep(Duration::from_millis(20));
         }
         shutdown.request();
@@ -736,6 +738,7 @@ fn deploys_over_real_ssh() {
                     gone = true;
                     break;
                 }
+                // real-clock: polls a child process (an OS resource a fake clock cannot advance) until a deadline
                 std::thread::sleep(Duration::from_millis(50));
             }
             if !gone {

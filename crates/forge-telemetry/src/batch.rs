@@ -256,6 +256,7 @@ mod tests {
         Arc::new(move |batch: Vec<u32>| {
             let exported = Arc::clone(&exported);
             Box::pin(async move {
+                // real-clock: simulated export latency of the exporter under test
                 tokio::time::sleep(delay).await;
                 exported.fetch_add(batch.len(), Ordering::SeqCst);
                 Ok(())

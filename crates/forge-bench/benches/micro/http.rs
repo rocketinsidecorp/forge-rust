@@ -27,7 +27,9 @@ pub fn cases(cases: &mut Vec<Case>) {
 ///
 /// `static` is `/static/rN/item`, `param` is `/param/rN/{id}` and
 /// `wildcard` is the catch-all `/files/rN/{path...}` matched by
-/// `/files/rN/docs/2026/report.txt`, as in Forge-Go.
+/// `/files/rN/docs/2026/report.txt`, as in Forge-Go. `escaped` is `param` with
+/// a percent-escaped capture (`/param/rN/a%20b`), the one path shape whose
+/// invalid-path check has to decode a segment.
 fn router_match(cases: &mut Vec<Case>) {
     for (variant, pattern, target) in [
         ("static", "/static/r{}/item", "/static/r{}/item"),
@@ -37,10 +39,13 @@ fn router_match(cases: &mut Vec<Case>) {
             "/files/r{}/{path...}",
             "/files/r{}/docs/2026/report.txt",
         ),
+        // A percent-escaped capture: the invalid-path rule decodes it. A
+        // reference row: Forge-Go's catalog has none.
+        ("escaped", "/param/r{}/{id}", "/param/r{}/a%20b"),
     ] {
         for routes in [1_usize, 10, 100, 1000] {
             let name: &'static str = Box::leak(format!("{variant}/{routes}").into_boxed_str());
-            cases.push(Case::new("router_match", name, 1_000_000, move || {
+            let case = Case::new("router_match", name, 1_000_000, move || {
                 let mut router = Router::new();
                 for index in 0..routes {
                     must(
@@ -65,7 +70,13 @@ fn router_match(cases: &mut Vec<Case>) {
                         black_box(block_on(router.dispatch(black_box(parts.build()))));
                     }
                 })
-            }));
+            });
+            // Forge-Go's catalog has no escaped-capture case.
+            cases.push(if variant == "escaped" {
+                case.reference()
+            } else {
+                case
+            });
         }
     }
 }

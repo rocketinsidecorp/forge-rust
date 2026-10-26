@@ -162,6 +162,7 @@ async fn contract(make: &Make) {
             }
             ThrottleDecision::Allowed => panic!("the pair is exhausted"),
         }
+        // real-clock: the store compares expiry with a real clock (database now() or the system clock) that the test cannot inject
         tokio::time::sleep(Duration::from_millis(600)).await;
         assert!(matches!(
             short.attempt(&expiring).await.expect("decides"),
@@ -252,6 +253,7 @@ async fn expired_counters_are_pruned_and_a_refusal_stores_nothing() {
         assert!(allowed(&short, &key(&format!("old{n}@example.com"), 7, n)).await);
     }
     assert_eq!(rows(&pool).await, 12);
+    // real-clock: the store compares expiry with a real clock (database now() or the system clock) that the test cannot inject
     tokio::time::sleep(Duration::from_millis(400)).await;
 
     // An attempt prunes up to 8 expired counters besides creating its own 3.

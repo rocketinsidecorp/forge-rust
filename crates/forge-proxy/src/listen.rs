@@ -565,6 +565,7 @@ mod tests {
             let mut buffer = [0_u8; 8];
             while received.len() < 64 {
                 // Slower than the limit in total, never stalled that long.
+                // real-clock: a real socket trickles bytes slower than the limit in total but never stalls long enough to trip it
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 let n = client.read(&mut buffer).await.expect("read");
                 received.extend_from_slice(&buffer[..n]);

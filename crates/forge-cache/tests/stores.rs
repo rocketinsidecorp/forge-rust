@@ -84,6 +84,7 @@ macro_rules! store_tests {
                 let keys = ["a", "b", "c", "d", "e", "f"];
                 for key in keys {
                     cache.set(key, b"v", HOUR).await.expect("set");
+                    // real-clock: gives each write a distinct millisecond timestamp: the stores order eviction by write time
                     tokio::time::sleep(Duration::from_millis(5)).await;
                 }
                 // Writes pruned inline: after one more explicit prune the bound holds.
@@ -107,6 +108,7 @@ macro_rules! store_tests {
                 let (cache, _test) = fresh(options).await;
                 for i in 0..60 {
                     cache.set(&format!("k{i:02}"), b"v", HOUR).await.expect("set");
+                    // real-clock: gives each write a distinct millisecond timestamp: the stores order eviction by write time
                     tokio::time::sleep(Duration::from_millis(2)).await;
                 }
                 // One call is bounded work: MAX_PRUNE_ROUNDS batches of 2.
