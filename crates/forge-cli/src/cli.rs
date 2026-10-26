@@ -25,8 +25,18 @@ impl Cli {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum Command {
-    /// Generate a sortable UUIDv7 identifier.
-    Id,
+    /// Print new sortable UUIDv7 identifiers, one per line.
+    Uuid {
+        #[command(flatten)]
+        count: UuidCount,
+    },
+    /// Deprecated spelling of `forge uuid`, kept until the next minor
+    /// version; prints a warning to standard error.
+    #[command(hide = true)]
+    Id {
+        #[command(flatten)]
+        count: UuidCount,
+    },
     /// Create a new full-stack application (server-rendered views; `--api`
     /// for JSON only) with hexagonal boundaries, Docker and CI.
     New {
@@ -553,6 +563,19 @@ pub(crate) enum DbCommand {
         )]
         arguments: Vec<String>,
     },
+}
+
+/// How many identifiers `forge uuid` prints.
+#[derive(Clone, Copy, Debug, Args)]
+pub(crate) struct UuidCount {
+    /// Number of UUIDv7 values to print, 1 to 1000.
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = 1,
+        value_parser = clap::value_parser!(u16).range(1..=1000)
+    )]
+    pub(crate) count: u16,
 }
 
 #[derive(Debug, Subcommand)]

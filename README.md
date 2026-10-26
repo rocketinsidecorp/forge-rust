@@ -206,7 +206,7 @@ and generated applications should port four files; see
 ### Command cheat sheet
 
 ```sh
-forge id                                       # print a UUIDv7
+forge uuid                                     # print a UUIDv7 (forge uuid --count 5 prints five)
 forge new shop                                 # full-stack, PostgreSQL, Docker and CI
 forge new shop -d sqlite3                      # or postgresql, mysql, mariadb, none
 forge new shop --api                           # JSON only, no views
@@ -285,7 +285,7 @@ cargo run -- migrate                           #   migrate [status], rollback [-
 cargo run -- seed                              #   setup, seed, openapi: what the forge commands above run
 ```
 
-The commands above that are not `new`, `generate`, `id`, `version`, `doctor`,
+The commands above that are not `new`, `generate`, `uuid`, `version`, `doctor`,
 `i18n`, `credentials`, `check`, `lint`, `test`, `format`, `build`, `deploy`, `logs` or
 `app` run the generated application's own subcommands (`deploy`, `logs` and `app`
 drive `ssh` and Docker on your hosts; see below): the CLI builds it with `cargo build --locked`, runs the binary it

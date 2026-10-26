@@ -48,6 +48,7 @@ use crate::cli::{
     AppCommand, Cli, Command, ControllerArgs, CredentialsCommand, DbCommand, DeployArgs,
     DeployCommand, DestroyArgs, DestroyCommand, DestructiveArgs, GenerateCommand, I18nCommand,
     JobArgs, LockActionArg, LogsArgs, MailerArgs, MigrateView, RemoteCommon, ResourceArgs, Toggle,
+    UuidCount,
 };
 use crate::controller::ControllerOptions;
 use crate::destroy::{DestroyFlags, DestroyPlan};
@@ -58,6 +59,19 @@ use crate::mailer::MailerOptions;
 use crate::process::Signals;
 use crate::project::Project;
 use crate::scaffold::{Layers, ScaffoldOptions, Scope};
+
+/// What `forge id`, the deprecated spelling of `forge uuid`, prints to
+/// standard error.
+const ID_DEPRECATION: &str = "warning: `forge id` is deprecated and will be removed in the next \
+     minor version; use `forge uuid`";
+
+/// `forge uuid [--count N]`: one UUIDv7 per line, in creation order.
+fn print_uuids(count: UuidCount, output: &mut dyn io::Write) -> Result<(), CliError> {
+    for _ in 0..count.count {
+        writeln!(output, "{}", Uuid::now_v7()).map_err(CliError::Output)?;
+    }
+    Ok(())
+}
 
 /// Parses process arguments and executes the selected Forge command.
 pub fn run() -> Result<(), CliError> {
@@ -72,7 +86,13 @@ fn execute(
     output: &mut dyn io::Write,
 ) -> Result<(), CliError> {
     match command {
-        Command::Id => writeln!(output, "{}", Uuid::now_v7()).map_err(CliError::Output),
+        Command::Uuid { count } => print_uuids(count, output),
+        Command::Id { count } => {
+            use std::io::Write as _;
+            // A warning must never fail the command.
+            let _ = writeln!(io::stderr(), "{ID_DEPRECATION}");
+            print_uuids(count, output)
+        }
         Command::New {
             name,
             skip_docker,
@@ -720,14 +740,38 @@ mod tests {
     use super::*;
 
     #[test]
-    fn id_command_emits_a_version_seven_uuid() {
+    fn uuid_command_emits_version_seven_uuids_in_order() {
         let directory = tempfile::tempdir().expect("temporary directory should be available");
-        let mut output = Vec::new();
-
-        execute(Command::Id, directory.path(), &mut output).expect("id generation should succeed");
-
-        let rendered = String::from_utf8(output).expect("UUID output should be UTF-8");
-        let id = Uuid::parse_str(rendered.trim()).expect("output should be a UUID");
-        assert_eq!(id.get_version_num(), 7);
+        for (command, expected) in [
+            (
+                Command::Uuid {
+                    count: UuidCount { count: 1 },
+                },
+                1,
+            ),
+            (
+                Command::Uuid {
+                    count: UuidCount { count: 3 },
+                },
+                3,
+            ),
+            (
+                Command::Id {
+                    count: UuidCount { count: 2 },
+                },
+                2,
+            ),
+        ] {
+            let mut output = Vec::new();
+            execute(command, directory.path(), &mut output).expect("uuid generation");
+            let rendered = String::from_utf8(output).expect("UUID output should be UTF-8");
+            let ids: Vec<Uuid> = rendered
+                .lines()
+                .map(|line| Uuid::parse_str(line).expect("output should be a UUID"))
+                .collect();
+            assert_eq!(ids.len(), expected);
+            assert!(ids.iter().all(|id| id.get_version_num() == 7));
+            assert!(ids.windows(2).all(|pair| pair[0] < pair[1]), "{ids:?}");
+        }
     }
 }

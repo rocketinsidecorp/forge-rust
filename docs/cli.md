@@ -16,7 +16,7 @@ from a checkout.
 ## Command summary
 
 ```text
-forge id
+forge uuid [--count N]
 forge new <name> [-d <DATABASE>] [--api] [--locale en|es|pt-BR] [--skip-docker] [--skip-ci] [--skip-lockfile] [--forge-path <PATH>]
 forge generate migration <name>
 forge generate authentication [--dry-run]
@@ -62,11 +62,18 @@ non-zero status. The lifecycle commands (`dev`, `migrate`, `rollback`, `setup`,
 `seed`, `db`, `routes`, `openapi`) are described under
 [Application lifecycle commands](#application-lifecycle-commands).
 
-## `forge id`
+## `forge uuid`
 
-Prints a new UUIDv7 identifier to standard output. UUIDv7 values sort by
-creation time and are Forge's default identifier format
-([ADR 0003](adr/0003-uuidv7-default-identifiers.md)).
+```sh
+forge uuid              # one UUIDv7
+forge uuid --count 5    # five, one per line, in creation order (1 to 1000)
+```
+
+Prints new UUIDv7 identifiers to standard output, as Forge-Go's `forge uuid`
+does. UUIDv7 values sort by creation time and are Forge's default identifier
+format ([ADR 0003](adr/0003-uuidv7-default-identifiers.md)). `forge id`, the
+earlier spelling, still works until the next minor version and prints a
+deprecation warning to standard error.
 
 ## `forge new <name>`
 
