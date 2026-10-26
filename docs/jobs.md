@@ -223,6 +223,50 @@ lease can expire, and aborted after `cancel_grace` if it ignores the
 cancellation, so it never runs alongside a reclaimed copy for long nor keeps
 its concurrency slot until `TIMEOUT`.
 
+**Claim batches.** A claim leases up to `batch` jobs of a queue in one
+statement (`WorkerSettings::batch`, default 10, 1 to 100; Forge-Go's
+`BatchSize`), but never more than the queue's free slots, so every claimed job
+starts at once. A full batch is followed by another claim at once while slots
+remain; `batch(1)` claims one job per round trip.
+
+**Wake-up (`LISTEN/NOTIFY`, opt-in).** With the session setting
+`forge.jobs_notify=on` on the connections of every process (Forge-Go's
+`queuepostgres.WithNotify()`), every due job announces itself on the
+`forge_jobs` channel (payload: its queue) when its transaction commits, and
+`serve`/`jobs work` hold one `LISTEN` connection: an idle worker claims a new
+job within milliseconds instead of at its next poll. Each announcement wakes
+the queue's worker once (announcements merge while it is busy; at most one
+woken claim per 10 ms), and every (re)subscription claims each queue once.
+Polling stays on, so a lost announcement only delays a job to the next poll;
+jobs due later, retries and released jobs are found by polling. The listener
+reconnects after a jittered 0.5 s to 1 s, doubling to 15 s to 30 s, and logs
+`listening for job announcements` and each disconnect.
+
+```sh
+# every process that enqueues or runs workers
+PGOPTIONS='-c forge.jobs_notify=on' cargo run -- serve
+PGOPTIONS='-c forge.jobs_notify=on' cargo run -- jobs work
+# or in the URL itself
+FORGE_DATABASE_URL='postgres://app_runtime:...@db/shop?options=-c%20forge.jobs_notify%3Don' cargo run -- jobs work
+```
+
+```rust
+composition.jobs()?.settings(
+    forge::jobs::WorkerSettings::default()
+        .batch(10)                                         // jobs per claim (1 to 100)
+        .poll_interval(std::time::Duration::from_secs(5)), // the fallback poll
+);
+```
+
+Costs of the wake-up: one extra connection per job runtime (outside the
+pool's `FORGE_DATABASE_MAX_CONNS`); `LISTEN` needs a direct connection or
+session pooling, not PgBouncer transaction pooling (behind such a pooler,
+turn it on per transaction with `SELECT set_config('forge.jobs_notify', 'on',
+true)`); and PostgreSQL serializes the commits of notifying transactions,
+which matters only at thousands of enqueues per second. Anyone who can
+`NOTIFY` on the database can wake workers, which then claim once. Design:
+[ADR 0046](adr/0046-job-wake-up-and-claim-batches.md).
+
 ## Failures and dead jobs
 
 | Outcome | Result |
@@ -299,9 +343,17 @@ composition.events()?.publish_to(subscribers);
 
 The dispatcher publishes committed events in id order (best effort; retries
 and concurrent dispatchers can reorder), with a per-event timeout, retries
-with backoff (default 20 attempts) and a dead state. Any broker adapter can
-implement `EventPublisher` instead. Two consequences of `Subscribers` that a
-consumer must design for:
+with backoff (default 20 attempts) and a dead state. It claims
+`DispatcherSettings::batch` events per transaction (default 10, 1 to 1000,
+like Forge-Go's `DispatcherOptions.BatchSize`) and publishes them one after
+another, so a slow subscriber holds up the rest of its batch:
+
+```rust
+composition.events()?.settings(forge::events::DispatcherSettings::default().batch(10));
+```
+
+Any broker adapter can implement `EventPublisher` instead. Two consequences
+of `Subscribers` that a consumer must design for:
 
 - **A retry re-runs every subscriber.** Delivery state is tracked per event,
   not per subscriber: when one subscriber of a type fails, the whole event is
@@ -386,12 +438,12 @@ They run as a non-superuser, non-owner runtime role created per test
 transactional enqueue, many concurrent workers without double execution,
 lease expiry and fencing, retries and dead jobs, timeouts, panics, graceful
 drain, exactly-once schedule ticks across two runtimes, RLS tenant isolation,
-outbox atomicity and consumer idempotency.
+enqueue announcements, the wake-up, listener reconnection and shutdown, claim
+batches, outbox atomicity and consumer idempotency.
 
 ## Limits and follow-ups
 
 - Tenant jobs do not re-check membership at execution time (ADR 0025).
-- Polling only; `LISTEN/NOTIFY` wake-ups are not implemented.
 - No per-key concurrency limits or rate limits yet; use queues and their
   concurrency.
 - `forge new` wires the job queue but not the outbox (`App::events`), and
