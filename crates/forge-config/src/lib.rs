@@ -1655,23 +1655,43 @@ pub enum ConfigError {
     },
 }
 
+/// A [`Duration`] as whole seconds when it has no fraction (the form older
+/// configurations hold), otherwise as an exact Forge-Go duration in
+/// nanoseconds (`"250000000ns"`): nothing is lost, and both forms (and any
+/// other Go duration such as `"1m30s"`) deserialize.
 mod duration_seconds {
     use std::time::Duration;
 
-    use serde::{Deserialize, Deserializer, Serializer};
+    use serde::{Deserialize, Deserializer, Serializer, de::Error as _};
 
     pub fn serialize<S>(value: &Duration, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
-        serializer.serialize_u64(value.as_secs())
+        if value.subsec_nanos() == 0 {
+            serializer.serialize_u64(value.as_secs())
+        } else {
+            serializer.serialize_str(&format!("{}ns", value.as_nanos()))
+        }
+    }
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Form {
+        Seconds(u64),
+        Go(String),
     }
 
     pub fn deserialize<'de, D>(deserializer: D) -> Result<Duration, D::Error>
     where
         D: Deserializer<'de>,
     {
-        Ok(Duration::from_secs(u64::deserialize(deserializer)?))
+        match Form::deserialize(deserializer)? {
+            Form::Seconds(seconds) => Ok(Duration::from_secs(seconds)),
+            Form::Go(text) => super::telemetry::parse_go_duration(&text).ok_or_else(|| {
+                D::Error::custom("expected a number of seconds or a duration such as 15s")
+            }),
+        }
     }
 }
 
@@ -2869,6 +2889,32 @@ mod tests {
         assert!(v6.contains(v4("fd00:1::abcd")));
         assert!(!v6.contains(v4("fd00:2::1")));
         assert!(!v6.contains(v4("10.0.0.1")));
+    }
+
+    #[test]
+    fn server_durations_round_trip_without_losing_fractions() {
+        for (grace, timeout) in [
+            (Duration::from_millis(250), Duration::from_secs(30)),
+            (Duration::from_millis(1500), Duration::new(2, 1)),
+            (Duration::from_secs(15), Duration::from_nanos(1)),
+        ] {
+            let server = ServerConfig {
+                shutdown_grace: grace,
+                request_timeout: timeout,
+                ..ServerConfig::default()
+            };
+            let json = serde_json::to_string(&server).expect("serializes");
+            let back: ServerConfig = serde_json::from_str(&json).expect("deserializes");
+            assert_eq!(back, server, "{json}");
+        }
+        // Whole seconds keep the integer form older configurations hold.
+        let json = serde_json::to_string(&ServerConfig::default()).expect("serializes");
+        assert!(json.contains(r#""shutdown_grace":15"#), "{json}");
+        let go = json.replace(r#""shutdown_grace":15"#, r#""shutdown_grace":"1m30s""#);
+        let back: ServerConfig = serde_json::from_str(&go).expect("a Go duration");
+        assert_eq!(back.shutdown_grace, Duration::from_secs(90));
+        let bad = json.replace(r#""shutdown_grace":15"#, r#""shutdown_grace":"soon""#);
+        assert!(serde_json::from_str::<ServerConfig>(&bad).is_err());
     }
 
     #[test]
