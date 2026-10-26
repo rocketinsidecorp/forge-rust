@@ -25,10 +25,10 @@ mod mail;
 mod telemetry;
 
 pub use mail::{
-    AuthConfig, MAIL_KEYS, MFA_KEY_BYTES, MFA_KEY_KEY, MailConfig, MailEndpoint, MailTransport,
-    MailboxError, PASSWORD_RESET_URL_KEY, has_text_problem, is_bidi_control, is_local_web_host,
-    is_loopback_host, parse_mailbox, valid_mail_domain, validate_mailbox,
-    validate_password_reset_url,
+    AuthConfig, DEFAULT_SESSION_IDLE_TIMEOUT, MAIL_KEYS, MFA_KEY_BYTES, MFA_KEY_KEY, MailConfig,
+    MailEndpoint, MailTransport, MailboxError, PASSWORD_RESET_URL_KEY, SESSION_IDLE_TIMEOUT_KEY,
+    has_text_problem, is_bidi_control, is_local_web_host, is_loopback_host, parse_mailbox,
+    valid_mail_domain, validate_mailbox, validate_password_reset_url,
 };
 pub use telemetry::{
     EndpointScheme, OtlpCompression, OtlpHeader, SampleRatio, TELEMETRY_ENABLED_KEY,
@@ -128,6 +128,7 @@ pub const KNOWN_KEYS: &[&str] = &[
     PASSWORD_RESET_URL_KEY,
     // ADR 0040.
     MFA_KEY_KEY,
+    SESSION_IDLE_TIMEOUT_KEY,
     // TELEMETRY_KEYS, ADR 0033.
     "FORGE_TELEMETRY_ENABLED",
     "FORGE_TELEMETRY_SERVICE_NAME",
@@ -958,7 +959,7 @@ pub struct AppConfig {
     #[serde(default)]
     pub mail: MailConfig,
     /// Identity settings (`FORGE_AUTH_PASSWORD_RESET_URL`,
-    /// `FORGE_AUTH_MFA_KEY`).
+    /// `FORGE_AUTH_MFA_KEY`, `FORGE_AUTH_SESSION_IDLE_TIMEOUT`).
     #[serde(default)]
     pub auth: AuthConfig,
     /// Translations (`FORGE_I18N_DEFAULT_LOCALE`, ADR 0037).
@@ -1998,6 +1999,7 @@ mod tests {
             "/etc/ssl/private-relay.pem",
             "https://billing.example.com/passwords/edit",
             "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc",
+            "30m",
             "true",
             "billing",
             "1.0.0",

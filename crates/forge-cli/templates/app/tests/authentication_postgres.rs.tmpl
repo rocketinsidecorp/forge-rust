@@ -7,7 +7,9 @@
 //! tampered seed; factor changes that see a factor installed while they
 //! waited for the account lock; sign-in steps that lock the account before
 //! any MFA row, so they never deadlock with a factor change; step-up backup
-//! codes used up only by a change that commits.
+//! codes used up only by a change that commits; sessions that end after the
+//! idle timeout, record their use at most once a minute and survive the
+//! upgrade that adds `last_seen_at`.
 //!
 //! PostgreSQL tests need `FORGE_TEST_DATABASE_URL` (a role that may create
 //! databases) and are ignored by default:
@@ -23,13 +25,15 @@ use app::infrastructure::accounts::{
 };
 use app::infrastructure::auth::{PostgresPasswordCredentialStore, PostgresSessionStore};
 use app::infrastructure::security::{
-    Argon2idPasswordHasher, authenticate_password, issue_persisted_session, verify_password,
+    Argon2idPasswordHasher, IssuedSession, RequestAuthError, authenticate_password,
+    authenticate_request, issue_persisted_session, verify_password,
 };
 use forge::CommandContext;
 use forge::auth::{
-    CanonicalLogin, PasswordHasher as _, PasswordResetToken, SessionStore as _, UnixTimestamp,
+    CanonicalLogin, PasswordHasher as _, PasswordResetToken, SessionIdleTimeout, SessionStore as _,
+    UnixTimestamp,
 };
-use forge::db::testing::TestDatabase;
+use forge::db::testing::{RlsTestDatabase, TestDatabase};
 use forge::tenancy::{
     PasswordResetGrant, PasswordResetStore as _, TenantDirectory as _, TenantSlug,
 };
@@ -1505,6 +1509,369 @@ async fn two_reset_links_of_one_account_redeemed_together_do_not_deadlock() -> T
     },);
     finished?;
     assert_eq!(redeemed?, None, "the other redemption used this link up");
+    database.cleanup().await?;
+    Ok(())
+}
+
+type IdleFixture = (
+    RlsTestDatabase,
+    PostgresSessionStore,
+    forge::security::PrincipalId,
+);
+
+/// A database migrated and served like production (the migration role
+/// applies the migrations and creates the owner, the runtime role runs the
+/// session store), a session store with `idle` as its idle timeout (the
+/// default without one) and the owner.
+async fn idle_fixture(idle: Option<std::time::Duration>) -> Result<IdleFixture, Box<dyn Error>> {
+    let database = RlsTestDatabase::create([&MIGRATOR]).await?;
+    let owner = provision_owner(
+        database.migrator().pool(),
+        &OwnerAccount {
+            tenant: TenantSlug::new("acme")?,
+            organization: "Acme".to_owned(),
+            login: CanonicalLogin::parse("idle@example.com")?,
+            password_hash: Argon2idPasswordHasher.hash(PASSWORD.as_bytes()).await?,
+            now: now()?,
+        },
+    )
+    .await?;
+    let mut sessions = PostgresSessionStore::new(database.runtime().pool().clone());
+    if let Some(idle) = idle {
+        sessions = sessions.with_idle_timeout(SessionIdleTimeout::new(idle)?);
+    }
+    Ok((database, sessions, owner.principal_id))
+}
+
+/// Moves the session's last use `ago` before the database clock (zero
+/// leaves it alone) and returns the stored value in microseconds.
+async fn last_seen(
+    database: &RlsTestDatabase,
+    session: &IssuedSession,
+    ago: std::time::Duration,
+) -> Result<i64, Box<dyn Error>> {
+    let id = session.session.id().into_uuid();
+    let admin = database.admin().pool();
+    if !ago.is_zero() {
+        sqlx::query(
+            "UPDATE forge_sessions
+             SET last_seen_at = now() - $2::bigint * interval '1 microsecond'
+             WHERE id = $1",
+        )
+        .bind(id)
+        .bind(i64::try_from(ago.as_micros())?)
+        .execute(admin)
+        .await?;
+    }
+    Ok(sqlx::query_scalar(
+        "SELECT (EXTRACT(EPOCH FROM last_seen_at) * 1000000)::bigint FROM forge_sessions WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_one(admin)
+    .await?)
+}
+
+/// A browser request carrying `session`'s cookie.
+fn with_session_cookie(session: &IssuedSession) -> Result<forge::http::Request, Box<dyn Error>> {
+    let mut headers = forge::http::HeaderMap::new();
+    headers.insert(
+        forge::http::header::COOKIE,
+        forge::http::HeaderValue::from_str(&format!(
+            "__Host-forge_session={}",
+            session.secrets.bearer.expose()
+        ))?,
+    );
+    Ok(forge::http::Request::new_for_test(
+        forge::http::Method::GET,
+        "/".parse()?,
+        headers,
+        String::new().into(),
+        "127.0.0.1:4000".parse()?,
+        forge::core::Id::<forge::http::Request>::new().into_uuid(),
+    ))
+}
+
+const MINUTE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// A session unused for the idle timeout no longer resolves, is refused
+/// exactly as a revoked one and is not revived by the attempt; one used
+/// within the timeout resolves and records the use; a revoked session keeps
+/// its last use. Forge-Go's `TestSessionsEndAfterTheIdleTimeout`.
+#[tokio::test]
+#[ignore = "needs FORGE_TEST_DATABASE_URL"]
+async fn sessions_end_after_the_idle_timeout_and_record_their_use() -> TestResult {
+    let (database, sessions, principal) = idle_fixture(Some(30 * MINUTE)).await?;
+    let now = now()?;
+    let day = UnixTimestamp::from_secs(now.as_secs() + 86_400);
+    let issue = || issue_persisted_session(&sessions, principal, now, day);
+
+    let fresh = issue().await?;
+    assert!(
+        sessions
+            .find_by_credential(&fresh.secrets.bearer_digest)
+            .await?
+            .is_some()
+    );
+
+    let idle = issue().await?;
+    let before = last_seen(
+        &database,
+        &idle,
+        30 * MINUTE + std::time::Duration::from_secs(1),
+    )
+    .await?;
+    for _ in 0..2 {
+        assert!(
+            sessions
+                .find_by_credential(&idle.secrets.bearer_digest)
+                .await?
+                .is_none(),
+            "a session idle past the timeout is not found"
+        );
+    }
+    assert_eq!(
+        last_seen(&database, &idle, std::time::Duration::ZERO).await?,
+        before,
+        "resolving an idle session recorded a use"
+    );
+    // The request is refused exactly as with a revoked session: the
+    // middleware answers 401, the pages redirect to the sign-in page.
+    let revoked = issue().await?;
+    sessions.revoke(revoked.session.id(), now).await?;
+    let refused = authenticate_request(&sessions, &with_session_cookie(&idle)?, now).await;
+    assert_eq!(refused, Err(RequestAuthError::InvalidSession));
+    assert_eq!(
+        authenticate_request(&sessions, &with_session_cookie(&revoked)?, now).await,
+        refused,
+        "an idle session is refused like a revoked one"
+    );
+
+    let active = issue().await?;
+    let before = last_seen(&database, &active, 29 * MINUTE).await?;
+    let principal_of_active =
+        authenticate_request(&sessions, &with_session_cookie(&active)?, now).await?;
+    assert_eq!(principal_of_active.principal_id(), principal);
+    let after = last_seen(&database, &active, std::time::Duration::ZERO).await?;
+    assert!(
+        after > before + 28 * 60 * 1_000_000,
+        "the use was recorded: {before} -> {after}"
+    );
+
+    // A revoked session is refused and its last use is left alone.
+    sessions.revoke(active.session.id(), now).await?;
+    let before = last_seen(&database, &active, 10 * MINUTE).await?;
+    assert_eq!(
+        authenticate_request(&sessions, &with_session_cookie(&active)?, now).await,
+        Err(RequestAuthError::InvalidSession)
+    );
+    assert_eq!(
+        last_seen(&database, &active, std::time::Duration::ZERO).await?,
+        before,
+        "resolving a revoked session recorded a use"
+    );
+    database.cleanup().await?;
+    Ok(())
+}
+
+/// Without a configured timeout the store ends sessions after two hours.
+#[tokio::test]
+#[ignore = "needs FORGE_TEST_DATABASE_URL"]
+async fn sessions_use_the_default_idle_timeout_of_two_hours() -> TestResult {
+    let (database, sessions, principal) = idle_fixture(None).await?;
+    assert_eq!(
+        sessions.idle_timeout().get(),
+        std::time::Duration::from_secs(7_200)
+    );
+    let now = now()?;
+    let session = issue_persisted_session(
+        &sessions,
+        principal,
+        now,
+        UnixTimestamp::from_secs(now.as_secs() + 86_400),
+    )
+    .await?;
+    last_seen(&database, &session, 119 * MINUTE).await?;
+    assert!(
+        sessions
+            .find_by_credential(&session.secrets.bearer_digest)
+            .await?
+            .is_some(),
+        "used 1h59m ago"
+    );
+    last_seen(
+        &database,
+        &session,
+        120 * MINUTE + std::time::Duration::from_secs(1),
+    )
+    .await?;
+    assert!(
+        sessions
+            .find_by_credential(&session.secrets.bearer_digest)
+            .await?
+            .is_none(),
+        "used just over 2h ago"
+    );
+    database.cleanup().await?;
+    Ok(())
+}
+
+/// Resolutions within a minute of the recorded use only read; a stale use
+/// is recorded once, even by 16 concurrent requests. A trigger counts every
+/// write to `forge_sessions` (Forge-Go's
+/// `TestSessionUseIsWrittenAtMostOncePerMinute`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "needs FORGE_TEST_DATABASE_URL"]
+async fn a_session_use_is_written_at_most_once_a_minute() -> TestResult {
+    let (database, sessions, principal) = idle_fixture(None).await?;
+    // The migration role owns forge_sessions; the runtime role may insert
+    // into the counting table through its default privileges.
+    for statement in [
+        "CREATE TABLE session_writes (n bigint NOT NULL)",
+        "CREATE FUNCTION count_session_write() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN INSERT INTO session_writes VALUES (1); RETURN NEW; END $$",
+        "CREATE TRIGGER count_session_writes AFTER UPDATE ON forge_sessions
+         FOR EACH ROW EXECUTE FUNCTION count_session_write()",
+    ] {
+        sqlx::query(statement)
+            .execute(database.migrator().pool())
+            .await?;
+    }
+    let admin = database.admin().pool().clone();
+    let writes = || {
+        let admin = admin.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM session_writes")
+                .fetch_one(&admin)
+                .await
+        }
+    };
+    let resolve_concurrently = |digest: forge::auth::SessionCredentialDigest| {
+        let sessions = sessions.clone();
+        async move {
+            let mut resolutions = tokio::task::JoinSet::new();
+            for _ in 0..16 {
+                let sessions = sessions.clone();
+                resolutions.spawn(async move { sessions.find_by_credential(&digest).await });
+            }
+            while let Some(resolved) = resolutions.join_next().await {
+                if resolved??.is_none() {
+                    return Err("a live session was not found".into());
+                }
+            }
+            Ok::<(), Box<dyn Error>>(())
+        }
+    };
+
+    let now = now()?;
+    let session = issue_persisted_session(
+        &sessions,
+        principal,
+        now,
+        UnixTimestamp::from_secs(now.as_secs() + 86_400),
+    )
+    .await?;
+    let digest = session.secrets.bearer_digest;
+    let created = last_seen(&database, &session, std::time::Duration::ZERO).await?;
+    resolve_concurrently(digest).await?;
+    assert_eq!(
+        writes().await?,
+        0,
+        "resolving a session used just now wrote"
+    );
+    assert_eq!(
+        last_seen(&database, &session, std::time::Duration::ZERO).await?,
+        created
+    );
+
+    last_seen(&database, &session, std::time::Duration::from_secs(59)).await?;
+    let before = writes().await?;
+    resolve_concurrently(digest).await?;
+    assert_eq!(writes().await? - before, 0, "a use 59s old was rewritten");
+
+    let stale = last_seen(&database, &session, std::time::Duration::from_secs(61)).await?;
+    let before = writes().await?;
+    resolve_concurrently(digest).await?;
+    assert_eq!(
+        writes().await? - before,
+        1,
+        "16 concurrent resolutions of a stale use write exactly once"
+    );
+    let recorded = last_seen(&database, &session, std::time::Duration::ZERO).await?;
+    assert!(
+        recorded > stale + 60 * 1_000_000,
+        "the stale use was recorded: {stale} -> {recorded}"
+    );
+    let before = writes().await?;
+    resolve_concurrently(digest).await?;
+    assert_eq!(
+        writes().await? - before,
+        0,
+        "resolving right after the recorded use wrote"
+    );
+    database.cleanup().await?;
+    Ok(())
+}
+
+/// Upgrading a database whose sessions predate migration
+/// 00000000000000000006: a session three days old counts as used at the
+/// upgrade, so nobody is signed out; the down migration drops the column
+/// (Forge-Go's `TestSessionIdleMigrationKeepsExistingSessions`).
+#[tokio::test]
+#[ignore = "needs FORGE_TEST_DATABASE_URL"]
+async fn the_idle_timeout_migration_keeps_open_sessions_and_reverts() -> TestResult {
+    const IDLE_MIGRATION: i64 = 6;
+    let database = TestDatabase::<sqlx::Postgres>::create_empty().await?;
+    let pool = database.database().pool().clone();
+    MIGRATOR.run_to(IDLE_MIGRATION - 1, &pool).await?;
+    let now = now()?;
+    let owner = provision_owner(
+        &pool,
+        &OwnerAccount {
+            tenant: TenantSlug::new("acme")?,
+            organization: "Acme".to_owned(),
+            login: CanonicalLogin::parse("old@example.com")?,
+            password_hash: Argon2idPasswordHasher.hash(PASSWORD.as_bytes()).await?,
+            now,
+        },
+    )
+    .await?;
+    // A session created three days ago by the code before the upgrade,
+    // with that code's columns only.
+    let secrets = app::infrastructure::security::issue_session_secrets()?;
+    sqlx::query(
+        "INSERT INTO forge_sessions
+             (id, principal_id, credential_digest, csrf_digest, issued_at, expires_at)
+         VALUES ($1, $2, $3, $4, now() - interval '3 days', now() + interval '20 days')",
+    )
+    .bind(forge::auth::SessionId::new().into_uuid())
+    .bind(owner.principal_id.into_uuid())
+    .bind(secrets.bearer_digest.as_bytes().as_slice())
+    .bind(secrets.csrf_digest.as_bytes().as_slice())
+    .execute(&pool)
+    .await?;
+
+    MIGRATOR.run_to(IDLE_MIGRATION, &pool).await?;
+    let sessions = PostgresSessionStore::new(pool.clone());
+    assert!(
+        sessions
+            .find_by_credential(&secrets.bearer_digest)
+            .await?
+            .is_some(),
+        "a session from before the upgrade still resolves"
+    );
+
+    MIGRATOR.undo(&pool, IDLE_MIGRATION - 1).await?;
+    let columns: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM information_schema.columns
+         WHERE table_name = 'forge_sessions' AND column_name = 'last_seen_at'",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(columns, 0, "the down migration drops last_seen_at");
+    let kept: i64 = sqlx::query_scalar("SELECT count(*) FROM forge_sessions")
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(kept, 1, "the down migration keeps the sessions");
     database.cleanup().await?;
     Ok(())
 }

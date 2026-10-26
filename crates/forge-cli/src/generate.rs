@@ -363,6 +363,17 @@ const TEMPLATES: &[Template] = &[
         Group::Authentication,
         "migrations/00000000000000000005_forge_login_throttle.down.sql" => "migrations/00000000000000000005_forge_login_throttle.down.sql.tmpl"
     ),
+    // Every PostgreSQL application has the session store
+    // (src/infrastructure/auth), which reads `last_seen_at`; the sessions
+    // table comes from migration 00000000000000000002, also in every one.
+    template!(
+        Group::Postgres,
+        "migrations/00000000000000000006_forge_session_idle_timeout.up.sql" => "migrations/00000000000000000006_forge_session_idle_timeout.up.sql.tmpl"
+    ),
+    template!(
+        Group::Postgres,
+        "migrations/00000000000000000006_forge_session_idle_timeout.down.sql" => "migrations/00000000000000000006_forge_session_idle_timeout.down.sql.tmpl"
+    ),
     template!(
         Group::Authentication,
         "src/infrastructure/accounts/mod.rs" => "src/infrastructure/accounts/mod.rs.tmpl"
@@ -1557,6 +1568,23 @@ mod tests {
         assert!(identity_migration.contains("csrf_digest bytea"));
         assert!(identity_migration.contains("CREATE TABLE forge_tenant_memberships"));
         assert!(identity_migration.contains("GRANT UPDATE (password_hash, updated_at, version)"));
+        let idle_migration = read(
+            &root,
+            "migrations/00000000000000000006_forge_session_idle_timeout.up.sql",
+        );
+        assert!(
+            idle_migration.contains("ADD COLUMN last_seen_at timestamptz NOT NULL DEFAULT now()")
+        );
+        assert!(
+            read(
+                &root,
+                "migrations/00000000000000000006_forge_session_idle_timeout.down.sql"
+            )
+            .contains("DROP COLUMN IF EXISTS last_seen_at")
+        );
+        let session_store = read(&root, "src/infrastructure/auth/mod.rs");
+        assert!(session_store.contains("pub fn with_idle_timeout"));
+        assert!(session_store.contains("last_seen_at"));
 
         let auth_module = read(&root, "src/infrastructure/auth/mod.rs");
         assert!(auth_module.contains("PasswordCredentialVersion"));
@@ -1705,6 +1733,7 @@ mod tests {
     const POSTGRES_ONLY_FILES: &[&str] = &[
         "migrations/00000000000000000001_forge_audit.up.sql",
         "migrations/00000000000000000002_forge_identity.up.sql",
+        "migrations/00000000000000000006_forge_session_idle_timeout.up.sql",
         "docker/postgres/init.sql",
         "src/infrastructure/audit/mod.rs",
         "src/infrastructure/auth/mod.rs",

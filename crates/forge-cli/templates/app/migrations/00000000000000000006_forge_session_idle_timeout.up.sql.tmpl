@@ -1,0 +1,16 @@
+-- When each session was last used, for the idle timeout
+-- (FORGE_AUTH_SESSION_IDLE_TIMEOUT, forge::auth::SessionIdleTimeout;
+-- Forge-Go's migration 20261026090000_session_idle_timeout). Sessions that
+-- exist when this migration runs count as used now, so upgrading signs
+-- nobody out; from then on a session unused for the idle timeout no longer
+-- resolves. now() is stable, so PostgreSQL stores the default once instead
+-- of rewriting the table. ADD COLUMN still takes a brief ACCESS EXCLUSIVE
+-- lock on forge_sessions, which waits behind every open transaction that
+-- touched the table; on a busy database run `forge migrate` with a
+-- lock_timeout (docs/getting-started.md, "Session idle timeout").
+--
+-- The runtime role's table-wide SELECT, INSERT, UPDATE on forge_sessions
+-- (migration 00000000000000000002) covers the column: nothing to grant.
+
+ALTER TABLE forge_sessions
+    ADD COLUMN last_seen_at timestamptz NOT NULL DEFAULT now();

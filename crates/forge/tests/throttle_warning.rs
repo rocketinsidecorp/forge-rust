@@ -1,17 +1,19 @@
 //! The production warning for attempt throttles that count in one process
-//! (Forge-Go's `auth.warnProcessLocalThrottle`).
+//! (Forge-Go's `auth.warnProcessLocalThrottle`), and the agreement of the
+//! session idle timeout's configuration with its domain type.
 
 use std::cell::RefCell;
 use std::io;
 use std::sync::{Arc, Once};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use forge::Composition;
 use forge::auth::{
-    LoginThrottle, MemoryLoginThrottle, PgLoginThrottle, ThrottleConfig, ThrottleDecision,
-    ThrottleError, ThrottleKey,
+    LoginThrottle, MemoryLoginThrottle, PgLoginThrottle, SessionIdleTimeout, ThrottleConfig,
+    ThrottleDecision, ThrottleError, ThrottleKey,
 };
-use forge::config::{AppConfig, Environment};
+use forge::config::{AppConfig, DEFAULT_SESSION_IDLE_TIMEOUT, Environment};
 use forge::http::Router;
 
 /// One process-wide subscriber writes into a per-thread buffer (the pattern
@@ -124,4 +126,34 @@ async fn process_local_throttles_warn_in_production_only() {
             }
         }
     }
+}
+
+/// `FORGE_AUTH_SESSION_IDLE_TIMEOUT`'s default and bounds are the ones the
+/// session store accepts, so every configured value builds a store.
+#[test]
+fn the_configured_idle_timeout_is_one_the_session_store_accepts() {
+    assert_eq!(
+        DEFAULT_SESSION_IDLE_TIMEOUT,
+        SessionIdleTimeout::DEFAULT.get()
+    );
+    assert_eq!(
+        AppConfig::default().auth.session_idle_timeout,
+        SessionIdleTimeout::default().get()
+    );
+    let lookup = |value: &'static str| {
+        move |key: &str| (key == "FORGE_AUTH_SESSION_IDLE_TIMEOUT").then(|| value.to_owned())
+    };
+    for (value, bound) in [
+        ("5m", SessionIdleTimeout::MIN),
+        ("720h", SessionIdleTimeout::MAX),
+    ] {
+        let config = AppConfig::from_lookup(lookup(value)).expect("in bounds");
+        assert_eq!(config.auth.session_idle_timeout, bound);
+        assert!(SessionIdleTimeout::new(config.auth.session_idle_timeout).is_ok());
+    }
+    for value in ["4m59s", "720h1s"] {
+        assert!(AppConfig::from_lookup(lookup(value)).is_err(), "{value}");
+    }
+    assert!(SessionIdleTimeout::new(SessionIdleTimeout::MIN - Duration::from_secs(1)).is_err());
+    assert!(SessionIdleTimeout::new(SessionIdleTimeout::MAX + Duration::from_secs(1)).is_err());
 }

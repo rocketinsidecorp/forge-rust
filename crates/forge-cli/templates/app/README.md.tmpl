@@ -279,6 +279,22 @@ least 12 characters, and refuses once a tenant exists. The owner gets the
 `owner` role; tenant-scoped scaffolds grant it their permissions and send
 signed-out browsers to the sign-in page.
 
+### Session lifetime
+
+A session ends 24 hours after sign-in, or earlier after two hours without a
+request. Change the idle limit (from `5m` to `720h`; it cannot be turned off)
+with `FORGE_AUTH_SESSION_IDLE_TIMEOUT`, in your environment or the
+deployment's:
+
+```bash
+export FORGE_AUTH_SESSION_IDLE_TIMEOUT=30m
+forge dev                     # or: cargo run
+```
+
+`PostgresSessionStore` records a session's last use in `last_seen_at` at most
+once a minute; if that write fails, the request fails (`503`) rather than
+passing unrecorded.
+
 ### Password-reset emails
 
 Reset links are emailed once outgoing mail is configured; until then the

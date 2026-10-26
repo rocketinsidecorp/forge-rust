@@ -503,6 +503,10 @@ fn postgresql_application_with_scaffolds_passes_its_gates_and_migrations_revert(
         "setup_creates_one_owner_who_can_sign_in_and_refuses_afterwards ... ok",
         "concurrent_setups_create_exactly_one_tenant ... ok",
         "reset_tokens_work_once_expire_and_revoke_every_session ... ok",
+        "sessions_end_after_the_idle_timeout_and_record_their_use ... ok",
+        "sessions_use_the_default_idle_timeout_of_two_hours ... ok",
+        "a_session_use_is_written_at_most_once_a_minute ... ok",
+        "the_idle_timeout_migration_keeps_open_sessions_and_reverts ... ok",
     ] {
         assert!(tests.contains(test), "{test}\n{tests}");
     }
