@@ -1009,6 +1009,44 @@ async fn heads_are_due_within_the_read_header_timeout_and_idle_connections_withi
     server.stop().await;
 }
 
+/// A pipelined head that waits in the server's buffer while a slow handler
+/// runs gets its own read-header deadline: the first head's deadline, long
+/// expired by then, does not cut it.
+#[tokio::test]
+async fn a_pipelined_head_after_a_slow_handler_gets_its_own_deadline() {
+    let header = Duration::from_millis(200);
+    let config = ServerConfig {
+        read_header_timeout: header,
+        // `/slow` ends with 504 after this, well past the head deadline.
+        ..test_config(Duration::from_millis(800))
+    };
+    let server = TestServer::start(config, test_router()).await;
+    let addr = server.addr;
+    tokio::task::spawn_blocking(move || {
+        let mut stream = connect(addr);
+        // The second head arrives with the first, unfinished.
+        stream
+            .write_all(
+                b"GET /slow HTTP/1.1\r\nHost: localhost\r\n\r\n\
+                  GET /health/live HTTP/1.1\r\nHost: localhost\r\n",
+            )
+            .expect("pipelined requests");
+        let first = read_until(&mut stream, "request timed out");
+        assert!(first.starts_with("HTTP/1.1 504 "), "{first}");
+        stream
+            .write_all(b"Connection: close\r\n\r\n")
+            .expect("the rest of the second head");
+        let (second, _) = read_to_close(&mut stream);
+        assert!(
+            second.contains("HTTP/1.1 200 ") && second.ends_with(r#"{"status":"live"}"#),
+            "the pipelined head was cut: {second:?}"
+        );
+    })
+    .await
+    .expect("client task must not panic");
+    server.stop().await;
+}
+
 /// A head larger than `FORGE_HTTP_MAX_HEADER_BYTES` is answered `431`.
 #[tokio::test]
 async fn an_oversized_request_head_is_refused_with_431() {

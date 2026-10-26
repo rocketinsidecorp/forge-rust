@@ -7,7 +7,7 @@ use std::{
     pin::Pin,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     task::{Context, Poll},
     time::Duration,
@@ -122,21 +122,39 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for StallTimeout<T> {
 
 /// Whether a connection is waiting for a request head: true from its
 /// start and again once a handler returned, false from the moment the
-/// server has a request's head until its handler returns.
+/// server has a request's head until its handler returns. Each head the
+/// server receives also bumps a generation, so a reader that saw no read
+/// while the handler ran (hyper had the next, pipelined bytes buffered)
+/// still learns that a request happened and drops the deadline of the head
+/// before it.
 #[derive(Clone, Debug)]
-pub(crate) struct AwaitingHead(Arc<AtomicBool>);
+pub(crate) struct AwaitingHead(Arc<HeadState>);
+
+#[derive(Debug)]
+struct HeadState {
+    awaiting: AtomicBool,
+    generation: AtomicU64,
+}
 
 impl AwaitingHead {
     pub(crate) fn new() -> Self {
-        Self(Arc::new(AtomicBool::new(true)))
+        Self(Arc::new(HeadState {
+            awaiting: AtomicBool::new(true),
+            generation: AtomicU64::new(0),
+        }))
     }
 
     pub(crate) fn set(&self, awaiting: bool) {
-        self.0.store(awaiting, Ordering::Release);
+        if !awaiting {
+            self.0.generation.fetch_add(1, Ordering::AcqRel);
+        }
+        self.0.awaiting.store(awaiting, Ordering::Release);
     }
 
-    fn get(&self) -> bool {
-        self.0.load(Ordering::Acquire)
+    /// Whether a head is awaited, and how many heads were received.
+    fn get(&self) -> (bool, u64) {
+        let awaiting = self.0.awaiting.load(Ordering::Acquire);
+        (awaiting, self.0.generation.load(Ordering::Acquire))
     }
 }
 
@@ -158,6 +176,9 @@ pub(crate) struct HeadDeadline<T> {
     awaiting: AwaitingHead,
     /// The awaiting state the last read saw, to notice a new wait.
     was_awaiting: bool,
+    /// The head generation the last read saw, to notice a request that
+    /// started and ended between two reads.
+    generation: u64,
     deadline: Option<Pin<Box<Sleep>>>,
 }
 
@@ -168,6 +189,7 @@ impl<T> HeadDeadline<T> {
             limit,
             awaiting,
             was_awaiting: true,
+            generation: 0,
             // The first request's head is due from the connection's start.
             deadline: Some(Box::pin(tokio::time::sleep(limit))),
         }
@@ -181,7 +203,13 @@ impl<T: AsyncRead + Unpin> AsyncRead for HeadDeadline<T> {
         buffer: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
-        let awaiting = this.awaiting.get();
+        let (awaiting, generation) = this.awaiting.get();
+        if generation != this.generation {
+            // A head arrived since the last read: the deadline belonged to
+            // it, not to whatever head comes next.
+            this.generation = generation;
+            this.deadline = None;
+        }
         if !awaiting {
             // A request is in progress: its body has its own bound.
             this.was_awaiting = false;
