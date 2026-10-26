@@ -1013,8 +1013,16 @@ volume, so it resumes routing after a restart. It:
   client cannot hold a drain open. WebSocket applications should ping more
   often than that. There is no total time limit per connection: like
   nginx's `send_timeout`, a client that reads or sends a little in every
-  interval keeps its connection, bounded only by the 10,000 connections per
-  listener (no per-address limit);
+  interval keeps its connection, bounded only by `-max-connections` (no
+  per-address limit);
+- bounds what one client can make it hold: request lines and headers up to
+  `-max-header-bytes` (64 KiB by default, `4096` to `1048576`; larger ones get
+  `431` and the connection is closed), and at most `-max-connections` open
+  connections on each listener (10,000 by default, at least 1; further clients
+  wait in the kernel's listen backlog until one closes). Both are flags of
+  `forge-proxy run`, with the same names, defaults and range as Forge-Go's,
+  and every `forge deploy setup` uses the defaults; `config/deploy.yml` does
+  not expose them. Try them with `cargo run -p forge-proxy -- run -h`;
 - tunnels protocol upgrades (WebSocket) and counts them as in flight, so a
   switch drains them; refuses `CONNECT`;
 - writes JSON access logs (service, host, method, path without query,

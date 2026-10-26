@@ -369,12 +369,19 @@ forge deploy
 forge-proxy's connection limits are Go's `http.Server` ones: a keep-alive
 connection waits `-idle-timeout` (120 s) for its next request, whose headers
 then have `-read-header-timeout` (10 s); a silent first request gets only the
-header timeout. To try them locally (no control socket under `/run`, no state
-file, no HTTPS):
+header timeout. It also bounds what one client can make it hold: request line
+and headers up to `-max-header-bytes` (65536; `4096` to `1048576`; `431` above
+it) and `-max-connections` open connections per listener (10000, at least 1;
+further clients wait in the kernel's listen backlog). Both are flags of
+`forge-proxy run` with those defaults in every deploy (`config/deploy.yml` does
+not expose them), the same names, defaults and range as Forge-Go's. To try them
+locally (no control socket under `/run`, no state file, no HTTPS):
 
 ```sh
 cargo run -p forge-proxy -- run -http-addr 127.0.0.1:8080 -https-addr '' \
-  -control /tmp/forge-proxy.sock -state '' -idle-timeout 120s -read-header-timeout 10s
+  -control /tmp/forge-proxy.sock -state '' -idle-timeout 120s -read-header-timeout 10s \
+  -max-header-bytes 65536 -max-connections 10000
+cargo run -p forge-proxy -- run -h   # lists every flag
 ```
 
 Release note: `retain: 1` in `config/deploy.yml` is now refused (`retain`

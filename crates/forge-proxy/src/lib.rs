@@ -28,7 +28,10 @@ pub mod tls;
 
 pub use control::{ControlRequest, ControlResponse, call, listen_control};
 pub use duration::GoDuration;
-pub use listen::HttpLimits;
+pub use listen::{
+    DEFAULT_MAX_CONNECTIONS, DEFAULT_MAX_HEADER_BYTES, HttpLimits, MAX_MAX_HEADER_BYTES,
+    MIN_MAX_HEADER_BYTES,
+};
 pub use server::{DeployError, Server};
 pub use settings::{DeployRequest, DeployResult, ServiceStatus};
 

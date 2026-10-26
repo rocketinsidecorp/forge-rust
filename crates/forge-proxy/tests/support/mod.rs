@@ -131,6 +131,8 @@ pub fn limits() -> HttpLimits {
         read_header_timeout: Duration::from_secs(10),
         idle_timeout: Duration::from_secs(120),
         shutdown_timeout: Duration::from_secs(5),
+        max_header_bytes: forge_proxy::DEFAULT_MAX_HEADER_BYTES,
+        max_connections: forge_proxy::DEFAULT_MAX_CONNECTIONS,
     }
 }
 

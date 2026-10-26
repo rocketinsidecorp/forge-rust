@@ -26,6 +26,7 @@ fn limits(read_header: Duration, idle: Duration) -> HttpLimits {
         read_header_timeout: read_header,
         idle_timeout: idle,
         shutdown_timeout: Duration::from_secs(5),
+        ..support::limits()
     }
 }
 
