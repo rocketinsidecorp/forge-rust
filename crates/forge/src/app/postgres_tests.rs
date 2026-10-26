@@ -138,7 +138,7 @@ fn production(url: &str) -> Vec<(&'static str, String)> {
 /// would serve is stopped with `SIGTERM` and fails the test.
 fn refused_in_production(app: App, command: &'static [&'static str], url: &str) {
     let mut vars = production(url);
-    vars.push(("FORGE_BIND", format!("127.0.0.1:{}", free_port())));
+    vars.push(("FORGE_HTTP_ADDR", format!("127.0.0.1:{}", free_port())));
     let running = start(app, command, vars);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     while !running.is_finished() && std::time::Instant::now() < deadline {
@@ -198,7 +198,7 @@ fn serve_in_production_refuses_a_superuser_and_serves_the_runtime_role() {
 
     let port = free_port();
     let mut vars = production(roles.runtime_url().expose());
-    vars.push(("FORGE_BIND", format!("127.0.0.1:{port}")));
+    vars.push(("FORGE_HTTP_ADDR", format!("127.0.0.1:{port}")));
     let running = start(app(), &["serve"], vars);
     assert_eq!(
         wait_until_serving(&running, port, "/health/ready").status,
@@ -213,7 +213,7 @@ fn serve_in_production_refuses_a_superuser_and_serves_the_runtime_role() {
         app(),
         &["serve"],
         vec![
-            ("FORGE_BIND", format!("127.0.0.1:{port}")),
+            ("FORGE_HTTP_ADDR", format!("127.0.0.1:{port}")),
             ("FORGE_DATABASE_URL", superuser.url().expose().to_owned()),
         ],
     );
@@ -410,9 +410,9 @@ mod jobs {
             app,
             &["serve"],
             vec![
-                ("FORGE_BIND", format!("127.0.0.1:{port}")),
+                ("FORGE_HTTP_ADDR", format!("127.0.0.1:{port}")),
                 ("FORGE_DATABASE_URL", url),
-                ("FORGE_SHUTDOWN_GRACE_SECS", "2".to_owned()),
+                ("FORGE_HTTP_SHUTDOWN_TIMEOUT", "2s".to_owned()),
             ],
         );
         assert_eq!(wait_until_serving(&running, port, "/marker").status, 200);
@@ -451,7 +451,7 @@ mod jobs {
                     "FORGE_TELEMETRY_METRICS_ADDR",
                     format!("127.0.0.1:{metrics}"),
                 ),
-                ("FORGE_SHUTDOWN_GRACE_SECS", "2".to_owned()),
+                ("FORGE_HTTP_SHUTDOWN_TIMEOUT", "2s".to_owned()),
             ],
         );
 
@@ -495,7 +495,7 @@ mod jobs {
             app,
             &["serve"],
             vec![
-                ("FORGE_BIND", format!("127.0.0.1:{port}")),
+                ("FORGE_HTTP_ADDR", format!("127.0.0.1:{port}")),
                 ("FORGE_DATABASE_URL", url),
             ],
         );

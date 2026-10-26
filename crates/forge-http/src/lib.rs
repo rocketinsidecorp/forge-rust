@@ -1040,7 +1040,7 @@ struct ServedApp {
 
 /// The bytes of request bodies all connections may hold in memory at once,
 /// a semaphore with one permit per byte. Bodies are buffered before
-/// dispatch, so without it `FORGE_MAX_BODY_BYTES` times
+/// dispatch, so without it `FORGE_HTTP_MAX_BODY_BYTES` times
 /// `FORGE_MAX_CONNECTIONS` (about 10 GiB by default) could be resident.
 struct BodyBudget(Arc<Semaphore>);
 

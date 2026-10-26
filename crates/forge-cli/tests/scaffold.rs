@@ -977,7 +977,7 @@ fn sign_in_use_a_tenant_scaffold_and_sign_out(root: &Path, binary: &str, url: &s
         &["serve"],
         &[
             ("FORGE_DATABASE_URL", url),
-            ("FORGE_BIND", &bind),
+            ("FORGE_HTTP_ADDR", &bind),
             ("FORGE_AUTH_MFA_KEY", MFA_KEY),
             ("FORGE_AUTH_SESSION_IDLE_TIMEOUT", "5m"),
         ],

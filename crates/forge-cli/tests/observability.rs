@@ -424,11 +424,11 @@ fn the_app_settings_are_valid_framework_configuration() {
         // and the overlay's.
         let mut variables: BTreeMap<String, String> = BTreeMap::from([
             ("FORGE_ENV".to_owned(), "production".to_owned()),
-            ("FORGE_BIND".to_owned(), "0.0.0.0:3000".to_owned()),
+            ("FORGE_HTTP_ADDR".to_owned(), "0.0.0.0:3000".to_owned()),
         ]);
         let dockerfile = read(&root, "Dockerfile");
         assert!(dockerfile.contains("ENV FORGE_ENV=production"));
-        assert!(dockerfile.contains("FORGE_BIND=0.0.0.0:3000"));
+        assert!(dockerfile.contains("FORGE_HTTP_ADDR=0.0.0.0:3000"));
         let compose = read_yaml(&root, "compose.yaml");
         for environment in [
             mapping(&compose, &["services", "app", "environment"]),

@@ -47,7 +47,7 @@ fn telemetry_is_built_from_the_configuration_unless_disabled() {
 fn an_open_metrics_listener_is_warned_about_outside_production_only() {
     let open = [
         ("FORGE_TELEMETRY_METRICS_ADDR", "0.0.0.0:9464"),
-        ("FORGE_BIND", "127.0.0.1:3000"),
+        ("FORGE_HTTP_ADDR", "127.0.0.1:3000"),
     ];
     let log = warnings(|| warn_public_metrics(&config(&open).expect("config")));
     assert!(log.contains("FORGE_TELEMETRY_METRICS_ADDR"), "{log}");

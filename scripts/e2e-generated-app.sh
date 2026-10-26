@@ -388,7 +388,7 @@ log "Host run: serve, probe and graceful shutdown"
 cargo build --quiet --locked
 port="$(free_port)"
 metrics_port="$(free_port)"
-env_args=(FORGE_BIND="127.0.0.1:$port" FORGE_SHUTDOWN_GRACE_SECS=5
+env_args=(FORGE_HTTP_ADDR="127.0.0.1:$port" FORGE_HTTP_SHUTDOWN_TIMEOUT=5s
   FORGE_TELEMETRY_METRICS_ADDR="127.0.0.1:$metrics_port")
 if [[ -n "$runtime_database_url" ]]; then
   env_args+=(FORGE_DATABASE_URL="$runtime_database_url")

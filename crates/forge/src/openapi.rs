@@ -55,7 +55,7 @@ use serde::de::DeserializeOwned;
 /// `Content-Type: application/json` (`415` otherwise), and a body that does
 /// not decode, or has a member the document does not list for `T`
 /// (`additionalProperties: false`), is `422 invalid_json`. One over
-/// `FORGE_MAX_BODY_BYTES` is refused with `413` before the handler runs.
+/// `FORGE_HTTP_MAX_BODY_BYTES` is refused with `413` before the handler runs.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Json<T>(pub T);
 

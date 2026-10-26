@@ -4,7 +4,7 @@
 //! ```text
 //! export FORGE_STORAGE_ROOT=/tmp/forge-services-storage
 //! export FORGE_STORAGE_SIGNING_KEY=$(openssl rand -base64 32 | tr '+/' '-_' | tr -d '=')
-//! FORGE_BIND=127.0.0.1:3000 \
+//! FORGE_HTTP_ADDR=127.0.0.1:3000 \
 //!   cargo run -p forge --example services --features "ratelimit cache storage"
 //! ```
 //!

@@ -1877,7 +1877,9 @@ mod tests {
         let configured = App::new("demo").command("seed", "x", |_| async { Ok(()) });
         assert_eq!(
             configured.run_with(args(&["seed"]), || {
-                Err(ConfigError::NotUnicode { key: "FORGE_BIND" })
+                Err(ConfigError::NotUnicode {
+                    key: "FORGE_HTTP_ADDR",
+                })
             }),
             ExitCode::from(EXIT_CONFIG)
         );
@@ -2004,7 +2006,9 @@ mod tests {
         for command in ["serve", "migrate", "rollback"] {
             let app = App::new("demo").postgres(migrator()).mysql(migrator());
             let code = app.run_with(args(&[command]), || {
-                Err(ConfigError::NotUnicode { key: "FORGE_BIND" })
+                Err(ConfigError::NotUnicode {
+                    key: "FORGE_HTTP_ADDR",
+                })
             });
             assert_eq!(code, ExitCode::FAILURE, "{command}");
         }

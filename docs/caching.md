@@ -89,7 +89,7 @@ eviction clean up.
 | `FORGE_CACHE_MAX_ENTRIES` | `10000` | Entry bound of every cache |
 | `FORGE_CACHE_MAX_BYTES` | `67108864` | Memory bound of the in-memory cache (keys, values and per-entry overhead) |
 | `FORGE_CACHE_MAX_VALUE_BYTES` | `1048576` | Largest cached value, at most `8388608`; the byte bound must exceed it by 4096 |
-| `FORGE_CACHE_DEFAULT_TTL_SECS` | `3600` | ttl used when a write passes none; `1` to `31536000` |
+| `FORGE_CACHE_DEFAULT_TTL` | `1h` | ttl used when a write passes none, a duration from `1ms` to `8760h` |
 
 Invalid values stop the process at startup.
 

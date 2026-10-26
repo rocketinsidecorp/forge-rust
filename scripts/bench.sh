@@ -174,7 +174,7 @@ tenant_id="$(sed -n 's/^Created tenant bench (\([^)]*\)).*$/\1/p' "$work/setup.l
 [ -n "$tenant_id" ] || { echo "bench.sh: setup printed no tenant id" >&2; cat "$work/setup.log" >&2; exit 1; }
 
 echo "starting the application on 127.0.0.1:${port}" >&2
-FORGE_DATABASE_URL="$runtime_url" FORGE_BIND="127.0.0.1:${port}" "$server" >"$work/server.log" 2>&1 &
+FORGE_DATABASE_URL="$runtime_url" FORGE_HTTP_ADDR="127.0.0.1:${port}" "$server" >"$work/server.log" 2>&1 &
 server_pid=$!
 
 meta_cpu="unknown"

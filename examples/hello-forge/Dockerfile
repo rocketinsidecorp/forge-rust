@@ -26,7 +26,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
 FROM gcr.io/distroless/cc-debian13:nonroot@sha256:b7e81cb1af38d9345680e68bcf564d388f96304e25222030fc8c051faf8565b3 AS runtime
 COPY --from=build /out/hello-forge /usr/local/bin/hello-forge
 ENV FORGE_ENV=production \
-    FORGE_BIND=0.0.0.0:3000
+    FORGE_HTTP_ADDR=0.0.0.0:3000
 USER 65532:65532
 EXPOSE 3000
 # The binary probes its own /health/live endpoint; no curl or shell is needed.

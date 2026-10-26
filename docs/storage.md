@@ -19,8 +19,8 @@ forge = { version = "0.1", features = ["storage"] }
 | --- | --- | --- |
 | `FORGE_STORAGE_ROOT` | unset (storage not used) | Directory of the disk adapter. In `production`: an absolute path on a persistent volume. |
 | `FORGE_STORAGE_SIGNING_KEY` | unset | HMAC key of signed links: unpadded base64url of 32 to 1024 random bytes. Redacted. **Required in `production` whenever `FORGE_STORAGE_ROOT` is set**; there is no default key. |
-| `FORGE_STORAGE_MAX_UPLOAD_BYTES` | `524288` | Largest uploaded file; at most `1073741824`, and when storage is configured not above `FORGE_MAX_BODY_BYTES` |
-| `FORGE_STORAGE_LINK_TTL_SECS` | `900` | Default lifetime of signed links; `1` to `604800` |
+| `FORGE_STORAGE_MAX_UPLOAD_BYTES` | `524288` | Largest uploaded file; at most `1073741824`, and when storage is configured not above `FORGE_HTTP_MAX_BODY_BYTES` |
+| `FORGE_STORAGE_LINK_TTL` | `15m` | Default lifetime of signed links, a duration from `1s` to `168h` |
 
 ```sh
 openssl rand -base64 32 | tr '+/' '-_' | tr -d '='   # a signing key
@@ -28,7 +28,7 @@ export FORGE_STORAGE_ROOT=/var/lib/shop/storage
 export FORGE_STORAGE_SIGNING_KEY=$(openssl rand -base64 32 | tr '+/' '-_' | tr -d '=')
 ```
 
-`FORGE_MAX_BODY_BYTES` (default 1 MiB) caps **every** request body and an
+`FORGE_HTTP_MAX_BODY_BYTES` (default 1 MiB) caps **every** request body and an
 upload route cannot raise it; raise it with the upload limit (multipart framing
 adds a few hundred bytes per part) and remember that it applies to all routes.
 `forge-http` buffers whole bodies and responses, so memory use is bounded by

@@ -94,6 +94,15 @@ impl Diagnostic {
         }
     }
 
+    fn warning(code: &'static str, summary: String, remediation: String) -> Self {
+        Self {
+            code,
+            severity: "warning",
+            summary,
+            remediation,
+        }
+    }
+
     fn json(&self) -> Value {
         json!({
             "code": self.code,
@@ -132,6 +141,27 @@ pub(crate) fn run(
             .map(|(_, value)| value.to_string_lossy().into_owned())
     };
     let process_environment: &dyn Fn(&str) -> Option<String> = &process_environment;
+    for key in
+        forge_config::deprecated_keys_in(variables.iter().filter_map(|(key, _)| key.to_str()))
+    {
+        diagnostics.push(Diagnostic::warning(
+            "configuration.deprecated_key",
+            format!(
+                "{} is a deprecated spelling of {}.",
+                key.deprecated, key.canonical
+            ),
+            format!(
+                "Rename {} to {}{}; the old name is read only until the next minor version.",
+                key.deprecated,
+                key.canonical,
+                if key.value_change.is_empty() {
+                    String::new()
+                } else {
+                    format!(" and give it {}", key.value_change)
+                }
+            ),
+        ));
+    }
     match AppConfig::from_vars(variables.clone()) {
         Err(error) => {
             diagnostics.push(Diagnostic::error(
@@ -438,6 +468,47 @@ mod tests {
                 "{text}"
             );
         }
+    }
+
+    #[test]
+    fn a_deprecated_spelling_is_a_warning_and_a_conflict_an_error() {
+        let (result, text) = report(false, &[("FORGE_BIND", "127.0.0.1:4000")], &Fake::healthy());
+        result.expect("a deprecated key is only a warning");
+        assert!(text.contains("http address: 127.0.0.1:4000\n"), "{text}");
+        assert!(
+            text.contains(
+                "warning: FORGE_BIND is a deprecated spelling of FORGE_HTTP_ADDR. Rename \
+                 FORGE_BIND to FORGE_HTTP_ADDR;"
+            ),
+            "{text}"
+        );
+        let (result, text) = report(
+            true,
+            &[("FORGE_SHUTDOWN_GRACE_SECS", "15")],
+            &Fake::healthy(),
+        );
+        result.expect("a deprecated key is only a warning");
+        let parsed: Value = serde_json::from_str(text.trim()).expect("json");
+        assert_eq!(parsed["ok"], true);
+        assert_eq!(
+            parsed["diagnostics"][0]["code"],
+            "configuration.deprecated_key"
+        );
+        assert_eq!(parsed["diagnostics"][0]["severity"], "warning");
+        let (result, text) = report(
+            false,
+            &[
+                ("FORGE_BIND", "127.0.0.1:4000"),
+                ("FORGE_HTTP_ADDR", "127.0.0.1:4001"),
+            ],
+            &Fake::healthy(),
+        );
+        assert!(matches!(result, Err(CliError::Reported)));
+        assert!(
+            text.contains("FORGE_HTTP_ADDR and FORGE_BIND are both set, to different values"),
+            "{text}"
+        );
+        assert!(!text.contains("4000") && !text.contains("4001"), "{text}");
     }
 
     #[test]

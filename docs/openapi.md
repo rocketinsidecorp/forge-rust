@@ -170,7 +170,7 @@ false` for every object:
 | Request | Answer |
 | --- | --- |
 | `Content-Type` other than `application/json` (case-insensitive; empty parameters such as `application/json;` and a UTF-8 `charset` are fine, any other parameter is not), absent, or repeated | `415`, `unsupported_media_type` |
-| a body over `FORGE_MAX_BODY_BYTES` | `413` (text), before the handler runs |
+| a body over `FORGE_HTTP_MAX_BODY_BYTES` | `413` (text), before the handler runs |
 | not valid JSON for `T`, a wrong type, a missing member | `422`, `invalid_json` |
 | a member the schema of `T` does not list, at any depth | `422`, `invalid_json`, the member's path (`address.street`, `items[2].sku`) in `metadata.member` |
 
@@ -263,7 +263,7 @@ own:
 
 | Declared | Adds |
 | --- | --- |
-| a request body (`Json<T>`, `Operation::request`) | `413` (`text/plain`, `FORGE_MAX_BODY_BYTES`), `415` (`unsupported_media_type`), `422` (`invalid_json`) |
+| a request body (`Json<T>`, `Operation::request`) | `413` (`text/plain`, `FORGE_HTTP_MAX_BODY_BYTES`), `415` (`unsupported_media_type`), `422` (`invalid_json`) |
 | `authenticated()` | `401` (`text/plain`), `security: sessionCookie` |
 | `permission("posts:write")` | `401`, `403` (`text/plain`), `security: sessionCookie`, `x-forge-permission` |
 

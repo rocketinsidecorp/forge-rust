@@ -534,7 +534,7 @@ FORGE_TELEMETRY_ENABLED=false cargo run
 Custom spans and application metrics use `Composition::telemetry()`; a
 handler parents its spans with `request.trace_context()`. Queues are bounded
 (a full queue drops and counts, requests never wait) and telemetry is
-flushed last at shutdown, within `FORGE_SHUTDOWN_GRACE_SECS`.
+flushed last at shutdown, within `FORGE_HTTP_SHUTDOWN_TIMEOUT`.
 
 #### Grafana, Prometheus, Tempo and Loki, preconfigured
 
@@ -944,7 +944,7 @@ checkout of this repository:
 ```sh
 export FORGE_STORAGE_ROOT=/tmp/forge-services-storage
 export FORGE_STORAGE_SIGNING_KEY=$(openssl rand -base64 32 | tr '+/' '-_' | tr -d '=')
-FORGE_BIND=127.0.0.1:3000 cargo run -p forge --example services --features "ratelimit cache storage"
+FORGE_HTTP_ADDR=127.0.0.1:3000 cargo run -p forge --example services --features "ratelimit cache storage"
 ```
 
 In another terminal:
@@ -991,12 +991,12 @@ export FORGE_RATE_LIMIT_MAX_KEYS=100000          # live buckets of the in-memory
 export FORGE_CACHE_MAX_ENTRIES=10000             # entry bound of every cache
 export FORGE_CACHE_MAX_BYTES=67108864            # memory bound of the in-memory cache
 export FORGE_CACHE_MAX_VALUE_BYTES=1048576       # largest cached value (at most 8388608)
-export FORGE_CACHE_DEFAULT_TTL_SECS=3600         # ttl of writes that pass none
+export FORGE_CACHE_DEFAULT_TTL=1h                # ttl of writes that pass none
 export FORGE_STORAGE_ROOT=/var/lib/shop/storage  # absolute in production
 export FORGE_STORAGE_SIGNING_KEY=$(openssl rand -base64 32 | tr '+/' '-_' | tr -d '=')
-export FORGE_STORAGE_MAX_UPLOAD_BYTES=524288     # must not exceed FORGE_MAX_BODY_BYTES
+export FORGE_STORAGE_MAX_UPLOAD_BYTES=524288     # must not exceed FORGE_HTTP_MAX_BODY_BYTES
 export FORGE_MAX_IN_FLIGHT_BODY_BYTES=268435456  # all request bodies buffered at once; 503 + Retry-After beyond
-export FORGE_STORAGE_LINK_TTL_SECS=900           # default signed link lifetime
+export FORGE_STORAGE_LINK_TTL=15m                # default signed link lifetime
 ```
 
 Behind a reverse proxy, list it in `FORGE_HTTP_TRUSTED_PROXIES` so
@@ -1006,7 +1006,7 @@ cap count each client instead of the proxy (see
 the example above, restarted with `127.0.0.1` playing the proxy:
 
 ```sh
-FORGE_HTTP_TRUSTED_PROXIES=127.0.0.1 FORGE_BIND=127.0.0.1:3000 cargo run -p forge --example services --features "ratelimit cache storage"
+FORGE_HTTP_TRUSTED_PROXIES=127.0.0.1 FORGE_HTTP_ADDR=127.0.0.1:3000 cargo run -p forge --example services --features "ratelimit cache storage"
 # 201 201 201 429 for one client, then 201 for another client behind the same proxy
 for ip in 203.0.113.1 203.0.113.1 203.0.113.1 203.0.113.1 203.0.113.2; do
   curl -s -o /dev/null -w '%{http_code} ' -X POST -H "X-Forwarded-For: $ip" http://127.0.0.1:3000/comments

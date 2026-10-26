@@ -393,14 +393,14 @@ Commands:
 {jobs}
 Environment:
   FORGE_ENV                   development | test | production (default: development)
-  FORGE_BIND                  listen socket address (default: 127.0.0.1:3000)
+  FORGE_HTTP_ADDR             listen socket address (default: 127.0.0.1:3000)
   FORGE_REQUEST_TIMEOUT_SECS  per-request deadline in seconds (default: 30)
-  FORGE_SHUTDOWN_GRACE_SECS   connection drain period on shutdown in seconds (default: 15)
-  FORGE_MAX_BODY_BYTES        maximum request body size in bytes (default: 1048576)
+  FORGE_HTTP_SHUTDOWN_TIMEOUT connection drain period on shutdown, a duration (default: 15s)
+  FORGE_HTTP_MAX_BODY_BYTES   maximum request body size in bytes (default: 1048576)
   FORGE_MAX_CONNECTIONS       maximum concurrent connections (default: 10000)
   FORGE_MAX_IN_FLIGHT_BODY_BYTES request body bytes buffered at once across connections; a
                               body that does not fit gets 503 (default: 268435456, at least
-                              FORGE_MAX_BODY_BYTES)
+                              FORGE_HTTP_MAX_BODY_BYTES)
   FORGE_HTTP_TRUSTED_PROXIES  comma-separated CIDRs or addresses of reverse proxies whose
                               X-Forwarded-For is believed (default: empty, trust nobody)
   FORGE_HTTP_TRANSPORT        plain | trusted-proxy: trusted-proxy (TLS terminated in front)
@@ -425,11 +425,11 @@ Environment:
   FORGE_CACHE_MAX_ENTRIES     entry bound of every cache (default: 10000)
   FORGE_CACHE_MAX_BYTES       memory bound of the in-memory cache (default: 67108864)
   FORGE_CACHE_MAX_VALUE_BYTES largest cached value, at most 8388608 (default: 1048576)
-  FORGE_CACHE_DEFAULT_TTL_SECS ttl of writes that pass none (default: 3600)
+  FORGE_CACHE_DEFAULT_TTL     ttl of writes that pass none, 1ms-8760h (default: 1h)
   FORGE_STORAGE_ROOT          disk storage directory (absolute in production)
   FORGE_STORAGE_SIGNING_KEY   unpadded base64url of 32+ bytes; required in production with a root
   FORGE_STORAGE_MAX_UPLOAD_BYTES largest uploaded file (default: 524288)
-  FORGE_STORAGE_LINK_TTL_SECS default signed link lifetime (default: 900)
+  FORGE_STORAGE_LINK_TTL      default signed link lifetime, 1s-168h (default: 15m)
   FORGE_STREAMS_KEY           base64 of 32+ bytes signing live-update stream names; required in production when streams are served
   FORGE_STREAMS_PREVIOUS_KEYS up to 3 comma-separated old FORGE_STREAMS_KEY values that still verify
                               stream names but never sign (key rotation); needs FORGE_STREAMS_KEY
@@ -464,6 +464,12 @@ Environment:
   FORGE_TELEMETRY_METRICS_ADDR    separate Prometheus listener serving GET /metrics (default: off)
   FORGE_TELEMETRY_METRICS_PUBLIC  true confirms a non-loopback metrics address
   FORGE_TELEMETRY_METRICS_INTERVAL OTLP metric push interval, at least 1s (default: 1m)
+
+Deprecated spellings, still read with a warning until the next minor version (setting
+both spellings to different values is refused): FORGE_BIND (FORGE_HTTP_ADDR),
+FORGE_MAX_BODY_BYTES (FORGE_HTTP_MAX_BODY_BYTES), FORGE_SHUTDOWN_GRACE_SECS,
+FORGE_CACHE_DEFAULT_TTL_SECS and FORGE_STORAGE_LINK_TTL_SECS (in seconds; their
+replacements take durations).
 
 Unknown FORGE_* variables are rejected at startup.
 "
@@ -778,6 +784,9 @@ mod tests {
         }
         for key in forge_config::KNOWN_KEYS {
             assert!(text.contains(key), "{key}");
+        }
+        for key in forge_config::DEPRECATED_KEYS {
+            assert!(text.contains(key.deprecated), "{key:?}");
         }
     }
 }
