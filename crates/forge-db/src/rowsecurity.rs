@@ -3,7 +3,7 @@
 //! 0046).
 
 use forge_config::Environment;
-use sqlx::{Postgres, Row as _};
+use sqlx::{PgConnection, Pool, Postgres, Row as _, pool::PoolOptions};
 
 use crate::{Database, DbError};
 
@@ -14,14 +14,21 @@ use crate::{Database, DbError};
 /// can `SET ROLE`); membership in a predefined role that reaches the server's
 /// files or programs (`pg_execute_server_program`, `pg_write_server_files`,
 /// `pg_read_server_files`, a path to superuser or to every tenant's data);
-/// and whether it owns, or is a member of the owner of, a table of this
+/// whether it owns, or is a member of the owner of, a table of this
 /// database with row-level security enabled (an owner can switch `FORCE` off
 /// with `ALTER TABLE`; `pg_has_role(u, u)` is true, so direct ownership
-/// counts too). Every row also carries both names, so a role in effect that
-/// has no row still counts.
+/// counts too); whether it, or a role it is a member of, holds `TRUNCATE`,
+/// `REFERENCES` or `TRIGGER` on such a table (`has_table_privilege` counts
+/// `PUBLIC` and inherited grants; the membership join adds roles it can only
+/// `SET ROLE` to, and `has_any_column_privilege` adds a column-level
+/// `REFERENCES` grant); and whether it, or a role it is a member of, holds
+/// any privilege on a partition without row-level security whose ancestors
+/// (`pg_partition_ancestors`) include a table with it. Every row also
+/// carries both names, so a role in effect that has no row still counts.
+/// The predicates are Forge-Go's `roleEscapeQuery`.
 ///
 /// It runs with `search_path` pinned to `pg_catalog` (see
-/// [`refuse_row_security_bypass`]), so the operators (`=`, `IN`, `<>`)
+/// [`check_connection`]), so the operators (`=`, `IN`, `<>`)
 /// resolve to PostgreSQL's own, never to an operator, function or view a
 /// `search_path` setting in the URL or on the role would put first; catalog
 /// names and functions are also qualified, as defense in depth.
@@ -37,7 +44,21 @@ SELECT u.rolname, session_user, current_user, u.rolsuper, u.rolbypassrls, u.rolc
                  AND pg_catalog.pg_has_role(u.oid, r.oid, 'MEMBER')),
        EXISTS (SELECT 1 FROM pg_catalog.pg_class c
                WHERE c.relrowsecurity
-                 AND pg_catalog.pg_has_role(u.oid, c.relowner, 'MEMBER'))
+                 AND pg_catalog.pg_has_role(u.oid, c.relowner, 'MEMBER')),
+       EXISTS (SELECT 1 FROM pg_catalog.pg_class c, pg_catalog.pg_roles r
+               WHERE c.relrowsecurity
+                 AND pg_catalog.pg_has_role(u.oid, r.oid, 'MEMBER')
+                 AND (pg_catalog.has_table_privilege(r.oid, c.oid, 'TRUNCATE, REFERENCES, TRIGGER')
+                      OR pg_catalog.has_any_column_privilege(r.oid, c.oid, 'REFERENCES'))),
+       EXISTS (SELECT 1 FROM pg_catalog.pg_class c, pg_catalog.pg_roles r
+               WHERE c.relispartition AND NOT c.relrowsecurity
+                 AND EXISTS (SELECT 1 FROM pg_catalog.pg_partition_ancestors(c.oid) a
+                             JOIN pg_catalog.pg_class p ON p.oid = a.relid
+                             WHERE p.relrowsecurity)
+                 AND pg_catalog.pg_has_role(u.oid, r.oid, 'MEMBER')
+                 AND (pg_catalog.has_table_privilege(r.oid, c.oid,
+                          'SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER')
+                      OR pg_catalog.has_any_column_privilege(r.oid, c.oid, 'SELECT, INSERT, UPDATE, REFERENCES')))
 FROM pg_catalog.pg_roles u
 WHERE u.rolname IN (session_user, current_user)";
 
@@ -61,24 +82,39 @@ impl Database<Postgres> {
     ///   membership),
     /// - is a member of `pg_execute_server_program`, `pg_write_server_files`
     ///   or `pg_read_server_files` (paths to superuser or to the data files),
-    ///   or
     /// - owns, or is a member of the owner of, a table of this database with
     ///   row-level security enabled (an owner can `ALTER TABLE ... NO FORCE
     ///   ROW LEVEL SECURITY`),
+    /// - holds `TRUNCATE`, `REFERENCES` (on the table or on any of its
+    ///   columns) or `TRIGGER` on such a table, itself, through `PUBLIC` or
+    ///   through a role it is a member of (none of the three is subject to
+    ///   row-level security: `TRUNCATE` empties every tenant's rows, a
+    ///   foreign key probes them and a trigger sees them; the usual cause is
+    ///   a `GRANT ALL`), or
+    /// - holds any privilege on a partition that has no row-level security
+    ///   of its own but belongs to a partitioned table with it (querying the
+    ///   partition directly skips the parent's policies),
     ///
     /// or when the two differ: a role setting (`options=-c role=...`,
     /// `ALTER ROLE ... SET role`) makes the session act as another role, and
     /// `SET ROLE NONE` returns it to the login role, so only a login as the
-    /// serving role itself passes. Any failure to run the check (an
-    /// unreachable server, a catalog that does not describe the login role)
-    /// is an error too: it fails closed. In development and test it does
-    /// nothing, so local tools may connect as an administrator.
+    /// serving role itself passes. Membership counts whatever its `INHERIT`
+    /// and `SET` options: a role granted `WITH INHERIT FALSE, SET FALSE` is
+    /// refused all the same (it fails closed; do not grant the serving role
+    /// such memberships). Any failure to run the check (an unreachable
+    /// server, a catalog that does not describe the login role) is an error
+    /// too: it fails closed. In development and test it does nothing, so
+    /// local tools may connect as an administrator.
     ///
+    /// Every pool already runs this check unless its
+    /// [`PoolSettings`](crate::PoolSettings) name development or test or opt
+    /// out; this method runs it on demand, on a connection of its own (so a
+    /// lazy pool's refusal is reported at once, not as a pool timeout).
     /// `serve`, `jobs work` and the `jobs` operator commands of an
     /// application declared with `forge::App::postgres` call it before using
     /// the pool. Serve as a `NOSUPERUSER NOBYPASSRLS NOCREATEROLE` runtime
-    /// role that owns no table and migrate as a separate role
-    /// (`FORGE_MIGRATION_DATABASE_URL`, ADR 0011).
+    /// role that owns no table and has only data privileges, and migrate as
+    /// a separate role (`FORGE_MIGRATION_DATABASE_URL`, ADR 0011).
     ///
     /// The role query runs in a `READ ONLY` transaction with `SET LOCAL
     /// search_path = pg_catalog`; the connection's own `search_path` is back
@@ -87,15 +123,34 @@ impl Database<Postgres> {
         if matches!(environment, Environment::Development | Environment::Test) {
             return Ok(());
         }
-        refuse_row_security_bypass(self).await
+        // The pool's own connection settings, without its hooks: a lazy pool
+        // that checks each new connection would retry a refused one until
+        // its acquire timeout and report only the timeout.
+        let probe = PoolOptions::<Postgres>::new()
+            .max_connections(1)
+            .min_connections(0)
+            .acquire_timeout(self.pool().options().get_acquire_timeout())
+            .idle_timeout(None)
+            .max_lifetime(None)
+            .connect_lazy_with((*self.pool().connect_options()).clone());
+        let result = check_pool(&probe).await;
+        probe.close().await;
+        result
     }
 }
 
-/// Runs [`ROLE_ESCAPE_QUERY`] in a read-only transaction whose `search_path`
-/// is `pg_catalog` alone and judges the rows with [`judge`]. Any failure,
-/// including starting the transaction or pinning the path, is returned.
-async fn refuse_row_security_bypass(database: &Database<Postgres>) -> Result<(), DbError> {
-    let mut transaction = database.pool().begin_with("BEGIN READ ONLY").await?;
+/// Runs the check on a connection of `pool`.
+pub(crate) async fn check_pool(pool: &Pool<Postgres>) -> Result<(), DbError> {
+    let mut connection = pool.acquire().await?;
+    check_connection(&mut connection).await
+}
+
+/// Runs [`ROLE_ESCAPE_QUERY`] on `connection` in a read-only transaction
+/// whose `search_path` is `pg_catalog` alone and judges the rows with
+/// [`judge`]. Any failure, including starting the transaction or pinning the
+/// path, is returned.
+pub(crate) async fn check_connection(connection: &mut PgConnection) -> Result<(), DbError> {
+    let mut transaction = sqlx::Connection::begin_with(connection, "BEGIN READ ONLY").await?;
     sqlx::query("SET LOCAL search_path = pg_catalog")
         .execute(&mut *transaction)
         .await?;
@@ -115,6 +170,8 @@ async fn refuse_row_security_bypass(database: &Database<Postgres>) -> Result<(),
                 member_of_bypassing_role: row.try_get(7)?,
                 member_of_server_file_role: row.try_get(8)?,
                 owns_row_security_table: row.try_get(9)?,
+                holds_unconfined_privilege: row.try_get(10)?,
+                reaches_unprotected_partition: row.try_get(11)?,
             })
         })
         .collect::<Result<Vec<_>, sqlx::Error>>()?;
@@ -138,6 +195,8 @@ struct RoleRow {
     member_of_bypassing_role: bool,
     member_of_server_file_role: bool,
     owns_row_security_table: bool,
+    holds_unconfined_privilege: bool,
+    reaches_unprotected_partition: bool,
 }
 
 impl RoleRow {
@@ -160,6 +219,20 @@ impl RoleRow {
             )
         } else if self.owns_row_security_table {
             Some("owns, or can SET ROLE to the owner of, a table with row-level security")
+        } else if self.holds_unconfined_privilege {
+            Some(
+                "holds TRUNCATE, REFERENCES or TRIGGER, which row-level security does not \
+                 confine, on a table with row-level security, itself, through PUBLIC or through \
+                 a role it belongs to (REVOKE TRUNCATE, REFERENCES, TRIGGER ON ALL TABLES IN \
+                 SCHEMA public FROM each of them)",
+            )
+        } else if self.reaches_unprotected_partition {
+            Some(
+                "holds a privilege on a partition without row-level security of a table with \
+                 row-level security, so querying the partition directly skips the parent's \
+                 policies (ENABLE and FORCE ROW LEVEL SECURITY with the same policies on every \
+                 partition, or revoke the privileges on it)",
+            )
         } else {
             None
         }
@@ -269,6 +342,14 @@ mod tests {
                 |row| row.owns_row_security_table = true,
                 "owner of, a table with row-level security",
             ),
+            (
+                |row| row.holds_unconfined_privilege = true,
+                "holds TRUNCATE, REFERENCES or TRIGGER, which row-level security does not confine",
+            ),
+            (
+                |row| row.reaches_unprotected_partition = true,
+                "holds a privilege on a partition without row-level security",
+            ),
         ] {
             let mut escaping = row("app_runtime");
             change(&mut escaping);
@@ -339,7 +420,10 @@ mod database_tests {
     use sqlx::{AssertSqlSafe, Postgres};
     use uuid::Uuid;
 
-    use crate::{Database, DbError, testing::RlsTestDatabase};
+    use crate::{
+        Database, DbError, PoolSettings,
+        testing::{RlsTestDatabase, test_settings},
+    };
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -358,9 +442,11 @@ mod database_tests {
         SecretString::new(format!("{url}{separator}options=-c%20{encoded}"))
     }
 
-    /// Opens a pool on `url` and runs the check for `environment`.
+    /// Opens a pool on `url` and runs the check for `environment`. The pool
+    /// itself is a test pool (no check of its own), so this is the explicit
+    /// check alone.
     async fn check(url: &SecretString, environment: Environment) -> Result<(), DbError> {
-        let database = Database::<Postgres>::connect(url).await?;
+        let database = Database::<Postgres>::connect_with(url, test_settings()).await?;
         let result = database.require_row_security(environment).await;
         database.close().await;
         result
@@ -697,6 +783,342 @@ mod database_tests {
 
         check(&runtime_url, Environment::Production).await?;
         test.cleanup().await?;
+        Ok(())
+    }
+
+    /// TRUNCATE, REFERENCES and TRIGGER are not subject to row-level
+    /// security: holding any of them on a table with it, by any path, is
+    /// refused. The same grants on a table without row-level security are
+    /// harmless and accepted.
+    #[tokio::test]
+    #[ignore = "needs FORGE_TEST_DATABASE_URL"]
+    async fn require_row_security_refuses_privileges_row_level_security_does_not_confine()
+    -> TestResult {
+        let test = RlsTestDatabase::create([&MIGRATIONS]).await?;
+        let runtime_url = test.runtime_url().clone();
+        let secret = credentials(runtime_url.expose())?;
+        let admin = test.admin();
+        let role = format!("\"{}\"", test.runtime_role());
+        let unconfined = "holds TRUNCATE, REFERENCES or TRIGGER, which row-level security does \
+                          not confine, on a table with row-level security";
+        let suffix = Uuid::now_v7().simple().to_string();
+        let middle_name = format!("forge_test_grants_{suffix}");
+        let _dropped = Roles(vec![middle_name.clone()]);
+        let middle = format!("\"{middle_name}\"");
+        exec(admin, format!("CREATE ROLE {middle} NOLOGIN")).await?;
+
+        let mut cases = vec![
+            (
+                "TRUNCATE",
+                format!("GRANT TRUNCATE ON notes TO {role}"),
+                format!("REVOKE TRUNCATE ON notes FROM {role}"),
+            ),
+            (
+                "REFERENCES",
+                format!("GRANT REFERENCES ON notes TO {role}"),
+                format!("REVOKE REFERENCES ON notes FROM {role}"),
+            ),
+            (
+                "TRIGGER",
+                format!("GRANT TRIGGER ON notes TO {role}"),
+                format!("REVOKE TRIGGER ON notes FROM {role}"),
+            ),
+            (
+                "column REFERENCES",
+                format!("GRANT REFERENCES (tenant_id) ON notes TO {role}"),
+                format!("REVOKE REFERENCES (tenant_id) ON notes FROM {role}"),
+            ),
+            (
+                "ALL",
+                format!("GRANT ALL ON notes TO {role}"),
+                format!("REVOKE TRUNCATE, REFERENCES, TRIGGER ON notes FROM {role}"),
+            ),
+            (
+                "PUBLIC",
+                "GRANT TRUNCATE ON notes TO PUBLIC".to_owned(),
+                "REVOKE TRUNCATE ON notes FROM PUBLIC".to_owned(),
+            ),
+            (
+                "inherited",
+                format!("GRANT TRUNCATE ON notes TO {middle}; GRANT {middle} TO {role}"),
+                format!("REVOKE {middle} FROM {role}; REVOKE TRUNCATE ON notes FROM {middle}"),
+            ),
+        ];
+        let version: i32 = sqlx::query_scalar("SELECT current_setting('server_version_num')::int")
+            .fetch_one(admin.pool())
+            .await?;
+        if version >= 160_000 {
+            // A membership that only allows SET ROLE: the privileges are one
+            // statement away.
+            cases.push((
+                "SET-only membership",
+                format!("GRANT TRIGGER ON notes TO {middle}; GRANT {middle} TO {role} WITH INHERIT FALSE"),
+                format!("REVOKE {middle} FROM {role}; REVOKE TRIGGER ON notes FROM {middle}"),
+            ));
+        }
+        for (name, grant, revoke) in cases {
+            for statement in grant.split("; ") {
+                exec(admin, statement.to_owned()).await?;
+            }
+            assert_refused(
+                name,
+                check(&runtime_url, Environment::Production).await,
+                unconfined,
+                &secret,
+            );
+            for statement in revoke.split("; ") {
+                exec(admin, statement.to_owned()).await?;
+            }
+            check(&runtime_url, Environment::Production).await?;
+        }
+
+        // A table without row-level security: every privilege is accepted.
+        exec(
+            admin,
+            "CREATE TABLE plain_lookup (id int PRIMARY KEY)".to_owned(),
+        )
+        .await?;
+        exec(admin, format!("GRANT ALL ON plain_lookup TO {role}")).await?;
+        exec(admin, "GRANT TRUNCATE ON plain_lookup TO PUBLIC".to_owned()).await?;
+        check(&runtime_url, Environment::Production).await?;
+        test.cleanup().await?;
+        Ok(())
+    }
+
+    /// A partition without row-level security of a table with it is a way
+    /// around the parent's policies: any privilege on it is refused, and
+    /// protecting the partition makes the role acceptable again.
+    #[tokio::test]
+    #[ignore = "needs FORGE_TEST_DATABASE_URL"]
+    async fn require_row_security_refuses_an_unprotected_partition_of_a_protected_table()
+    -> TestResult {
+        let test = RlsTestDatabase::create([&MIGRATIONS]).await?;
+        let runtime_url = test.runtime_url().clone();
+        let secret = credentials(runtime_url.expose())?;
+        let admin = test.admin();
+        let role = format!("\"{}\"", test.runtime_role());
+        for statement in [
+            "CREATE TABLE events (tenant_id uuid NOT NULL, body text) PARTITION BY HASH (tenant_id)",
+            "ALTER TABLE events ENABLE ROW LEVEL SECURITY",
+            "ALTER TABLE events FORCE ROW LEVEL SECURITY",
+            "CREATE POLICY events_tenant_isolation ON events USING \
+             (tenant_id = NULLIF(current_setting('forge.tenant_id', true), '')::uuid)",
+            "CREATE TABLE events_0 PARTITION OF events FOR VALUES WITH (MODULUS 1, REMAINDER 0)",
+        ] {
+            exec(admin, statement.to_owned()).await?;
+        }
+        exec(admin, format!("GRANT SELECT ON events TO {role}")).await?;
+        // Through the parent only: accepted.
+        check(&runtime_url, Environment::Production).await?;
+        for (name, grant, revoke) in [
+            (
+                "table privilege",
+                format!("GRANT SELECT ON events_0 TO {role}"),
+                format!("REVOKE SELECT ON events_0 FROM {role}"),
+            ),
+            (
+                "column privilege",
+                format!("GRANT SELECT (body) ON events_0 TO {role}"),
+                format!("REVOKE SELECT (body) ON events_0 FROM {role}"),
+            ),
+            (
+                "PUBLIC",
+                "GRANT SELECT ON events_0 TO PUBLIC".to_owned(),
+                "REVOKE SELECT ON events_0 FROM PUBLIC".to_owned(),
+            ),
+        ] {
+            exec(admin, grant).await?;
+            assert_refused(
+                name,
+                check(&runtime_url, Environment::Production).await,
+                "holds a privilege on a partition without row-level security",
+                &secret,
+            );
+            exec(admin, revoke).await?;
+        }
+        exec(admin, format!("GRANT SELECT ON events_0 TO {role}")).await?;
+        exec(
+            admin,
+            "ALTER TABLE events_0 ENABLE ROW LEVEL SECURITY".to_owned(),
+        )
+        .await?;
+        check(&runtime_url, Environment::Production).await?;
+        test.cleanup().await?;
+        Ok(())
+    }
+
+    /// Every pool checks its role unless its settings name development or
+    /// test or opt out; no environment at all is checked. An eager pool is
+    /// refused when it connects, a lazy one on every connection it opens.
+    #[tokio::test]
+    #[ignore = "needs FORGE_TEST_DATABASE_URL"]
+    async fn every_pool_checks_its_role_unless_development_test_or_the_opt_out() -> TestResult {
+        let Some((own, url)) = superuser_database().await? else {
+            return Ok(());
+        };
+        let url = SecretString::new(url);
+        let secret = credentials(url.expose())?;
+        let short = |settings: PoolSettings| {
+            settings.with_acquire_timeout(std::time::Duration::from_secs(2))
+        };
+        for settings in [
+            PoolSettings::default(),
+            PoolSettings::default().with_environment(Environment::Production),
+            PoolSettings::from_config(&forge_config::DatabaseConfig::default()),
+        ] {
+            match Database::<Postgres>::connect_with(&url, settings).await {
+                Err(error) => assert_refused("eager pool", Err(error), "is a superuser", &secret),
+                Ok(database) => {
+                    database.close().await;
+                    panic!("an eager superuser pool was accepted with {settings:?}");
+                }
+            }
+            // A lazy pool connects on first use, and refuses that connection.
+            let lazy = Database::<Postgres>::connect_lazy_with(&url, short(settings))?;
+            let refused = lazy.ping().await;
+            assert!(
+                matches!(refused, Err(DbError::PoolTimeout)),
+                "a lazy superuser pool answered: {refused:?}"
+            );
+            // The explicit check names the reason at once.
+            assert_refused(
+                "lazy pool, explicit check",
+                lazy.require_row_security(Environment::Production).await,
+                "is a superuser",
+                &secret,
+            );
+            lazy.close().await;
+        }
+        for settings in [
+            PoolSettings::default().with_environment(Environment::Development),
+            test_settings(),
+            PoolSettings::default()
+                .with_environment(Environment::Production)
+                .allow_row_security_bypass(),
+        ] {
+            Database::<Postgres>::connect_with(&url, settings)
+                .await?
+                .close()
+                .await;
+            let lazy = Database::<Postgres>::connect_lazy_with(&url, short(settings))?;
+            lazy.ping().await?;
+            lazy.close().await;
+        }
+        own.cleanup().await?;
+
+        // The runtime role passes in every pool, eager and lazy.
+        let test = RlsTestDatabase::create([&MIGRATIONS]).await?;
+        let settings = PoolSettings::default().with_environment(Environment::Production);
+        let eager = Database::<Postgres>::connect_with(test.runtime_url(), settings).await?;
+        assert_eq!(count(&eager, None).await?, 0);
+        eager.close().await;
+        let lazy = Database::<Postgres>::connect_lazy_with(test.runtime_url(), settings)?;
+        assert_eq!(count(&lazy, None).await?, 0);
+        lazy.close().await;
+        test.cleanup().await?;
+        Ok(())
+    }
+
+    /// Run by [`pgoptions_never_reaches_a_pool_but_the_migrator`] in a child
+    /// process whose environment sets `PGOPTIONS`, `PGAPPNAME` and `PGTZ`;
+    /// a no-op anywhere else.
+    #[tokio::test]
+    #[ignore = "needs FORGE_TEST_DATABASE_URL"]
+    async fn child_with_session_variables() -> TestResult {
+        let Ok(tenant) = std::env::var("FORGE_TEST_CHILD_TENANT") else {
+            return Ok(());
+        };
+        let url = SecretString::new(admin_url()?);
+        // The serving pool refuses to open, eager or lazy, in every
+        // environment: SQLx would give each session the default tenant.
+        for settings in [
+            test_settings(),
+            PoolSettings::default().allow_row_security_bypass(),
+        ] {
+            match Database::<Postgres>::connect_with(&url, settings).await {
+                Err(DbError::Configuration { reason }) => {
+                    assert!(reason.contains("PGOPTIONS is set"), "{reason}");
+                    assert!(!reason.contains(&tenant), "{reason}");
+                }
+                Err(other) => panic!("{other:?}"),
+                Ok(database) => {
+                    // Without the refusal: the session has a default tenant.
+                    let leaked: Option<String> = sqlx::query_scalar(
+                        "SELECT NULLIF(current_setting('forge.tenant_id', true), '')",
+                    )
+                    .fetch_one(database.pool())
+                    .await?;
+                    database.close().await;
+                    panic!("the serving pool opened; its sessions' default tenant: {leaked:?}");
+                }
+            }
+            assert!(matches!(
+                Database::<Postgres>::connect_lazy_with(&url, settings),
+                Err(DbError::Configuration { .. })
+            ));
+        }
+        // The migrator keeps the driver's behavior: the variables reach it.
+        let migrator = Database::<Postgres>::connect_with(
+            &url,
+            test_settings().with_environment_session(true),
+        )
+        .await?;
+        let (seen, name, zone): (Option<String>, String, String) = sqlx::query_as(
+            "SELECT NULLIF(current_setting('forge.tenant_id', true), ''), \
+             current_setting('application_name'), current_setting('TimeZone')",
+        )
+        .fetch_one(migrator.pool())
+        .await?;
+        migrator.close().await;
+        assert_eq!(
+            seen.as_deref(),
+            Some(tenant.as_str()),
+            "PGOPTIONS reaches the migrator"
+        );
+        assert_eq!(name, "forge-test-pgappname");
+        // SQLx never reads PGTZ: every session is UTC.
+        assert_eq!(zone, "UTC");
+        Ok(())
+    }
+
+    /// `PGOPTIONS='-c forge.tenant_id=...'` would give every pooled session a
+    /// default tenant, so a query outside a tenant transaction would read
+    /// that tenant's rows instead of none: no pool but the migrator's opens
+    /// while it is set. The variables are set for a child process (the test
+    /// binary itself), never in this one.
+    #[tokio::test]
+    #[ignore = "needs FORGE_TEST_DATABASE_URL"]
+    async fn pgoptions_never_reaches_a_pool_but_the_migrator() -> TestResult {
+        admin_url()?;
+        let tenant = TenantId::new().to_string();
+        let output = std::process::Command::new(std::env::current_exe()?)
+            .args([
+                "--exact",
+                "rowsecurity::database_tests::child_with_session_variables",
+                "--include-ignored",
+                "--test-threads=1",
+            ])
+            .env("FORGE_TEST_CHILD_TENANT", &tenant)
+            .env("PGOPTIONS", format!("-c forge.tenant_id={tenant}"))
+            .env("PGAPPNAME", "forge-test-pgappname")
+            .env("PGTZ", "America/Sao_Paulo")
+            .output()?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        // Without PGOPTIONS the serving pool takes its name from the URL, else
+        // `forge`, never from PGAPPNAME.
+        let url = admin_url()?;
+        let database =
+            Database::<Postgres>::connect_with(&SecretString::new(url), test_settings()).await?;
+        let name: String = sqlx::query_scalar("SELECT current_setting('application_name')")
+            .fetch_one(database.pool())
+            .await?;
+        database.close().await;
+        assert_eq!(name, "forge");
         Ok(())
     }
 

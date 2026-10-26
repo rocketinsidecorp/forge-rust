@@ -3,7 +3,7 @@
 use std::{fmt, str::FromStr, time::Duration};
 
 use async_trait::async_trait;
-use forge_config::{DatabaseScheme, SecretString};
+use forge_config::{DatabaseScheme, Environment, SecretString};
 use sqlx::{Connection, Pool, migrate::Migrator, pool::PoolOptions};
 
 use crate::{
@@ -22,13 +22,36 @@ pub type MySqlDatabase = Database<sqlx::MySql>;
 #[cfg(feature = "sqlite")]
 pub type SqliteDatabase = Database<sqlx::Sqlite>;
 
-/// Pool sizing shared by every backend.
+/// Pool sizing shared by every backend, and the PostgreSQL pool's
+/// row-level security check.
 ///
 /// The defaults suit a small service: 10 connections, a 5 second wait for
 /// one and no statement timeout. A request that cannot get a connection in
 /// time fails with the retryable [`DbError::PoolTimeout`] instead of queueing
 /// indefinitely. The serving process takes its settings from the
 /// configuration ([`PoolSettings::from_config`]).
+///
+/// # Row-level security (PostgreSQL)
+///
+/// Every PostgreSQL pool refuses, with [`DbError::RowSecurityBypass`], a
+/// role that could escape row-level security (the rules are those of
+/// `PgDatabase::require_row_security`) unless its
+/// [environment](PoolSettings::with_environment) is development or test. An
+/// unset environment is checked: it fails closed. An eager pool
+/// ([`Database::connect_with`]) checks once, when it connects; a lazy pool
+/// ([`Database::connect_lazy_with`]) checks each connection it opens, before
+/// its first use. [`PoolSettings::allow_row_security_bypass`] is the only
+/// opt-out (Forge-Go's `postgres.AllowRowSecurityBypass`).
+///
+/// # Session settings from the environment (PostgreSQL)
+///
+/// SQLx reads `PGOPTIONS` and `PGAPPNAME` into every connection. A pool
+/// refuses to open while `PGOPTIONS` is set (`PGOPTIONS='-c
+/// forge.tenant_id=...'` would give every session a default tenant, and
+/// SQLx cannot drop it once read), and its `application_name` is the URL's,
+/// else `forge`, never `PGAPPNAME`. SQLx never reads `PGTZ`: every session
+/// is in UTC. [`PoolSettings::with_environment_session`] restores the
+/// driver's behavior, for the migrator only.
 ///
 /// ```
 /// use std::time::Duration;
@@ -45,9 +68,15 @@ pub type SqliteDatabase = Database<sqlx::Sqlite>;
 #[non_exhaustive]
 pub struct PoolSettings {
     max_connections: u32,
+    min_connections: u32,
     acquire_timeout: Duration,
+    max_lifetime: Option<Duration>,
+    idle_timeout: Option<Duration>,
     statement_timeout: Option<Duration>,
     job_announcements: bool,
+    environment: Option<Environment>,
+    row_security_bypass: bool,
+    environment_session: bool,
 }
 
 impl PoolSettings {
@@ -116,9 +145,112 @@ impl PoolSettings {
         self
     }
 
+    /// Fewest connections the pool keeps open (at most
+    /// [`max_connections`](Self::max_connections)); default 0.
+    #[must_use]
+    pub const fn min_connections(&self) -> u32 {
+        self.min_connections
+    }
+
+    /// Sets the fewest connections the pool keeps open, opening them in the
+    /// background; a value above the maximum is lowered to it.
+    #[must_use]
+    pub const fn with_min_connections(mut self, min_connections: u32) -> Self {
+        self.min_connections = min_connections;
+        self
+    }
+
+    /// How long a connection lives before the pool replaces it, if bounded.
+    #[must_use]
+    pub const fn max_lifetime(&self) -> Option<Duration> {
+        self.max_lifetime
+    }
+
+    /// Bounds how long a connection lives (`None`: forever); default 30
+    /// minutes.
+    #[must_use]
+    pub const fn with_max_lifetime(mut self, max_lifetime: Option<Duration>) -> Self {
+        self.max_lifetime = max_lifetime;
+        self
+    }
+
+    /// How long an idle connection above the minimum stays open, if bounded.
+    #[must_use]
+    pub const fn idle_timeout(&self) -> Option<Duration> {
+        self.idle_timeout
+    }
+
+    /// Bounds how long an idle connection above the minimum stays open
+    /// (`None`: forever); default 10 minutes.
+    #[must_use]
+    pub const fn with_idle_timeout(mut self, idle_timeout: Option<Duration>) -> Self {
+        self.idle_timeout = idle_timeout;
+        self
+    }
+
+    /// The environment the pool serves in, if set.
+    #[must_use]
+    pub const fn environment(&self) -> Option<Environment> {
+        self.environment
+    }
+
+    /// Sets the environment the pool serves in. Development and test skip
+    /// the PostgreSQL row-level security check; production, or no
+    /// environment at all, runs it (see the type documentation).
+    #[must_use]
+    pub const fn with_environment(mut self, environment: Environment) -> Self {
+        self.environment = Some(environment);
+        self
+    }
+
+    /// Accepts any PostgreSQL role, even one that could escape row-level
+    /// security: the only opt-out of the check (Forge-Go's
+    /// `postgres.AllowRowSecurityBypass`). Use it only for a pool that must
+    /// connect as such a role on purpose, such as the migrator or an
+    /// administration tool, never for a pool that serves tenants.
+    #[must_use]
+    pub const fn allow_row_security_bypass(mut self) -> Self {
+        self.row_security_bypass = true;
+        self
+    }
+
+    /// Whether a PostgreSQL pool built from these settings checks its role:
+    /// unless [`allow_row_security_bypass`](Self::allow_row_security_bypass)
+    /// was called, everywhere but development and test, and when no
+    /// environment was set.
+    #[must_use]
+    pub const fn checks_row_security(&self) -> bool {
+        !self.row_security_bypass
+            && !matches!(
+                self.environment,
+                Some(Environment::Development | Environment::Test)
+            )
+    }
+
+    /// Whether PostgreSQL connections take session settings from
+    /// `PGOPTIONS` and `PGAPPNAME`.
+    #[must_use]
+    pub const fn environment_session(&self) -> bool {
+        self.environment_session
+    }
+
+    /// Lets `PGOPTIONS` and `PGAPPNAME` reach every PostgreSQL connection,
+    /// as for `psql`. Only the migrator does this (`PGOPTIONS='-c
+    /// lock_timeout=5s' forge migrate`); a pool without it refuses to open
+    /// while `PGOPTIONS` is set and names its sessions after the URL's
+    /// `application_name`, else `forge`. Other backends ignore it.
+    #[must_use]
+    pub const fn with_environment_session(mut self, on: bool) -> Self {
+        self.environment_session = on;
+        self
+    }
+
     /// The serving pool of `config`: `FORGE_DATABASE_MAX_CONNS`,
-    /// `FORGE_DATABASE_CONNECT_TIMEOUT` (the acquire timeout, which bounds
-    /// opening a connection too) and `FORGE_DATABASE_STATEMENT_TIMEOUT`.
+    /// `FORGE_DATABASE_MIN_CONNS`, `FORGE_DATABASE_CONNECT_TIMEOUT` (the
+    /// acquire timeout, which bounds opening a connection too),
+    /// `FORGE_DATABASE_MAX_CONN_LIFETIME`, `FORGE_DATABASE_MAX_CONN_IDLE_TIME`
+    /// and `FORGE_DATABASE_STATEMENT_TIMEOUT`. The environment is left unset
+    /// (checked); add it with [`with_environment`](Self::with_environment).
     #[must_use]
     pub const fn from_config(config: &forge_config::DatabaseConfig) -> Self {
         Self {
@@ -127,9 +259,15 @@ impl PoolSettings {
             } else {
                 config.max_connections
             },
+            min_connections: config.min_connections,
             acquire_timeout: config.connect_timeout,
+            max_lifetime: Some(config.max_conn_lifetime),
+            idle_timeout: Some(config.max_conn_idle_time),
             statement_timeout: Some(config.statement_timeout),
             job_announcements: false,
+            environment: None,
+            row_security_bypass: false,
+            environment_session: false,
         }
     }
 }
@@ -138,9 +276,15 @@ impl Default for PoolSettings {
     fn default() -> Self {
         Self {
             max_connections: 10,
+            min_connections: 0,
             acquire_timeout: Duration::from_secs(5),
+            max_lifetime: Some(Duration::from_secs(30 * 60)),
+            idle_timeout: Some(Duration::from_secs(10 * 60)),
             statement_timeout: None,
             job_announcements: false,
+            environment: None,
+            row_security_bypass: false,
+            environment_session: false,
         }
     }
 }
@@ -187,14 +331,21 @@ impl<B: Backend> Database<B> {
     /// for the acquire timeout.
     ///
     /// Fails with [`DbError::Configuration`] when the URL scheme does not
-    /// belong to this backend.
+    /// belong to this backend. The default settings name no environment, so
+    /// a PostgreSQL pool is checked for row-level security (see
+    /// [`PoolSettings`]); pass
+    /// `PoolSettings::default().with_environment(...)` to
+    /// [`Database::connect_with`] for development and test.
     pub async fn connect(url: &SecretString) -> Result<Self, DbError> {
         Self::connect_with(url, PoolSettings::default()).await
     }
 
-    /// Like [`Database::connect`] with explicit pool sizing.
+    /// Like [`Database::connect`] with explicit settings. A PostgreSQL pool
+    /// that [checks row-level security](PoolSettings::checks_row_security)
+    /// runs the check once it is connected and is closed when the role is
+    /// refused.
     pub async fn connect_with(url: &SecretString, settings: PoolSettings) -> Result<Self, DbError> {
-        let (options, pool_options) = Self::prepare(url, settings)?;
+        let (options, pool_options) = Self::prepare(url, settings, false)?;
         let pool = pool_options
             .connect_with(options)
             .await
@@ -204,6 +355,10 @@ impl<B: Backend> Database<B> {
                 sqlx::Error::PoolTimedOut => DbError::Unavailable(error),
                 other => DbError::from(other),
             })?;
+        if let Err(error) = <B as crate::backend::sealed::Hooks>::verify(&pool, &settings).await {
+            pool.close().await;
+            return Err(error);
+        }
         Ok(Self { pool })
     }
 
@@ -214,9 +369,14 @@ impl<B: Backend> Database<B> {
         Self::connect_lazy_with(url, PoolSettings::default())
     }
 
-    /// Like [`Database::connect_lazy`] with explicit pool sizing.
+    /// Like [`Database::connect_lazy`] with explicit settings. A PostgreSQL
+    /// pool that [checks row-level security](PoolSettings::checks_row_security)
+    /// checks every connection it opens before its first use. SQLx retries
+    /// a refused connection until the acquire timeout, so the caller sees
+    /// [`DbError::PoolTimeout`], and the refusal is logged at error level;
+    /// `PgDatabase::require_row_security` reports it directly.
     pub fn connect_lazy_with(url: &SecretString, settings: PoolSettings) -> Result<Self, DbError> {
-        let (options, pool_options) = Self::prepare(url, settings)?;
+        let (options, pool_options) = Self::prepare(url, settings, true)?;
         Ok(Self {
             pool: pool_options.connect_lazy_with(options),
         })
@@ -225,6 +385,7 @@ impl<B: Backend> Database<B> {
     fn prepare(
         url: &SecretString,
         settings: PoolSettings,
+        lazy: bool,
     ) -> Result<(ConnectOptions<B>, PoolOptions<B>), DbError> {
         let raw = url.expose();
         if DatabaseScheme::of_url(raw) != Some(<B as Backend>::SCHEME) {
@@ -237,12 +398,16 @@ impl<B: Backend> Database<B> {
         let options = <ConnectOptions<B> as FromStr>::from_str(raw)
             .map_err(|_| DbError::configuration("the database URL could not be parsed"))?;
         let options = <B as crate::backend::sealed::Hooks>::configure(raw, options);
+        let options = <B as crate::backend::sealed::Hooks>::session(raw, options, &settings)?;
         let pool_options = PoolOptions::<B>::new()
             .max_connections(settings.max_connections())
-            .acquire_timeout(settings.acquire_timeout());
+            .min_connections(settings.min_connections().min(settings.max_connections()))
+            .acquire_timeout(settings.acquire_timeout())
+            .max_lifetime(settings.max_lifetime())
+            .idle_timeout(settings.idle_timeout());
         let pool_options = <B as crate::backend::sealed::Hooks>::pool_options(raw, pool_options);
         let pool_options =
-            <B as crate::backend::sealed::Hooks>::connection_setup(pool_options, &settings);
+            <B as crate::backend::sealed::Hooks>::connection_setup(pool_options, &settings, lazy);
         Ok((options, pool_options))
     }
 
@@ -441,5 +606,58 @@ mod tests {
         );
         // Commands and tests keep the old defaults: no statement bound.
         assert_eq!(PoolSettings::default().statement_timeout(), None);
+    }
+
+    #[test]
+    fn the_serving_pool_takes_the_size_and_lifetimes_of_the_configuration() {
+        let config = forge_config::DatabaseConfig {
+            min_connections: 2,
+            max_conn_lifetime: Duration::from_secs(600),
+            max_conn_idle_time: Duration::from_secs(60),
+            ..forge_config::DatabaseConfig::default()
+        };
+        let settings = PoolSettings::from_config(&config);
+        assert_eq!(settings.min_connections(), 2);
+        assert_eq!(settings.max_lifetime(), Some(Duration::from_secs(600)));
+        assert_eq!(settings.idle_timeout(), Some(Duration::from_secs(60)));
+        let defaults = PoolSettings::from_config(&forge_config::DatabaseConfig::default());
+        assert_eq!(defaults.min_connections(), 0);
+        assert_eq!(defaults.max_lifetime(), Some(Duration::from_secs(30 * 60)));
+        assert_eq!(defaults.idle_timeout(), Some(Duration::from_secs(5 * 60)));
+    }
+
+    #[test]
+    fn the_row_security_check_runs_unless_development_test_or_the_opt_out() {
+        use forge_config::Environment;
+        // No environment fails closed: checked.
+        assert!(PoolSettings::default().checks_row_security());
+        assert!(
+            PoolSettings::from_config(&forge_config::DatabaseConfig::default())
+                .checks_row_security()
+        );
+        assert!(
+            PoolSettings::default()
+                .with_environment(Environment::Production)
+                .checks_row_security()
+        );
+        for skipped in [Environment::Development, Environment::Test] {
+            assert!(
+                !PoolSettings::default()
+                    .with_environment(skipped)
+                    .checks_row_security()
+            );
+        }
+        assert!(
+            !PoolSettings::default()
+                .with_environment(Environment::Production)
+                .allow_row_security_bypass()
+                .checks_row_security()
+        );
+        assert!(!PoolSettings::default().environment_session());
+        assert!(
+            PoolSettings::default()
+                .with_environment_session(true)
+                .environment_session()
+        );
     }
 }

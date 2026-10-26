@@ -120,7 +120,8 @@ pub(crate) async fn execute(
     command: JobsCommand,
     environment: forge_config::Environment,
 ) -> Result<String, ExitCode> {
-    let database = match PgDatabase::connect(url).await {
+    let settings = forge_db::PoolSettings::default().with_environment(environment);
+    let database = match PgDatabase::connect_with(url, settings).await {
         Ok(database) => database,
         Err(failure) => {
             error!(app, error = %ErrorChain(&failure), "failed to connect to the database");

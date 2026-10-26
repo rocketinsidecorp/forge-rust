@@ -416,8 +416,13 @@ Environment:
   FORGE_DATABASE_ALLOW_PLAINTEXT true accepts production URLs without verified TLS, only
                                on a trusted private network (default: false)
   FORGE_DATABASE_MAX_CONNS     connections of the serving pool, 1-1000 (default: 10)
+  FORGE_DATABASE_MIN_CONNS     connections the serving pool keeps open, 0 to
+                               FORGE_DATABASE_MAX_CONNS (default: 0)
   FORGE_DATABASE_CONNECT_TIMEOUT wait for a pooled connection, opening one included
                                (default: 5s)
+  FORGE_DATABASE_MAX_CONN_LIFETIME age at which a pooled connection is replaced (default: 30m)
+  FORGE_DATABASE_MAX_CONN_IDLE_TIME idle time after which a connection above the minimum
+                               is closed (default: 5m)
   FORGE_DATABASE_STATEMENT_TIMEOUT server-side bound of every statement, 1ms-596h; not
                                for migrations and commands (default: 30s)
   FORGE_JOBS_NOTIFY            true | false: enqueues announce due jobs and job workers

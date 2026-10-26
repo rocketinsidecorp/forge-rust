@@ -62,19 +62,14 @@ impl Declaration {
         }
     }
 
-    /// Creates the lazily connecting pool for `serve` and `jobs work`, sized
-    /// and bounded by `FORGE_DATABASE_MAX_CONNS`,
-    /// `FORGE_DATABASE_CONNECT_TIMEOUT` and `FORGE_DATABASE_STATEMENT_TIMEOUT`,
-    /// announcing enqueued jobs when `announce_jobs` (PostgreSQL, ADR 0046).
-    /// Must run inside the Tokio runtime.
+    /// Creates the lazily connecting pool for `serve`, `jobs work`, `routes`
+    /// and `openapi` with `settings` ([`serving_pool`]). Must run inside the
+    /// Tokio runtime.
     pub(crate) fn connect_lazy(
         &self,
         url: &SecretString,
-        config: &DatabaseConfig,
-        announce_jobs: bool,
+        settings: forge_db::PoolSettings,
     ) -> Result<DatabaseHandle, DbError> {
-        let settings =
-            forge_db::PoolSettings::from_config(config).with_job_announcements(announce_jobs);
         let _ = (url, settings);
         match *self {
             #[cfg(feature = "postgres")]
@@ -92,20 +87,35 @@ impl Declaration {
         }
     }
 
-    /// Connects eagerly with `url`, for application commands.
-    pub(crate) async fn connect(&self, url: &SecretString) -> Result<DatabaseHandle, DbError> {
-        let _ = url;
+    /// Connects eagerly with `url`, the migration credential, for
+    /// application commands such as `setup` and `seed`.
+    ///
+    /// The migration role owns the schema by design (ADR 0011, ADR 0026:
+    /// `setup` creates principals, which the runtime role may only read), so
+    /// the row-level security check, which refuses every table owner, would
+    /// refuse every correctly provisioned migration role: the pool opts out
+    /// explicitly, as the migrator does. The serving process never receives
+    /// this credential. Session settings still never come from `PGOPTIONS`.
+    pub(crate) async fn connect(
+        &self,
+        url: &SecretString,
+        environment: Environment,
+    ) -> Result<DatabaseHandle, DbError> {
+        let settings = forge_db::PoolSettings::default()
+            .with_environment(environment)
+            .allow_row_security_bypass();
+        let _ = (url, settings);
         match *self {
             #[cfg(feature = "postgres")]
-            Self::Postgres(_) => forge_db::Database::connect(url)
+            Self::Postgres(_) => forge_db::Database::connect_with(url, settings)
                 .await
                 .map(DatabaseHandle::Postgres),
             #[cfg(feature = "mysql")]
-            Self::MySql(_) => forge_db::Database::connect(url)
+            Self::MySql(_) => forge_db::Database::connect_with(url, settings)
                 .await
                 .map(DatabaseHandle::MySql),
             #[cfg(feature = "sqlite")]
-            Self::Sqlite(_) => forge_db::Database::connect(url)
+            Self::Sqlite(_) => forge_db::Database::connect_with(url, settings)
                 .await
                 .map(DatabaseHandle::Sqlite),
         }
@@ -211,6 +221,26 @@ impl Declaration {
                 accepted: expected.accepted_schemes(),
             })
         }
+    }
+}
+
+/// The settings of the application's pool on `FORGE_DATABASE_URL`: the
+/// `FORGE_DATABASE_*` sizes and timeouts, job announcements when
+/// `FORGE_JOBS_NOTIFY` is on (PostgreSQL, ADR 0046) and `FORGE_ENV`, so a
+/// PostgreSQL role that could bypass row-level security is refused outside
+/// development and test, on every connection the lazy pool opens. A pool
+/// for `inspecting` (`routes`, `openapi`) keeps no idle connection open.
+pub(crate) fn serving_pool(
+    config: &forge_config::AppConfig,
+    inspecting: bool,
+) -> forge_db::PoolSettings {
+    let settings = forge_db::PoolSettings::from_config(&config.database)
+        .with_job_announcements(config.jobs.notify == Some(true))
+        .with_environment(config.environment);
+    if inspecting {
+        settings.with_min_connections(0)
+    } else {
+        settings
     }
 }
 
@@ -455,7 +485,13 @@ mod commands {
         command: MigrationCommand,
         framework: &[Migrator],
     ) -> ExitCode {
-        let database = match Database::<B>::connect(url).await {
+        // The migration role owns the schema: it is not checked for
+        // row-level security, and like psql it takes session settings from
+        // PGOPTIONS (`PGOPTIONS='-c lock_timeout=5s' forge migrate`).
+        let settings = forge_db::PoolSettings::default()
+            .allow_row_security_bypass()
+            .with_environment_session(true);
+        let database = match Database::<B>::connect_with(url, settings).await {
             Ok(database) => database,
             Err(error) => {
                 error!(app, error = %ErrorChain(&error), "failed to connect to the database");
@@ -717,6 +753,35 @@ mod commands {
                     Environment::Development,
                 ));
             assert_eq!(code, ExitCode::FAILURE, "refused before any connection");
+        }
+    }
+}
+
+#[cfg(test)]
+mod pool_tests {
+    use forge_config::{AppConfig, Environment};
+
+    use super::serving_pool;
+
+    /// The application's pool is checked for row-level security outside
+    /// development and test, takes every pool key, and keeps no idle
+    /// connection for inspection.
+    #[test]
+    fn the_serving_pool_follows_the_environment_and_the_pool_keys() {
+        let mut config = AppConfig::default();
+        config.database.min_connections = 3;
+        config.environment = Environment::Production;
+        let serving = serving_pool(&config, false);
+        assert!(serving.checks_row_security());
+        assert_eq!(serving.environment(), Some(Environment::Production));
+        assert_eq!(serving.min_connections(), 3);
+        assert!(!serving.environment_session());
+        let inspecting = serving_pool(&config, true);
+        assert!(inspecting.checks_row_security());
+        assert_eq!(inspecting.min_connections(), 0);
+        for environment in [Environment::Development, Environment::Test] {
+            config.environment = environment;
+            assert!(!serving_pool(&config, false).checks_row_security());
         }
     }
 }
