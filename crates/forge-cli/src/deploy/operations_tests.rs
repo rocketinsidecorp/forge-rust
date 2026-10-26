@@ -23,6 +23,7 @@ use super::runner::{Cancel, ExecLocal, LocalRunner, Output, RunError, Runner, Si
 use super::secrets::Secrets;
 use super::tests::{
     Buffer, FakeRunner, PLAN_SECRETS, VALID_CONFIG, common, image_json, io, plan_fixture, remote,
+    write_executable,
 };
 
 const HOSTS: [&str; 3] = ["192.0.2.10", "192.0.2.11", "192.0.2.20"];
@@ -48,8 +49,7 @@ fn write_hook(root: &Path, name: &str, body: &str) {
     let hooks = root.join(".forge/hooks");
     std::fs::create_dir_all(&hooks).expect("hooks directory");
     let path = hooks.join(name);
-    std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("hook");
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    write_executable(&path, &format!("#!/bin/sh\n{body}\n"));
 }
 
 /// Runs `deploy` with every remote command for which `fail` answers `Some`

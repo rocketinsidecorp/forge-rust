@@ -23,6 +23,7 @@ use super::errors::{EXIT_LOCK_HELD, EXIT_MIGRATION_FAILED, EXIT_UNHEALTHY};
 use super::remote::{ExecOptions, LogsOptions};
 use super::runner::{Cancel, LocalRunner, SshRunner};
 use super::secrets::{REDACTED, Secrets};
+use super::tests::write_executable;
 use crate::process::Shutdown;
 
 const REGISTRY_PASSWORD: &str = "reg-pass-1234567";
@@ -243,21 +244,15 @@ fn start_cluster(names: &[&str]) -> Option<Cluster> {
         std::fs::create_dir_all(&home).expect("home");
         std::fs::create_dir_all(&state).expect("state");
         let wrapper = dir.join(name).join("session.sh");
-        std::fs::write(
+        write_executable(
             &wrapper,
-            format!(
+            &format!(
                 "#!/bin/sh\nexport PATH={}:/usr/bin:/bin HOME={} FAKE_DOCKER_STATE={}\ncd \"$HOME\" || exit 1\nexec /bin/sh -c \"$SSH_ORIGINAL_COMMAND\"\n",
                 dir.join("bin").display(),
                 home.display(),
                 state.display()
             ),
-        )
-        .expect("wrapper");
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700))
-                .expect("chmod");
-        }
+        );
         let (daemon, port) = start_sshd(
             &sshd,
             &dir.join(name),

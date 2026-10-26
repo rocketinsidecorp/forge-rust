@@ -1070,11 +1070,7 @@ fn failing_hook_aborts_before_remote_changes() {
         marker.display()
     );
     let hook = hooks.join("pre-deploy");
-    std::fs::write(&hook, script).expect("hook");
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o700)).expect("chmod");
-    }
+    write_executable(&hook, &script);
     let error = deployer
         .deploy(&Cancel::never(), "v3", true)
         .1
@@ -1437,14 +1433,11 @@ fn inventory_parsing_sorts_newest_first() {
 
 /// A fake `ssh` that prints a secret on stderr and fails.
 fn leaky_ssh(dir: &Path, secret: &str) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt as _;
     let path = dir.join("ssh");
-    std::fs::write(
+    write_executable(
         &path,
-        format!("#!/bin/sh\necho 'connect failed: {secret}' >&2\nexit 3\n"),
-    )
-    .expect("write");
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        &format!("#!/bin/sh\necho 'connect failed: {secret}' >&2\nexit 3\n"),
+    );
     path
 }
 
@@ -1689,6 +1682,41 @@ fn logs_respect_parallelism_unless_following() {
         assert_eq!((active, total), (0, 5), "follow={follow}");
         assert_eq!(peak, want_peak, "follow={follow}: streams open at once");
     }
+}
+
+/// Writes an executable (mode 0755) script at `path` without this process
+/// ever holding a write descriptor on it.
+///
+/// Writing the file here (`std::fs::write`) leaves a writable descriptor open
+/// in this process for a moment. Any other test thread that forks in that
+/// window (`Command::spawn`) inherits the descriptor until it execs, and
+/// while any process holds the inode open for writing `execve` of it fails
+/// with `ETXTBSY` ("Text file busy"). `O_CLOEXEC` only closes the descriptor
+/// at exec, so it does not close that window. Creating the file from a
+/// short-lived child keeps the writer out of this process, so forks on other
+/// threads cannot inherit it, and the child has exited before this returns.
+pub(super) fn write_executable(path: &Path, body: &str) {
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+
+    let mut child = Command::new("/bin/sh")
+        .args(["-c", "umask 022; cat > \"$1\" && chmod 755 \"$1\"", "sh"])
+        .arg(path)
+        .stdin(Stdio::piped())
+        .spawn()
+        .expect("spawn sh to write the executable");
+    child
+        .stdin
+        .take()
+        .expect("piped stdin")
+        .write_all(body.as_bytes())
+        .expect("send the script body");
+    let status = child.wait().expect("wait for sh");
+    assert!(
+        status.success(),
+        "writing {} failed: {status}",
+        path.display()
+    );
 }
 
 pub(super) fn common(_root: &Path) -> Common {

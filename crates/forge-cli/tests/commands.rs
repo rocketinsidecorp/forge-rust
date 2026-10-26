@@ -4,7 +4,6 @@
 #![cfg(unix)]
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -312,8 +311,7 @@ impl Bin {
         let directory = tempfile::tempdir().expect("temporary directory");
         fs::create_dir(directory.path().join("bin")).expect("bin");
         let cargo = directory.path().join("bin/cargo");
-        fs::write(&cargo, FAKE_CARGO).expect("script");
-        fs::set_permissions(&cargo, fs::Permissions::from_mode(0o755)).expect("chmod");
+        write_executable(&cargo, FAKE_CARGO);
         Self { directory }
     }
 
@@ -465,4 +463,39 @@ fn dry_runs_of_models_and_public_controllers() {
     );
     assert!(!controller.contains("reuse"), "{controller}");
     assert!(!root.join("src/adapters/http/access.rs").exists());
+}
+
+/// Writes an executable (mode 0755) script at `path` without this process
+/// ever holding a write descriptor on it.
+///
+/// Writing the file here (`std::fs::write`) leaves a writable descriptor open
+/// in this process for a moment. Any other test thread that forks in that
+/// window (`Command::spawn`) inherits the descriptor until it execs, and
+/// while any process holds the inode open for writing `execve` of it fails
+/// with `ETXTBSY` ("Text file busy"). `O_CLOEXEC` only closes the descriptor
+/// at exec, so it does not close that window. Creating the file from a
+/// short-lived child keeps the writer out of this process, so forks on other
+/// threads cannot inherit it, and the child has exited before this returns.
+fn write_executable(path: &Path, body: &str) {
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+
+    let mut child = Command::new("/bin/sh")
+        .args(["-c", "umask 022; cat > \"$1\" && chmod 755 \"$1\"", "sh"])
+        .arg(path)
+        .stdin(Stdio::piped())
+        .spawn()
+        .expect("spawn sh to write the executable");
+    child
+        .stdin
+        .take()
+        .expect("piped stdin")
+        .write_all(body.as_bytes())
+        .expect("send the script body");
+    let status = child.wait().expect("wait for sh");
+    assert!(
+        status.success(),
+        "writing {} failed: {status}",
+        path.display()
+    );
 }
