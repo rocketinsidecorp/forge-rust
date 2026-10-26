@@ -17,16 +17,17 @@ from a checkout.
 
 ```text
 forge uuid [--count N]
-forge new <name> [-d <DATABASE>] [--api] [--locale en|es|pt-BR] [--skip-docker] [--skip-ci] [--skip-lockfile] [--forge-path <PATH>]
+forge new <name> [-d <DATABASE>] [--api | --api-auth] [--locale en|es|pt-BR] [--skip-docker] [--skip-ci] [--skip-lockfile] [--forge-path <PATH>]
 forge generate migration <name>
-forge generate authentication [--dry-run]
+forge generate authentication [--api-auth] [--dry-run]
+forge generate resource <name> <field:type>... (--global | --tenant-scoped) [--plural <PLURAL>] [--dry-run]
 forge generate scaffold <name> <field:type>... (--global | --tenant-scoped) [--plural <PLURAL>] [--broadcast] [--dry-run]
 forge generate model <name> <field:type>... (--global | --tenant-scoped) [--plural <PLURAL>] [--dry-run]
 forge generate controller <name> <action>... [--api] [--public] [--dry-run]
 forge generate mailer <name> <method[:field,...]>... [--dry-run]
 forge generate job <name> [<field:type>...] --queue [--dry-run]
 forge generate view [<dir>/]<name> [--dry-run]
-forge destroy model|scaffold|controller|mailer|job|view <arguments of the generator> [--dry-run] [--force] [--migrations]
+forge destroy model|resource|scaffold|controller|mailer|job|view <arguments of the generator> [--dry-run] [--force] [--migrations]
 forge check
 forge test [ARGS]
 forge format
@@ -91,6 +92,7 @@ lowercase ASCII letter and use only lowercase letters, digits, `-` and `_`.
 | Flag | Effect |
 | --- | --- |
 | `--api` | Generate an API-only application, like `rails new --api`: JSON handlers, no `templates/`, `assets/`, view models, Askama dependency or HTML request layers. |
+| `--api-auth` | Also mount the JSON authentication API beside the sign-in pages (Forge-Go's flag): `POST /auth/login` issues bearer tokens to API clients, `POST /auth/logout` revokes them, `GET /v1/auth/session` shows the signed-in client. Full-stack PostgreSQL applications only; see [`forge generate authentication`](#forge-generate-authentication). |
 | `--skip-docker` | Do not generate `Dockerfile`, `.dockerignore`, `compose.yaml` or the observability stack (`compose.observability.yaml`, `observability/`). |
 | `--skip-ci` | Do not generate `.github/workflows/ci.yml` or `.github/dependabot.yml`. |
 | `-d`, `--database <DATABASE>` | `postgresql` (default, alias `postgres`), `mysql`, `mariadb`, `sqlite3` (alias `sqlite`) or `none`. `none` omits SQLx, migrations, database Compose services and bootstrap hooks. See [Database backends](#database-backends). |
@@ -403,6 +405,7 @@ backends rests on the application layer (bind the tenant predicate from
 ```sh
 forge generate authentication --dry-run
 forge generate authentication
+forge generate authentication --api-auth   # the JSON sign-in too (only it, when the pages exist)
 ```
 
 The `rails generate authentication` of Forge
@@ -468,6 +471,41 @@ Security behavior, all covered by the generated tests:
 - `SignInRedirect` sends a browser that gets `401` from an access policy to
   `/session/new?return_to=<page>`; JSON clients keep the `401`.
 
+### `--api-auth`: the JSON authentication API
+
+`forge new --api-auth` (and `forge generate authentication --api-auth`, which
+writes only these files in an application that has every page file) adds
+Forge-Go's bearer-token sign-in for API clients
+([ADR 0045](adr/0045-json-resources-and-bearer-api-authentication.md)):
+
+```text
+migrations/00000000000000000007_forge_bearer_sessions.{up,down}.sql   forge_bearer_sessions, runtime grants
+src/infrastructure/bearer_sessions/mod.rs   PostgresBearerSessionStore
+src/adapters/http/api_authentication.rs     routes, ApiAuthenticationPorts
+tests/api_authentication_http.rs            every refusal, with in-memory ports
+tests/api_authentication_postgres.rs        the store as the runtime role (TestDatabase)
+```
+
+| Method | Path | Behavior |
+| --- | --- | --- |
+| `POST` | `/auth/login` | `{"email", "password", "tenant"}`: `200` `{"access_token", "token_type": "Bearer", "expires_at"}` (`no-store`); `401 credentials_invalid` for any wrong field; `403 mfa_required` for an account with two-factor; `429 login_throttled` with `Retry-After` |
+| `POST` | `/auth/logout` | revokes the presented token: `204`, also for an unknown or revoked one; `401` without a well-formed header |
+| `GET` | `/v1/auth/session` | `{"subject_id", "tenant_id", "roles"}` of the token's tenant |
+
+The token is 32 bytes from the OS CSPRNG (`SessionBearerToken::generate`,
+64 hex digits) and the store keeps only its SHA-256 digest, bound to the
+tenant named at sign-in and to the account's password credential version.
+It ends after 24 hours, on `/auth/logout`, after
+`FORGE_AUTH_SESSION_IDLE_TIMEOUT` without a request, and at once when the
+password changes, the account is disabled or turns two-factor on. Attempts
+count in the pages' sign-in throttle (the same keys and limits) and are
+audited (`auth.sign_in`, `auth.sign_out`). Only `Authorization: Bearer`
+authenticates (exactly one header); cookies never stand in for it, and a
+cookie session is not a bearer session. Forge-Go's `/auth/mfa/complete`,
+`/auth/recovery/*` and `/auth/cookie/*` routes are not ported yet: accounts
+with two-factor and password resets use the pages. Resources generated with
+`forge generate resource` (and scaffolds) accept these tokens.
+
 Reset links are delivered by a `forge::auth::PasswordResetNotifier`: the
 generated composition calls `forge::mail::password_reset_notifier`, which
 emails them through the sender `FORGE_MAIL_URL` selects once
@@ -496,7 +534,9 @@ The `rails generate scaffold` of Forge ([ADR 0022](adr/0022-server-rendered-view
 decision 7, [ADR 0024](adr/0024-scaffold-generator.md)): run in the root of a
 full-stack database application, it generates a server-rendered HTML CRUD
 (index, show, new/create, edit/update, delete) through every ring, for the
-application's database backend, with tests. The walkthrough is in
+application's database backend, with tests, plus the JSON API under
+`/v1/<plural>` that `forge generate resource` writes
+([generators](generators.md#resource), as Forge-Go's scaffold does). The walkthrough is in
 [docs/views.md](views.md#scaffolding-a-resource).
 
 | Argument | Meaning |
@@ -528,10 +568,13 @@ src/application/ports/post_repository.rs     PostRepository port, PostPage, Post
 src/application/use_cases/posts.rs           PostService (list/find/create/update/delete), permissions
 src/infrastructure/database/posts.rs         PgPostRepository (SQLx, optimistic locking, cursor pages)
 src/adapters/http/access.rs                  access policies (first scaffold only; reused after)
+src/adapters/http/api_access.rs              JSON API access policies (first scaffold or resource only)
 src/adapters/http/posts.rs                   routes and handlers
+src/adapters/http/posts_api.rs               the JSON API under /v1/posts
 src/adapters/http/views/posts.rs             Askama view models
 templates/posts/{index,show,new,edit,_form,not_found}.html
 tests/posts_http.rs                          HTML flow with an in-memory port
+tests/posts_api.rs                           the JSON API with an in-memory port
 tests/posts_repository.rs                    repository as the runtime role (RlsTestDatabase on PostgreSQL)
 ```
 
@@ -565,10 +608,24 @@ and the statements to append to the `compose` function in
     crate::adapters::http::posts::routes(
         composition.router(),
         &site,
-        posts,
+        posts.clone(),
         std::sync::Arc::new(crate::adapters::http::access::DenyAll),
     )?;
+    // posts JSON API (/v1/posts): global. DenyAll refuses every request until
+    // you decide who may use it: implement ApiGlobalAccess
+    // (src/adapters/http/api_access.rs).
+    crate::adapters::http::posts_api::routes(
+        composition.router(),
+        posts,
+        std::sync::Arc::new(crate::adapters::http::api_access::DenyAll),
+    )?;
 ```
+
+A tenant-scoped scaffold in an application with bearer tokens (`forge new
+--api-auth`) wires its JSON API with `BearerTenantAccess`, which shares the
+pages' `policy` (the pages then take `policy.clone()`); without them the JSON
+API is `DenyAll` until `forge generate authentication --api-auth`
+([generators](generators.md#resource)).
 
 With `--broadcast` the first broadcasting scaffold also prints
 `pub mod streams;` and, before its routes,
@@ -634,18 +691,20 @@ unavailable) with a generic body. With the sign-in pages, browsers get a
 
 The scaffold refuses, with an explanation and without writing:
 
-- `forge new --api` applications: the scaffold generates HTML pages; JSON
-  scaffolds are not available yet.
+- `forge new --api` applications: the scaffold generates HTML pages
+  (`forge generate resource` writes the JSON API alone, in an application
+  created without `--api`).
 - `forge new -d none` applications: there is no database.
 - Applications without the `compose` function, the `forge` dev-dependency
   with the `testing` feature or (PostgreSQL tenant resources)
   `begin_tenant_transaction`, all of which `forge new` generates.
 - An `src/adapters/http/access.rs` that lacks the generated traits.
 
-## `forge generate model|controller|mailer|job` and `forge destroy`
+## `forge generate model|resource|controller|mailer|job` and `forge destroy`
 
 ```sh
 forge generate model post title:string 'body:text?' --global          # the scaffold's model files, no pages
+forge generate resource product name:string price_cents:integer --tenant-scoped   # model + JSON CRUD under /v1/products
 forge generate controller pages index about_us --public               # read-only GET pages
 forge generate controller reports monthly                             # guarded: asks for reports:read
 forge generate controller status_checks index --api                   # JSON under /v1
@@ -1031,7 +1090,7 @@ Same command names, flags, messages and exit codes, except:
 - Progress lines of `forge dev` carry no time stamp.
 - `forge generate` does not re-vendor: Go's `go mod vendor` step has no Rust
   counterpart because no generator changes the dependency set (see
-  [above](#forge-generate-modelcontrollermailerjob-and-forge-destroy)).
+  [above](#forge-generate-modelresourcecontrollermailerjob-and-forge-destroy)).
 
 ## `forge deploy`, `forge logs`, `forge app`
 

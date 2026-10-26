@@ -269,5 +269,8 @@ diff -u src/adapters/http/authentication.rs /tmp/shop-new/src/adapters/http/auth
 - A QR code image: Forge-Go renders none either; the page shows the
   `otpauth://` link (which phones open in their authenticator app) and the
   Base32 key.
-- A JSON (bearer) completion route: Forge-Rust has no JSON login API.
+- A JSON (bearer) completion route (Forge-Go's `/auth/mfa/complete`): the
+  JSON login of `forge new --api-auth` refuses a two-factor account with
+  `403 mfa_required` instead, and its bearer sessions end when the account
+  turns two-factor on.
 - Pruning expired enrollments and consumed challenges (Forge-Go's `PruneMFA`).

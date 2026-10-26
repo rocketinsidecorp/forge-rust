@@ -12,7 +12,7 @@ the work is finished and waiting for its review; **Planned** means not started.
 | New application with Docker and CI | `rails new` | Done | Done |
 | Database selection | `rails new -d` | Done (PostgreSQL, MySQL, MariaDB, SQLite) | Done (PostgreSQL, MySQL, MariaDB, SQLite) |
 | Server-rendered HTML, layouts, partials, forms, flash, CSRF | Action View | Done | Done |
-| HTML + JSON CRUD generator | `rails g scaffold` | Done | Done |
+| HTML + JSON CRUD generator | `rails g scaffold` | Done | Done (HTML pages); In review (the JSON API under `/v1/<plural>` behind bearer tokens that `forge generate scaffold` now writes next to its pages, [ADR 0045](adr/0045-json-resources-and-bearer-api-authentication.md)) |
 | Authentication pages, password reset | `rails g authentication` | Done | Done |
 | First tenant and owner, seeds | `db:seed` | Done (`forge setup`, `forge seed`) | In review (`forge setup`, `forge seed`; the application commands `setup` and `seed` are Done) |
 | Multi-tenancy with database enforcement | (gems) | Done (PostgreSQL RLS; `app_migrator`/`app_runtime` roles, staging and production refuse a serving role that could bypass RLS, tests run as the runtime role; Forge-Go ADR 0046) | Done (PostgreSQL RLS; `app_migrator`/`app_runtime` roles, [ADR 0011](adr/0011-postgresql-runtime-migration-roles-and-rls-context.md)); In review (production refuses a serving role that could bypass RLS, generated repository tests run as a per-test runtime role and prove it cannot run DDL, [ADR 0044](adr/0044-refused-row-level-security-bypass-and-runtime-role-tests.md); see follow-ups) |
@@ -27,7 +27,7 @@ the work is finished and waiting for its review; **Planned** means not started.
 | Stream signing key rotation without breaking open pages | `MessageVerifier#rotate` | Done ([forge-go#64](https://github.com/rocketinsidecorp/forge-go/pull/64): `FORGE_STREAMS_PREVIOUS_KEYS`, at most 3, redacted, `broadcast.DecodePreviousKeys`) | Done (`FORGE_STREAMS_PREVIOUS_KEYS`, same name, separator, limit and redaction; `Signer::from_config` reads it for every generated application, [forge-rust#77](https://github.com/rocketinsidecorp/forge-rust/issues/77), [views](views.md#rotating-the-stream-signing-key)) |
 | forge-proxy bounds on request headers and connections | nginx `large_client_header_buffers`, `worker_connections` | Done ([forge-go#64](https://github.com/rocketinsidecorp/forge-go/pull/64): `-max-header-bytes` 65536, `431` above; `-max-connections` 10000 per listener) | Done (`-max-header-bytes` and `-max-connections`, same names, defaults and range, [forge-rust#77](https://github.com/rocketinsidecorp/forge-rust/issues/77), [deployment](deployment.md#forge-deploy)) |
 | Inline stylesheets allowed by hash, not `'unsafe-inline'` | `content_security_policy` | Done ([forge-go#64](https://github.com/rocketinsidecorp/forge-go/pull/64): the welcome page, with a test that recomputes the hash) | Done (mail preview pages, with a test that recomputes the hash; the generated welcome page has no inline style; two cases stay, see follow-ups) |
-| Re-vendor after `forge generate` | — | Done ([forge-go#64](https://github.com/rocketinsidecorp/forge-go/pull/64): `go mod vendor` in an application with `vendor/`, never on `--dry-run`) | Not applicable (`forge new` sets up no vendoring and no generator changes `Cargo.toml` or `Cargo.lock`; a test runs every generator against a vendored application, [cli](cli.md#forge-generate-modelcontrollermailerjob-and-forge-destroy)) |
+| Re-vendor after `forge generate` | — | Done ([forge-go#64](https://github.com/rocketinsidecorp/forge-go/pull/64): `go mod vendor` in an application with `vendor/`, never on `--dry-run`) | Not applicable (`forge new` sets up no vendoring and no generator changes `Cargo.toml` or `Cargo.lock`; a test runs every generator against a vendored application, [cli](cli.md#forge-generate-modelresourcecontrollermailerjob-and-forge-destroy)) |
 | Bounded memory-hard password hashing | — | Not needed (PBKDF2, no per-hash memory) | In review (`forge::auth::PasswordWorkLimiter`: one Argon2id hash per CPU, at most 16, then `503`) |
 | Client address behind trusted proxies | `request.remote_ip`, `trusted_proxies` | Done (`FORGE_HTTP_TRUSTED_PROXIES`, ADR 0037) | Done (`FORGE_HTTP_TRUSTED_PROXIES`, ADR 0032; `forge deploy` sets it for the proxied role, [ADR 0042](adr/0042-forge-deploy.md)) |
 | `HEAD` on every `GET` route | `HEAD` routed to `GET` | Done (`http.ServeMux`) | In review (the router serves `HEAD` with the `GET` route unless a `HEAD` route exists, the server drops the body, `Allow` lists `HEAD`) |
@@ -53,7 +53,8 @@ the work is finished and waiting for its review; **Planned** means not started.
 | List the application's routes | `rails routes` | Done (`forge routes`, a source scan: literal `Handle`/`Resources` paths only, so the `/v1/<plural>` JSON routes of resources are missing) | Done (`forge routes`, runs the composed application: every HTML and JSON route with its source line, [CLI](cli.md#application-lifecycle-commands)) |
 | Controller, model, mailer and job generators | `rails g` | Done (Forge-Go ADR 0041) | Done (`forge generate model\|controller\|mailer\|job --queue`, [ADR 0038](adr/0038-generators-and-destroy.md), [generators](generators.md)) |
 | One page generator | — | Done (`forge generate view [DIR/]NAME`, `forge destroy view`) | In review (same command and arguments: `templates/DIR/NAME.html`, plus the Askama view model and a rendering test; refuses `--api` applications instead of adding a views base, [generators](generators.md#view)) |
-| Model plus JSON API generator | `rails g resource` | Done (`forge generate resource`, `forge destroy resource`: model + `/v1/<plural>` JSON routes behind bearer tokens) | Planned (it is the JSON layer of the scaffold, which needs the JSON CRUD and bearer-token login that `show_json` waits for; it lands with that work, under the same name) |
+| Model plus JSON API generator | `rails g resource` | Done (`forge generate resource`, `forge destroy resource`: model + `/v1/<plural>` JSON routes behind bearer tokens) | In review (`forge generate resource`, `forge destroy resource`: the model + `/v1/<plural>` JSON CRUD behind bearer tokens, `<plural>:read`/`<plural>:write`, OpenAPI `bearerAuth`, generated `401`/`403`/cross-tenant/validation tests, [generators](generators.md#resource); see follow-ups) |
+| JSON sign-in for API clients (bearer tokens) | (gems) | Done (`forge new --api-auth`, `forge generate authentication --api-auth`: `/auth/login`, `/auth/logout`, `/auth/mfa/complete`, `/auth/recovery/*`, `/auth/cookie/*`, `GET /v1/auth/session`) | In review (`forge new --api-auth`, `forge generate authentication --api-auth`: `POST /auth/login`, `POST /auth/logout`, `GET /v1/auth/session`; tenant-bound tokens stored as SHA-256 digests in `forge_bearer_sessions`; the MFA, recovery and cookie JSON routes are follow-ups) |
 | Undo a generator | `rails d` | Done (`forge destroy`, Forge-Go ADR 0041) | Done (`forge destroy`, [ADR 0038](adr/0038-generators-and-destroy.md)) |
 | Continuous fuzzing, SBOM, signed images | — | Done (`scripts/fuzz.sh`, `scripts/sbom.sh`, `release.yml`, Forge-Go ADR 0044) | Done (`scripts/fuzz.sh`, `scripts/sbom.sh`, signed forge-proxy image, SHA/digest pins enforced by `crates/forge/tests/supply_chain.rs`, [ADR 0043](adr/0043-continuous-fuzzing-sbom-signed-images.md), [supply chain](supply-chain.md)) |
 | Published benchmarks | — | Done (`go test -bench`, `scripts/bench.sh`, [BENCHMARKS.md](https://github.com/rocketinsidecorp/forge-go/blob/main/docs/BENCHMARKS.md)) | Done (`cargo bench -p forge-bench`, `scripts/bench.sh`, [benchmarks](benchmarks.md)) |
@@ -153,9 +154,32 @@ the work is finished and waiting for its review; **Planned** means not started.
   `auth.mfa.backup_codes_regenerated`) and the HTML enrollment, rotation,
   backup-code and disable pages behind password and code step-up match
   Forge-Go (its ADR 0045). Both use a step-up backup code up only with the
-  change it authorizes. Forge-Rust has no JSON login API, so it has no
-  `/auth/mfa/complete` bearer route and does not port `PruneMFA` yet. Its
+  change it authorizes. Forge-Rust's JSON login (`--api-auth`, ADR 0045)
+  refuses a two-factor account (`403 mfa_required`) instead of completing it
+  at `/auth/mfa/complete`, which is not ported, nor is `PruneMFA` yet. Its
   sign-in, reset and MFA counters are in PostgreSQL since QR2 (below).
+
+- JSON resources and bearer tokens (forge-rust QR3b, 2026-10-26,
+  [ADR 0045](adr/0045-json-resources-and-bearer-api-authentication.md)):
+  `forge generate resource`, the scaffold's JSON API and `forge new
+  --api-auth` follow Forge-Go's commands, routes, error codes
+  (`credentials_required`, `credentials_invalid`, `permission_denied`,
+  `login_throttled`), `bearerAuth` scheme and `PATCH` semantics. Differences:
+  (1) Forge-Rust has no permission table, so no migration registers
+  `PLURAL:read`/`PLURAL:write` (the use cases declare them and the printed
+  `RbacPolicy` grants them, ADR 0038); (2) tokens are 64 hex digits in their
+  own `forge_bearer_sessions` table, not 43 base64url characters in the
+  sessions table, and they end when the password changes, the account is
+  disabled or turns two-factor on; (3) a two-factor account gets
+  `403 mfa_required` (no `/auth/mfa/complete`), and the JSON recovery and
+  cookie routes are not ported; (4) `GET /v1/auth/session` lists `roles`, not
+  permissions; (5) global JSON resources are `DenyAll` for reads too, where
+  Forge-Go lets tenant roles read them; (6) responses have no
+  `created_at`/`updated_at`, pages are in UUIDv7 order without `limit`, and
+  undecodable bodies are `422` (Forge-Go `400`); (7) `--api` applications
+  (Forge-Rust only) get no resource, having no `fn compose`. **Forge-Go
+  follow-up:** its `docs/AUTHENTICATION.md` and `RAILS_PARITY.md` still say
+  Forge-Rust has no JSON login.
 
 - Shared attempt throttle (forge-rust QR2, 2026-10-26): `PgLoginThrottle`
   ports Forge-Go's `auth/postgres` `LoginThrottler`: the same
@@ -197,18 +221,16 @@ the work is finished and waiting for its review; **Planned** means not started.
   (3) The production warning has Forge-Go's wording with Forge-Rust's type
   names; Forge-Rust has no framework sign-in or recovery service, so the
   generated `authentication::routes` asks `Composition` to check the three
-  throttles it receives. `--api-auth` needs nothing in Forge-Rust while it
-  has no JSON login.
+  throttles it receives. The JSON login of `--api-auth` (ADR 0045) counts
+  in the pages' `PgLoginThrottle`, which that check already covers.
 
 - Benchmarks ([benchmarks](benchmarks.md), rocketinsidecorp/forge-rust#41): the
   scenario names, variants and output formats are Forge-Go's, and results are
-  read side by side. Forge-Rust has no equivalent of one scenario, so it is
-  not run and not reported: the end-to-end `show_json` (a generated
-  application has no JSON scaffold and no bearer-token login: `forge generate
-  scaffold` is HTML-only, [CLI](cli.md#refusals)). Adding a JSON
-  scaffold with bearer-token login to Forge-Rust makes the scenario
-  available; the load generator already names `show_json` and refuses it
-  with that reason. `router_match/wildcard/*` runs since the router has
+  read side by side. One scenario is not run yet and not reported: the
+  end-to-end `show_json`. Generated applications now have the JSON scaffold
+  and bearer-token login it needs (`forge new --api-auth`, ADR 0045), but
+  the load generator still names `show_json` and refuses it until it signs
+  in for a token and drives `GET /v1/<plural>/{id}` (follow-up). `router_match/wildcard/*` runs since the router has
   Forge-Go's catch-all `{name...}` segment. Differences that are not gaps: `health` is
   `GET /health/ready` in Forge-Rust (the probe that pings the database; its
   `/health` never does), `password_verify` times Argon2id where Forge-Go's is
@@ -310,7 +332,7 @@ the work is finished and waiting for its review; **Planned** means not started.
 - Re-vendoring after `forge generate` (forge-go QG4b D-9): Forge-Go runs `go
   mod vendor` in an application with `vendor/`. Not applicable to Forge-Rust:
   `forge new` sets up no vendoring and generators never change the
-  dependency set ([cli](cli.md#forge-generate-modelcontrollermailerjob-and-forge-destroy)).
+  dependency set ([cli](cli.md#forge-generate-modelresourcecontrollermailerjob-and-forge-destroy)).
 
 - Deployment ([ADR 0042](adr/0042-forge-deploy.md)): commands, flags,
   `config/deploy.yml`, `.forge/secrets`, hooks, remote layout, lock and

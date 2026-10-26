@@ -31,7 +31,8 @@ Forge-Go ADR 0041). Every generator follows the same rules:
 | `forge generate controller NAME ACTION...` | HTTP handlers, routes, views, tests; no persistence | `rails g controller` |
 | `forge generate mailer NAME METHOD...` | a mailer with subject, text and HTML templates, previews, tests | `rails g mailer` |
 | `forge generate job NAME [field:type...] --queue` | a typed job of the persistent queue, its handler, registration, enqueue function, tests | `rails g job` |
-| `forge generate scaffold` | a model plus HTML CRUD pages ([cli](cli.md#forge-generate-scaffold)) | `rails g scaffold` |
+| `forge generate resource NAME field:type...` | a model plus a JSON CRUD API under `/v1/<plural>`, behind bearer tokens | `rails g resource` |
+| `forge generate scaffold` | a resource plus HTML CRUD pages ([cli](cli.md#forge-generate-scaffold)) | `rails g scaffold` |
 | `forge generate view [DIR/]NAME` | one page in the layout, its view model, a test | |
 | `forge generate authentication` | the sign-in pages | `rails g authentication` |
 | `forge destroy GENERATOR ARGUMENTS...` | removes what a generator created | `rails d` |
@@ -45,11 +46,11 @@ forge migrate
 forge test
 ```
 
-Takes exactly the arguments of `forge generate scaffold` without
-`--broadcast` (`--tenant-scoped` or `--global`, `--plural`, field types
-`string`, `text`, `integer`, `boolean`, `timestamp`, `uuid`, a trailing `?`
-for optional) and writes exactly the model files the scaffold writes, byte
-for byte, without the HTTP layer:
+Takes exactly the arguments of `forge generate resource` (and of `forge
+generate scaffold` without `--broadcast`: `--tenant-scoped` or `--global`,
+`--plural`, field types `string`, `text`, `integer`, `boolean`, `timestamp`,
+`uuid`, a trailing `?` for optional) and writes exactly the model files the
+resource and the scaffold write, byte for byte, without the HTTP layer:
 
 ```text
 migrations/<version>_create_posts.{up,down}.sql
@@ -71,15 +72,94 @@ let posts = crate::application::use_cases::posts::PostService::new(std::sync::Ar
 
 Tenant-scoped models take the authorized `TenantContext` in every use case,
 bind the tenant in every statement and, on PostgreSQL, run behind forced
-row-level security. IDs are UUIDv7 generated in Rust. Adding the pages later
-is `forge generate scaffold` on a new name: a model and a scaffold of one
-plural collide instead of mixing layers.
+row-level security. IDs are UUIDv7 generated in Rust. Adding the HTTP layer
+later is `forge generate resource` or `forge generate scaffold` on a new
+name: a model, resource and scaffold of one plural collide instead of
+mixing layers.
 
 A model also works in a `forge new --api` application: it has no views and
 the model needs none (a scaffold is refused there, because it writes pages).
 Every application with a database has the `forge` dev-dependency with
 `testing` that the repository tests need; one generated before that is told to
 add `"testing"` to the features of that dev-dependency.
+
+## Resource
+
+```sh
+forge generate resource product name:string 'summary:text?' price_cents:integer --tenant-scoped --dry-run
+forge generate resource product name:string 'summary:text?' price_cents:integer --tenant-scoped
+forge migrate
+forge test
+```
+
+Forge-Go's `forge generate resource` ([ADR
+0045](adr/0045-json-resources-and-bearer-api-authentication.md)): the model
+files above, byte for byte, plus a JSON CRUD API under `/v1/<plural>`:
+
+```text
+src/adapters/http/products_api.rs     routes(), ProductJson, NewProduct, ProductChanges, ProductList
+src/adapters/http/api_access.rs       shared API access policies, when missing
+tests/products_api.rs                 the API through the router, with real bearer tokens in memory
+```
+
+| Method | Path | Answer | Permission |
+| --- | --- | --- | --- |
+| `GET` | `/v1/products?cursor=ID` | `200` `{"items", "next_cursor"}`, creation order, 25 per page | `products:read` |
+| `POST` | `/v1/products` | `201` with `Location`; `422` | `products:write` |
+| `GET` | `/v1/products/{id}` | `200`; `404`; `400 invalid_id` | `products:read` |
+| `PATCH` | `/v1/products/{id}` | `{"version", members to change}`: `200`; `409` when stale | `products:write` |
+| `DELETE` | `/v1/products/{id}?version=N` | `204`; `409` when stale | `products:write` |
+
+A response is `{"id", the fields, "version"}`. `PATCH` changes only the
+members it names, and `null` clears an optional one (`forge::web::Patch`,
+Forge-Go's `PatchField`); `null` for a required member and a value that
+breaks a rule are `422 validation_failed` with a message per member in
+`metadata`; a body that does not decode, or has a member the type lacks,
+is `422 invalid_json`. Every route is described in the OpenAPI document
+with the `bearerAuth` scheme and its permission, and the generated tests
+check every response against it.
+
+**Access.** Every route asks an access policy of
+`src/adapters/http/api_access.rs` first, and nothing is public by default:
+
+- **Tenant-scoped** resources take an `ApiTenantAccess`. In an application
+  with bearer tokens (`forge new --api-auth`, or `forge generate
+  authentication --api-auth`) the printed wiring passes
+  `BearerTenantAccess`: exactly one `Authorization: Bearer` header with a
+  live token, an active membership in the tenant **the token was issued
+  for** and an RBAC grant (`owner` gets both permissions; the output prints
+  a read-only `viewer` example). The tenant never comes from the path, the
+  query or a header, so a token works only in its own tenant. Without
+  bearer tokens, and on MySQL, MariaDB and SQLite, the wiring passes
+  `DenyAll` (`403`) and says what to do.
+- **Global** resources take an `ApiGlobalAccess`, wired with `DenyAll`
+  until you implement your own rule: tenant roles cannot authorize rows
+  every tenant shares. (Forge-Go lets tenant roles read a global resource and
+  denies its writes; Forge-Rust closes both, as its global scaffold pages
+  do.)
+
+Refusals are JSON error reports: `401 credentials_required` without a
+header, `401 credentials_invalid` for a malformed, unknown, expired, idle or
+revoked token (both with `WWW-Authenticate: Bearer realm="forge"`),
+`403 permission_denied`, `503` when a store fails. The use cases check the
+grant again (defense in depth). The generated tests cover the round trip,
+`401` without a valid token, `403` without the permission, another
+tenant's rows (not listed, not found, not changed), validation, conflicts
+and the `DenyAll` default.
+
+The site's CSRF layer lets requests with a bearer header or a JSON body
+through without a CSRF token, after its cross-site check, as Forge-Go's
+does: a cross-site page cannot send either. A resource needs `fn compose`,
+so `forge new --api` applications are refused.
+
+Differences from Forge-Go: Forge-Rust has no permission table, so no
+migration registers `PLURAL:read`/`PLURAL:write`: the use cases declare
+them (`READ_PERMISSION`, `WRITE_PERMISSION`) and the printed `RbacPolicy`
+grants them ([permission ownership](#permission-ownership)). Responses have
+no `created_at`/`updated_at` (the entity does not carry them), pages are in
+creation (UUIDv7) order with the service's page size instead of newest
+first with `limit`, and a body that does not decode is `422` where Forge-Go
+answers `400`.
 
 ## Controller
 
@@ -284,6 +364,7 @@ permission of the model or scaffold of its name and refuses any other owner.
 ```sh
 forge destroy scaffold post title:string body:text --tenant-scoped --dry-run
 forge destroy scaffold post title:string body:text --tenant-scoped
+forge destroy resource product name:string price_cents:integer --tenant-scoped
 forge destroy controller pages home about_us --public
 forge destroy mailer user welcome:name,url password_reset
 forge destroy job send_welcome user_id:uuid 'note:string?' --queue
@@ -308,16 +389,19 @@ therefore be exact, and it works for code generated by any earlier version.
   translated (`config/locales/posts.es.json`) is kept and reported as `keep`,
   not refused.
 - Files a bigger or dependent generation needs are refused the same way:
-  `destroy model post` while the scaffold's `src/adapters/http/posts.rs`
-  exists, `destroy model|scaffold` while a controller reuses its
+  `destroy model post` while the scaffold's `src/adapters/http/posts.rs` or
+  the resource's `src/adapters/http/posts_api.rs` exists, `destroy resource
+  post` while the scaffold's pages exist, `destroy model|resource|scaffold`
+  while a controller reuses its
   permission, and `destroy view pages/about_us` while the `pages` controller
   renders that page. Destroy that generation first, or pass `--force`.
 - **Migrations are kept**: a migration that ran is part of the database's
   history. Run `forge rollback`, then pass `--migrations`; a destroy that
   finds nothing but kept files says so. `forge destroy migration` explains
   the same.
-- Shared files, the access policy (`src/adapters/http/access.rs`), the
-  live-update transport (`src/adapters/http/streams.rs`) and the jobs module
+- Shared files, the access policies (`src/adapters/http/access.rs` and
+  `src/adapters/http/api_access.rs`), the live-update transport
+  (`src/adapters/http/streams.rs`) and the jobs module
   (`src/adapters/jobs/mod.rs`), are never removed; directories are removed
   when they become empty, except the application's layout directories.
 - `--dry-run` lists what would be removed. Nothing is removed through a
@@ -337,7 +421,7 @@ application racing the command.
 
 The generators live in `crates/forge-cli/src`: `generators.rs` (planned files,
 roles, overwrite and symlink refusal, the permission scan), `scaffold/` (the
-model and scaffold), `controller.rs`, `mailer.rs`, `job.rs`, `view.rs`,
+model, resource and scaffold), `controller.rs`, `mailer.rs`, `job.rs`, `view.rs`,
 `destroy.rs`, and the templates in
 `crates/forge-cli/templates/{scaffold,controller,mailer,job,view}`.
 `crates/forge-cli/tests/scaffold.rs` generates every artifact into a fresh

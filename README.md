@@ -127,7 +127,8 @@ and generated applications should port four files; see
 ### From `forge new` to a working CRUD resource
 
 1. Generate the resource (the migration, entity, use cases, repository,
-   handlers, views and tests; `--dry-run` lists the files without writing):
+   HTML handlers, views, the JSON API under `/v1/invoices` and tests;
+   `--dry-run` lists the files without writing):
 
    ```sh
    forge generate scaffold invoice number:string total_cents:integer due_at:timestamp? --tenant-scoped
@@ -142,7 +143,9 @@ and generated applications should port four files; see
    src/application/use_cases/mod.rs       pub mod invoices;
    src/infrastructure/database/mod.rs     pub mod invoices;
    src/adapters/http/mod.rs               pub mod access;      (first scaffold only)
+   src/adapters/http/mod.rs               pub mod api_access;  (first scaffold or resource only)
    src/adapters/http/mod.rs               pub mod invoices;
+   src/adapters/http/mod.rs               pub mod invoices_api;
    src/adapters/http/views/mod.rs         pub mod invoices;
    ```
 
@@ -184,10 +187,23 @@ and generated applications should port four files; see
    crate::adapters::http::invoices::routes(
        composition.router(),
        &site,
-       invoices,
+       invoices.clone(),
        std::sync::Arc::new(access),
    )?;
+   // invoices JSON API (/v1/invoices): tenant-scoped, for bearer tokens. This
+   // application issues none yet, so DenyAll refuses every request: run
+   // `forge generate authentication --api-auth`, then pass BearerTenantAccess
+   // (src/adapters/http/api_access.rs) here.
+   crate::adapters::http::invoices_api::routes(
+       composition.router(),
+       invoices,
+       std::sync::Arc::new(crate::adapters::http::api_access::DenyAll),
+   )?;
    ```
+
+   In an application created with `forge new --api-auth` the JSON API is
+   wired with `BearerTenantAccess` instead, sharing the pages' `policy`
+   (see [A JSON API with bearer tokens](#a-json-api-with-bearer-tokens)).
 
    A `--global` resource (`forge generate scaffold post title:string
    body:text published:boolean --global`) is wired with `DenyAll` and
@@ -211,6 +227,50 @@ and generated applications should port four files; see
    run them with
    `FORGE_TEST_DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5432/postgres cargo test -- --include-ignored`.
 
+### A JSON API with bearer tokens
+
+`forge new --api-auth` adds Forge-Go's JSON sign-in beside the pages (bearer
+tokens for API clients, bound to the tenant named at sign-in), and
+`forge generate resource` writes a model with a JSON CRUD API under
+`/v1/<plural>` that accepts them (`<plural>:read` / `<plural>:write`):
+
+```sh
+forge new shop --api-auth && cd shop
+forge setup --tenant acme --email owner@example.com   # the owner; password prompted
+forge generate resource product name:string 'summary:text?' price_cents:integer --tenant-scoped
+# add the printed `pub mod` lines, and the statements at the end of `fn compose`
+forge migrate
+forge dev
+
+TOKEN=$(curl -s -X POST http://127.0.0.1:3000/auth/login -H 'Content-Type: application/json' \
+  -d '{"email":"owner@example.com","password":"your password","tenant":"acme"}' \
+  | sed -n 's/.*"access_token":"\([0-9a-f]*\)".*/\1/p')
+curl -s http://127.0.0.1:3000/v1/auth/session -H "Authorization: Bearer $TOKEN"
+curl -s -X POST http://127.0.0.1:3000/v1/products -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' -d '{"name":"Launch kit","price_cents":4200}'
+curl -s http://127.0.0.1:3000/v1/products -H "Authorization: Bearer $TOKEN"
+curl -s -X PATCH http://127.0.0.1:3000/v1/products/<id> -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' -d '{"version":1,"summary":null}'
+curl -s -X DELETE "http://127.0.0.1:3000/v1/products/<id>?version=2" -H "Authorization: Bearer $TOKEN"
+curl -s -X POST http://127.0.0.1:3000/auth/logout -H "Authorization: Bearer $TOKEN"   # revoke: 204
+curl -s http://127.0.0.1:3000/v1/products -H "Authorization: Bearer $TOKEN"           # now 401
+
+forge generate authentication --api-auth   # adds the JSON sign-in to an existing application
+forge rollback && forge destroy resource product name:string 'summary:text?' price_cents:integer --tenant-scoped --migrations
+```
+
+Tokens are 256 bits from the OS CSPRNG, stored only as SHA-256 digests, last
+24 hours, end after `FORGE_AUTH_SESSION_IDLE_TIMEOUT` without a request, on
+`/auth/logout`, and at once when the account's password changes, the account
+is disabled or turns two-factor authentication on (such accounts sign in
+through the pages: `403 mfa_required`). Sign-in attempts count in the pages'
+throttle (`429 login_throttled` with `Retry-After`) and are audited. Without
+a token the API answers `401` (`credentials_required`, `credentials_invalid`,
+`WWW-Authenticate: Bearer`), without the permission `403`, and another
+tenant's rows are not found. Global resources stay `DenyAll` until you
+implement `ApiGlobalAccess`. Details: [generators](docs/generators.md#resource),
+[ADR 0045](docs/adr/0045-json-resources-and-bearer-api-authentication.md).
+
 ### Command cheat sheet
 
 ```sh
@@ -218,16 +278,20 @@ forge uuid                                     # print a UUIDv7 (forge uuid --co
 forge new shop                                 # full-stack, PostgreSQL, Docker and CI
 forge new shop -d sqlite3                      # or postgresql, mysql, mariadb, none
 forge new shop --api                           # JSON only, no views
+forge new shop --api-auth                      # also the JSON sign-in: bearer tokens at /auth/login (PostgreSQL)
 forge new shop --locale pt-BR                  # pages in Brazilian Portuguese by default (or es; en is the default)
 forge new shop --skip-docker --skip-ci --skip-lockfile
 forge generate migration create_customers      # empty reversible .up.sql/.down.sql pair
 forge generate authentication                  # sign-in pages + setup for an older PostgreSQL app
 forge generate authentication --dry-run
+forge generate authentication --api-auth       # the JSON sign-in (bearer tokens) for an existing app
 forge generate scaffold post title:string body:text? published:boolean --global
 forge generate scaffold person name:string --tenant-scoped --plural people
 forge generate scaffold post title:string --global --dry-run
 forge generate scaffold event name:string starts_at:timestamp --tenant-scoped --broadcast  # live updates
 forge generate model book title:string 'pages:integer?' --global   # migration, entity, port, use cases, repository, tests
+forge generate resource product name:string price_cents:integer --tenant-scoped   # the model + JSON CRUD under /v1/products
+forge destroy resource product name:string price_cents:integer --tenant-scoped     # removes only files still as generated
 forge generate controller pages index about_us --public            # read-only GET pages, views and tests
 forge generate controller reports monthly                          # guarded by reports:read (DenyAll until you decide)
 forge generate controller status_checks index --api                # JSON endpoints under /v1
@@ -736,9 +800,15 @@ Kubernetes and systemd deployment is covered in
   the rest of `rails g` in the hexagonal rings, with printed wiring, one owner
   per permission, and a `rails d` that removes only files still identical to
   what the generator writes and keeps migrations unless `--migrations`.
+- `forge generate resource <name> field:type... --global|--tenant-scoped`:
+  the model plus a JSON CRUD API under `/v1/<plural>`, described in the
+  OpenAPI document, behind bearer tokens (`forge new --api-auth`) and the
+  `<plural>:read`/`<plural>:write` permissions, with generated tests for
+  `401`, `403`, cross-tenant isolation and validation
+  ([ADR 0045](docs/adr/0045-json-resources-and-bearer-api-authentication.md)).
 - `forge generate scaffold <name> field:type... --global|--tenant-scoped`:
-  migration, entity, port, use cases, SQLx repository, HTML handlers, views
-  and tests for the application's backend, deny-by-default access, tenant
+  migration, entity, port, use cases, SQLx repository, HTML handlers, views,
+  the resource's JSON API and tests for the application's backend, deny-by-default access, tenant
   predicates plus forced RLS on PostgreSQL, and printed wiring instead of
   edits to existing files ([ADR 0024](docs/adr/0024-scaffold-generator.md)).
   With `--broadcast`, open index pages update live: Turbo Streams over
