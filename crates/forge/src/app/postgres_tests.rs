@@ -181,7 +181,19 @@ fn serve_in_production_refuses_a_superuser_and_serves_the_runtime_role() {
         )
         .expect("role query");
     if is_superuser {
-        refused_in_production(app(), &["serve"], superuser.url().expose());
+        // Refused before any composition hook sees the pool.
+        let composed = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&composed);
+        let app_with_hook = app().compose(move |_| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        });
+        refused_in_production(app_with_hook, &["serve"], superuser.url().expose());
+        assert_eq!(
+            composed.load(Ordering::SeqCst),
+            0,
+            "a hook ran before the refusal"
+        );
     }
 
     let port = free_port();
@@ -221,10 +233,22 @@ fn serve_in_production_refuses_a_superuser_and_serves_the_runtime_role() {
 #[test]
 fn serve_in_production_fails_closed_when_the_role_cannot_be_checked() {
     let _serial = serialized();
+    let composed = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&composed);
     refused_in_production(
-        App::new("demo").postgres(forge_db::Migrator::DEFAULT),
+        App::new("demo")
+            .postgres(forge_db::Migrator::DEFAULT)
+            .compose(move |_| {
+                counted.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }),
         &["serve"],
         "postgres://app_runtime:app_runtime@127.0.0.1:1/app",
+    );
+    assert_eq!(
+        composed.load(Ordering::SeqCst),
+        0,
+        "a hook ran before the refusal"
     );
 }
 

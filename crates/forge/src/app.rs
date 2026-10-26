@@ -485,6 +485,12 @@ impl App {
         // begins (a signal, or the server or job runtime failing). Composed
         // adapters see it through `Composition::shutdown_started`.
         let shutdown = Cancellation::new();
+        // The pool is checked before telemetry starts and before any
+        // composition hook sees it (ADR 0044).
+        let database = match open_checked_pool(name, &runtime, declaration.zip(url), &config) {
+            Ok(database) => database,
+            Err(code) => return code,
+        };
         // SQLx pools and the adapters composed around them need a Tokio
         // context even before the first request arrives.
         let composed = {
@@ -497,7 +503,7 @@ impl App {
                 &config,
                 registrations,
                 compose_hooks,
-                declaration.zip(url),
+                database,
                 jobs_slot,
                 &shutdown,
                 telemetry.as_ref(),
@@ -513,13 +519,6 @@ impl App {
             Ok(built) => built,
             Err(code) => return code,
         };
-        if let Err(code) = runtime.block_on(require_row_security(
-            name,
-            database.as_ref(),
-            config.environment,
-        )) {
-            return code;
-        }
         if let Err(code) = mount_openapi(name, &mut router, &config, &info) {
             return code;
         }
@@ -790,16 +789,19 @@ impl App {
         let shutdown = Cancellation::new();
         let composed = {
             let _guard = runtime.enter();
-            compose(
-                name,
-                &config,
-                registrations,
-                compose_hooks,
-                declaration.zip(url),
-                jobs_slot,
-                &shutdown,
-                None,
-            )
+            // Inspection never queries, so the role is not checked.
+            open_pool(name, declaration.zip(url), &config).and_then(|database| {
+                compose(
+                    name,
+                    &config,
+                    registrations,
+                    compose_hooks,
+                    database,
+                    jobs_slot,
+                    &shutdown,
+                    None,
+                )
+            })
         };
         Ok(Inspected {
             built: composed?,
@@ -954,6 +956,13 @@ impl App {
         // `jobs work` serves no HTTP; composed adapters that watch for
         // shutdown see this signal end with the process.
         let shutdown = Cancellation::new();
+        // Checked before telemetry starts and before any composition hook
+        // sees the pool (ADR 0044).
+        let database =
+            match open_checked_pool(self.name, &runtime, Some((declaration, &url)), &config) {
+                Ok(database) => database,
+                Err(code) => return code,
+            };
         let composed = {
             let _guard = runtime.enter();
             if let Some(telemetry) = &telemetry {
@@ -964,7 +973,7 @@ impl App {
                 &config,
                 self.registrations,
                 self.compose_hooks,
-                Some((declaration, &url)),
+                database,
                 Some(JobsParts::new(jobs)),
                 &shutdown,
                 telemetry.as_ref(),
@@ -981,13 +990,6 @@ impl App {
             Ok(built) => built,
             Err(code) => return code,
         };
-        if let Err(code) = runtime.block_on(require_row_security(
-            self.name,
-            database.as_ref(),
-            config.environment,
-        )) {
-            return code;
-        }
         let Some(background) = background_for(jobs_slot, database.as_ref(), telemetry.as_ref())
         else {
             write_stderr("error: the jobs commands require App::postgres and App::jobs\n");
@@ -1247,10 +1249,11 @@ fn write_openapi(document: &forge_openapi::Document, output: &OpenApiOutput) -> 
     }
 }
 
-/// Refuses to start `serve` or `jobs work` when the declared PostgreSQL
-/// pool's role could bypass row-level security outside development and test,
-/// or cannot be checked (ADR 0044). The pool is closed before returning the
-/// exit code; the error names the role and the fix, never the URL.
+/// Refuses to start `serve`, `jobs work` or a `jobs` operator command when
+/// the declared PostgreSQL pool's role could bypass row-level security
+/// outside development and test, or cannot be checked (ADR 0044). The pool is
+/// closed before returning the exit code; the error names the role and the
+/// fix, never the URL.
 pub(crate) async fn require_row_security(
     name: &'static str,
     database: Option<&DatabaseHandle>,
@@ -1283,7 +1286,47 @@ struct Built {
     pool: Option<PoolObservation>,
 }
 
-/// Builds the route table and the declared database pool, then runs the
+/// Creates the lazily connecting pool of the declared database. Must run
+/// inside the Tokio runtime context.
+fn open_pool(
+    name: &'static str,
+    declared: Option<(Declaration, &forge_config::SecretString)>,
+    config: &AppConfig,
+) -> Result<Option<DatabaseHandle>, ExitCode> {
+    match declared {
+        Some((declaration, url)) => match declaration.connect_lazy(url, &config.database) {
+            Ok(database) => Ok(Some(database)),
+            Err(error) => {
+                error!(app = name, error = %ErrorChain(&error), "failed to create the database pool");
+                Err(ExitCode::FAILURE)
+            }
+        },
+        None => Ok(None),
+    }
+}
+
+/// [`open_pool`] followed by [`require_row_security`], for the commands that
+/// serve or work with the pool: the role is refused before telemetry starts
+/// and before any composition hook receives the pool.
+fn open_checked_pool(
+    name: &'static str,
+    runtime: &tokio::runtime::Runtime,
+    declared: Option<(Declaration, &forge_config::SecretString)>,
+    config: &AppConfig,
+) -> Result<Option<DatabaseHandle>, ExitCode> {
+    let database = {
+        let _guard = runtime.enter();
+        open_pool(name, declared, config)?
+    };
+    runtime.block_on(require_row_security(
+        name,
+        database.as_ref(),
+        config.environment,
+    ))?;
+    Ok(database)
+}
+
+/// Builds the route table around the declared database pool, then runs the
 /// composition hooks. Must run inside the Tokio runtime context.
 #[allow(clippy::too_many_arguments)]
 fn compose(
@@ -1291,23 +1334,13 @@ fn compose(
     config: &AppConfig,
     registrations: Vec<RouteRegistration>,
     hooks: Vec<ComposeHook>,
-    declared: Option<(Declaration, &forge_config::SecretString)>,
+    database: Option<DatabaseHandle>,
     jobs: JobsSlot,
     shutdown: &Cancellation,
     telemetry: Option<&Telemetry>,
 ) -> Result<Built, ExitCode> {
     #[cfg_attr(not(feature = "jobs"), allow(unused_mut, clippy::let_unit_value))]
     let mut jobs = jobs;
-    let database = match declared {
-        Some((declaration, url)) => match declaration.connect_lazy(url, &config.database) {
-            Ok(database) => Some(database),
-            Err(error) => {
-                error!(app = name, error = %ErrorChain(&error), "failed to create the database pool");
-                return Err(ExitCode::FAILURE);
-            }
-        },
-        None => None,
-    };
     let pool = telemetry
         .zip(database.as_ref())
         .and_then(|(telemetry, database)| process_telemetry::observe_database(telemetry, database));
@@ -2393,7 +2426,12 @@ mod tests {
                 &config,
                 Vec::new(),
                 vec![hook],
-                Some((Declaration::Sqlite(forge_db::Migrator::DEFAULT), url)),
+                open_pool(
+                    "demo",
+                    Some((Declaration::Sqlite(forge_db::Migrator::DEFAULT), url)),
+                    &config,
+                )
+                .expect("pool"),
                 JobsSlot::default(),
                 &Cancellation::new(),
                 None,
@@ -2415,7 +2453,12 @@ mod tests {
                     &config,
                     Vec::new(),
                     vec![hook],
-                    Some((Declaration::Sqlite(forge_db::Migrator::DEFAULT), url)),
+                    open_pool(
+                        "demo",
+                        Some((Declaration::Sqlite(forge_db::Migrator::DEFAULT), url)),
+                        &config,
+                    )
+                    .expect("pool"),
                     JobsSlot::default(),
                     &Cancellation::new(),
                     None,
@@ -2664,10 +2707,15 @@ mod tests {
                 &config,
                 Vec::new(),
                 vec![hook],
-                Some((
-                    Declaration::Postgres(forge_db::Migrator::DEFAULT),
-                    &runtime_url,
-                )),
+                open_pool(
+                    "demo",
+                    Some((
+                        Declaration::Postgres(forge_db::Migrator::DEFAULT),
+                        &runtime_url,
+                    )),
+                    &config,
+                )
+                .expect("pool"),
                 Some(JobsParts::new(declaration)),
                 &Cancellation::new(),
                 None,
