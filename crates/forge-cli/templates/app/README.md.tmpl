@@ -249,6 +249,15 @@ forge generate scaffold event name:string starts_at:timestamp --tenant-scoped --
 export FORGE_STREAMS_KEY=$(openssl rand -base64 32)
 ```
 
+To rotate the key without breaking the pages that are open, move the old one to
+`FORGE_STREAMS_PREVIOUS_KEYS` (comma-separated, at most 3; it only verifies, the
+current key signs) and remove it after 24 hours, the token lifetime:
+
+```bash
+export FORGE_STREAMS_PREVIOUS_KEYS=$OLD_STREAMS_KEY
+export FORGE_STREAMS_KEY=$(openssl rand -base64 32)
+```
+
 That is why `Cargo.toml` enables the `broadcast` feature of `forge`: it only
 compiles the live-update code, and nothing is served, connected or started
 until you add the printed `Streams::register` wiring. If this application
