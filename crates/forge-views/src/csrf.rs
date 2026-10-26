@@ -204,8 +204,11 @@ pub fn presented_csrf_token(request: &Request) -> Result<Option<CsrfToken>, Csrf
     let mut headers = request.headers().get_all(CSRF_HEADER_NAME).iter();
     let from_header = match (headers.next(), headers.next()) {
         // The header takes the token masked (the `csrf-token` meta tag) or
-        // as it is, for good: a script may send the cookie's value, and a
-        // header is never part of a compressed body.
+        // as it is, for good. Accepting it unmasked is harmless: masking is
+        // a public transform anyone holding the token can apply, so it adds
+        // no secret, and a client the server gave the token to (such as a
+        // generated application's API client, from the session) may send it
+        // plain. The cookie stays HttpOnly; scripts cannot read it.
         (None, _) => None,
         (Some(value), None) => Some(parse_token(value.to_str().ok())?),
         (Some(_), Some(_)) => return Err(CsrfError::InvalidToken),
@@ -277,11 +280,13 @@ pub fn mask_csrf_token(token: &CsrfToken) -> Result<String, CredentialError> {
 /// A masked token must be exactly [`MASKED_CSRF_TOKEN_LEN`] characters of
 /// unpadded base64url, decode to exactly 64 bytes and be the canonical
 /// encoding of them (no padding, no stray trailing bits); anything else is
-/// [`CsrfError::InvalidToken`]. The unmasked form stays accepted: scripts
-/// that read the double-submit cookie send it (a header is not part of a
-/// compressed body, so BREACH does not reach it), and forms rendered before
-/// the upgrade embed it. Comparing the result with the cookie's token is
-/// the caller's job, in constant time ([`CsrfProtection`] does it).
+/// [`CsrfError::InvalidToken`]. The unmasked form stays accepted, which is
+/// harmless: masking is a public transform anyone holding the token can
+/// apply, so it guards only against the token's bytes repeating in pages
+/// (BREACH), not against a client that already has the token. Clients the
+/// server gave the token to may send it plain, and forms rendered before the
+/// upgrade embed it. Comparing the result with the cookie's token is the
+/// caller's job, in constant time ([`CsrfProtection`] does it).
 pub fn unmask_csrf_token(value: &str) -> Result<CsrfToken, CsrfError> {
     if value.len() != MASKED_CSRF_TOKEN_LEN {
         return CsrfToken::new(value).map_err(|_| CsrfError::InvalidToken);

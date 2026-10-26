@@ -391,9 +391,13 @@ of the router it is added to:
   bytes and re-encode to the same text, or the 64 lowercase hex digits of
   the token; constant-time comparison). The query string is never read;
   repeated or malformed values are refused.
-- The unmasked token stays accepted in the header for good: a script that
-  reads the cookie sends it so, and a header is not part of a compressed
-  body. In the `csrf_token` field it is accepted for one release, v0.1.x,
+- The unmasked token stays accepted in the header for good. That is
+  harmless: masking is a public transform anyone holding the token can
+  apply, so it only keeps the token's bytes from repeating in pages; a
+  client the server gave the token to (an API client of a generated
+  application, from the session) may send it plain. The `__Host-forge_csrf`
+  cookie stays `HttpOnly`, so page scripts never read it; they send the
+  meta tag's masked value. In the `csrf_token` field it is accepted for one release, v0.1.x,
   so forms rendered before the upgrade to masked tokens keep working while
   it is deployed; from v0.2.0 the field takes only masked tokens.
 - Before that, a browser-declared cross-site request is refused:
