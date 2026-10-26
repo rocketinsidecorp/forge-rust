@@ -38,6 +38,7 @@ fn wait_for(path: &Path) -> String {
         {
             return text.trim().to_owned();
         }
+        // real-clock: polls a child process (an OS resource a fake clock cannot advance) until a deadline (its output)
         std::thread::sleep(Duration::from_millis(20));
     }
     panic!("{} never appeared", path.display());
@@ -133,6 +134,7 @@ fn sigterm_during_the_edit_wipes_the_plaintext_and_keeps_the_credentials() {
             break status;
         }
         assert!(Instant::now() < deadline, "forge did not stop");
+        // real-clock: polls a child process (an OS resource a fake clock cannot advance) until a deadline
         std::thread::sleep(Duration::from_millis(20));
     };
     let output = child.wait_with_output().expect("output");
@@ -186,6 +188,7 @@ fn sighup_during_the_edit_wipes_the_plaintext_and_keeps_the_credentials() {
             break status;
         }
         assert!(Instant::now() < deadline, "forge did not stop");
+        // real-clock: polls a child process (an OS resource a fake clock cannot advance) until a deadline
         std::thread::sleep(Duration::from_millis(20));
     };
     let output = child.wait_with_output().expect("output");

@@ -75,6 +75,7 @@ where
             tokio::time::Instant::now() < deadline,
             "timed out waiting for {what}"
         );
+        // real-clock: polls state written by a background task through a real database, until a deadline
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
@@ -126,6 +127,7 @@ impl JobHandler for Counter {
     type Job = Count;
 
     async fn perform(&self, context: &JobContext, _: Count) -> Result<(), JobError> {
+        // real-clock: simulated work of the job handler on a real runtime and database
         tokio::time::sleep(Duration::from_millis(2)).await;
         *self
             .0
@@ -177,6 +179,7 @@ impl JobHandler for Sleeper {
     type Job = Slow;
 
     async fn perform(&self, _: &JobContext, _: Slow) -> Result<(), JobError> {
+        // real-clock: real sockets: the handler must outlive the timeout under test, so a paused clock would skip it instantly
         tokio::time::sleep(Duration::from_secs(60)).await;
         Ok(())
     }
@@ -224,6 +227,7 @@ impl JobHandler for Lingers {
             return Err(JobError::retry("cancelled"));
         }
         // Ignores cancellation: only an abort stops it.
+        // real-clock: real sockets: the handler must outlive the timeout under test, so a paused clock would skip it instantly
         tokio::time::sleep(Duration::from_secs(600)).await;
         Ok(())
     }
@@ -421,6 +425,7 @@ async fn expired_leases_are_reclaimed_and_stale_workers_are_fenced_out() {
         .expect("claim");
     assert!(none.is_empty());
 
+    // real-clock: the store compares expiry with a real clock (database now() or the system clock) that the test cannot inject (lease expiry)
     tokio::time::sleep(Duration::from_millis(1300)).await;
     let fresh_token = LeaseToken::new();
     let second = store
@@ -474,6 +479,7 @@ async fn expired_leases_are_reclaimed_and_stale_workers_are_fenced_out() {
         .claim("default", &once_names, 1, lease, LeaseToken::new())
         .await
         .expect("claim");
+    // real-clock: the store compares expiry with a real clock (database now() or the system clock) that the test cannot inject (lease expiry)
     tokio::time::sleep(Duration::from_millis(1300)).await;
     let reclaimed = store
         .claim("default", &once_names, 1, lease, LeaseToken::new())
@@ -755,6 +761,7 @@ async fn two_schedulers_fire_each_tick_exactly_once() {
             == 1
     })
     .await;
+    // real-clock: settles: lets the runtimes run for real polls to show no job runs twice
     tokio::time::sleep(Duration::from_millis(1500)).await;
     for (shutdown, handle) in runtimes {
         stop(shutdown, handle).await;
@@ -1341,6 +1348,7 @@ async fn a_role_without_worker_grants_fails_fast_with_the_documented_message() {
     jobs.register(Counter::default()).expect("register");
     jobs.settings(fast());
     let (shutdown, handle) = spawn_runtime(jobs, db.runtime());
+    // real-clock: observes that the runtime does NOT exit early: the claim loop must run for real polls
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(!handle.is_finished(), "the granted role must keep running");
     stop(shutdown, handle).await;
@@ -1349,6 +1357,7 @@ async fn a_role_without_worker_grants_fails_fast_with_the_documented_message() {
     jobs.register(Counter::default()).expect("register");
     jobs.settings(fast());
     let (shutdown, handle) = spawn_runtime(jobs, db.worker());
+    // real-clock: observes that the runtime does NOT exit early: the claim loop must run for real polls
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(!handle.is_finished(), "the worker role must keep running");
     stop(shutdown, handle).await;
@@ -1414,6 +1423,7 @@ impl JobHandler for HoldsCompletion {
         transaction.commit().await?;
         self.probe.committed.fetch_add(1, Ordering::SeqCst);
         // Heartbeats after the commit see the lease gone; that is not a loss.
+        // real-clock: lets heartbeats run against a lease the database has already released
         tokio::time::sleep(Duration::from_millis(2500)).await;
         if context.cancellation().is_cancelled() {
             self.probe
@@ -1459,6 +1469,7 @@ async fn renewal_skips_rows_locked_by_transactional_completion() {
     assert_eq!(renewal, vec![(held.0, LeaseStatus::Busy)]);
     // Let a renewal hit the locked row, then enqueue more work: the worker
     // loop must not be stuck behind that row lock.
+    // real-clock: lets a lease renewal meet a row lock held by another session in the database
     tokio::time::sleep(Duration::from_millis(1500)).await;
     store
         .enqueue(&Holder { hold: false }, EnqueueOptions::new())
@@ -1478,6 +1489,7 @@ async fn renewal_skips_rows_locked_by_transactional_completion() {
         count_state(&db, "completed").await == 2
     })
     .await;
+    // real-clock: settles: shows the worker loop is not stuck behind a row lock, over real polls
     tokio::time::sleep(Duration::from_secs(3)).await;
     stop(shutdown, handle).await;
     assert_eq!(probe.committed.load(Ordering::SeqCst), 1);

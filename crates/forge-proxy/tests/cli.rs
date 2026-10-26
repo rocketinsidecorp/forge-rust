@@ -219,6 +219,7 @@ async fn run_serves_and_shuts_down() {
             "proxy did not start: {}",
             stderr.text()
         );
+        // real-clock: polls a real TCP listener or connection, which a fake clock cannot advance, until a deadline
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     shutdown.cancel();

@@ -79,6 +79,7 @@ async fn running_without_a_command_word_serves_on_go_style_addresses() {
         .is_ok_and(|response| response.ok)
     {
         assert!(tokio::time::Instant::now() < deadline, "{}", stderr.text());
+        // real-clock: polls a real TCP listener or connection, which a fake clock cannot advance, until a deadline
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     shutdown.cancel();

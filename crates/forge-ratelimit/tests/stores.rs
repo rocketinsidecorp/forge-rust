@@ -65,6 +65,7 @@ macro_rules! store_tests {
                 for key in ["a", "b", "c"] {
                     limiter.allow(key, short).await.expect("allow");
                 }
+                // real-clock: TTLs and windows run on the backing store's clock (SQL now() on the database backends), which no injected clock reaches
                 tokio::time::sleep(Duration::from_millis(200)).await;
                 limiter.allow("d", limit(1, Duration::from_secs(60))).await.expect("allow");
                 // The prune ran inline after the hit above: nothing expired is left.
@@ -85,6 +86,7 @@ macro_rules! store_tests {
                         .await
                         .expect("allow");
                 }
+                // real-clock: TTLs and windows run on the backing store's clock (SQL now() on the database backends), which no injected clock reaches
                 tokio::time::sleep(Duration::from_millis(150)).await;
                 let per_call = u64::from(MAX_PRUNE_ROUNDS) * 2;
                 for expected in [per_call, 60 - per_call, 0] {
@@ -103,6 +105,7 @@ macro_rules! store_tests {
                         .await
                         .expect("allow");
                     if i % 100 == 99 {
+                        // real-clock: TTLs and windows run on the backing store's clock (SQL now() on the database backends), which no injected clock reaches
                         tokio::time::sleep(Duration::from_millis(3)).await;
                     }
                 }

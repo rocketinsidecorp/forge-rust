@@ -408,6 +408,7 @@ mod tests {
         let requester = {
             let shutdown = shutdown.clone();
             std::thread::spawn(move || {
+                // real-clock: the shutdown request must arrive while the child process is running; the requester is a plain thread
                 std::thread::sleep(Duration::from_millis(100));
                 shutdown.request();
             })
@@ -445,6 +446,7 @@ mod tests {
                 waited.elapsed() < Duration::from_secs(20),
                 "the shell never installed its trap"
             );
+            // real-clock: polls a child process (an OS resource a fake clock cannot advance) until a deadline (the shell installs its trap)
             std::thread::sleep(Duration::from_millis(5));
         }
         let (status, interrupted) = child
@@ -497,6 +499,7 @@ mod tests {
 
         let began = Instant::now();
         while running(orphan) && began.elapsed() < Duration::from_secs(5) {
+            // real-clock: polls a child process (an OS resource a fake clock cannot advance) until a deadline
             std::thread::sleep(Duration::from_millis(20));
         }
         assert!(!running(orphan), "the helper was killed");

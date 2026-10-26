@@ -108,6 +108,7 @@ async fn window_resets(subject: Subject) {
             continue;
         }
         assert!(!third.allowed, "third hit in the window");
+        // real-clock: TTLs and windows run on the backing store's clock (SQL now() on the database backends), which no injected clock reaches
         tokio::time::sleep(WINDOW + Duration::from_millis(150)).await;
         let d = allow(&subject.limiter, &key, l).await;
         assert!(
@@ -198,6 +199,7 @@ async fn prunes_expired_buckets_only(subject: Subject) {
         allow(&subject.limiter, &format!("short-{i}"), short).await;
     }
     allow(&subject.limiter, "long", long).await;
+    // real-clock: TTLs and windows run on the backing store's clock (SQL now() on the database backends), which no injected clock reaches
     tokio::time::sleep(WINDOW + Duration::from_millis(150)).await;
     assert_eq!(
         pruner.prune().await.expect("prune"),

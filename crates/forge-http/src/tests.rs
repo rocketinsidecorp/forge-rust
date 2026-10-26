@@ -936,6 +936,7 @@ fn test_router() -> Router {
         .expect("echo route must register");
     router
         .route(Method::GET, "/slow", |_| async {
+            // real-clock: real sockets: the handler must outlive the timeout under test, so a paused clock would skip it instantly
             tokio::time::sleep(Duration::from_secs(60)).await;
             Response::empty(StatusCode::OK)
         })
@@ -1235,6 +1236,7 @@ fn counting(count: u8, pause: Duration) -> Response {
         if sent == count {
             return None;
         }
+        // real-clock: real sockets: a slow stream is paced by real time between chunks
         tokio::time::sleep(pause).await;
         Some((Bytes::from(format!("line {sent}\n")), sent + 1))
     })
@@ -1388,6 +1390,7 @@ async fn a_short_request_timeout_does_not_disconnect_a_slow_reader() {
             .expect("request must be written");
         // Not reading: the socket buffers fill and the server's writes
         // stall for ten request timeouts.
+        // real-clock: real sockets: the client stops reading so the server's writes stall against the socket buffers
         std::thread::sleep(Duration::from_secs(1));
         let mut buffer = vec![0_u8; 64 * 1024];
         let mut received = 0;
@@ -1436,6 +1439,7 @@ async fn a_client_that_stops_reading_a_stream_is_disconnected() {
             tokio::time::Instant::now() < deadline,
             "a stalled stream must be dropped"
         );
+        // real-clock: polls a real TCP listener or connection, which a fake clock cannot advance, until a deadline
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     drop(client);
@@ -1778,6 +1782,7 @@ async fn budget_reaches(budget: &Semaphore, bytes: usize) {
             "budget stuck at {} free, expected {bytes}",
             budget.available_permits()
         );
+        // real-clock: polls a real TCP listener or connection, which a fake clock cannot advance, until a deadline
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
 }

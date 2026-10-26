@@ -83,6 +83,7 @@ mod tests {
     fn prunes_after_the_interval_and_never_when_disabled() {
         let gate = PruneGate::new();
         assert!(!gate.due(Some(Duration::from_secs(3600)), 1_000_000));
+        // real-clock: PruneGate measures std::time::Instant and takes no clock, so the interval must really elapse
         std::thread::sleep(Duration::from_millis(5));
         assert!(gate.due(Some(Duration::from_millis(1)), 1_000_000));
         for _ in 0..100 {

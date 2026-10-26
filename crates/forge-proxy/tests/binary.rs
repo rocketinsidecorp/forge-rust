@@ -46,6 +46,7 @@ async fn ready(dir: &Path) {
             tokio::time::Instant::now() < deadline,
             "forge-proxy did not start"
         );
+        // real-clock: polls a real TCP listener or connection, which a fake clock cannot advance, until a deadline
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }

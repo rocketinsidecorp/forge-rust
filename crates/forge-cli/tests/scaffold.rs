@@ -721,6 +721,7 @@ fn run_the_job_workers(root: &Path, binary: &str, url: &str) {
         if let Ok(Some(exit)) = worker.try_wait() {
             panic!("jobs work exited with {exit}:\n{}", read());
         }
+        // real-clock: polls the logs of a task or process that runs on its own threads, until a deadline
         std::thread::sleep(Duration::from_millis(100));
     }
     if !started {
@@ -729,6 +730,7 @@ fn run_the_job_workers(root: &Path, binary: &str, url: &str) {
     }
     // Long enough for several claim polls: with the grants of the runtime
     // role missing, each one would log `claiming jobs failed`.
+    // real-clock: the generated worker polls for jobs on its own timer; it must run for several real polls to show none fails
     std::thread::sleep(Duration::from_millis(2500));
     let signalled = Command::new("kill")
         .args(["-TERM", &worker.id().to_string()])
@@ -741,6 +743,7 @@ fn run_the_job_workers(root: &Path, binary: &str, url: &str) {
         if exit.is_some() {
             break;
         }
+        // real-clock: polls a child process (an OS resource a fake clock cannot advance) until a deadline
         std::thread::sleep(Duration::from_millis(100));
     }
     let Some(exit) = exit else {

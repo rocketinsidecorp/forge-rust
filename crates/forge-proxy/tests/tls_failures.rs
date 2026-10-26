@@ -85,6 +85,7 @@ async fn first_failure(
             "no failure logged: {}",
             logs.text()
         );
+        // real-clock: polls the logs of a task or process that runs on its own threads, until a deadline
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     stop.cancel();

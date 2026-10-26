@@ -131,9 +131,11 @@ async fn shutdown_during_accept_errors_returns_every_permit() {
             tokio::time::Instant::now() < deadline,
             "the accept loop never took its retry permit"
         );
+        // real-clock: polls a real TCP listener or connection, which a fake clock cannot advance, until a deadline
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
     // And it keeps only that one while it retries.
+    // real-clock: proves the accept loop does NOT take more permits while it retries: real time must pass
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(permits.available_permits(), 1);
 

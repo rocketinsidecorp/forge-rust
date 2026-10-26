@@ -38,6 +38,7 @@ async fn switch_under_concurrent_load_drops_no_requests() {
             async move {
                 let _ = request.into_body().collect().await;
                 // 0-3ms, spread deterministically.
+                // real-clock: simulated upstream latency (0-3 ms) so requests overlap in flight
                 tokio::time::sleep(Duration::from_micros(n.wrapping_mul(7919) % 3000)).await;
                 text(name)
             }
@@ -88,6 +89,7 @@ async fn switch_under_concurrent_load_drops_no_requests() {
             result.drained && result.in_flight == 0,
             "deploy {i} not drained: {result:?}"
         );
+        // real-clock: paces the deploy loop so traffic and drains interleave on real sockets
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
     stop.cancel();
@@ -248,6 +250,7 @@ async fn deploy_drains_in_flight_requests_before_returning() {
             tokio::time::Instant::now() < deadline,
             "traffic never switched"
         );
+        // real-clock: polls a real TCP listener or connection, which a fake clock cannot advance, until a deadline
         tokio::time::sleep(Duration::from_millis(2)).await;
     }
     assert!(
@@ -785,6 +788,7 @@ async fn access_log_omits_the_query() {
             "no request logged: {}",
             logs.text()
         );
+        // real-clock: polls the logs of a task or process that runs on its own threads, until a deadline
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     let text = logs.text();
@@ -906,6 +910,7 @@ async fn wait_for_in_flight(server: &Server, expected: i64, wait: Duration) {
             tokio::time::Instant::now() < deadline,
             "in flight stayed {in_flight}, expected {expected}"
         );
+        // real-clock: polls a real TCP listener or connection, which a fake clock cannot advance, until a deadline
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
@@ -1008,6 +1013,7 @@ async fn idle_tunnels_are_closed_and_active_ones_kept() {
             .expect("echo in time")
             .expect("echo");
         assert_eq!(echoed, [round]);
+        // real-clock: paces the echo rounds on a real connection
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     assert_eq!(front.server.status()[0].in_flight, 1);

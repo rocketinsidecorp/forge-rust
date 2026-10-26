@@ -137,6 +137,7 @@ mod tests {
                     .run(move || {
                         let now = running.fetch_add(1, Ordering::SeqCst) + 1;
                         peak.fetch_max(now, Ordering::SeqCst);
+                        // real-clock: the work holds a blocking worker thread for a real 20 ms so the limiter's peak concurrency is observable; threads ignore a paused clock
                         std::thread::sleep(Duration::from_millis(20));
                         running.fetch_sub(1, Ordering::SeqCst);
                     })
@@ -172,6 +173,7 @@ mod tests {
         };
         // Let the holder take the only slot.
         while limiter.slots.available_permits() != 0 {
+            // real-clock: yields to the spawned holder until it owns the only slot; no wait is asserted on
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
         let started = std::time::Instant::now();
@@ -220,6 +222,7 @@ mod tests {
                 freed = true;
                 break;
             }
+            // real-clock: polls the semaphore until the blocking worker releases it, bounded to about 5 s
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         assert!(freed, "the slot returns when the work ends");

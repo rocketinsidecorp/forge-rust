@@ -2755,6 +2755,7 @@ mod tests {
                     tokio::time::Instant::now() < deadline,
                     "the runtime did not run the job"
                 );
+                // real-clock: polls state written by a background task through a real database, until a deadline
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
             shutdown.cancel();

@@ -335,6 +335,7 @@ async fn eventually_serving(address: SocketAddr, path: &str) -> Option<u16> {
         if let Some(status) = status_of(address, path).await {
             return Some(status);
         }
+        // real-clock: polls a real TCP listener or connection, which a fake clock cannot advance, until a deadline
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     None
@@ -377,6 +378,7 @@ async fn run_on_a_free_address() -> Running {
                     task,
                 };
             }
+            // real-clock: polls a real TCP listener or connection, which a fake clock cannot advance, until a deadline
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         let outcome = tokio::time::timeout(Duration::from_secs(10), task)
