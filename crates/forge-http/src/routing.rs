@@ -205,6 +205,8 @@ impl Node {
     /// yield no route. A catch-all takes the rest of the path as one raw
     /// capture, slashes included, even when it is empty (`/files/` for
     /// `/files/{key...}`), but not when the path ends before it (`/files`).
+    /// The capture is raw: dispatch refuses one that starts with `/` or holds
+    /// `//`, and every path with an encoded separator or a dot segment.
     /// Only nodes with at least one endpoint match, so method
     /// selection happens after the path has been resolved. The search only
     /// descends into existing trie nodes, so its depth is bounded by the

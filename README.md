@@ -767,8 +767,12 @@ Kubernetes and systemd deployment is covered in
 A route segment is static text, a `{name}` that captures one segment, or, as
 the last segment, a `{name...}` catch-all that captures the rest of the path,
 slashes included (Forge-Go's `ServeMux` wildcard, Rails' `*path` glob). Static
-segments win over `{name}`, which wins over a catch-all; a catch-all value
-with an encoded slash or a `.`/`..` segment is answered `400`:
+segments win over `{name}`, which wins over a catch-all. Like Forge-Go's router,
+every request whose path holds `%2F`, `%5C` (any case), a raw `\` or a `.`/`..`
+segment (also as `%2e%2e`) is answered `400` before routing, and so is a
+catch-all value that starts with `/` or holds `//` (`/docs//etc/passwd`); a
+trailing `/` is kept. Escapes are decoded once (`%252e%252e` arrives as the
+text `%2e%2e`): never decode a captured value again:
 
 ```rust
 use forge::http::{Method, Request, Response, StatusCode};

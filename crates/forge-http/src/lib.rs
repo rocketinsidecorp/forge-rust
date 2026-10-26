@@ -290,8 +290,10 @@ impl Request {
     }
 
     /// Parses a named parameter captured by a dynamic route such as
-    /// `/customers/{id}`. Percent escapes are decoded before parsing; `+`
-    /// remains a literal plus, as it does in a URL path. Returns an error if the
+    /// `/customers/{id}`. Percent escapes are decoded once before parsing
+    /// (`%252e` becomes the text `%2e`: never decode the value again, or a
+    /// dot segment the router refused comes back); `+` remains a literal
+    /// plus, as it does in a URL path. Returns an error if the
     /// parameter is missing, malformed or cannot be parsed as `T`.
     pub fn path_param_as<T>(&self, name: &str) -> Result<T, PathParamError>
     where
@@ -739,12 +741,17 @@ impl Router {
     /// [`Server`] sends the headers without the body (here the body is
     /// left in place). A matched path without a handler for the request
     /// method answers `405` with an `Allow` header listing the served
-    /// methods in sorted order (`HEAD` included wherever `GET` is). A
-    /// captured segment containing an encoded slash (`%2F`) answers `400`,
-    /// because it would let a client smuggle a path separator past routing,
-    /// and so does a catch-all capture with a `.` or `..` segment;
-    /// other malformed escapes are reported by [`Request::path_param_as`]
-    /// when the handler reads the parameter.
+    /// methods in sorted order (`HEAD` included wherever `GET` is).
+    ///
+    /// Before matching, every path is refused with `400` that Forge-Go's
+    /// router refuses: one holding `%2F` or `%5C` (any case) or a raw `\`,
+    /// or a `.` or `..` segment, spelled or percent-encoded (`%2e%2e`). A
+    /// `{name...}` catch-all also answers `400` when its capture starts with
+    /// `/` or holds `//` (`/files//etc/passwd`); a trailing `/` is kept.
+    /// Other malformed escapes are reported by [`Request::path_param_as`]
+    /// when the handler reads the parameter. Escapes are decoded once:
+    /// `%252e%252e` reaches the handler as the text `%2e%2e`, which a
+    /// handler must not decode again.
     pub async fn dispatch(&self, mut request: Request) -> Response {
         for layer in &self.layers {
             layer.rewrite(&mut request);
@@ -760,6 +767,9 @@ impl Router {
     /// Matches the request against the route table and calls its handler.
     async fn route_request(&self, request: Request) -> Response {
         let path = request.uri.path().to_owned();
+        if is_invalid_path(&path) {
+            return Response::new(StatusCode::BAD_REQUEST, "bad request");
+        }
         let mut captures = Vec::new();
         let Some(node) = self.root.find(&path, &mut captures) else {
             return Response::new(StatusCode::NOT_FOUND, "not found");
@@ -772,9 +782,7 @@ impl Router {
             }
             return response;
         };
-        if captures.iter().any(|value| has_encoded_slash(value))
-            || endpoint.catch_all && captures.last().is_some_and(|rest| has_dot_segment(rest))
-        {
+        if endpoint.catch_all && captures.last().is_some_and(|rest| has_empty_segment(rest)) {
             return Response::new(StatusCode::BAD_REQUEST, "bad request");
         }
         let params = endpoint
@@ -793,21 +801,28 @@ impl Router {
     }
 }
 
-/// Whether a catch-all capture has a `.` or `..` segment, spelled or
-/// percent-encoded: handing one to a handler that maps the capture to a
-/// file or key would let a client climb out of it.
-fn has_dot_segment(rest: &str) -> bool {
-    rest.split('/').any(|segment| {
-        crate::encoding::percent_decode(segment, false)
-            .is_ok_and(|decoded| decoded == "." || decoded == "..")
-    })
+/// Forge-Go's `invalid_path` rule (`router/router.go`), applied to every
+/// request before routing: an encoded slash or backslash (`%2F`, `%5C`, any
+/// case), a raw backslash, or a `.` or `..` segment, spelled or
+/// percent-encoded. A capture holding one could smuggle a separator past
+/// routing or climb out of a directory a handler joins it to.
+fn is_invalid_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower.contains("%2f")
+        || lower.contains("%5c")
+        || path.contains('\\')
+        || path.split('/').any(|segment| {
+            crate::encoding::percent_decode(segment, false)
+                .is_ok_and(|decoded| decoded == "." || decoded == "..")
+        })
 }
 
-/// Whether `segment` contains `%2F` or `%2f`.
-fn has_encoded_slash(segment: &str) -> bool {
-    segment.as_bytes().windows(3).any(|window| {
-        window[0] == b'%' && window[1] == b'2' && window[2].eq_ignore_ascii_case(&b'f')
-    })
+/// Whether a catch-all capture starts with `/` or has an empty segment
+/// inside (`//`), which `ServeMux` would have cleaned away: `/files//etc`
+/// must not hand a handler the absolute `/etc`. A trailing `/` is allowed,
+/// as in Forge-Go (`/files/a/` captures `a/`).
+fn has_empty_segment(rest: &str) -> bool {
+    rest.starts_with('/') || rest.contains("//")
 }
 
 fn static_json(status: StatusCode, body: &'static str) -> Response {

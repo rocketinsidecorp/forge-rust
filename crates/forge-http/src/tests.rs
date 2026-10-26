@@ -380,8 +380,9 @@ async fn a_catch_all_captures_the_rest_of_the_path_like_forge_go() {
     // everywhere in the router).
     let short = router.dispatch(request(Method::GET, "/files")).await;
     assert_eq!(short.status, StatusCode::NOT_FOUND);
-    // Encoded slashes and dot segments are refused, as Forge-Go's router
-    // refuses them for every request.
+    // Encoded slashes and backslashes, dot segments and empty segments
+    // (an absolute or `//` capture) are refused: Forge-Go's router refuses
+    // the first ones for every request and `ServeMux` cleans the last.
     for path in [
         "/files/a%2Fb",
         "/files/a/..",
@@ -389,9 +390,17 @@ async fn a_catch_all_captures_the_rest_of_the_path_like_forge_go() {
         "/files/a/./b",
         "/files/%2e%2e/secret",
         "/files/a/%2E",
+        "/files//etc/passwd",
+        "/files/a//b",
+        "/files/a/b//",
+        "/files/..%5C..%5Cwin.ini",
+        "/files/..%5c..%5cwin.ini",
+        "/files/a%5Cb",
+        "/files/..\\..\\win.ini",
     ] {
         let response = router.dispatch(request(Method::GET, path)).await;
         assert_eq!(response.status, StatusCode::BAD_REQUEST, "{path}");
+        assert_eq!(response.body(), "bad request", "{path}");
     }
     // Dots inside a segment are ordinary text.
     let dotted = router
@@ -430,6 +439,59 @@ async fn a_catch_all_at_the_root_and_its_registration_rules() {
         }),
         Err(RouteError::InvalidPath(_))
     ));
+}
+
+#[tokio::test]
+async fn traversal_and_encoded_separators_are_refused_for_every_path_like_forge_go() {
+    let mut router = Router::new();
+    router
+        .route(
+            Method::GET,
+            "/files/{name}",
+            |request: Request| async move {
+                let name: String = request.path_param_as("name").expect("capture");
+                Response::new(StatusCode::OK, name)
+            },
+        )
+        .expect("parameter route");
+    router
+        .route(Method::GET, "/static/page", |_| async {
+            Response::empty(StatusCode::OK)
+        })
+        .expect("static route");
+    for path in [
+        "/files/..",
+        "/files/.",
+        "/files/%2e%2e",
+        "/files/%2E%2e",
+        "/files/%2e",
+        "/files/a%5Cb",
+        "/files/%5c",
+        "/files/a%2fb",
+        "/files/..\\win.ini",
+        "/files/a\\b",
+        "/../static/page",
+        "/static/./page",
+        "/static/page/..",
+        "/nowhere/%2e%2e/x",
+        "/static%2Fpage",
+    ] {
+        let response = router.dispatch(request(Method::GET, path)).await;
+        assert_eq!(response.status, StatusCode::BAD_REQUEST, "{path}");
+    }
+    // Dots inside a segment, a double-encoded escape (decoded once) and an
+    // escaped percent are ordinary text.
+    for (path, body) in [
+        ("/files/a..b", "a..b"),
+        ("/files/...", "..."),
+        ("/files/.env", ".env"),
+        ("/files/%252e%252e", "%2e%2e"),
+        ("/files/a%255Cb", "a%5Cb"),
+    ] {
+        let response = router.dispatch(request(Method::GET, path)).await;
+        assert_eq!(response.status, StatusCode::OK, "{path}");
+        assert_eq!(response.body(), body, "{path}");
+    }
 }
 
 #[tokio::test]
