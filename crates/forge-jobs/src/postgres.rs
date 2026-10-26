@@ -1094,6 +1094,67 @@ mod tests {
         );
     }
 
+    fn claimed(tenant_id: Option<Uuid>, principal_id: Option<Uuid>) -> ClaimedJob {
+        ClaimedJob {
+            id: JobId::new(),
+            tenant_id,
+            principal_id,
+            name: "test.big".to_owned(),
+            payload: "{}".to_owned(),
+            attempt: 1,
+            max_attempts: 1,
+        }
+    }
+
+    #[test]
+    fn a_stored_tenant_scope_must_be_whole_and_well_formed() {
+        assert!(matches!(claimed(None, None).tenant(), Ok(None)));
+        let whole = claimed(Some(Uuid::now_v7()), Some(Uuid::now_v7()))
+            .tenant()
+            .expect("a whole scope");
+        assert!(whole.is_some());
+        // A tenant without its principal, or the reverse, fails closed.
+        assert!(matches!(
+            claimed(Some(Uuid::now_v7()), None).tenant(),
+            Err(JobsError::Corrupt)
+        ));
+        assert!(matches!(
+            claimed(None, Some(Uuid::now_v7())).tenant(),
+            Err(JobsError::Corrupt)
+        ));
+        // Identifiers must be UUIDv7: a v4 or nil identifier is refused.
+        assert!(matches!(
+            claimed(
+                Some(Uuid::from_u128(0x1111_1111_1111_4111_8111_1111_1111_1111)),
+                Some(Uuid::now_v7())
+            )
+            .tenant(),
+            Err(JobsError::Corrupt)
+        ));
+        assert!(matches!(
+            claimed(Some(Uuid::now_v7()), Some(Uuid::nil())).tenant(),
+            Err(JobsError::Corrupt)
+        ));
+    }
+
+    #[test]
+    fn a_job_state_the_framework_does_not_know_is_corrupt() {
+        for (text, state) in [
+            ("queued", JobState::Queued),
+            ("running", JobState::Running),
+            ("completed", JobState::Completed),
+            ("dead", JobState::Dead),
+        ] {
+            assert_eq!(JobState::parse(text).expect(text), state);
+        }
+        for text in ["", "Queued", "paused", "queued "] {
+            assert!(
+                matches!(JobState::parse(text), Err(JobsError::Corrupt)),
+                "{text:?}"
+            );
+        }
+    }
+
     #[test]
     fn time_conversions_round_trip() {
         let time = timestamp(1_792_434_165_935_102).expect("timestamp");

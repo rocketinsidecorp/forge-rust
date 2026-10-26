@@ -474,6 +474,24 @@ mod tests {
         const NAME: &'static str = "test.orphan";
     }
 
+    #[tokio::test]
+    async fn a_registered_handler_performs_its_job() {
+        let context = JobContext::new(
+            crate::JobId::new(),
+            "test.ping",
+            "default",
+            1,
+            1,
+            None,
+            crate::job::LeaseToken::new(),
+            forge_core::Cancellation::new(),
+        );
+        PingHandler
+            .perform(&context, Ping)
+            .await
+            .expect("the ping handler succeeds");
+    }
+
     #[test]
     fn claims_ask_for_a_batch_of_ten_never_more_than_the_free_slots() {
         let defaults = WorkerSettings::default();

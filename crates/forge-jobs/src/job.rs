@@ -454,6 +454,30 @@ mod tests {
     }
 
     #[test]
+    fn the_context_knows_its_attempt_budget_and_the_final_attempt() {
+        let context = |attempt, max_attempts| {
+            JobContext::new(
+                JobId::new(),
+                "test.budget",
+                "default",
+                attempt,
+                max_attempts,
+                None,
+                LeaseToken::new(),
+                Cancellation::new(),
+            )
+        };
+        let first = context(1, 3);
+        assert_eq!((first.attempt(), first.max_attempts()), (1, 3));
+        assert!(!first.is_final_attempt());
+        assert!(!context(2, 3).is_final_attempt());
+        assert!(context(3, 3).is_final_attempt());
+        // A budget lowered below the attempt number still counts as final.
+        assert!(context(4, 3).is_final_attempt());
+        assert!(first.tenant().is_none(), "a plain job has no tenant scope");
+    }
+
+    #[test]
     fn enqueue_options_keep_the_last_schedule() {
         let at = Timestamp::from_unix_micros(10).expect("timestamp");
         let options = EnqueueOptions::new().delay(Duration::from_secs(1)).at(at);

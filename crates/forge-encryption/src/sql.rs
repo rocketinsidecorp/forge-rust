@@ -470,6 +470,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_primary_key_defaults_to_a_uuid_and_can_be_changed() {
+        let spec = SqlColumn::new("people", "ssn").expect("spec");
+        assert_eq!(spec.id_type(), IdType::Uuid);
+        for id_type in [IdType::Text, IdType::Integer, IdType::Uuid] {
+            let changed = spec.clone().with_id_type(id_type);
+            assert_eq!(changed.id_type(), id_type);
+            // Only the binding changes; the statements do not.
+            assert_eq!(
+                changed.page_sql(1, true, Placeholders::Question),
+                spec.page_sql(1, true, Placeholders::Question)
+            );
+        }
+        // The identifiers are still checked after the type changes.
+        assert!(
+            spec.with_id_type(IdType::Text)
+                .with_id_column("id; DROP TABLE people")
+                .is_err()
+        );
+    }
+
+    #[test]
     fn statements_match_forge_go() {
         let spec = SqlColumn::new("people", "ssn")
             .expect("spec")

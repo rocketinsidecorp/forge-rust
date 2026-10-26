@@ -730,3 +730,105 @@ async fn sleep_until_opt(instant: Option<Instant>) {
         None => std::future::pending().await,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use serde::{Deserialize, Serialize};
+
+    use super::*;
+    use crate::Job;
+
+    #[derive(Serialize, Deserialize)]
+    struct Order {
+        card_number: String,
+    }
+
+    impl Job for Order {
+        const NAME: &'static str = "worker.order";
+    }
+
+    struct Handler;
+
+    #[async_trait]
+    impl JobHandler for Handler {
+        type Job = Order;
+
+        async fn perform(&self, _: &JobContext, _: Order) -> Result<(), JobError> {
+            Ok(())
+        }
+    }
+
+    fn context() -> JobContext {
+        JobContext::new(
+            JobId::new(),
+            Order::NAME,
+            "default",
+            1,
+            1,
+            None,
+            LeaseToken::new(),
+            Cancellation::new(),
+        )
+    }
+
+    #[tokio::test]
+    async fn an_undecodable_payload_fails_permanently_without_quoting_it() {
+        let handler = Typed(Handler);
+        let secret = "4111111111111111";
+        let failure = handler
+            .perform(
+                &context(),
+                &format!(r#"{{"card_number": 7, "x": "{secret}""#),
+            )
+            .await
+            .expect_err("a truncated payload is refused");
+        assert!(!failure.is_retryable(), "retrying cannot fix the payload");
+        assert_eq!(failure.message(), "the job payload could not be decoded");
+        assert!(!failure.message().contains(secret));
+        let wrong_type = handler
+            .perform(&context(), &format!(r#"{{"card_number": {secret}}}"#))
+            .await
+            .expect_err("a number is not a string");
+        assert_eq!(wrong_type.disposition(), Disposition::Discard);
+        assert!(!wrong_type.message().contains(secret));
+        handler
+            .perform(&context(), r#"{"card_number": "x"}"#)
+            .await
+            .expect("a valid payload runs");
+    }
+
+    #[test]
+    fn the_handler_reports_the_job_settings() {
+        let handler = Typed(Handler);
+        assert_eq!(handler.name(), "worker.order");
+        assert_eq!(handler.queue(), "default");
+        assert_eq!(handler.timeout(), <Order as Job>::TIMEOUT);
+    }
+
+    #[test]
+    fn recorded_failures_are_named_for_telemetry_and_logs() {
+        for (state, outcome, name) in [
+            (Some(AfterFailure::Retrying), OUTCOME_RETRY, "retrying"),
+            (Some(AfterFailure::Dead), OUTCOME_DEAD, "dead"),
+            (None, OUTCOME_LEASE_LOST, "lease_lost"),
+        ] {
+            assert_eq!(outcome_of(state), outcome);
+            assert_eq!(outcome_name(state), name);
+        }
+    }
+
+    #[test]
+    fn an_error_chain_shows_every_source_in_order() {
+        #[derive(Debug, thiserror::Error)]
+        #[error("outer")]
+        struct Outer(#[source] Middle);
+        #[derive(Debug, thiserror::Error)]
+        #[error("middle")]
+        struct Middle(#[source] std::io::Error);
+
+        let error = Outer(Middle(std::io::Error::other("inner")));
+        assert_eq!(Chain(&error).to_string(), "outer: middle: inner");
+        let plain = std::io::Error::other("alone");
+        assert_eq!(Chain(&plain).to_string(), "alone");
+    }
+}
