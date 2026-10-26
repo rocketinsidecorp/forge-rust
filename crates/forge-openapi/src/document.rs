@@ -108,7 +108,10 @@ pub struct Document {
 #[derive(Debug)]
 pub(crate) struct DocumentedRoute {
     pub(crate) method: String,
+    /// The pattern as the router registered it (`/files/{key...}`).
     pub(crate) path: String,
+    /// The path in the document (`/files/{key}`).
+    pub(crate) documented: String,
     pub(crate) segments: Vec<Segment>,
 }
 
@@ -119,6 +122,30 @@ pub(crate) enum Segment {
     Static(String),
     /// A `{name}` parameter: any one non-empty segment.
     Param(String),
+    /// A `{name...}` catch-all, the last segment: the rest of the path,
+    /// possibly empty. The document names it `{name}`, as Forge-Go's does;
+    /// OpenAPI has no multi-segment parameter.
+    Rest(String),
+}
+
+/// The document's path of a route: `{name...}` becomes `{name}`.
+fn documented_path(segments: &[Segment]) -> String {
+    if segments.is_empty() {
+        return "/".to_owned();
+    }
+    let mut path = String::new();
+    for segment in segments {
+        path.push('/');
+        match segment {
+            Segment::Static(text) => path.push_str(text),
+            Segment::Param(name) | Segment::Rest(name) => {
+                path.push('{');
+                path.push_str(name);
+                path.push('}');
+            }
+        }
+    }
+    path
 }
 
 impl Document {
@@ -158,17 +185,18 @@ impl Document {
                 )));
             }
             let segments = parse_path(&route.path).map_err(fail)?;
+            let documented_as = documented_path(&segments);
             let wildcards: Vec<&str> = segments
                 .iter()
                 .filter_map(|segment| match segment {
-                    Segment::Param(name) => Some(name.as_str()),
+                    Segment::Param(name) | Segment::Rest(name) => Some(name.as_str()),
                     Segment::Static(_) => None,
                 })
                 .collect();
             let built = operation_object(
                 &mut generator,
                 &method,
-                &route.path,
+                &documented_as,
                 &wildcards,
                 operation,
                 &error_schema,
@@ -189,13 +217,20 @@ impl Document {
             }
             operation_ids.insert(id, pattern.clone());
             uses_session |= operation.permission.is_some() || operation.authenticated;
-            paths
-                .entry(route.path.clone())
-                .or_default()
-                .insert(method.clone(), Value::Object(built));
+            let item = paths.entry(documented_as.clone()).or_default();
+            if item.contains_key(&method) {
+                // `/files/{key}` and `/files/{key...}` are distinct routes
+                // the document can only spell alike.
+                return Err(fail(format!(
+                    "cannot describe: another {} route is documented as {documented_as}",
+                    route.method
+                )));
+            }
+            item.insert(method.clone(), Value::Object(built));
             documented.push(DocumentedRoute {
                 method: route.method.to_ascii_uppercase(),
                 path: route.path.clone(),
+                documented: documented_as,
                 segments,
             });
         }
@@ -316,16 +351,25 @@ fn parse_path(path: &str) -> Result<Vec<Segment>, String> {
     if rest.is_empty() {
         return Ok(Vec::new());
     }
+    let count = rest.split('/').count();
     rest.split('/')
-        .map(|segment| {
+        .enumerate()
+        .map(|(index, segment)| {
             if !segment.contains(['{', '}']) {
                 return Ok(Segment::Static(segment.to_owned()));
             }
-            match segment
+            let inner = segment
                 .strip_prefix('{')
-                .and_then(|inner| inner.strip_suffix('}'))
-            {
-                Some(name) if !name.is_empty() && !name.contains(['{', '}']) => {
+                .and_then(|inner| inner.strip_suffix('}'));
+            match inner.map(|inner| (inner.strip_suffix("..."), inner)) {
+                Some((Some(name), _))
+                    if index + 1 == count
+                        && !name.is_empty()
+                        && !name.contains(['{', '}', '.']) =>
+                {
+                    Ok(Segment::Rest(name.to_owned()))
+                }
+                Some((None, name)) if !name.is_empty() && !name.contains(['{', '}']) => {
                     Ok(Segment::Param(name.to_owned()))
                 }
                 _ => Err(format!("cannot describe: wildcard segment {segment:?}")),

@@ -31,6 +31,7 @@ the work is finished and waiting for its review; **Planned** means not started.
 | Bounded memory-hard password hashing | — | Not needed (PBKDF2, no per-hash memory) | In review (`forge::auth::PasswordWorkLimiter`: one Argon2id hash per CPU, at most 16, then `503`) |
 | Client address behind trusted proxies | `request.remote_ip`, `trusted_proxies` | Done (`FORGE_HTTP_TRUSTED_PROXIES`, ADR 0037) | Done (`FORGE_HTTP_TRUSTED_PROXIES`, ADR 0032; `forge deploy` sets it for the proxied role, [ADR 0042](adr/0042-forge-deploy.md)) |
 | `HEAD` on every `GET` route | `HEAD` routed to `GET` | Done (`http.ServeMux`) | In review (the router serves `HEAD` with the `GET` route unless a `HEAD` route exists, the server drops the body, `Allow` lists `HEAD`) |
+| Catch-all route segment | `get "files/*path"` | Done (`GET /files/{key...}`, `http.ServeMux`) | Done (`{name...}` as the last segment: the rest of the path, possibly empty; static and `{name}` routes win; encoded slashes and dot segments answer `400` as Forge-Go's router does; the OpenAPI document names it `{name}` like Forge-Go's; a path that stops before the catch-all, `/files`, is `404` where `ServeMux` redirects to `/files/`) |
 | Handler panic answered with `500` | `ShowExceptions` | Done (`recoverer`: JSON error body with the request id) | In review (text body `internal server error`, `x-request-id`, logged with the request id) |
 | HSTS behind TLS | `config.force_ssl` | Done (`Strict-Transport-Security` unless `FORGE_HTTP_TRANSPORT=plain`) | In review (same header and rule, `FORGE_HTTP_TRANSPORT=plain\|trusted-proxy`, see follow-ups) |
 | Verified database TLS in production, pool limits | `sslmode` in `database.yml`, `pool` | Done (`sslmode=verify-full\|verify-ca`, MySQL `tls=true`, `FORGE_DATABASE_ALLOW_PLAINTEXT`, `FORGE_DATABASE_MAX_CONNS\|MIN_CONNS\|MAX_CONN_LIFETIME\|MAX_CONN_IDLE_TIME\|CONNECT_TIMEOUT\|STATEMENT_TIMEOUT`) | In review (stricter TLS rule: `sslmode=verify-full`, SQLx's MySQL spelling `ssl-mode=VERIFY_IDENTITY`; `verify-ca` refused, see follow-ups; `FORGE_DATABASE_ALLOW_PLAINTEXT`, `FORGE_DATABASE_MAX_CONNS\|CONNECT_TIMEOUT\|STATEMENT_TIMEOUT`; see follow-ups) |
@@ -197,14 +198,14 @@ the work is finished and waiting for its review; **Planned** means not started.
 
 - Benchmarks ([benchmarks](benchmarks.md), rocketinsidecorp/forge-rust#41): the
   scenario names, variants and output formats are Forge-Go's, and results are
-  read side by side. Forge-Rust has no equivalent of two scenarios, so they are
-  not run and not reported: `router_match/wildcard/*` (its router has no
-  catch-all `{name...}` segment) and the end-to-end `show_json` (a generated
+  read side by side. Forge-Rust has no equivalent of one scenario, so it is
+  not run and not reported: the end-to-end `show_json` (a generated
   application has no JSON scaffold and no bearer-token login: `forge generate
   scaffold` is HTML-only, [CLI](cli.md#refusals)). Adding a JSON
-  scaffold with bearer-token login to Forge-Rust, or a catch-all to its router,
-  makes the scenario available; the load generator already names `show_json`
-  and refuses it with that reason. Differences that are not gaps: `health` is
+  scaffold with bearer-token login to Forge-Rust makes the scenario
+  available; the load generator already names `show_json` and refuses it
+  with that reason. `router_match/wildcard/*` runs since the router has
+  Forge-Go's catch-all `{name...}` segment. Differences that are not gaps: `health` is
   `GET /health/ready` in Forge-Rust (the probe that pings the database; its
   `/health` never does), `password_verify` times Argon2id where Forge-Go's is
   PBKDF2, `middleware_chain` and `http_telemetry` drive `Router::dispatch`

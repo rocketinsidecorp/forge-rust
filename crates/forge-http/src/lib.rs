@@ -634,8 +634,12 @@ impl Router {
     }
 
     /// Registers a route and rejects duplicate or ambiguous method/pattern
-    /// pairs. Whole path segments may be named captures such as `{id}`.
-    /// Static segments take precedence over capture segments during dispatch.
+    /// pairs. Whole path segments may be named captures such as `{id}`, and
+    /// the last one may be a catch-all such as `{key...}`, which captures
+    /// the rest of the path, slashes included (Forge-Go's wildcard): `GET
+    /// /files/{key...}` serves `/files/a/b.png` with `key` = `a/b.png`, and
+    /// `/files/` with an empty `key`. Static segments take precedence over
+    /// `{name}` captures, and those over a catch-all, during dispatch.
     /// The call site is kept for [`Router::routes`].
     #[track_caller]
     pub fn route(
@@ -649,17 +653,16 @@ impl Router {
         let segments = routing::parse_pattern(&path)?;
         let params = segments
             .iter()
-            .filter_map(|segment| match segment {
-                routing::Segment::Param(name) => Some(Arc::clone(name)),
-                routing::Segment::Static(_) => None,
-            })
+            .filter_map(|segment| segment.capture().map(Arc::clone))
             .collect::<Vec<_>>();
+        let catch_all = matches!(segments.last(), Some(routing::Segment::Rest(_)));
         self.root.insert(
             segments,
             routing::Endpoint {
                 method: method.clone(),
                 path: Arc::from(path.as_str()),
                 params: params.into_boxed_slice(),
+                catch_all,
                 handler: Arc::new(handler),
             },
         )?;
@@ -738,7 +741,8 @@ impl Router {
     /// method answers `405` with an `Allow` header listing the served
     /// methods in sorted order (`HEAD` included wherever `GET` is). A
     /// captured segment containing an encoded slash (`%2F`) answers `400`,
-    /// because it would let a client smuggle a path separator past routing;
+    /// because it would let a client smuggle a path separator past routing,
+    /// and so does a catch-all capture with a `.` or `..` segment;
     /// other malformed escapes are reported by [`Request::path_param_as`]
     /// when the handler reads the parameter.
     pub async fn dispatch(&self, mut request: Request) -> Response {
@@ -768,7 +772,9 @@ impl Router {
             }
             return response;
         };
-        if captures.iter().any(|value| has_encoded_slash(value)) {
+        if captures.iter().any(|value| has_encoded_slash(value))
+            || endpoint.catch_all && captures.last().is_some_and(|rest| has_dot_segment(rest))
+        {
             return Response::new(StatusCode::BAD_REQUEST, "bad request");
         }
         let params = endpoint
@@ -785,6 +791,16 @@ impl Router {
         request.route = Some(Arc::clone(&endpoint.path));
         endpoint.handler.call(request).await
     }
+}
+
+/// Whether a catch-all capture has a `.` or `..` segment, spelled or
+/// percent-encoded: handing one to a handler that maps the capture to a
+/// file or key would let a client climb out of it.
+fn has_dot_segment(rest: &str) -> bool {
+    rest.split('/').any(|segment| {
+        crate::encoding::percent_decode(segment, false)
+            .is_ok_and(|decoded| decoded == "." || decoded == "..")
+    })
 }
 
 /// Whether `segment` contains `%2F` or `%2f`.

@@ -1,8 +1,10 @@
 //! Route patterns and the segment trie behind [`Router`](crate::Router).
 //!
 //! A pattern is split on `/` into segments that are either static text,
-//! compared byte-for-byte with the raw request path, or a `{name}` parameter
-//! that captures exactly one non-empty segment. Every route of the same
+//! compared byte-for-byte with the raw request path, a `{name}` parameter
+//! that captures exactly one non-empty segment, or, as the last segment, a
+//! `{name...}` catch-all that captures the rest of the path, slashes
+//! included and possibly empty (Forge-Go's `ServeMux` wildcard). Every route of the same
 //! shape (same static text, parameters in the same positions) ends at the
 //! same trie node regardless of parameter names; each node holds at most one
 //! endpoint per method, which is how ambiguous registrations are detected.
@@ -20,6 +22,19 @@ pub(crate) enum Segment {
     Static(String),
     /// A named capture of one non-empty segment.
     Param(Arc<str>),
+    /// A named capture of the rest of the path (`{name...}`), possibly
+    /// empty; only ever the last segment.
+    Rest(Arc<str>),
+}
+
+impl Segment {
+    /// The capture's name, for a parameter or catch-all.
+    pub(crate) fn capture(&self) -> Option<&Arc<str>> {
+        match self {
+            Self::Static(_) => None,
+            Self::Param(name) | Self::Rest(name) => Some(name),
+        }
+    }
 }
 
 /// The text after the leading `/`, or `None` for `/` itself, which has no
@@ -38,26 +53,38 @@ pub(crate) fn parse_pattern(path: &str) -> Result<Vec<Segment>, RouteError> {
     let Some(rest) = path.strip_prefix('/') else {
         return Err(invalid());
     };
-    let mut parsed = Vec::new();
+    let mut parsed: Vec<Segment> = Vec::new();
     for raw in segment_text(rest)
         .into_iter()
         .flat_map(|text| text.split('/'))
     {
-        let segment = match raw
+        if matches!(parsed.last(), Some(Segment::Rest(_))) {
+            // A catch-all takes the rest of the path: nothing may follow it.
+            return Err(invalid());
+        }
+        let capture = raw
             .strip_prefix('{')
             .and_then(|rest| rest.strip_suffix('}'))
-        {
-            Some(name) if is_param_name(name) => {
+            .map(|inner| match inner.strip_suffix("...") {
+                Some(name) => (name, true),
+                None => (inner, false),
+            });
+        let segment = match capture {
+            Some((name, catch_all)) if is_param_name(name) => {
                 if parsed
                     .iter()
-                    .any(|seen| matches!(seen, Segment::Param(seen) if &**seen == name))
+                    .any(|seen| seen.capture().is_some_and(|seen| &**seen == name))
                 {
                     return Err(RouteError::DuplicateParameter {
                         path: path.to_owned(),
                         name: name.to_owned(),
                     });
                 }
-                Segment::Param(Arc::from(name))
+                if catch_all {
+                    Segment::Rest(Arc::from(name))
+                } else {
+                    Segment::Param(Arc::from(name))
+                }
             }
             // Braces are reserved for whole-segment parameters.
             _ if raw.contains(['{', '}']) => return Err(invalid()),
@@ -84,6 +111,8 @@ pub(crate) struct Endpoint {
     pub(crate) path: Arc<str>,
     /// Parameter names in path order.
     pub(crate) params: Box<[Arc<str>]>,
+    /// Whether the last parameter is a `{name...}` catch-all.
+    pub(crate) catch_all: bool,
     pub(crate) handler: Arc<dyn Handler>,
 }
 
@@ -92,6 +121,8 @@ pub(crate) struct Endpoint {
 pub(crate) struct Node {
     statics: HashMap<Box<str>, Node>,
     param: Option<Box<Node>>,
+    /// The node of a `{name...}` catch-all here; it has no children.
+    rest: Option<Box<Node>>,
     endpoints: Vec<Endpoint>,
 }
 
@@ -108,6 +139,7 @@ impl Node {
             node = match segment {
                 Segment::Static(text) => node.statics.entry(text.into_boxed_str()).or_default(),
                 Segment::Param(_) => node.param.get_or_insert_with(Box::default),
+                Segment::Rest(_) => node.rest.get_or_insert_with(Box::default),
             };
         }
         if let Some(existing) = node.endpoint(&endpoint.method) {
@@ -168,9 +200,12 @@ impl Node {
     /// Resolves a raw request path to the node of the route that serves it,
     /// pushing the raw captured segments onto `captures` in path order.
     ///
-    /// At each position a static child is tried before the parameter child;
-    /// the parameter child is only tried when the static branch yields no
-    /// route. Only nodes with at least one endpoint match, so method
+    /// At each position a static child is tried before the parameter child,
+    /// and the catch-all last: each is only tried when the ones before it
+    /// yield no route. A catch-all takes the rest of the path as one raw
+    /// capture, slashes included, even when it is empty (`/files/` for
+    /// `/files/{key...}`), but not when the path ends before it (`/files`).
+    /// Only nodes with at least one endpoint match, so method
     /// selection happens after the path has been resolved. The search only
     /// descends into existing trie nodes, so its depth is bounded by the
     /// longest registered pattern, not by the request.
@@ -180,7 +215,18 @@ impl Node {
         captures: &mut Vec<&'p str>,
     ) -> Option<&'n Self> {
         let rest = path.strip_prefix('/')?;
-        self.find_in(segment_text(rest), captures)
+        if let Some(found) = self.find_in(segment_text(rest), captures) {
+            return Some(found);
+        }
+        // `/` is the empty rest of a catch-all at the root (`/{path...}`).
+        if rest.is_empty()
+            && let Some(child) = &self.rest
+            && !child.endpoints.is_empty()
+        {
+            captures.push(rest);
+            return Some(child);
+        }
+        None
     }
 
     fn find_in<'n, 'p>(
@@ -208,6 +254,12 @@ impl Node {
                 return Some(found);
             }
             captures.pop();
+        }
+        if let Some(child) = &self.rest
+            && !child.endpoints.is_empty()
+        {
+            captures.push(remaining);
+            return Some(child);
         }
         None
     }
@@ -263,6 +315,44 @@ mod tests {
                 "{path:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_catch_all_is_the_last_segment_only() {
+        assert_eq!(
+            pattern("/files/{key...}"),
+            Ok(vec![
+                Segment::Static("files".to_owned()),
+                Segment::Rest(Arc::from("key")),
+            ])
+        );
+        assert_eq!(
+            pattern("/{all...}"),
+            Ok(vec![Segment::Rest(Arc::from("all"))])
+        );
+        for path in [
+            "/files/{key...}/meta",
+            "/files/{key...}/",
+            "/{a...}/{b...}",
+            "/files/{...}",
+            "/files/{key..}",
+            "/files/{key....}",
+            "/files/{Key...}",
+            "/files/x{key...}",
+        ] {
+            assert_eq!(
+                pattern(path),
+                Err(RouteError::InvalidPath(path.to_owned())),
+                "{path:?}"
+            );
+        }
+        assert_eq!(
+            pattern("/a/{id}/{id...}"),
+            Err(RouteError::DuplicateParameter {
+                path: "/a/{id}/{id...}".to_owned(),
+                name: "id".to_owned(),
+            })
+        );
     }
 
     #[test]

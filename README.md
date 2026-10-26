@@ -751,6 +751,31 @@ Kubernetes and systemd deployment is covered in
   with `rust-toolchain.toml` (skip all of them with `--skip-docker`), plus `.github/workflows/ci.yml` and `.github/dependabot.yml`
   (skip with `--skip-ci`).
 
+### Routes
+
+A route segment is static text, a `{name}` that captures one segment, or, as
+the last segment, a `{name...}` catch-all that captures the rest of the path,
+slashes included (Forge-Go's `ServeMux` wildcard, Rails' `*path` glob). Static
+segments win over `{name}`, which wins over a catch-all; a catch-all value
+with an encoded slash or a `.`/`..` segment is answered `400`:
+
+```rust
+use forge::http::{Method, Request, Response, StatusCode};
+
+router.route(Method::GET, "/posts/{id}", show_post)?;            // /posts/42
+router.route(Method::GET, "/docs/{page...}", |request: Request| async move {
+    // /docs/guides/getting-started: page = "guides/getting-started"; /docs/: page = ""
+    match request.path_param_as::<String>("page") {
+        Ok(page) => Response::new(StatusCode::OK, page),
+        Err(_) => Response::empty(StatusCode::BAD_REQUEST),
+    }
+})?;
+```
+
+```sh
+cargo run -- routes   # lists GET /docs/{page...}; the OpenAPI document names it /docs/{page}
+```
+
 ## Email
 
 `forge::mail` (feature `mail`, on in every full-stack application) is the
