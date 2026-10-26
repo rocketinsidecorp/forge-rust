@@ -8,10 +8,15 @@
 //! [`TenantDirectory`] and [`PasswordResetStore`]; people name a tenant by
 //! its [`TenantSlug`]. Accounts with a TOTP second factor sign in through
 //! [`MfaService`] over an [`MfaStore`] (the `testing` feature adds the
-//! in-memory [`testing::MemoryMfaStore`]).
+//! in-memory [`testing::MemoryMfaStore`]). API clients authenticate with
+//! [`BearerSession`]s, bound to the tenant they signed in to and kept by a
+//! [`BearerSessionStore`].
 
 mod accounts;
+mod bearer;
 mod mfa;
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
 
 use async_trait::async_trait;
 use forge_auth::AuthenticatedPrincipal;
@@ -26,9 +31,7 @@ pub use accounts::{
     RedeemedPasswordReset, TenantDirectory, TenantSlug, TenantSlugError,
 };
 
-/// Test support: the in-memory [`MfaStore`].
-#[cfg(any(test, feature = "testing"))]
-pub use mfa::testing;
+pub use bearer::{BearerDenied, BearerSession, BearerSessionStore};
 pub use mfa::{
     ActiveTotp, IssuedMfaChallenge, MFA_CHALLENGE_LIFETIME_SECS, MFA_ENROLLMENT_LIFETIME_SECS,
     MfaChallengeGrant, MfaChallengeRecord, MfaChange, MfaChangeRequest, MfaError, MfaRejection,
