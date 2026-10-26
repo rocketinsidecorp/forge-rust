@@ -1,4 +1,4 @@
-//! The model, controller, mailer and job generators and `forge destroy`
+//! The model, resource, controller, mailer and job generators and `forge destroy`
 //! against freshly generated applications (ADR 0038). Nothing here builds
 //! the application: `tests/scaffold.rs` does, with
 //! `postgresql_application_generates_and_destroys_every_generator`.
@@ -211,6 +211,177 @@ fn a_model_is_the_scaffold_without_its_http_layer_byte_for_byte() {
     assert_eq!(tree(&model_root), before);
 }
 
+/// `forge generate resource` is the model plus the JSON API, byte for byte
+/// the scaffold's files; the three generators of one name collide, and each
+/// destroy refuses while a bigger generation needs its files.
+#[test]
+fn a_resource_is_the_model_plus_the_json_api_and_collides_with_the_others() {
+    let fields = ["title:string", "body:text?"];
+    let (_parent, root) = application(Database::Postgresql, true, Locale::En);
+    let (_scaffold_parent, scaffold_root) = application(Database::Postgresql, true, Locale::En);
+    let before = tree(&root);
+    let outcome = scaffold::generate(
+        &root,
+        &resource("post", &fields, Scope::Tenant, Layers::Resource),
+        VERSION,
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
+    scaffold::generate(
+        &scaffold_root,
+        &resource("post", &fields, Scope::Tenant, Layers::Scaffold),
+        VERSION,
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(
+        outcome.created,
+        [
+            format!("migrations/{VERSION}_create_posts.up.sql"),
+            format!("migrations/{VERSION}_create_posts.down.sql"),
+            "src/domain/entities/post.rs".to_owned(),
+            "src/application/ports/post_repository.rs".to_owned(),
+            "src/application/use_cases/posts.rs".to_owned(),
+            "src/infrastructure/database/posts.rs".to_owned(),
+            scaffold::API_ACCESS_PATH.to_owned(),
+            "src/adapters/http/posts_api.rs".to_owned(),
+            "tests/posts_api.rs".to_owned(),
+            "tests/posts_repository.rs".to_owned(),
+        ]
+    );
+    let scaffolded = tree(&scaffold_root);
+    for path in &outcome.created {
+        assert_eq!(
+            fs::read_to_string(root.join(path)).ok().as_ref(),
+            scaffolded.get(path),
+            "{path}"
+        );
+    }
+    assert!(!root.join(scaffold::ACCESS_PATH).exists());
+    // Without `--api-auth` nothing issues bearer tokens: the wiring stays
+    // closed and says how to open it.
+    assert!(
+        outcome.wiring.contains("api_access::DenyAll"),
+        "{}",
+        outcome.wiring
+    );
+    assert!(
+        outcome
+            .wiring
+            .contains("forge generate authentication --api-auth")
+    );
+    assert!(!outcome.wiring.contains("BearerTenantAccess::new"));
+
+    for (layers, version) in [
+        (Layers::Model, "1760832000000000001"),
+        (Layers::Resource, "1760832000000000002"),
+        (Layers::Scaffold, "1760832000000000003"),
+    ] {
+        let collision = scaffold::generate(
+            &root,
+            &resource("post", &fields, Scope::Tenant, layers),
+            version,
+        )
+        .err()
+        .map(|error| error.to_string())
+        .unwrap_or_default();
+        assert!(
+            collision.contains("refusing to overwrite"),
+            "{layers:?}: {collision}"
+        );
+    }
+
+    let owned = destroy_resource(
+        &root,
+        &resource("post", &fields, Scope::Tenant, Layers::Model),
+        ALL,
+    )
+    .err()
+    .unwrap_or_default();
+    assert!(owned.contains("src/adapters/http/posts_api.rs"), "{owned}");
+    assert!(owned.contains("forge destroy resource"), "{owned}");
+    let owned = destroy_resource(
+        &scaffold_root,
+        &resource("post", &fields, Scope::Tenant, Layers::Resource),
+        ALL,
+    )
+    .err()
+    .unwrap_or_default();
+    assert!(owned.contains("src/adapters/http/posts.rs"), "{owned}");
+    assert!(owned.contains("forge destroy scaffold"), "{owned}");
+
+    // Destroying the resource restores the application but the shared
+    // API access module.
+    let printed = destroy_resource(
+        &root,
+        &resource("post", &fields, Scope::Tenant, Layers::Resource),
+        ALL,
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
+    assert!(
+        printed.contains("remove       src/adapters/http/posts_api.rs"),
+        "{printed}"
+    );
+    let mut after = tree(&root);
+    assert!(after.remove(scaffold::API_ACCESS_PATH).is_some());
+    assert_eq!(after, before);
+}
+
+/// In a `forge new --api-auth` application a tenant-scoped resource is wired
+/// with the bearer tokens; a resource needs `fn compose`, which `--api`
+/// applications lack.
+#[test]
+fn a_resource_takes_bearer_tokens_with_api_auth_and_needs_compose() {
+    let parent = tempfile::tempdir().unwrap_or_else(|error| panic!("{error}"));
+    let root = create_application(
+        parent.path(),
+        &NewApplication {
+            name: "shop".to_owned(),
+            docker: false,
+            ci: false,
+            database: Database::Postgresql,
+            views: true,
+            forge: ForgeSource::Path("../forge/crates/forge".to_owned()),
+            locale: Locale::En,
+            api_auth: true,
+        },
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
+    let tenant = scaffold::generate(
+        &root,
+        &resource("product", &["name:string"], Scope::Tenant, Layers::Resource),
+        VERSION,
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
+    assert!(
+        tenant.wiring.contains("BearerTenantAccess::new"),
+        "{}",
+        tenant.wiring
+    );
+    assert!(tenant.wiring.contains("PostgresBearerSessionStore::new"));
+    assert!(tenant.wiring.contains("policy.allow(viewer, read);"));
+    let global = scaffold::generate(
+        &root,
+        &resource("tag", &["label:string"], Scope::Global, Layers::Resource),
+        "1760832000000000001",
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
+    assert!(global.reused_api_access);
+    assert!(
+        global.wiring.contains("api_access::DenyAll"),
+        "{}",
+        global.wiring
+    );
+    assert!(!global.wiring.contains("pub mod api_access;"));
+
+    let (_api_parent, api) = application(Database::Postgresql, false, Locale::En);
+    let refused = refused(scaffold::generate(
+        &api,
+        &resource("product", &["name:string"], Scope::Tenant, Layers::Resource),
+        VERSION,
+    ));
+    assert!(refused.contains("no `fn compose`"), "{refused}");
+    assert!(refused.contains("the resource"), "{refused}");
+}
+
 #[test]
 fn models_need_a_database_and_its_test_support_but_no_views() {
     // A full-stack SQLite application: a model needs no views of its own.
@@ -344,6 +515,7 @@ fn destroying_a_scaffold_keeps_shared_files_migrations_and_translations() {
 
     let mut after = tree(&root);
     after.remove(scaffold::ACCESS_PATH);
+    after.remove(scaffold::API_ACCESS_PATH);
     after.remove("src/adapters/http/streams.rs");
     assert_eq!(after, before);
 }

@@ -1,0 +1,35 @@
+
+Forge did not edit any existing file. Wire the resource by hand:
+
+  1. Declare the new modules (each in the listed file, keeping `mod` lines sorted):
+
+       src/domain/entities/mod.rs             pub mod tag;
+       src/application/ports/mod.rs           pub mod tag_repository;
+       src/application/use_cases/mod.rs       pub mod tags;
+       src/infrastructure/database/mod.rs     pub mod tags;
+       src/adapters/http/mod.rs               pub mod api_access;
+       src/adapters/http/mod.rs               pub mod tags_api;
+
+  2. In src/bootstrap/mod.rs, at the end of `fn compose`, before `Ok(())`:
+
+    let tags = crate::application::use_cases::tags::TagService::new(std::sync::Arc::new(
+        crate::infrastructure::database::tags::MySqlTagRepository::new(
+            composition.mysql()?.clone(),
+        ),
+    ));
+    // tags JSON API (/v1/tags): global. DenyAll refuses every request until
+    // you decide who may use it: implement ApiGlobalAccess
+    // (src/adapters/http/api_access.rs).
+    crate::adapters::http::tags_api::routes(
+        composition.router(),
+        tags,
+        std::sync::Arc::new(crate::adapters::http::api_access::DenyAll),
+    )?;
+
+  Every route of /v1/tags asks the access policy for `tags:read` or
+  `tags:write` first; src/adapters/http/api_access.rs explains the
+  deny-by-default choice.
+
+  Then apply the migration (`cargo run -- migrate` with FORGE_MIGRATION_DATABASE_URL)
+  and run `cargo test` (repository tests on a database server need
+  `cargo test -- --include-ignored` and FORGE_TEST_* URLs, see docs/database.md).

@@ -204,6 +204,28 @@ fn execute(
                     writeln!(output, "  {:<12} src/adapters/http/streams.rs", "reuse")
                         .map_err(CliError::Output)?;
                 }
+                if outcome.reused_api_access {
+                    writeln!(output, "  {:<12} {}", "reuse", scaffold::API_ACCESS_PATH)
+                        .map_err(CliError::Output)?;
+                }
+                write!(output, "{}", outcome.wiring).map_err(CliError::Output)
+            }
+            GenerateCommand::Resource { resource } => {
+                let options = resource_options(resource, Layers::Resource, false);
+                let version = generate::migration_version(current_dir)?;
+                let outcome = scaffold::generate(current_dir, &options, &version)?;
+                let verb = if options.dry_run {
+                    "would create"
+                } else {
+                    "create"
+                };
+                for path in &outcome.created {
+                    writeln!(output, "  {verb:<12} {path}").map_err(CliError::Output)?;
+                }
+                if outcome.reused_api_access {
+                    writeln!(output, "  {:<12} {}", "reuse", scaffold::API_ACCESS_PATH)
+                        .map_err(CliError::Output)?;
+                }
                 write!(output, "{}", outcome.wiring).map_err(CliError::Output)
             }
             GenerateCommand::Model { resource } => {
@@ -599,6 +621,18 @@ fn run_destroy(
     let (plan, flags) = match generator {
         DestroyCommand::Model { resource, flags } => {
             let options = resource_options(resource, Layers::Model, false);
+            let (files, unwire, owned_elsewhere) = scaffold::plan_destroy(root, &options)?;
+            (
+                DestroyPlan {
+                    files,
+                    unwire,
+                    owned_elsewhere,
+                },
+                destroy_flags(options.dry_run, flags),
+            )
+        }
+        DestroyCommand::Resource { resource, flags } => {
+            let options = resource_options(resource, Layers::Resource, false);
             let (files, unwire, owned_elsewhere) = scaffold::plan_destroy(root, &options)?;
             (
                 DestroyPlan {

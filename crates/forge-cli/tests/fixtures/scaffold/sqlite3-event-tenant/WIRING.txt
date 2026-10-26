@@ -8,7 +8,9 @@ Forge did not edit any existing file. Wire the resource by hand:
        src/application/use_cases/mod.rs       pub mod events;
        src/infrastructure/database/mod.rs     pub mod events;
        src/adapters/http/mod.rs               pub mod access;
+       src/adapters/http/mod.rs               pub mod api_access;
        src/adapters/http/mod.rs               pub mod events;
+       src/adapters/http/mod.rs               pub mod events_api;
        src/adapters/http/views/mod.rs         pub mod events;
 
   2. In src/bootstrap/mod.rs, at the end of `fn compose`, before `Ok(())`:
@@ -25,12 +27,21 @@ Forge did not edit any existing file. Wire the resource by hand:
     crate::adapters::http::events::routes(
         composition.router(),
         &site,
-        events,
+        events.clone(),
         std::sync::Arc::new(crate::adapters::http::access::DenyAll),
+    )?;
+    // events JSON API (/v1/events): tenant-scoped. SQLite has no Forge
+    // bearer sessions or memberships yet (ADR 0021), so DenyAll refuses every
+    // request until you implement ApiTenantAccess (src/adapters/http/api_access.rs).
+    crate::adapters::http::events_api::routes(
+        composition.router(),
+        events,
+        std::sync::Arc::new(crate::adapters::http::api_access::DenyAll),
     )?;
 
   Every route asks the access policy for `events:read` or `events:write`
-  first; src/adapters/http/access.rs explains the deny-by-default choice.
+  first; src/adapters/http/access.rs explains the deny-by-default choice for the
+  pages, src/adapters/http/api_access.rs for the JSON API under /v1/events.
 
   Then apply the migration (`cargo run -- migrate` with FORGE_MIGRATION_DATABASE_URL)
   and run `cargo test` (repository tests on a database server need
