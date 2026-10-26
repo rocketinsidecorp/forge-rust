@@ -807,15 +807,33 @@ impl Router {
 /// case), a raw backslash, or a `.` or `..` segment, spelled or
 /// percent-encoded. A capture holding one could smuggle a separator past
 /// routing or climb out of a directory a handler joins it to.
+///
+/// It runs on every routed request, so it allocates nothing for a path
+/// without `%`: the separator search is byte-wise and case-insensitive, and
+/// only a segment that holds an escape is decoded (a segment without one is
+/// its own decoding, so it is compared as it is).
 fn is_invalid_path(path: &str) -> bool {
-    let lower = path.to_ascii_lowercase();
-    lower.contains("%2f")
-        || lower.contains("%5c")
-        || path.contains('\\')
-        || path.split('/').any(|segment| {
-            crate::encoding::percent_decode(segment, false)
-                .is_ok_and(|decoded| decoded == "." || decoded == "..")
+    let bytes = path.as_bytes();
+    bytes.contains(&b'\\')
+        || bytes.windows(3).any(|window| {
+            window[0] == b'%'
+                && matches!(
+                    (window[1], window[2].to_ascii_lowercase()),
+                    (b'2', b'f') | (b'5', b'c')
+                )
         })
+        || path.split('/').any(|segment| {
+            if segment.contains('%') {
+                crate::encoding::percent_decode(segment, false)
+                    .is_ok_and(|decoded| is_dot_segment(&decoded))
+            } else {
+                is_dot_segment(segment)
+            }
+        })
+}
+
+fn is_dot_segment(segment: &str) -> bool {
+    segment == "." || segment == ".."
 }
 
 /// Whether a catch-all capture starts with `/` or has an empty segment
