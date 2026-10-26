@@ -662,3 +662,70 @@ fn a_skipped_flattened_member_makes_its_members_optional() -> Result<(), forge_o
     assert!(required.contains("created_at"), "{required}");
     Ok(())
 }
+
+/// A bearer route (`Operation::bearer`, an API client's token) is secured by
+/// Forge-Go's `bearerAuth` scheme and refuses with JSON error reports; a
+/// document with both kinds declares both schemes.
+#[test]
+fn bearer_routes_use_the_bearer_scheme_and_json_refusals() -> Result<(), Box<dyn std::error::Error>>
+{
+    let routes = [
+        route(
+            "GET",
+            "/v1/posts",
+            Operation::new()
+                .bearer()
+                .permission("posts:read")
+                .response(Response::empty(204)),
+        ),
+        route(
+            "GET",
+            "/v1/auth/session",
+            Operation::new().bearer().response(Response::empty(204)),
+        ),
+        route(
+            "GET",
+            "/posts",
+            Operation::new()
+                .permission("posts:read")
+                .response(Response::empty(204)),
+        ),
+    ];
+    let document: Value = serde_json::from_slice(Document::build(&info(), &routes)?.json())?;
+    let list = &document["paths"]["/v1/posts"]["get"];
+    assert_eq!(list["security"], json!([{"bearerAuth": []}]));
+    assert_eq!(list["x-forge-permission"], "posts:read");
+    for status in ["401", "403"] {
+        assert_eq!(
+            list["responses"][status]["content"]["application/json"]["schema"],
+            json!({"$ref": "#/components/schemas/ErrorReport"}),
+            "{status}"
+        );
+    }
+    let session = &document["paths"]["/v1/auth/session"]["get"];
+    assert_eq!(session["security"], json!([{"bearerAuth": []}]));
+    assert!(session["responses"].get("401").is_some());
+    assert!(session["responses"].get("403").is_none());
+    assert_eq!(
+        document["paths"]["/posts"]["get"]["security"],
+        json!([{"sessionCookie": []}])
+    );
+    assert_eq!(
+        document["components"]["securitySchemes"]["bearerAuth"],
+        json!({
+            "type": "http",
+            "scheme": "bearer",
+            "description": "A Forge session token: Authorization: Bearer <token>.",
+        })
+    );
+    assert!(document["components"]["securitySchemes"]["sessionCookie"].is_object());
+
+    let only_bearer: Value =
+        serde_json::from_slice(Document::build(&info(), &routes[..1])?.json())?;
+    assert!(
+        only_bearer["components"]["securitySchemes"]
+            .get("sessionCookie")
+            .is_none()
+    );
+    Ok(())
+}
