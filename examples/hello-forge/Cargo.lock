@@ -649,6 +649,7 @@ name = "forge-views"
 version = "0.1.0"
 dependencies = [
  "askama",
+ "base64",
  "bytes",
  "cookie",
  "forge-auth",

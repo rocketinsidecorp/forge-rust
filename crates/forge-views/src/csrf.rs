@@ -8,13 +8,19 @@
 //! - the token is 256 bits from the operating-system CSPRNG (`getrandom`), in
 //!   the canonical [`CsrfToken`] encoding, kept in the `__Host-forge_csrf`
 //!   cookie (`Secure`, `HttpOnly`, `SameSite=Lax`, `Path=/`, no `Domain`);
-//! - pages render the same token with [`csrf_meta`](crate::csrf_meta) and
-//!   [`csrf_field`](crate::csrf_field); the cookie is only set on a response
-//!   whose handler actually asked for the token ([`csrf_token`]);
+//! - pages never embed the token itself: [`csrf_meta`](crate::csrf_meta) and
+//!   [`csrf_field`](crate::csrf_field) write it masked ([`mask_csrf_token`]),
+//!   as Rails and Forge-Go do: a fresh 32-byte one-time pad followed by the
+//!   token XOR the pad, unpadded base64url (86 characters). Every render
+//!   embeds different bytes, so a page compressed together with reflected
+//!   input cannot leak the token through its size (BREACH). The cookie keeps
+//!   the token itself, and is only set on a response whose handler actually
+//!   asked for the token ([`csrf_token`]);
 //! - every unsafe request (anything but `GET`, `HEAD`, `OPTIONS`, `TRACE`)
 //!   must present exactly one well-formed token, in the `x-csrf-token`
-//!   header or in the `csrf_token` field of a form-encoded body, equal to the
-//!   cookie (constant-time comparison). The query string is never read;
+//!   header or in the `csrf_token` field of a form-encoded body, that
+//!   carries the cookie's token, masked or as it is ([`unmask_csrf_token`];
+//!   constant-time comparison). The query string is never read;
 //! - before the token check, a browser-declared cross-site request is
 //!   refused: `Sec-Fetch-Site` must be `same-origin` or `none` when present,
 //!   otherwise an `Origin` header must name the request's `Host`;
@@ -30,8 +36,9 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use cookie::{Cookie, SameSite};
-use forge_auth::CsrfToken;
+use forge_auth::{CredentialError, CsrfToken};
 use forge_http::{
     BoxResponseFuture, CSRF_FIELD_NAME, FormErrorKind, HeaderValue, METHOD_FIELD_NAME, Method,
     Middleware, Next, Request, Response, StatusCode, header,
@@ -44,6 +51,13 @@ use crate::{
     common::hex,
     forms::{CSRF_HEADER_NAME, CsrfVerified, method_override},
 };
+
+/// Length of a masked token ([`mask_csrf_token`]): the unpadded base64url
+/// encoding of the 32-byte one-time pad followed by the token XOR the pad.
+pub const MASKED_CSRF_TOKEN_LEN: usize = 86;
+
+/// Bytes of a CSRF token (its canonical form is 64 lowercase hex digits).
+const TOKEN_BYTES: usize = 32;
 
 /// Name of the host-only cookie that holds the form CSRF token.
 ///
@@ -153,6 +167,10 @@ impl CsrfState {
 
 /// The CSRF token to render in the current page (`csrf_meta`, `csrf_field`).
 ///
+/// This is the token itself, as the cookie holds it: pages embed it only
+/// through [`csrf_meta`](crate::csrf_meta), [`csrf_field`](crate::csrf_field)
+/// or [`mask_csrf_token`], which mask it afresh on every render.
+///
 /// Returns the browser's existing token, or issues a new one that
 /// [`CsrfProtection`] stores in the `__Host-forge_csrf` cookie of this
 /// response. Reading the token also marks the response `Cache-Control:
@@ -174,20 +192,29 @@ pub fn csrf_verified(request: &Request) -> Option<CsrfVerified> {
 }
 
 /// The token an unsafe request presents, from exactly one `x-csrf-token`
-/// header and/or exactly one `csrf_token` field of a form-encoded body.
+/// header and/or exactly one `csrf_token` field of a form-encoded body,
+/// unmasked ([`unmask_csrf_token`]): the canonical token whatever form it
+/// was sent in.
 ///
-/// The query string is never read. When both carry a token they must be
-/// equal. `Ok(None)` when neither is present. Generated applications use
-/// this for their session-bound check (ADR 0014) so it reads the token with
-/// the same rules as [`CsrfProtection`].
+/// The query string is never read. When both carry a token they must carry
+/// the same one. `Ok(None)` when neither is present. Generated applications
+/// use this for their session-bound check (ADR 0014) so it reads the token
+/// with the same rules as [`CsrfProtection`].
 pub fn presented_csrf_token(request: &Request) -> Result<Option<CsrfToken>, CsrfError> {
     let mut headers = request.headers().get_all(CSRF_HEADER_NAME).iter();
     let from_header = match (headers.next(), headers.next()) {
+        // The header takes the token masked (the `csrf-token` meta tag) or
+        // as it is, for good: a script may send the cookie's value, and a
+        // header is never part of a compressed body.
         (None, _) => None,
         (Some(value), None) => Some(parse_token(value.to_str().ok())?),
         (Some(_), Some(_)) => return Err(CsrfError::InvalidToken),
     };
     let from_field = match request.form_value(CSRF_FIELD_NAME) {
+        // TODO(v0.2.0): accept only masked tokens in the form field. The
+        // unmasked token stays accepted for one release, the one that
+        // introduces masking (v0.1.x), so forms rendered before an upgrade
+        // keep working while it is deployed (docs/views.md).
         Ok(value) => value
             .map(|value| parse_token(Some(value.as_str())))
             .transpose()?,
@@ -220,8 +247,73 @@ pub fn csrf_cookie(token: &CsrfToken) -> String {
 
 fn parse_token(value: Option<&str>) -> Result<CsrfToken, CsrfError> {
     value
-        .and_then(|value| CsrfToken::new(value).ok())
         .ok_or(CsrfError::InvalidToken)
+        .and_then(unmask_csrf_token)
+}
+
+/// `token` masked with a fresh one-time pad from the operating-system
+/// CSPRNG: the unpadded base64url encoding of the 32-byte pad followed by
+/// the token's bytes XOR the pad ([`MASKED_CSRF_TOKEN_LEN`] characters, the
+/// format of Rails' `masked_authenticity_token` and Forge-Go's
+/// `csrf.MaskToken`). Every call returns a different value for the same
+/// token; [`unmask_csrf_token`] turns any of them back into it.
+/// [`csrf_meta`](crate::csrf_meta) and [`csrf_field`](crate::csrf_field)
+/// call it on every render; a custom renderer that embeds the token in a
+/// page calls it too, never [`CsrfToken::expose`].
+pub fn mask_csrf_token(token: &CsrfToken) -> Result<String, CredentialError> {
+    let raw = token_bytes(token).ok_or(CredentialError::InvalidToken)?;
+    let mut masked = [0_u8; 2 * TOKEN_BYTES];
+    let (pad, body) = masked.split_at_mut(TOKEN_BYTES);
+    getrandom::fill(pad).map_err(|_| CredentialError::RandomnessUnavailable)?;
+    for ((out, byte), mask) in body.iter_mut().zip(raw).zip(pad.iter()) {
+        *out = byte ^ mask;
+    }
+    Ok(URL_SAFE_NO_PAD.encode(masked))
+}
+
+/// Decodes a submitted token: masked ([`mask_csrf_token`]) or as it is (the
+/// canonical 64 lowercase hex digits of [`CsrfToken`]).
+///
+/// A masked token must be exactly [`MASKED_CSRF_TOKEN_LEN`] characters of
+/// unpadded base64url, decode to exactly 64 bytes and be the canonical
+/// encoding of them (no padding, no stray trailing bits); anything else is
+/// [`CsrfError::InvalidToken`]. The unmasked form stays accepted: scripts
+/// that read the double-submit cookie send it (a header is not part of a
+/// compressed body, so BREACH does not reach it), and forms rendered before
+/// the upgrade embed it. Comparing the result with the cookie's token is
+/// the caller's job, in constant time ([`CsrfProtection`] does it).
+pub fn unmask_csrf_token(value: &str) -> Result<CsrfToken, CsrfError> {
+    if value.len() != MASKED_CSRF_TOKEN_LEN {
+        return CsrfToken::new(value).map_err(|_| CsrfError::InvalidToken);
+    }
+    let decoded = URL_SAFE_NO_PAD
+        .decode(value)
+        .map_err(|_| CsrfError::InvalidToken)?;
+    if decoded.len() != 2 * TOKEN_BYTES || URL_SAFE_NO_PAD.encode(&decoded) != value {
+        return Err(CsrfError::InvalidToken);
+    }
+    let (pad, body) = decoded.split_at(TOKEN_BYTES);
+    let raw: Vec<u8> = body
+        .iter()
+        .zip(pad)
+        .map(|(byte, mask)| byte ^ mask)
+        .collect();
+    CsrfToken::new(hex(&raw)).map_err(|_| CsrfError::InvalidToken)
+}
+
+/// The 32 bytes of a canonical (lowercase hex) token.
+fn token_bytes(token: &CsrfToken) -> Option<[u8; TOKEN_BYTES]> {
+    let text = token.expose().as_bytes();
+    if text.len() != 2 * TOKEN_BYTES {
+        return None;
+    }
+    let mut bytes = [0_u8; TOKEN_BYTES];
+    let (pairs, _) = text.as_chunks::<2>();
+    for (byte, &[high, low]) in bytes.iter_mut().zip(pairs) {
+        let digit = |character: u8| char::from(character).to_digit(16);
+        *byte = u8::try_from(digit(high)? * 16 + digit(low)?).ok()?;
+    }
+    Some(bytes)
 }
 
 /// Constant-time comparison of two canonical (fixed-length) tokens.
@@ -887,6 +979,239 @@ mod tests {
         assert_eq!(
             presented_csrf_token(&mismatch),
             Err(CsrfError::InvalidToken)
+        );
+    }
+
+    fn masked(token: &str) -> String {
+        mask_csrf_token(&CsrfToken::new(token).expect("valid token")).expect("CSPRNG")
+    }
+
+    fn unmasked(value: &str) -> Result<String, CsrfError> {
+        unmask_csrf_token(value).map(|token| token.expose().to_owned())
+    }
+
+    #[test]
+    fn masks_are_fresh_86_characters_of_base64url_and_unmask_to_the_token() {
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..64 {
+            let value = masked(TOKEN);
+            assert_eq!(value.len(), MASKED_CSRF_TOKEN_LEN);
+            assert!(
+                value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_'),
+                "{value}"
+            );
+            assert_eq!(unmasked(&value), Ok(TOKEN.to_owned()));
+            assert!(seen.insert(value), "a pad was reused");
+        }
+        // The canonical token is accepted as it is.
+        assert_eq!(unmasked(TOKEN), Ok(TOKEN.to_owned()));
+        // Rails' and Forge-Go's layout: pad, then token XOR pad.
+        let decoded = URL_SAFE_NO_PAD.decode(masked(TOKEN)).expect("base64url");
+        let (pad, body) = decoded.split_at(32);
+        let raw: Vec<u8> = body
+            .iter()
+            .zip(pad)
+            .map(|(byte, mask)| byte ^ mask)
+            .collect();
+        assert_eq!(hex(&raw), TOKEN);
+    }
+
+    #[test]
+    fn tampered_truncated_padded_and_foreign_tokens_are_refused() {
+        let value = masked(TOKEN);
+        let mut refused = vec![
+            String::new(),
+            value[..MASKED_CSRF_TOKEN_LEN - 1].to_owned(),
+            format!("{value}A"),
+            format!("{value}=="),
+            format!("{}==", &value[..MASKED_CSRF_TOKEN_LEN - 2]),
+            format!(" {}", &value[1..]),
+            // The standard alphabet's `+` and `/` are not base64url.
+            format!("+{}", &value[1..]),
+            format!("{}/{}", &value[..10], &value[11..]),
+            TOKEN.to_uppercase(),
+            TOKEN[..63].to_owned(),
+            format!("{TOKEN}0"),
+            "z".repeat(64),
+        ];
+        // The 86th character carries 4 bits that must be zero.
+        let mut stray = value.clone();
+        stray.pop();
+        stray.push('B');
+        refused.push(stray);
+        for candidate in &refused {
+            assert_eq!(
+                unmasked(candidate),
+                Err(CsrfError::InvalidToken),
+                "{candidate:?}"
+            );
+        }
+        // Any changed character yields another token or an invalid one,
+        // never the cookie's token.
+        for index in 0..MASKED_CSRF_TOKEN_LEN {
+            let mut tampered: Vec<u8> = value.clone().into_bytes();
+            tampered[index] = if tampered[index] == b'A' { b'B' } else { b'A' };
+            let tampered = String::from_utf8(tampered).expect("ASCII");
+            assert_ne!(unmasked(&tampered), Ok(TOKEN.to_owned()), "{index}");
+        }
+        // A masked form of another token is that other token.
+        assert_eq!(unmasked(&masked(OTHER)), Ok(OTHER.to_owned()));
+    }
+
+    /// Arbitrary input never panics and only well-formed tokens decode:
+    /// random strings of every length around the two accepted ones, from an
+    /// alphabet with base64, hex, padding, separators and multi-byte
+    /// characters.
+    #[test]
+    fn arbitrary_input_never_panics() {
+        const ALPHABET: &[char] = &[
+            'A',
+            'Z',
+            'a',
+            'f',
+            'z',
+            '0',
+            '9',
+            '-',
+            '_',
+            '+',
+            '/',
+            '=',
+            ' ',
+            '%',
+            '\0',
+            'é',
+            '€',
+            '\u{10348}',
+        ];
+        let mut random = [0_u8; 4096];
+        getrandom::fill(&mut random).expect("CSPRNG");
+        let mut bytes = random.iter().copied().cycle();
+        for length in (0..=100).chain([64, 86, 86, 86, 64]) {
+            for _ in 0..16 {
+                let candidate: String = (0..length)
+                    .map(|_| ALPHABET[usize::from(bytes.next().unwrap_or(0)) % ALPHABET.len()])
+                    .collect();
+                if let Ok(token) = unmask_csrf_token(&candidate) {
+                    assert_eq!(token.expose().len(), 64, "{candidate:?}");
+                }
+            }
+        }
+        // Every 86-byte string of random base64url decodes or is refused,
+        // without panicking; those that decode are canonical.
+        for chunk in random.as_chunks::<MASKED_CSRF_TOKEN_LEN>().0 {
+            let candidate: String = chunk
+                .iter()
+                .map(|byte| {
+                    char::from(
+                        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+                            [usize::from(*byte) % 64],
+                    )
+                })
+                .collect();
+            if unmask_csrf_token(&candidate).is_ok() {
+                let decoded = URL_SAFE_NO_PAD.decode(&candidate).expect("decodes");
+                assert_eq!(URL_SAFE_NO_PAD.encode(decoded), candidate);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn masked_and_plain_tokens_pass_in_the_field_and_the_header() {
+        let jar = cookie(TOKEN);
+        for token in [masked(TOKEN), TOKEN.to_owned()] {
+            let field = send(request(
+                Method::POST,
+                "/items",
+                &[("cookie", &jar), ("content-type", FORM)],
+                &format!("name=mug&{CSRF_FIELD_NAME}={token}"),
+            ))
+            .await;
+            assert_eq!(text(&field), "POST true", "{token}");
+            let header = send(request(
+                Method::DELETE,
+                "/items",
+                &[("cookie", &jar), (CSRF_HEADER_NAME, &token)],
+                "",
+            ))
+            .await;
+            assert_eq!(text(&header), "DELETE true", "{token}");
+        }
+        // Header and field may carry the token in different forms or masks.
+        let both = send(request(
+            Method::POST,
+            "/items",
+            &[
+                ("cookie", &jar),
+                (CSRF_HEADER_NAME, &masked(TOKEN)),
+                ("content-type", FORM),
+            ],
+            &format!("{CSRF_FIELD_NAME}={}", masked(TOKEN)),
+        ))
+        .await;
+        assert_eq!(both.status(), StatusCode::OK);
+        // A masked token of another browser, or a header and a field that
+        // carry different tokens, are refused.
+        refused(request(
+            Method::POST,
+            "/items",
+            &[("cookie", &jar), ("content-type", FORM)],
+            &format!("{CSRF_FIELD_NAME}={}", masked(OTHER)),
+        ))
+        .await;
+        refused(request(
+            Method::PUT,
+            "/items",
+            &[("cookie", &jar), (CSRF_HEADER_NAME, &masked(OTHER))],
+            "",
+        ))
+        .await;
+        refused(request(
+            Method::POST,
+            "/items",
+            &[
+                ("cookie", &jar),
+                (CSRF_HEADER_NAME, &masked(TOKEN)),
+                ("content-type", FORM),
+            ],
+            &format!("{CSRF_FIELD_NAME}={}", masked(OTHER)),
+        ))
+        .await;
+        // A masked value never works as the cookie.
+        refused(request(
+            Method::POST,
+            "/items",
+            &[
+                ("cookie", &cookie(&masked(TOKEN))),
+                (CSRF_HEADER_NAME, TOKEN),
+            ],
+            "",
+        ))
+        .await;
+    }
+
+    #[test]
+    fn presented_tokens_are_unmasked() {
+        let header = request(Method::POST, "/", &[(CSRF_HEADER_NAME, &masked(TOKEN))], "");
+        assert_eq!(
+            presented_csrf_token(&header)
+                .expect("valid")
+                .map(|token| token.expose().to_owned()),
+            Some(TOKEN.to_owned())
+        );
+        let field = request(
+            Method::POST,
+            "/",
+            &[("content-type", FORM)],
+            &format!("{CSRF_FIELD_NAME}={}", masked(TOKEN)),
+        );
+        assert_eq!(
+            presented_csrf_token(&field)
+                .expect("valid")
+                .map(|token| token.expose().to_owned()),
+            Some(TOKEN.to_owned())
         );
     }
 

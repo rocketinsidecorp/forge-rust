@@ -181,6 +181,7 @@ adds three direct dependencies to `forge-views` (feature `runtime`) and makes
 | `cookie` | `0.18.2` | parse `Cookie` headers and build `Set-Cookie` values for `__Host-forge_csrf` and `__Host-forge_flash` | defaults disabled; `percent-encode` only (flash values); signed/private jars disabled |
 | `getrandom` | `0.4.3` | 256-bit CSRF tokens from the OS CSPRNG | default platform backend only |
 | `subtle` | `2.6.1` | constant-time comparison of the presented and cookie tokens | defaults disabled |
+| `base64` | `0.22.1` | masked CSRF tokens (forge-rust#75): unpadded base64url of the one-time pad and the masked token, strict decoding | defaults disabled; `alloc` only (the workspace entry) |
 | `askama` (generated apps) | `0.16.1` | the `Template` derive for the application's view models | defaults disabled; `derive`, `std`; same version as `forge-views` |
 
 Admission review:
@@ -206,6 +207,12 @@ Admission review:
   features = ["build"]` (SHA-2 and the standard library only).
 - The vendored Turbo 8.0.23 and Stimulus 3.2.2 modules were admitted with
   their pinned digests in earlier slices; this slice only serves them.
+- `base64` joined `forge-views` with the masked CSRF tokens (forge-rust#75);
+  it was already admitted (see the storage decision below) and in the
+  locked graph through `forge-auth` and `forge-config`, so no package is
+  added. It decodes submitted masks with the URL-safe alphabet, no padding
+  and no stray trailing bits, and Forge re-encodes to reject any other
+  spelling; it appears in no public signature.
 
 ## Authentication pages dependency decision
 

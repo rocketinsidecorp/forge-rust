@@ -376,11 +376,26 @@ of the router it is added to:
   layout (Turbo and `fetch` send it as `x-csrf-token`); `csrf_field(&token)`
   renders `<input type="hidden" name="csrf_token" ...>` for every non-GET form.
   Both escape the value and return markup: insert them with `|safe`.
+- Pages never embed the token itself. `csrf_meta` and `csrf_field` write it
+  masked, as Rails and Forge-Go do: a fresh 32-byte one-time pad followed by
+  the token XOR the pad, 86 characters of unpadded base64url
+  (`mask_csrf_token`). Every render embeds different bytes, so a page
+  compressed together with reflected input cannot leak the token through
+  its size (BREACH). The cookie keeps the token itself; a custom renderer
+  that embeds the token calls `mask_csrf_token`, never `CsrfToken::expose`.
 - Every method except `GET`, `HEAD`, `OPTIONS` and `TRACE` must present
   exactly one well-formed token, in the `x-csrf-token` header or the
-  `csrf_token` field of a form-encoded body (both, if present, must agree),
-  equal to the cookie's token (constant-time comparison). The query string is
-  never read; repeated or malformed values are refused.
+  `csrf_token` field of a form-encoded body (both, if present, must carry the
+  same token), that carries the cookie's token, masked or as it is
+  (`unmask_csrf_token`: exactly 86 characters that decode strictly to 64
+  bytes and re-encode to the same text, or the 64 lowercase hex digits of
+  the token; constant-time comparison). The query string is never read;
+  repeated or malformed values are refused.
+- The unmasked token stays accepted in the header for good: a script that
+  reads the cookie sends it so, and a header is not part of a compressed
+  body. In the `csrf_token` field it is accepted for one release, v0.1.x,
+  so forms rendered before the upgrade to masked tokens keep working while
+  it is deployed; from v0.2.0 the field takes only masked tokens.
 - Before that, a browser-declared cross-site request is refused:
   `Sec-Fetch-Site` must be `same-origin` or `none`, or, without it, `Origin`
   must be `http(s)://<Host>`.
@@ -392,9 +407,26 @@ of the router it is added to:
 For signed-in users, generated database applications keep the session-bound
 check of [ADR 0014](adr/0014-argon2-session-cookie-and-csrf.md):
 `infrastructure::security::enforce_csrf` reads the token with
-`presented_csrf_token` (header or form field, same rules). At login, set the
-form cookie to the session's CSRF token with `csrf_cookie(&token)` so the
-pages render it and both checks agree.
+`presented_csrf_token` (header or form field, same rules; it returns the
+token unmasked). At login, set the form cookie to the session's CSRF token
+with `csrf_cookie(&token)` so the pages render it and both checks agree.
+
+Upgrading an application generated before masked tokens: its pages need no
+change, but a test that expects the page to embed the cookie's value fails,
+since the meta tag and the form field now differ from the cookie and from
+each other. Compare through the unmasking instead, as `tests/http.rs` of a
+new application does:
+
+```rust
+let meta = csrf_meta(&page).ok_or("the csrf-token meta tag")?; // the content attribute
+assert_eq!(meta.len(), forge::views::MASKED_CSRF_TOKEN_LEN);
+assert_eq!(forge::views::unmask_csrf_token(meta)?.expose(), cookie_token);
+```
+
+```sh
+grep -rn 'csrf-token\\" content=\\"{' tests/   # tests that compare the meta tag with the cookie
+cargo test
+```
 
 Every unsafe request through a protected router needs a token, JSON endpoints
 included; machine clients send the header, and JSON-only services use

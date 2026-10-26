@@ -414,8 +414,11 @@ grep -qi "^content-security-policy: default-src 'self'; script-src 'self' 'sha25
 grep -q '<script type="importmap">' "$index_html" || fail "layout must render the import map"
 csrf_token="$(sed -n 's/^set-cookie: __Host-forge_csrf=\([0-9a-f]\{64\}\);.*/\1/Ip' "$index_headers" | head -n 1)"
 [[ -n "$csrf_token" ]] || fail "the page must issue the __Host-forge_csrf cookie"
-grep -q "<meta name=\"csrf-token\" content=\"$csrf_token\">" "$index_html" \
-  || fail "layout must render the CSRF meta tag with the cookie's token"
+# The page embeds the cookie's token masked with a fresh pad (86 characters
+# of base64url), never the token itself.
+masked_csrf_token="$(sed -n 's/.*<meta name="csrf-token" content="\([A-Za-z0-9_-]\{86\}\)">.*/\1/p' "$index_html" | head -n 1)"
+[[ -n "$masked_csrf_token" ]] || fail "layout must render the CSRF meta tag with the token masked"
+grep -q "$csrf_token" "$index_html" && fail "the page must not embed the CSRF token unmasked"
 for module in turbo stimulus; do
   module_path="$(grep -o "/assets/vendor/$module-[0-9a-f]\{16\}\.js" "$index_html" | head -n 1)"
   [[ -n "$module_path" ]] || fail "import map must pin the digested $module module"
@@ -430,7 +433,7 @@ post_status() {
   || fail "a method override without a CSRF token must be refused"
 [[ "$(post_status -H "cookie: __Host-forge_csrf=$csrf_token" -H 'sec-fetch-site: cross-site' \
   --data "csrf_token=$csrf_token")" == 403 ]] || fail "a cross-site form POST must be refused"
-[[ "$(post_status -H "cookie: __Host-forge_csrf=$csrf_token" --data "csrf_token=$csrf_token")" == 405 ]] \
+[[ "$(post_status -H "cookie: __Host-forge_csrf=$csrf_token" --data "csrf_token=$masked_csrf_token")" == 405 ]] \
   || fail "a form POST with the page's CSRF token must pass to routing (405: / is GET only)"
 [[ "$(curl --silent --output /dev/null --write-out '%{http_code}' "http://127.0.0.1:$port/missing")" == 404 ]]   || fail "unknown route must return 404"
 log "Telemetry: the separate Prometheus listener"
