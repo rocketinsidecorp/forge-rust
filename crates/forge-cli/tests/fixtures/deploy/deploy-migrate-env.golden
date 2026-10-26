@@ -1,0 +1,68 @@
+192.0.2.10      $ set -C; mkdir -p .forge/shop && cat > .forge/shop/lock.tmp.$$ || { rm -f .forge/shop/lock.tmp.$$; exit 1; }; claim() { if err=$(ln .forge/shop/lock.tmp.$$ .forge/shop/lock/info 2>&1); then return 0; fi; [ -e .forge/shop/lock/info ] || echo "$err" >&2; return 1; }; won=; if mkdir .forge/shop/lock 2>/dev/null; then claim && won=1; elif [ ! -e .forge/shop/lock/info ] && [ -n "$(find .forge/shop/lock -maxdepth 0 -mmin +1 2>/dev/null)" ]; then if claim; then won=1; { echo 'took over a stale lock without a record (an earlier acquire was interrupted)' >&2; true; }; fi; fi; rm -f .forge/shop/lock.tmp.$$; [ -n "$won" ] && exit 0; cat .forge/shop/lock/info 2>/dev/null; exit 75
+192.0.2.10      < stdin: lock record (holder, time, message)
+192.0.2.11      $ set -C; mkdir -p .forge/shop && cat > .forge/shop/lock.tmp.$$ || { rm -f .forge/shop/lock.tmp.$$; exit 1; }; claim() { if err=$(ln .forge/shop/lock.tmp.$$ .forge/shop/lock/info 2>&1); then return 0; fi; [ -e .forge/shop/lock/info ] || echo "$err" >&2; return 1; }; won=; if mkdir .forge/shop/lock 2>/dev/null; then claim && won=1; elif [ ! -e .forge/shop/lock/info ] && [ -n "$(find .forge/shop/lock -maxdepth 0 -mmin +1 2>/dev/null)" ]; then if claim; then won=1; { echo 'took over a stale lock without a record (an earlier acquire was interrupted)' >&2; true; }; fi; fi; rm -f .forge/shop/lock.tmp.$$; [ -n "$won" ] && exit 0; cat .forge/shop/lock/info 2>/dev/null; exit 75
+192.0.2.11      < stdin: lock record (holder, time, message)
+192.0.2.10      # lock acquired (deploy v3)
+192.0.2.11      # lock acquired (deploy v3)
+local           $ docker login registry.example.com --username acme --password-stdin
+local           < stdin: value not shown
+local           # building registry.example.com/acme/shop:v3
+local           $ docker build --tag registry.example.com/acme/shop:v3 --file Dockerfile --label forge.service=shop --label forge.version=v3 --platform linux/amd64 --build-arg GO_VERSION=1.27 .
+local           $ docker push registry.example.com/acme/shop:v3
+192.0.2.10      $ docker login registry.example.com --username acme --password-stdin
+192.0.2.10      < stdin: registry password (REGISTRY_PASSWORD)
+192.0.2.10      $ docker pull registry.example.com/acme/shop:v3
+192.0.2.10      $ umask 077 && mkdir -p .forge/shop/env && cat > .forge/shop/env/web.env.tmp && mv .forge/shop/env/web.env.tmp .forge/shop/env/web.env
+192.0.2.10      < stdin: env file: 1 clear, 1 secret (FORGE_DATABASE_URL), values not shown
+192.0.2.10      # pulled registry.example.com/acme/shop:v3
+192.0.2.11      $ docker login registry.example.com --username acme --password-stdin
+192.0.2.11      < stdin: registry password (REGISTRY_PASSWORD)
+192.0.2.11      $ docker pull registry.example.com/acme/shop:v3
+192.0.2.11      $ umask 077 && mkdir -p .forge/shop/env && cat > .forge/shop/env/web.env.tmp && mv .forge/shop/env/web.env.tmp .forge/shop/env/web.env
+192.0.2.11      < stdin: env file: 1 clear, 1 secret (FORGE_DATABASE_URL), values not shown
+192.0.2.11      $ umask 077 && mkdir -p .forge/shop/env && cat > .forge/shop/env/jobs.env.tmp && mv .forge/shop/env/jobs.env.tmp .forge/shop/env/jobs.env
+192.0.2.11      < stdin: env file: 2 clear, 1 secret (FORGE_DATABASE_URL), values not shown
+192.0.2.11      # pulled registry.example.com/acme/shop:v3
+192.0.2.10      # migrating with registry.example.com/acme/shop:v3
+192.0.2.10      $ umask 077 && mkdir -p .forge/shop/env && cat > .forge/shop/env/migrate.step.env.tmp && mv .forge/shop/env/migrate.step.env.tmp .forge/shop/env/migrate.step.env
+192.0.2.10      < stdin: migrate env file: 1 clear, 2 secret (FORGE_DATABASE_URL, FORGE_MIGRATION_DATABASE_URL), values not shown
+192.0.2.10      $ docker run --rm --name shop-migrate-v3-000001 --network forge --env-file .forge/shop/env/migrate.step.env --volume shop-storage:/app/storage registry.example.com/acme/shop:v3 migrate
+192.0.2.10      $ rm -f .forge/shop/env/migrate.step.env .forge/shop/env/migrate.step.env.tmp
+192.0.2.10      ? docker ps --all --no-trunc --filter label=forge.service=shop --format '{{json .}}'
+192.0.2.11      ? docker ps --all --no-trunc --filter label=forge.service=shop --format '{{json .}}'
+192.0.2.10      $ forge_proxies=$(docker network inspect --format '{{range $i, $c := .IPAM.Config}}{{if $i}},{{end}}{{$c.Subnet}}{{end}}' forge) || exit 1; [ -n "$forge_proxies" ] || { echo "docker network forge has no subnet; set FORGE_HTTP_TRUSTED_PROXIES in config/deploy.yml" >&2; exit 1; }; docker run --detach --name shop-web-v3-000002 --network forge --restart unless-stopped --stop-timeout 35 --env-file .forge/shop/env/web.env --env "FORGE_HTTP_TRUSTED_PROXIES=$forge_proxies" --label forge.service=shop --label forge.role=web --label forge.version=v3 --volume shop-storage:/app/storage registry.example.com/acme/shop:v3
+192.0.2.10      # started shop-web-v3-000002
+192.0.2.10      $ docker exec forge-proxy /usr/local/bin/forge-proxy deploy -service shop -target shop-web-v3-000002:8080 -hosts shop.example.com -tls -health-path /health/ready -health-interval 500ms -health-timeout 2s -healthy-count 3 -deploy-timeout 1m0s -drain-timeout 30s -response-timeout 30s -max-body-bytes 67108864
+192.0.2.10      # traffic switched to shop-web-v3-000002
+192.0.2.11      $ forge_proxies=$(docker network inspect --format '{{range $i, $c := .IPAM.Config}}{{if $i}},{{end}}{{$c.Subnet}}{{end}}' forge) || exit 1; [ -n "$forge_proxies" ] || { echo "docker network forge has no subnet; set FORGE_HTTP_TRUSTED_PROXIES in config/deploy.yml" >&2; exit 1; }; docker run --detach --name shop-web-v3-000003 --network forge --restart unless-stopped --stop-timeout 35 --env-file .forge/shop/env/web.env --env "FORGE_HTTP_TRUSTED_PROXIES=$forge_proxies" --label forge.service=shop --label forge.role=web --label forge.version=v3 --volume shop-storage:/app/storage registry.example.com/acme/shop:v3
+192.0.2.11      # started shop-web-v3-000003
+192.0.2.11      $ docker exec forge-proxy /usr/local/bin/forge-proxy deploy -service shop -target shop-web-v3-000003:8080 -hosts shop.example.com -tls -health-path /health/ready -health-interval 500ms -health-timeout 2s -healthy-count 3 -deploy-timeout 1m0s -drain-timeout 30s -response-timeout 30s -max-body-bytes 67108864
+192.0.2.11      # traffic switched to shop-web-v3-000003
+192.0.2.11      $ docker run --detach --name shop-jobs-v3-000004 --network forge --restart unless-stopped --stop-timeout 35 --env-file .forge/shop/env/jobs.env --label forge.service=shop --label forge.role=jobs --label forge.version=v3 --volume shop-storage:/app/storage registry.example.com/acme/shop:v3 jobs
+192.0.2.11      # started shop-jobs-v3-000004
+192.0.2.11      $ end=$(($(date +%s)+60)); ok=0; while :; do s=$(docker inspect --format '{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' shop-jobs-v3-000004) || exit 1; case "$s" in "running healthy") exit 0;; "running none") ok=$((ok+1)); [ "$ok" -ge 3 ] && exit 0;; "running starting") ;; *) echo "container shop-jobs-v3-000004 is $s" >&2; exit 1;; esac; [ "$(date +%s)" -ge "$end" ] && { echo "container shop-jobs-v3-000004 not ready after 60s" >&2; exit 1; }; sleep 1; done
+192.0.2.11      # shop-jobs-v3-000004 ready
+192.0.2.10      $ docker stop -t 35 shop-web-v2-bbbbbb
+192.0.2.10      # stopped shop-web-v2-bbbbbb
+192.0.2.10      $ docker rm shop-web-v1-aaaaaa shop-web-v0-999999
+192.0.2.10      # pruned shop-web-v1-aaaaaa, shop-web-v0-999999
+192.0.2.10      ? docker image ls --format '{{json .}}' registry.example.com/acme/shop
+192.0.2.10      $ docker image rm registry.example.com/acme/shop:v1
+192.0.2.10      $ docker image rm registry.example.com/acme/shop:v0
+192.0.2.10      $ umask 077 && mkdir -p .forge/shop && cat >> .forge/shop/deploys.log
+192.0.2.10      < stdin: deploy log entry
+192.0.2.11      $ docker stop -t 35 shop-web-v2-bbbbbb
+192.0.2.11      # stopped shop-web-v2-bbbbbb
+192.0.2.11      $ docker stop -t 35 shop-jobs-v2-bbbbbb
+192.0.2.11      # stopped shop-jobs-v2-bbbbbb
+192.0.2.11      $ docker rm shop-jobs-v1-aaaaaa shop-jobs-v0-999999 shop-web-v1-aaaaaa shop-web-v0-999999
+192.0.2.11      # pruned shop-jobs-v1-aaaaaa, shop-jobs-v0-999999, shop-web-v1-aaaaaa, shop-web-v0-999999
+192.0.2.11      ? docker image ls --format '{{json .}}' registry.example.com/acme/shop
+192.0.2.11      $ docker image rm registry.example.com/acme/shop:v1
+192.0.2.11      $ docker image rm registry.example.com/acme/shop:v0
+192.0.2.11      $ umask 077 && mkdir -p .forge/shop && cat >> .forge/shop/deploys.log
+192.0.2.11      < stdin: deploy log entry
+192.0.2.10      $ record=$(cat) && if [ ! -d .forge/shop/lock ]; then echo 'lock is already released' >&2; exit 77; elif [ -n "$record" ] && [ "$(cat .forge/shop/lock/info 2>/dev/null)" = "$record" ]; then rm -rf .forge/shop/lock; else echo 'lock is held by someone else; left in place' >&2; exit 76; fi
+192.0.2.10      < stdin: own lock record (release only if unchanged)
+192.0.2.11      $ record=$(cat) && if [ ! -d .forge/shop/lock ]; then echo 'lock is already released' >&2; exit 77; elif [ -n "$record" ] && [ "$(cat .forge/shop/lock/info 2>/dev/null)" = "$record" ]; then rm -rf .forge/shop/lock; else echo 'lock is held by someone else; left in place' >&2; exit 76; fi
+192.0.2.11      < stdin: own lock record (release only if unchanged)

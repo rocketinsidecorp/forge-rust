@@ -301,6 +301,9 @@ fn run_container(state: &mut State, rest: &[&str]) -> ExitCode {
         }
     };
     if one_off {
+        // What the one-off container's environment held, by container name
+        // (the migrate step's env file, for the tests).
+        state.env_seen.insert(container.name.clone(), env_content);
         let mut record = vec![(*image).to_owned()];
         record.extend(args.iter().map(|a| (*a).to_owned()));
         state.one_offs.push(record);

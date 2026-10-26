@@ -323,17 +323,33 @@ impl LocalRunner for NoLocal {
 
 impl Cluster {
     fn deployer(&self, performer: &str, dry_run: bool) -> (Deployer, Buffer) {
-        let config = super::config::Config::parse(CONFIG.as_bytes()).expect("config");
+        self.deployer_for(performer, dry_run, CONFIG, &[])
+    }
+
+    /// [`Self::deployer`] for another configuration; `extra` secrets are
+    /// added to the fixture's.
+    fn deployer_for(
+        &self,
+        performer: &str,
+        dry_run: bool,
+        config: &str,
+        extra: &[(&str, &str)],
+    ) -> (Deployer, Buffer) {
+        let config = super::config::Config::parse(config.as_bytes()).expect("config");
         let mut runner = SshRunner::new(&config.ssh);
         runner.config_file = Some(self.ssh_config.clone());
         let log = Buffer::default();
         let deployer = Deployer::new(Parts {
             config,
-            secrets: Secrets::from_values([
-                ("REGISTRY_PASSWORD", REGISTRY_PASSWORD),
-                ("FORGE_DATABASE_URL", DATABASE_URL),
-                ("POSTGRES_PASSWORD", POSTGRES_PASSWORD),
-            ]),
+            secrets: Secrets::from_values(
+                [
+                    ("REGISTRY_PASSWORD", REGISTRY_PASSWORD),
+                    ("FORGE_DATABASE_URL", DATABASE_URL),
+                    ("POSTGRES_PASSWORD", POSTGRES_PASSWORD),
+                ]
+                .into_iter()
+                .chain(extra.iter().copied()),
+            ),
             runner: Box::new(runner),
             local: Box::new(NoLocal),
             root: self.dir.clone(),
@@ -814,4 +830,87 @@ fn deploys_over_real_ssh() {
         }
     }
     assert!(!log.text().contains("db-secret"), "secret in progress log");
+}
+
+/// A deploy with `migrate.env` over real SSH: only the migrate container
+/// sees the schema owner's credential, through a 0600 file that is gone
+/// afterwards, and no serving container or env file has it.
+#[test]
+fn migrate_env_reaches_only_the_migrate_container_over_real_ssh() {
+    const MIGRATION_URL: &str = "postgres://shop_migrator:migration-secret-7654321@db/shop";
+    let Some(cluster) = start_cluster(&["alpha", "beta"]) else {
+        return;
+    };
+    let config = format!("{CONFIG}migrate:\n  env:\n    secret: [FORGE_MIGRATION_DATABASE_URL]\n");
+    let (deployer, log) = cluster.deployer_for(
+        "alice@laptop",
+        false,
+        &config,
+        &[("FORGE_MIGRATION_DATABASE_URL", MIGRATION_URL)],
+    );
+    let cancel = Cancel::never();
+    let (_, result) = deployer.setup(&cancel);
+    result.unwrap_or_else(|error| panic!("setup: {error}\n{}", log.text()));
+    let (_, result) = deployer.deploy(&cancel, "v1", true);
+    result.unwrap_or_else(|error| panic!("deploy: {error}\n{}", log.text()));
+
+    let (alpha, beta) = (cluster.state("alpha"), cluster.state("beta"));
+    assert_eq!(alpha["one_offs"].as_array().map(Vec::len), Some(1));
+    assert_eq!(alpha["one_offs"][0][1], "migrate");
+    assert!(
+        beta["one_offs"].as_array().is_none_or(Vec::is_empty),
+        "migration ran on beta"
+    );
+    let mut migrate_env = String::new();
+    for (name, content) in alpha["env_seen"].as_object().into_iter().flatten() {
+        let content = content.as_str().unwrap_or_default();
+        let is_migrate = name.starts_with("shop-migrate-");
+        if is_migrate {
+            content.clone_into(&mut migrate_env);
+        }
+        assert_eq!(
+            content.contains(MIGRATION_URL),
+            is_migrate,
+            "{name}: holds the migration credential"
+        );
+    }
+    for (name, content) in beta["env_seen"].as_object().into_iter().flatten() {
+        assert!(
+            !content.as_str().unwrap_or_default().contains(MIGRATION_URL),
+            "{name} holds the migration credential"
+        );
+    }
+    assert_eq!(
+        migrate_env,
+        format!(
+            "FORGE_ENV=production\nFORGE_DATABASE_URL={DATABASE_URL}\nFORGE_MIGRATION_DATABASE_URL={MIGRATION_URL}\n"
+        )
+    );
+    // Deleted after the step, with its temporary copy, on every host.
+    for host in ["alpha", "beta"] {
+        let directory = cluster.home(host).join(".forge/shop/env");
+        for entry in std::fs::read_dir(&directory).expect("env directory") {
+            let entry = entry.expect("entry");
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let content = std::fs::read_to_string(entry.path()).unwrap_or_default();
+            assert!(
+                !name.contains("migrate") && !content.contains(MIGRATION_URL),
+                "{host}: {name} remains on the host"
+            );
+        }
+    }
+    // Never on a command line, in the progress log or in a stored call.
+    assert!(
+        !log.text().contains("migration-secret-7654321"),
+        "{}",
+        log.text()
+    );
+    for host in ["alpha", "beta"] {
+        let calls =
+            std::fs::read_to_string(cluster.hosts[host].1.join("calls.log")).expect("calls");
+        assert!(
+            !calls.contains("migration-secret"),
+            "{host}: secret in docker argv"
+        );
+    }
 }

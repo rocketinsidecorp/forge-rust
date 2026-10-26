@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -317,6 +318,51 @@ fn parse_rejects_invalid_configurations() {
             "migrate.role",
         ),
         (
+            "migrate env empty",
+            with("migrate:\n  env: {}\n"),
+            "migrate.env must set at least one",
+        ),
+        (
+            "migrate env no keys",
+            with("migrate:\n  env:\n    clear: {}\n    secret: []\n"),
+            "migrate.env must set at least one",
+        ),
+        (
+            "migrate env unknown",
+            with("migrate:\n  env:\n    secrets: [X]\n"),
+            "field secrets not found",
+        ),
+        (
+            "migrate env bad name",
+            with("migrate:\n  env:\n    secret: [\"BAD-NAME\"]\n"),
+            "migrate.env.secret",
+        ),
+        (
+            "migrate env bad key",
+            with("migrate:\n  env:\n    clear: {BAD-KEY: x}\n"),
+            "migrate.env.clear",
+        ),
+        (
+            "migrate env both",
+            with("migrate:\n  env:\n    clear: {X: y}\n    secret: [X]\n"),
+            "both clear and secret",
+        ),
+        (
+            "migrate env twice",
+            with("migrate:\n  env:\n    secret: [X, X]\n"),
+            "listed twice",
+        ),
+        (
+            "migrate env multiline",
+            with("migrate:\n  env:\n    clear: {X: \"a\\nb\"}\n"),
+            "single line",
+        ),
+        (
+            "migrate env list",
+            with("migrate:\n  env: [X]\n"),
+            "cannot unmarshal",
+        ),
+        (
             "accessory port",
             replace("port: 5432", "port: 99999"),
             "not a port number",
@@ -620,11 +666,33 @@ pub(super) struct FakeRunner {
     pub(super) answers: Arc<Mutex<Vec<(String, String)>>>,
     #[allow(clippy::type_complexity)]
     fail: Arc<Mutex<Option<Box<dyn Fn(&str, &RemoteCommand) -> Option<RunError> + Send + Sync>>>>,
+    /// Every command that carried stdin, in order.
+    uploads: Arc<Mutex<Vec<Upload>>>,
+    /// Like the SSH runner, refuse to run once the command is cancelled.
+    refuse_cancelled: Arc<AtomicBool>,
+}
+
+/// A command with stdin: what a runner received.
+#[derive(Clone, Debug)]
+pub(super) struct Upload {
+    pub(super) host: String,
+    pub(super) script: String,
+    pub(super) stdin: String,
 }
 
 impl FakeRunner {
     pub(super) fn calls(&self) -> Vec<String> {
         self.calls.lock().expect("lock").clone()
+    }
+
+    pub(super) fn uploads(&self) -> Vec<Upload> {
+        self.uploads.lock().expect("lock").clone()
+    }
+
+    /// Makes `run` fail for a cancelled `Cancel`, as the SSH runner does
+    /// (it kills the ssh child), so a test proves what runs after a signal.
+    pub(super) fn refuse_cancelled(&self) {
+        self.refuse_cancelled.store(true, Ordering::SeqCst);
     }
 
     pub(super) fn fail_with(
@@ -638,14 +706,24 @@ impl FakeRunner {
 impl Runner for FakeRunner {
     fn run(
         &self,
-        _cancel: &Cancel,
+        cancel: &Cancel,
         host: &str,
         command: &RemoteCommand,
     ) -> Result<Output, RunError> {
+        if self.refuse_cancelled.load(Ordering::SeqCst) && cancel.is_cancelled() {
+            return Err(RunError::Other(format!("{host}: cancelled")));
+        }
         self.calls
             .lock()
             .expect("lock")
             .push(format!("{host}: {}", command.script));
+        if let Some(stdin) = &command.stdin {
+            self.uploads.lock().expect("lock").push(Upload {
+                host: host.to_owned(),
+                script: command.script.clone(),
+                stdin: String::from_utf8_lossy(stdin).into_owned(),
+            });
+        }
         if let Some(fail) = self.fail.lock().expect("lock").as_ref()
             && let Some(error) = fail(host, command)
         {
@@ -797,7 +875,13 @@ pub(super) struct Fixture {
 /// Forge-Go's `planFixture`: web on .10 and .11, jobs on .11; v2 is live,
 /// v1 and v0 are retained; retain is 2.
 pub(super) fn plan_fixture(dry_run: bool) -> Fixture {
-    let config = parse(&VALID_CONFIG.replacen("retain: 3", "retain: 2", 1));
+    plan_fixture_for(dry_run, VALID_CONFIG, &[])
+}
+
+/// [`plan_fixture`] for another configuration; `extra` secrets are added to
+/// [`PLAN_SECRETS`].
+pub(super) fn plan_fixture_for(dry_run: bool, config: &str, extra: &[(&str, &str)]) -> Fixture {
+    let config = parse(&config.replacen("retain: 3", "retain: 2", 1));
     let hour = Duration::from_secs(3600);
     let at = |hours_ago: u32| {
         let mut stamp = plan_epoch();
@@ -849,7 +933,7 @@ pub(super) fn plan_fixture(dry_run: bool) -> Fixture {
     let counter = Arc::new(Mutex::new(0_u32));
     let deployer = Deployer::new(Parts {
         config,
-        secrets: Secrets::from_values(PLAN_SECRETS),
+        secrets: Secrets::from_values(PLAN_SECRETS.into_iter().chain(extra.iter().copied())),
         runner: Box::new(runner.clone()),
         local: Box::new(local.clone()),
         root: root.path().to_owned(),
@@ -872,7 +956,7 @@ pub(super) fn plan_fixture(dry_run: bool) -> Fixture {
     }
 }
 
-fn check_golden(name: &str, got: &str) {
+pub(super) fn check_golden(name: &str, got: &str) {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/deploy")
         .join(format!("{name}.golden"));

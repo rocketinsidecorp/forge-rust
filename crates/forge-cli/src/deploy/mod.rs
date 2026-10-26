@@ -19,6 +19,8 @@ pub(crate) mod errors;
 pub(crate) mod init;
 #[cfg(all(test, unix))]
 mod lock_tests;
+#[cfg(all(test, unix))]
+mod migrate_env_tests;
 pub(crate) mod operations;
 #[cfg(all(test, unix))]
 mod operations_tests;

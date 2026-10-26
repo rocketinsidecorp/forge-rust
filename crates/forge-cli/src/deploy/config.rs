@@ -199,11 +199,24 @@ pub(crate) struct Healthcheck {
 }
 
 /// The image's migrate command, run once per deploy before any switch.
+///
+/// `env` is for that one-off container only: it gets the environment of
+/// `role` plus `env`, and no serving container ever sees it, because its
+/// names may not appear in the global `env` or in any `servers.*.env`
+/// block (accessories keep their own env and are not checked). It is how
+/// the schema owner's credential (`FORGE_MIGRATION_DATABASE_URL`) reaches
+/// the migrate step alone. `None` is an absent block (the container uses
+/// the role's env file, as before); an empty block is an error, and so is
+/// an explicit null, which `env_null` records because a null would
+/// otherwise read as an absent block and silently leave the credential
+/// out.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct Migrate {
     pub(crate) enabled: Option<bool>,
     pub(crate) cmd: Vec<String>,
     pub(crate) role: String,
+    pub(crate) env: Option<Env>,
+    env_null: bool,
 }
 
 /// A long-lived supporting container such as a database.
@@ -520,6 +533,11 @@ impl Decoder {
                             "enabled" => migrate.enabled = d.optional_bool(value),
                             "cmd" => migrate.cmd = d.strings(value),
                             "role" => migrate.role = d.string(value),
+                            "env" => match &value.value {
+                                // `env:`, `~` and `null` decode like an absent block.
+                                Value::Null => migrate.env_null = true,
+                                _ => migrate.env = Some(d.env(value)),
+                            },
                             _ => return false,
                         }
                         true
@@ -750,6 +768,7 @@ impl Config {
                 self.migrate.role
             ));
         }
+        self.check_migrate_env(&mut add);
 
         for (name, accessory) in &self.accessories {
             if !ROLE_NAME.matches(name) {
@@ -844,6 +863,55 @@ impl Config {
             Ok(())
         } else {
             Err(problems.join("; "))
+        }
+    }
+
+    /// Validates `migrate.env`: not empty, used, well-formed and exclusive.
+    fn check_migrate_env(&self, add: &mut impl FnMut(String)) {
+        const EMPTY: &str = "migrate.env must set at least one clear value or secret (remove the block to migrate with the role's env file)";
+        if self.migrate.env_null {
+            add(EMPTY.to_owned());
+        }
+        let Some(env) = &self.migrate.env else {
+            return;
+        };
+        if env.clear.is_empty() && env.secret.is_empty() {
+            add(EMPTY.to_owned());
+        }
+        if self.migrate.enabled != Some(true) {
+            add(
+                "migrate.env is set but migrate.enabled is false, so nothing would use it"
+                    .to_owned(),
+            );
+        }
+        check_env("migrate.env", env, add);
+        self.check_migrate_env_is_exclusive(env, add);
+    }
+
+    /// Refuses a name of `migrate.env` that another env block also sets:
+    /// that block's containers would receive it too, which is what
+    /// `migrate.env` exists to prevent.
+    fn check_migrate_env_is_exclusive(&self, env: &Env, add: &mut impl FnMut(String)) {
+        let mut blocks: Vec<(String, &Env)> = vec![("env".to_owned(), &self.env)];
+        blocks.extend(
+            self.servers
+                .iter()
+                .map(|(name, role)| (format!("servers.{name}.env"), &role.env)),
+        );
+        let names = env.secret.iter().chain(env.clear.keys());
+        for name in names {
+            for (path, block) in &blocks {
+                if block.clear.contains_key(name) {
+                    add(format!(
+                        "{name} is in migrate.env and in {path}.clear: remove it from {path}.clear, so only the migrate step receives it"
+                    ));
+                }
+                if block.secret.contains(name) {
+                    add(format!(
+                        "{name} is in migrate.env and in {path}.secret: remove it from {path}.secret, so only the migrate step receives it"
+                    ));
+                }
+            }
         }
     }
 
@@ -1032,6 +1100,9 @@ impl Config {
             add(std::slice::from_ref(&self.registry.password));
         }
         add(&self.env.secret);
+        if let Some(env) = &self.migrate.env {
+            add(&env.secret);
+        }
         for role in self.servers.values() {
             add(&role.env.secret);
         }
