@@ -17,7 +17,12 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::{any::Any, future::Future, sync::Arc, time::Duration};
+use std::{
+    any::Any,
+    future::Future,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use crate::{Limit, LimitError, Limiter, MAX_PER, Pruner};
 
@@ -86,12 +91,17 @@ async fn keys_are_independent(subject: Subject) {
 
 async fn window_resets(subject: Subject) {
     let l = limit(2, WINDOW);
+    let started = Instant::now();
     allow(&subject.limiter, "k", l).await;
     allow(&subject.limiter, "k", l).await;
-    assert!(
-        !allow(&subject.limiter, "k", l).await.allowed,
-        "third hit in the window"
-    );
+    let third = allow(&subject.limiter, "k", l).await;
+    // The third hit is refused only inside the window. A store that took the
+    // whole window to answer three hits (a loaded CI runner) may rightly have
+    // opened a new one, so the refusal only counts when the hits finished
+    // inside the window (the window opens at the first hit, after `started`).
+    if started.elapsed() < WINDOW {
+        assert!(!third.allowed, "third hit in the window");
+    }
     tokio::time::sleep(WINDOW + Duration::from_millis(150)).await;
     let d = allow(&subject.limiter, "k", l).await;
     assert!(

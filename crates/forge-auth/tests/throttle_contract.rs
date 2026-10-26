@@ -140,14 +140,21 @@ async fn contract(make: &Make) {
     // A window ends: the counters start over.
     let short = make(config(Duration::from_millis(400)));
     let expiring = key("expiring@example.com", 5, 1);
+    let started = std::time::Instant::now();
     for _ in 0..3 {
         assert!(allowed(short.as_ref(), &expiring).await);
     }
-    match short.attempt(&expiring).await.expect("decides") {
-        ThrottleDecision::Throttled { retry_after } => {
-            assert!(retry_after <= Duration::from_millis(400), "{retry_after:?}");
+    let decision = short.attempt(&expiring).await.expect("decides");
+    // The refusal only holds inside the window (it opens at the first
+    // attempt, after `started`): a store that took the whole window to answer
+    // four attempts (a loaded CI runner) may rightly have opened a new one.
+    if started.elapsed() < Duration::from_millis(400) {
+        match decision {
+            ThrottleDecision::Throttled { retry_after } => {
+                assert!(retry_after <= Duration::from_millis(400), "{retry_after:?}");
+            }
+            ThrottleDecision::Allowed => panic!("the pair is exhausted"),
         }
-        ThrottleDecision::Allowed => panic!("the pair is exhausted"),
     }
     tokio::time::sleep(Duration::from_millis(600)).await;
     assert!(matches!(
