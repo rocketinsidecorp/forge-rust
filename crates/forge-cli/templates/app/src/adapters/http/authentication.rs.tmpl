@@ -175,11 +175,20 @@ struct ResetRequest {
 /// signed-out browsers asking for a protected page (a `401` from an access
 /// policy) to [`SIGN_IN_PATH`]; JSON clients keep the `401`. The site's
 /// CSRF and flash layers must be registered first (`Site::register`).
+/// With `FORGE_ENV=production`, a throttle that counts in this process only
+/// (`forge::auth::MemoryLoginThrottle`) is logged as a warning.
 pub fn routes(
     composition: &mut Composition<'_>,
     site: &Arc<Site>,
     ports: AuthenticationPorts,
 ) -> Result<(), ComposeError> {
+    for (service, throttle) in [
+        ("sign-in", &ports.sign_in_throttle),
+        ("password-reset", &ports.reset_throttle),
+        ("two-factor", ports.mfa.throttle()),
+    ] {
+        composition.warn_if_process_local_throttle(service, throttle.as_ref());
+    }
     let worker_ports = ports.clone();
     let resets = composition.work_queue(
         "password_resets",

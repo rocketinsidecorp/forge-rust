@@ -322,4 +322,6 @@ async fn configurations_the_table_cannot_hold_are_refused() {
     }
     let throttle = PgLoginThrottle::new(pool, config(WINDOW)).expect("valid");
     assert!(!format!("{throttle:?}").contains("u:p"));
+    // Every replica shares its counters: production wiring does not warn.
+    assert!(!throttle.is_process_local());
 }
