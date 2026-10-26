@@ -35,7 +35,9 @@
 //! # Lifecycle
 //!
 //! [`Jobs::run`] owns every task it starts: one bounded worker loop per
-//! queue, the scheduler and the pruner. On shutdown it stops claiming, waits
+//! queue, the scheduler and the pruner. Each claim leases at most
+//! [`WorkerSettings::batch`] jobs and never more than the queue's free
+//! slots. On shutdown it stops claiming, waits
 //! for in-flight attempts up to a deadline, cancels the remaining ones
 //! cooperatively, then aborts them and releases their leases. A panicking
 //! handler is recorded as a failed attempt; the worker keeps running. Logs
@@ -72,7 +74,7 @@ pub use job::{
     EnqueueOptions, Enqueued, Job, JobContext, JobError, JobHandler, JobId, JobMarker, JobTenant,
 };
 pub use name::{MAX_JOB_NAME, MAX_QUEUE_NAME, is_valid as is_valid_name};
-pub use runtime::{Jobs, MAX_CONCURRENCY, WorkerSettings};
+pub use runtime::{Jobs, MAX_CLAIM_BATCH, MAX_CONCURRENCY, WorkerSettings};
 pub use scheduler::Schedule;
 
 /// Largest serialized job payload, in bytes (256 KiB). Larger payloads are

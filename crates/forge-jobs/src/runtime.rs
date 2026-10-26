@@ -43,6 +43,11 @@ pub struct WorkerSettings {
     /// Concurrent attempts per queue unless configured with
     /// [`Jobs::concurrency`] (default 5).
     pub default_concurrency: u16,
+    /// Most jobs one claim leases in a single round trip (1 to
+    /// [`MAX_CLAIM_BATCH`], default 10; Forge-Go's `BatchSize`). A claim
+    /// never asks for more than the queue's free slots, so every claimed job
+    /// starts at once; a full batch is followed by another claim at once.
+    pub batch: u16,
 }
 
 impl Default for WorkerSettings {
@@ -53,6 +58,7 @@ impl Default for WorkerSettings {
             drain_timeout: Duration::from_secs(20),
             cancel_grace: Duration::from_secs(5),
             default_concurrency: 5,
+            batch: 10,
         }
     }
 }
@@ -93,6 +99,13 @@ impl WorkerSettings {
         self
     }
 
+    /// Sets the most jobs one claim leases.
+    #[must_use]
+    pub const fn batch(mut self, jobs: u16) -> Self {
+        self.batch = jobs;
+        self
+    }
+
     pub(crate) fn heartbeat_interval(&self) -> Duration {
         self.lease / 3
     }
@@ -117,6 +130,9 @@ impl WorkerSettings {
                 "lease must be between 3 seconds and 1 day",
             ));
         }
+        if !(1..=MAX_CLAIM_BATCH).contains(&self.batch) {
+            return Err(JobsError::InvalidSetting("batch must be between 1 and 100"));
+        }
         validate_concurrency(self.default_concurrency)
     }
 }
@@ -133,6 +149,9 @@ fn validate_concurrency(workers: u16) -> Result<(), JobsError> {
 
 /// Upper bound of per-queue concurrency.
 pub const MAX_CONCURRENCY: u16 = 256;
+
+/// Upper bound of [`WorkerSettings::batch`] (Forge-Go's `MaxClaimBatch`).
+pub const MAX_CLAIM_BATCH: u16 = 100;
 
 /// Registered handlers, queues and schedules, and the entry point that runs
 /// them.
@@ -438,6 +457,17 @@ mod tests {
     }
 
     #[test]
+    fn claims_ask_for_a_batch_of_ten_never_more_than_the_free_slots() {
+        let defaults = WorkerSettings::default();
+        assert_eq!(defaults.batch, 10);
+        assert_eq!(crate::worker::claim_size(5, defaults.batch), 5);
+        assert_eq!(crate::worker::claim_size(256, defaults.batch), 10);
+        assert_eq!(crate::worker::claim_size(1, 100), 1);
+        assert_eq!(crate::worker::claim_size(0, 10), 0);
+        assert_eq!(defaults.batch(3).batch, 3);
+    }
+
+    #[test]
     fn registration_rejects_duplicates_and_bad_settings() {
         let mut jobs = Jobs::new();
         assert!(jobs.is_empty());
@@ -476,6 +506,10 @@ mod tests {
         assert!(fast.validate().is_err());
         fast.settings(WorkerSettings::default().default_concurrency(0));
         assert!(fast.validate().is_err());
+        for (batch, valid) in [(0, false), (1, true), (MAX_CLAIM_BATCH, true), (101, false)] {
+            fast.settings(WorkerSettings::default().batch(batch));
+            assert_eq!(fast.validate().is_ok(), valid, "batch {batch}");
+        }
         assert!(format!("{jobs:?}").contains("test.ping"));
     }
 }

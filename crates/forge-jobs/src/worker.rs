@@ -97,6 +97,12 @@ pub(crate) struct QueueWorker {
     pub(crate) telemetry: Option<JobInstrumentation>,
 }
 
+/// How many jobs to ask for: at most `batch`, never more than the free
+/// slots.
+pub(crate) fn claim_size(free: usize, batch: u16) -> usize {
+    free.min(usize::from(batch))
+}
+
 impl QueueWorker {
     /// Runs until `shutdown`, then drains: waits for in-flight attempts up to
     /// the drain timeout, cancels the rest cooperatively, aborts what is left
@@ -120,16 +126,20 @@ impl QueueWorker {
 
         while !shutdown.is_cancelled() {
             let free = self.concurrency.saturating_sub(tasks.len());
+            // A full batch may have left due jobs behind: claim again at once.
+            let mut claim_again = false;
             if free > 0 {
+                let want = claim_size(free, self.settings.batch);
                 let token = LeaseToken::new();
                 // The database grants the lease after this instant.
                 let claimed_at = Instant::now();
                 match self
                     .store
-                    .claim(self.queue, &names, free, self.settings.lease, token)
+                    .claim(self.queue, &names, want, self.settings.lease, token)
                     .await
                 {
                     Ok(claimed) => {
+                        claim_again = claimed.len() >= want;
                         for job in claimed {
                             self.start(
                                 job,
@@ -146,8 +156,9 @@ impl QueueWorker {
                     }
                 }
             }
-            // Below capacity means the queue had no more due jobs (or the
-            // claim failed): poll again later. At capacity, wait for a slot.
+            // Below capacity after a partial batch means the queue had no
+            // more due jobs (or the claim failed): poll again later. At
+            // capacity, wait for a slot.
             let below_capacity = tasks.len() < self.concurrency;
             tokio::select! {
                 () = shutdown.cancelled() => break,
@@ -156,7 +167,8 @@ impl QueueWorker {
                 }
                 _ = heartbeat.tick() => self.renew(&mut in_flight).await,
                 () = sleep_until_opt(self.next_check(&in_flight)) => self.expire(&mut in_flight),
-                () = tokio::time::sleep(jitter(self.settings.poll_interval)), if below_capacity => {}
+                () = std::future::ready(()), if below_capacity && claim_again => {}
+                () = tokio::time::sleep(jitter(self.settings.poll_interval)), if below_capacity && !claim_again => {}
             }
         }
 
