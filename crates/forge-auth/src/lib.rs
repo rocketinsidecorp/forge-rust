@@ -24,10 +24,16 @@
 //! default, `FORGE_AUTH_SESSION_IDLE_TIMEOUT`); session stores record each
 //! use at most once per [`SESSION_TOUCH_INTERVAL`].
 //!
+//! API clients present the same opaque tokens as bearer credentials:
+//! [`bearer_credential`] reads the `Authorization: Bearer` header,
+//! [`SessionBearerToken::generate`] issues a token from the OS CSPRNG and
+//! [`SessionBearerToken::digest`] is the SHA-256 digest servers store.
+//!
 //! The TOTP multi-factor primitives are in [`mfa`]: RFC 6238 codes over
 //! HMAC-SHA-1 (`hmac`, `sha1`), AES-256-GCM seed encryption (`ring`),
 //! one-time backup codes and the sign-in challenge token.
 
+mod bearer;
 mod login;
 pub mod mfa;
 mod password_policy;
@@ -45,6 +51,7 @@ use forge_core::Id;
 use forge_security::PrincipalId;
 use thiserror::Error;
 
+pub use bearer::{BEARER_CHALLENGE, BEARER_SCHEME, BearerCredentialError, bearer_credential};
 pub use login::{CanonicalLogin, LoginFormatError, MAX_LOGIN_BYTES};
 pub use mfa::{
     Aes256GcmSecretCipher, MFA_BACKUP_CODE_COUNT, MFA_KEY_BYTES, MfaBackupCode,
@@ -205,6 +212,14 @@ impl SessionCredentialDigest {
     #[must_use]
     pub const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
+    }
+
+    /// Compares two digests in constant time (`subtle`), for stores that
+    /// match digests in process rather than by an indexed lookup.
+    #[must_use]
+    pub fn matches(&self, other: &Self) -> bool {
+        use subtle::ConstantTimeEq as _;
+        self.0.ct_eq(&other.0).into()
     }
 }
 
