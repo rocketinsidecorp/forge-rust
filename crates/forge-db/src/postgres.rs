@@ -120,7 +120,10 @@ impl DbTransaction<Postgres> {
 }
 
 #[cfg(feature = "testing")]
-fn create_database(admin: forge_config::SecretString, name: String) -> crate::testing::BoxFuture {
+pub(crate) fn create_database(
+    admin: forge_config::SecretString,
+    name: String,
+) -> crate::testing::BoxFuture {
     Box::pin(async move {
         crate::testing::execute_admin::<Postgres>(&admin, format!("CREATE DATABASE \"{name}\""))
             .await
@@ -137,6 +140,34 @@ fn drop_database(admin: forge_config::SecretString, name: String) -> crate::test
             format!("DROP DATABASE IF EXISTS \"{name}\" WITH (FORCE)"),
         )
         .await
+    })
+}
+
+/// Drops a database of [`RlsTestDatabase`](crate::testing::RlsTestDatabase),
+/// then its roles (a role cannot be dropped while a database refers to it).
+/// Every statement is attempted; the first failure is returned.
+#[cfg(feature = "testing")]
+pub(crate) fn drop_rls_database(
+    admin: forge_config::SecretString,
+    name: String,
+) -> crate::testing::BoxFuture {
+    Box::pin(async move {
+        let mut statements = vec![format!("DROP DATABASE IF EXISTS \"{name}\" WITH (FORCE)")];
+        for role in crate::testing::rls_role_names(&name)
+            .into_iter()
+            .flatten()
+            .rev()
+        {
+            statements.push(format!("DROP ROLE IF EXISTS \"{role}\""));
+        }
+        let mut outcome = Ok(());
+        for statement in statements {
+            let result = crate::testing::execute_admin::<Postgres>(&admin, statement).await;
+            if outcome.is_ok() {
+                outcome = result;
+            }
+        }
+        outcome
     })
 }
 
