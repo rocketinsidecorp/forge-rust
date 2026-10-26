@@ -296,6 +296,11 @@ COVERAGE_JSON=summary.json scripts/coverage.sh       # report and gate an existi
   file; a line with `0` hits is what no test reaches).
   cargo-llvm-cov builds into its own `target/llvm-cov-target`, a second full
   build: run it locally only with the disk to spare.
+- **Two totals.** The script prints both. The *gross* total counts everything
+  measured except the exclusions below. The *gated* total, the one the floor
+  checks, also leaves out the contract test kits listed under "Contract test
+  kits". `target/coverage/summary.json` is the gross measurement; the per-crate
+  table shows both.
 - **Pinned tools.** cargo-llvm-cov 0.9.1 (2026-09-06, MSRV 1.87, not
   yanked: the newest release at least two weeks old that builds with the
   pinned Rust 1.98.1), installed `--locked` through
@@ -313,7 +318,36 @@ COVERAGE_JSON=summary.json scripts/coverage.sh       # report and gate an existi
   | `forge-bench`, `forge-loadgen` | The benchmark and load-generation harnesses: they measure the framework, they are not part of it. `fuzz/` is outside the workspace. |
   | `crates/forge-cli/templates/` | Generated-application templates: text that `forge new` renders, not code compiled into the framework. Their output is tested by the `scaffold` job. |
   | `forge-cli --test scaffold` | The generated-application suite builds separate applications in other target directories; it runs in the `scaffold` job. |
-  | `tests/` directories, `tests.rs`, `*_tests.rs`, `test_support.rs` | Test code (cargo-llvm-cov's default for `tests/`; the others are `#[cfg(test)]` modules kept in their own files). The `testing` modules behind the `testing` features are shipped API and stay measured. |
+  | `tests/` directories, `tests.rs`, `*_tests.rs`, `test_support.rs` | Test code (cargo-llvm-cov's default for `tests/`; the others are `#[cfg(test)]` modules kept in their own files). |
+
+  The `testing` modules behind the `testing` features are shipped API and stay
+  in the gross total; only the contract test kits below leave the gated one.
+
+### Contract test kits (decision D7)
+
+Coverage measures production code. These `src/testing.rs` files are harnesses
+that every backend's tests call; their only code that does not run is the
+failure branch of an assertion (a `panic!` or `assert!` when a backend breaks
+the contract), which cannot run while every backend passes. They stay verified
+by being run against every real backend (PostgreSQL 18 and 16, MySQL, MariaDB,
+SQLite) in CI, where a broken kit or a broken backend fails the suite. They
+are excluded from the gated total only, and still appear in the gross one:
+
+`crates/forge-cache/src/testing.rs`, `crates/forge-db/src/testing.rs`,
+`crates/forge-jobs/src/testing.rs`, `crates/forge-mail/src/testing.rs`,
+`crates/forge-ratelimit/src/testing.rs`, `crates/forge-storage/src/testing.rs`,
+`crates/forge-telemetry/src/testing.rs`.
+
+The list is explicit in `scripts/coverage.sh` (`kits`), exactly those files and
+never a pattern over `testing`, so production code cannot be hidden by a naming
+accident. The script also checks the list, as Forge-Go's does for its kit packages,
+and fails when a listed file does not exist, when the kit is not behind a
+`testing` feature gate (the `pub mod testing;` line of the crate's `lib.rs` must
+follow a `#[cfg(...)]` naming `feature = "testing"`), or when another crate's
+`Cargo.toml` enables a kit's `testing` feature anywhere but `[dev-dependencies]`
+or a feature that is itself named `testing`: such a kit is reachable from
+shipped code, is production code, and has to be covered. A new kit is added to the list, with its reason, in the pull request
+that adds it.
 
 The Forge-Go twin (`scripts/coverage.sh`, `.coverage-floor`, the same job
 name) measures statement coverage with `go test -coverpkg`; see its
@@ -378,6 +412,18 @@ guarantees, plus negative tests that mirror the Forge-Go reviews:
   metadata, disguised types refused on the sniffed bytes, the body cap, the
   repeated text-field budget, cleanup after a store failure, and a strict
   multipart parser table plus a differential/mutation test.
+
+Each shared store also runs an *unavailable backend* contract
+(`forge_cache::testing::run_unavailable`, `forge_ratelimit::testing::run_unavailable`,
+`forge_jobs::testing::run_unavailable`; the Forge-Go `RunUnavailable` helpers of
+`cachetest`, `limitertest` and `storetest`). The test renames the store's table
+away inside its test database and back, and the contract is that the failure is
+reported as a store error and never as an ordinary outcome: a cache read is not a
+miss (and `fetch` still returns the computed value), `allow` returns no decision, a
+job operation is never a lost lease, a missing job or a duplicate key. A write that
+failed changes nothing: cached entries, hit counts and the lease a worker held
+survive the outage. SQLite, PostgreSQL, MySQL and MariaDB run it for the cache and
+the limiter; the job store is PostgreSQL-only (ADR 0025).
 
 The SQLite suites always run. PostgreSQL, MySQL and MariaDB suites are
 `#[ignore]`d unless requested with `-- --include-ignored` and

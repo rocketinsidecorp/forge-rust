@@ -2,6 +2,8 @@
 
 #![allow(dead_code)]
 
+pub mod scripted_ca;
+
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;

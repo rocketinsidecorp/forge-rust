@@ -2,6 +2,7 @@
 //! failure paths of every step (warnings that must not fail a deploy, errors
 //! that must), locks, hooks, local builds, details, logs and `forge app`.
 
+use std::io::Write as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -22,6 +23,7 @@ use super::runner::{Cancel, ExecLocal, LocalRunner, Output, RunError, Runner, Si
 use super::secrets::Secrets;
 use super::tests::{
     Buffer, FakeRunner, PLAN_SECRETS, VALID_CONFIG, common, image_json, io, plan_fixture, remote,
+    write_executable,
 };
 
 const HOSTS: [&str; 3] = ["192.0.2.10", "192.0.2.11", "192.0.2.20"];
@@ -47,8 +49,7 @@ fn write_hook(root: &Path, name: &str, body: &str) {
     let hooks = root.join(".forge/hooks");
     std::fs::create_dir_all(&hooks).expect("hooks directory");
     let path = hooks.join(name);
-    std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("hook");
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    write_executable(&path, &format!("#!/bin/sh\n{body}\n"));
 }
 
 /// Runs `deploy` with every remote command for which `fail` answers `Some`
@@ -1153,11 +1154,15 @@ fn warnings_are_printed_before_the_summary() {
     });
     let (result, out, _) = project.deploy(DeployAction::Prune, &flags(false, false));
     result.expect("prune");
-    assert!(
-        out.starts_with("warning: 192.0.2.10: listing images failed"),
-        "{out}"
-    );
-    assert!(out.contains("prune complete ("), "{out}");
+    // Hosts run concurrently, so the warnings arrive in any order; each must
+    // come before the summary.
+    let summary = out.find("prune complete (").expect("summary");
+    for host in ["192.0.2.10", "192.0.2.11"] {
+        let warning = out
+            .find(&format!("warning: {host}: listing images failed"))
+            .unwrap_or_else(|| panic!("no warning for {host}: {out}"));
+        assert!(warning < summary, "{host}: warning after summary: {out}");
+    }
 }
 
 #[test]
@@ -1374,6 +1379,15 @@ fn the_system_factory_builds_the_ssh_and_local_runners() {
         .output(&Cancel::never(), &PathBuf::from("."), &["true".to_owned()])
         .expect("true runs");
     assert_eq!(output, "");
-    // The process streams are the process's own.
-    let _ = Io::process();
+    // The process streams are two distinct, writable handles (an empty
+    // write and a flush print nothing, whatever the harness captures).
+    let io = Io::process();
+    assert!(!Arc::ptr_eq(&io.stdout, &io.stderr));
+    for stream in [&io.stdout, &io.stderr] {
+        let mut stream = stream.lock().expect("stream");
+        stream
+            .write_all(b"")
+            .expect("the process stream accepts a write");
+        stream.flush().expect("the process stream flushes");
+    }
 }

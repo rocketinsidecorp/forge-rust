@@ -128,9 +128,6 @@ fn validate(options: &JobOptions) -> Result<Vec<Field>, CliError> {
     }
     let name = &options.name;
     generators::snake_case("job name", name, MAX_NAME_LENGTH).map_err(fail)?;
-    if name == "mod" {
-        return Err(fail("job name `mod` would replace the jobs module"));
-    }
     let type_name = pascal_case(name);
     for generated in [type_name.clone(), format!("{type_name}Handler")] {
         if RESERVED_TYPES.contains(&generated.as_str()) {

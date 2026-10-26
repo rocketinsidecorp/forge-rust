@@ -2,7 +2,6 @@
 //! answers by the command it is asked to run, and real local commands.
 //! Nothing here needs a network, an SSH server or Docker.
 
-use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -14,7 +13,7 @@ use super::runner::{
     Cancel, DryLocal, DryRunner, ExecLocal, LocalRunner, RunError, Runner, Sink, SshRunner,
 };
 use super::secrets::Secrets;
-use super::tests::Buffer;
+use super::tests::{Buffer, write_executable};
 
 /// A fake `ssh`: records its arguments to `log`, then behaves by the last
 /// argument, which is the quoted remote script (or the host for `-O exit`).
@@ -40,8 +39,7 @@ exit 0
 "#,
         log = log.display()
     );
-    std::fs::write(&script, body).expect("script");
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    write_executable(&script, &body);
     (script, log)
 }
 

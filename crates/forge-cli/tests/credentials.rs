@@ -5,7 +5,6 @@
 #![cfg(unix)]
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -27,8 +26,7 @@ fn forge(root: &Path, arguments: &[&str], env: &[(&str, &str)]) -> Output {
 /// An editor executable (a script; forge itself never starts a shell).
 fn editor(dir: &Path, body: &str) -> PathBuf {
     let path = dir.join("editor.sh");
-    fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("editor script");
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod");
+    write_executable(&path, &format!("#!/bin/sh\n{body}\n"));
     path
 }
 
@@ -267,4 +265,39 @@ fn rotate_key_replaces_the_key_and_prints_it_only_when_asked() {
         &[("FORGE_MASTER_KEY", &new_key)],
     );
     assert!(shown.status.success(), "{shown:?}");
+}
+
+/// Writes an executable (mode 0755) script at `path` without this process
+/// ever holding a write descriptor on it.
+///
+/// Writing the file here (`std::fs::write`) leaves a writable descriptor open
+/// in this process for a moment. Any other test thread that forks in that
+/// window (`Command::spawn`) inherits the descriptor until it execs, and
+/// while any process holds the inode open for writing `execve` of it fails
+/// with `ETXTBSY` ("Text file busy"). `O_CLOEXEC` only closes the descriptor
+/// at exec, so it does not close that window. Creating the file from a
+/// short-lived child keeps the writer out of this process, so forks on other
+/// threads cannot inherit it, and the child has exited before this returns.
+fn write_executable(path: &Path, body: &str) {
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+
+    let mut child = Command::new("/bin/sh")
+        .args(["-c", "umask 022; cat > \"$1\" && chmod 755 \"$1\"", "sh"])
+        .arg(path)
+        .stdin(Stdio::piped())
+        .spawn()
+        .expect("spawn sh to write the executable");
+    child
+        .stdin
+        .take()
+        .expect("piped stdin")
+        .write_all(body.as_bytes())
+        .expect("send the script body");
+    let status = child.wait().expect("wait for sh");
+    assert!(
+        status.success(),
+        "writing {} failed: {status}",
+        path.display()
+    );
 }

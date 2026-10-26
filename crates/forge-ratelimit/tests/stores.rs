@@ -10,7 +10,7 @@ use std::{sync::Arc, time::Duration};
 use forge_db::{Database, DbError, FRAMEWORK_MIGRATIONS, testing::TestDatabase};
 use forge_ratelimit::{
     Limit, LimitError, Limiter, MAX_PRUNE_ROUNDS, Pruner, StoreOptions,
-    testing::{Subject, run},
+    testing::{Subject, run, run_unavailable},
 };
 
 fn limit(n: u32, per: Duration) -> Limit {
@@ -139,6 +139,29 @@ macro_rules! store_tests {
                     Some(20_261_019_000_000)
                 );
                 assert!(second.allow("x", l).await.is_err(), "the table is gone after rollback");
+            }
+
+            #[tokio::test]
+            $(#[$attr])*
+            async fn an_unavailable_store_is_an_error_and_changes_nothing() {
+                let (store, test) = fresh(StoreOptions::default().with_prune_interval(None)).await;
+                let pool = test.database().pool();
+                run_unavailable(
+                    Subject { limiter: store.clone(), pruner: Some(store), guard: Box::new(()) },
+                    async || {
+                        sqlx::query("ALTER TABLE forge_rate_limits RENAME TO forge_rate_limits_away")
+                            .execute(pool)
+                            .await
+                            .expect("rename the table away");
+                    },
+                    async || {
+                        sqlx::query("ALTER TABLE forge_rate_limits_away RENAME TO forge_rate_limits")
+                            .execute(pool)
+                            .await
+                            .expect("rename the table back");
+                    },
+                )
+                .await;
             }
 
             #[tokio::test]

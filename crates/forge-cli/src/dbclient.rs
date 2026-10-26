@@ -737,6 +737,40 @@ mod tests {
 
     use super::*;
 
+    /// Writes an executable (mode 0755) script at `path` without this process
+    /// ever holding a write descriptor on it.
+    ///
+    /// Writing the file here (`std::fs::write`) leaves a writable descriptor open
+    /// in this process for a moment. Any other test thread that forks in that
+    /// window (`Command::spawn`) inherits the descriptor until it execs, and
+    /// while any process holds the inode open for writing `execve` of it fails
+    /// with `ETXTBSY` ("Text file busy"). `O_CLOEXEC` only closes the descriptor
+    /// at exec, so it does not close that window. Creating the file from a
+    /// short-lived child keeps the writer out of this process, so forks on other
+    /// threads cannot inherit it, and the child has exited before this returns.
+    fn write_executable(path: &Path, body: &str) {
+        use std::io::Write as _;
+
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "umask 022; cat > \"$1\" && chmod 755 \"$1\"", "sh"])
+            .arg(path)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn sh to write the executable");
+        child
+            .stdin
+            .take()
+            .expect("piped stdin")
+            .write_all(body.as_bytes())
+            .expect("send the script body");
+        let status = child.wait().expect("wait for sh");
+        assert!(
+            status.success(),
+            "writing {} failed: {status}",
+            path.display()
+        );
+    }
+
     const PASSWORD: &str = "s3cr3t-p4ss";
 
     struct Machine {
@@ -1285,15 +1319,15 @@ mod tests {
     fn executables_are_found_on_the_given_path_only() {
         let directory = tempfile::tempdir().expect("tempdir");
         let tool = directory.path().join("psql");
+        // Created without the execute bit (and never executed), then replaced
+        // by an executable written from a child process.
         fs::write(&tool, "#!/bin/sh\n").expect("write");
         let path =
             std::env::join_paths([Path::new("/nonexistent"), directory.path()]).expect("join");
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt as _;
-
             assert_eq!(locate("psql", Some(&path)), None, "not executable yet");
-            fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).expect("chmod");
+            write_executable(&tool, "#!/bin/sh\n");
         }
         assert_eq!(locate("psql", Some(&path)), Some(tool));
         assert_eq!(locate("mysql", Some(&path)), None);

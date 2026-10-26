@@ -12,6 +12,8 @@
 //! The suite panics with a descriptive message on the first violated
 //! guarantee. Windows are short so expiry can be observed with real clocks,
 //! including the database clocks of the shared limiters.
+//!
+//! [`run_unavailable`] is the contract of a shared limiter whose storage fails.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -185,5 +187,55 @@ async fn prunes_expired_buckets_only(subject: Subject) {
         pruner.prune().await.expect("prune"),
         0,
         "nothing left to remove"
+    );
+}
+
+/// What every database-backed limiter must do when its storage fails (the
+/// Forge-Go `limitertest.RunUnavailable`): `allow` reports the failure and
+/// never a decision (the caller chooses whether to fail open or closed),
+/// pruning reports it, and the hits counted before the outage still count
+/// afterwards while the failed hit counts for nothing.
+///
+/// `subject` is a limiter on fresh storage. `sabotage` makes that storage
+/// unavailable (a renamed table, a revoked grant) and `restore` makes it
+/// available again; both run with a connection that can change the schema.
+///
+/// The subject's database must not be shared with other tests: a panic between
+/// `sabotage` and `restore` leaves the table renamed, and nothing puts it back.
+///
+/// # Panics
+///
+/// With a message naming the first guarantee the limiter broke.
+pub async fn run_unavailable<S, R>(subject: Subject, sabotage: S, restore: R)
+where
+    S: AsyncFnOnce(),
+    R: AsyncFnOnce(),
+{
+    let l = limit(2, Duration::from_secs(3600));
+    allow(&subject.limiter, "key", l).await; // one hit of two
+
+    sabotage().await;
+    match subject.limiter.allow("key", l).await {
+        Err(LimitError::Store(_)) => {}
+        other => panic!("allow during the outage = {other:?}; want the failure and no decision"),
+    }
+    if let Some(pruner) = &subject.pruner {
+        assert!(
+            pruner.prune().await.is_err(),
+            "prune succeeded during the outage"
+        );
+    }
+    restore().await;
+
+    // The failed hit was not counted: one hit remains, then the limit bites.
+    let second = allow(&subject.limiter, "key", l).await;
+    assert!(
+        second.allowed && second.remaining == 0,
+        "second hit = {second:?}, want allowed with none remaining"
+    );
+    let third = allow(&subject.limiter, "key", l).await;
+    assert!(
+        !third.allowed,
+        "third hit = {third:?}, want denied: the hit before the outage must still count"
     );
 }

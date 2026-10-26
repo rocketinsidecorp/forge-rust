@@ -17,7 +17,7 @@ use super::deployer::{Deployer, Parts};
 use super::errors::{EXIT_LOCK_HELD, LOCK_HELD_EXIT_STATUS, RemoteError};
 use super::runner::{Cancel, LocalRunner, Output, RunError, Runner, Sink};
 use super::secrets::Secrets;
-use super::tests::{Buffer, PLAN_SECRETS, VALID_CONFIG, parse, plan_epoch};
+use super::tests::{Buffer, PLAN_SECRETS, VALID_CONFIG, parse, plan_epoch, write_executable};
 
 /// Runs each host's commands with `sh` in its own directory, the way SSH
 /// starts them in the home directory, so the lock scripts run for real
@@ -473,8 +473,9 @@ fn stale_recovery_interleaved_race_has_one_winner() {
         eprintln!("skipped: no find on PATH");
         return;
     };
-    let shim = write(
-        "find",
+    let shim = shims.path().join("find");
+    write_executable(
+        &shim,
         "#!/bin/sh\n\
          if [ -n \"$FORGE_SHIM_ACTIVE\" ]; then\n\
          \texec \"$FORGE_REAL_FIND\" \"$@\"\n\
@@ -483,11 +484,6 @@ fn stale_recovery_interleaved_race_has_one_winner() {
          echo $? > \"$FORGE_SHIM_STATUS\"\n\
          echo \"$1\"\n",
     );
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o700))
-            .expect("chmod shim");
-    }
     let mut search = vec![shims.path().to_owned()];
     search.extend(std::env::split_paths(&path));
     let runner = ShellRunner {

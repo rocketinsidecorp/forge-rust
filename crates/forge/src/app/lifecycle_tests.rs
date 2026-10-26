@@ -713,3 +713,79 @@ fn a_bookkeeping_table_that_cannot_be_read_fails_the_status_command() {
     assert_eq!(run(&["migrate", "status"]), ExitCode::FAILURE);
     assert_eq!(run(&["migrate"]), ExitCode::FAILURE);
 }
+
+#[cfg(all(feature = "postgres", feature = "sqlite"))]
+#[test]
+fn an_application_declaring_two_databases_is_refused_by_every_command() {
+    let app = || {
+        App::new("demo")
+            .postgres(forge_db::Migrator::DEFAULT)
+            .sqlite(forge_db::Migrator::DEFAULT)
+    };
+    for command in [
+        &["serve"][..],
+        &["migrate"],
+        &["migrate", "status"],
+        &["rollback"],
+        &["db", "exists"],
+    ] {
+        assert_eq!(
+            app().run_boxed(command, || config(&[])),
+            ExitCode::FAILURE,
+            "{command:?}"
+        );
+    }
+}
+
+#[cfg(all(feature = "jobs", feature = "sqlite"))]
+#[test]
+fn jobs_need_postgresql_and_the_application_is_refused_on_any_other_backend() {
+    let jobs = crate::background::WorkerMode::InServe;
+    assert_eq!(
+        App::new("demo")
+            .sqlite(forge_db::Migrator::DEFAULT)
+            .jobs(jobs)
+            .run_boxed(&["serve"], || config(&[])),
+        ExitCode::FAILURE
+    );
+    // And without any database there is nothing to keep the jobs in.
+    assert_eq!(
+        App::new("demo")
+            .jobs(jobs)
+            .run_boxed(&["serve"], || config(&[])),
+        ExitCode::FAILURE
+    );
+}
+
+#[test]
+fn database_commands_without_a_declared_database_say_what_is_missing() {
+    let url = "postgres://u:p@127.0.0.1:1/app";
+    let with_url = || config(&[("FORGE_MIGRATION_DATABASE_URL", url)]);
+    let app = || App::new("demo");
+
+    // `db` administers a declared database.
+    assert_eq!(
+        app().run_boxed(&["db", "exists"], || config(&[])),
+        ExitCode::FAILURE
+    );
+    // Migrations need a credential, from the environment when nothing is declared.
+    assert_eq!(
+        app().run_boxed(&["migrate"], || config(&[])),
+        ExitCode::from(EXIT_CONFIG)
+    );
+    // Without a declaration only the application's own handlers can migrate,
+    // and they know neither `status` nor several steps.
+    for command in [
+        &["migrate", "status"][..],
+        &["rollback", "--steps", "2"],
+        // No handler was registered either.
+        &["migrate"],
+        &["rollback"],
+    ] {
+        assert_eq!(
+            app().run_boxed(command, with_url),
+            ExitCode::FAILURE,
+            "{command:?}"
+        );
+    }
+}

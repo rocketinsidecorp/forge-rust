@@ -5,7 +5,6 @@
 #![cfg(unix)]
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -60,8 +59,7 @@ impl Project {
         fs::write(root.join("config/deploy.yml"), CONFIG).expect("config");
         fs::create_dir(root.join("bin")).expect("bin");
         let ssh = root.join("bin/ssh");
-        fs::write(&ssh, FAKE_SSH).expect("script");
-        fs::set_permissions(&ssh, fs::Permissions::from_mode(0o755)).expect("chmod");
+        write_executable(&ssh, FAKE_SSH);
         Self { directory }
     }
 
@@ -413,4 +411,39 @@ fn an_unusable_temporary_directory_fails_before_any_ssh_runs() {
         stderr(&output)
     );
     assert!(project.ssh_calls().is_empty(), "ssh never started");
+}
+
+/// Writes an executable (mode 0755) script at `path` without this process
+/// ever holding a write descriptor on it.
+///
+/// Writing the file here (`std::fs::write`) leaves a writable descriptor open
+/// in this process for a moment. Any other test thread that forks in that
+/// window (`Command::spawn`) inherits the descriptor until it execs, and
+/// while any process holds the inode open for writing `execve` of it fails
+/// with `ETXTBSY` ("Text file busy"). `O_CLOEXEC` only closes the descriptor
+/// at exec, so it does not close that window. Creating the file from a
+/// short-lived child keeps the writer out of this process, so forks on other
+/// threads cannot inherit it, and the child has exited before this returns.
+fn write_executable(path: &Path, body: &str) {
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+
+    let mut child = Command::new("/bin/sh")
+        .args(["-c", "umask 022; cat > \"$1\" && chmod 755 \"$1\"", "sh"])
+        .arg(path)
+        .stdin(Stdio::piped())
+        .spawn()
+        .expect("spawn sh to write the executable");
+    child
+        .stdin
+        .take()
+        .expect("piped stdin")
+        .write_all(body.as_bytes())
+        .expect("send the script body");
+    let status = child.wait().expect("wait for sh");
+    assert!(
+        status.success(),
+        "writing {} failed: {status}",
+        path.display()
+    );
 }
