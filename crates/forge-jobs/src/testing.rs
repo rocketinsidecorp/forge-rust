@@ -306,6 +306,9 @@ async fn claim_one(store: &PgJobStore, name: &str) -> (JobId, LeaseToken) {
 /// with a role that can change the schema (for example
 /// [`RlsTestDatabase::admin`]).
 ///
+/// The store's database must not be shared with other tests: a panic between
+/// `sabotage` and `restore` leaves the table renamed, and nothing puts it back.
+///
 /// # Panics
 ///
 /// With a message naming the first operation that succeeded, or reported an

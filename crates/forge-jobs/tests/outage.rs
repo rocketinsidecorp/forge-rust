@@ -26,6 +26,7 @@ use forge_jobs::{
 };
 use serde::{Deserialize, Serialize};
 use tokio::{sync::Notify, task::JoinHandle};
+use uuid::Uuid;
 
 const IGNORE: &str = "needs FORGE_TEST_DATABASE_URL";
 const PATIENCE: Duration = Duration::from_secs(60);
@@ -378,7 +379,9 @@ async fn an_attempt_that_loses_its_lease_is_cancelled_and_cannot_record_anything
     let _serial = SERIAL.lock().await;
     // Another worker took the job: the lease token no longer matches.
     let steal = async |rig: &Rig| {
-        sqlx::query("UPDATE forge_jobs SET lease_token = gen_random_uuid()")
+        // The new token is made here: no database UUID generator, which would be v4.
+        sqlx::query("UPDATE forge_jobs SET lease_token = $1")
+            .bind(Uuid::now_v7())
             .execute(rig.db.admin().pool())
             .await
             .expect("steal the lease");

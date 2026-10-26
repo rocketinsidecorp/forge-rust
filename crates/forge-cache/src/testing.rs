@@ -431,6 +431,9 @@ async fn prunes_expired_entries(subject: Subject) {
 /// unavailable (a renamed table, a revoked grant) and `restore` makes it
 /// available again; both run with a connection that can change the schema.
 ///
+/// The subject's database must not be shared with other tests: a panic between
+/// `sabotage` and `restore` leaves the table renamed, and nothing puts it back.
+///
 /// # Panics
 ///
 /// With a message naming the first guarantee the cache broke.

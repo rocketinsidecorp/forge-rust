@@ -340,7 +340,13 @@ are excluded from the gated total only, and still appear in the gross one:
 
 The list is explicit in `scripts/coverage.sh` (`kits`), exactly those files and
 never a pattern over `testing`, so production code cannot be hidden by a naming
-accident. A new kit is added to the list, with its reason, in the pull request
+accident. The script also checks the list, as Forge-Go's does for its kit packages,
+and fails when a listed file does not exist, when the kit is not behind a
+`testing` feature gate (the `pub mod testing;` line of the crate's `lib.rs` must
+follow a `#[cfg(...)]` naming `feature = "testing"`), or when another crate's
+`Cargo.toml` enables a kit's `testing` feature anywhere but `[dev-dependencies]`
+or a feature that is itself named `testing`: such a kit is reachable from
+shipped code, is production code, and has to be covered. A new kit is added to the list, with its reason, in the pull request
 that adds it.
 
 The Forge-Go twin (`scripts/coverage.sh`, `.coverage-floor`, the same job
