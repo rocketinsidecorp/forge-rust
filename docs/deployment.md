@@ -132,8 +132,12 @@ from env files, Kubernetes manifests and unit files.
 | `FORGE_HTTP_TRANSPORT` | `trusted-proxy` in production, `plain` otherwise | How clients reach the server, Forge-Go's key: `plain` HTTP, or `trusted-proxy` when forge-proxy or a load balancer terminates TLS in front of it. With `trusted-proxy` every response carries `Strict-Transport-Security: max-age=31536000; includeSubDomains` (a handler that sets its own value, for example with `preload`, keeps it). Production refuses `plain`. Forge-Go's `tls` is refused: Forge-Rust does not terminate TLS itself. |
 | `FORGE_LOG` | `info` | `tracing` filter directive, for example `info,shop=debug`. |
 | `FORGE_LOG_FORMAT` | `json` in production, `text` otherwise | `json` or `text`. |
-| `FORGE_DATABASE_URL` | none | Least-privilege PostgreSQL runtime connection URL. Treated as a secret and redacted from ordinary diagnostics. |
-| `FORGE_MIGRATION_DATABASE_URL` | none | PostgreSQL schema-owner/migration URL used only by `migrate`, `rollback` and application commands such as `setup` and `seed`. Treated as a secret and redacted. |
+| `FORGE_DATABASE_URL` | none | Least-privilege PostgreSQL runtime connection URL. Treated as a secret and redacted from ordinary diagnostics. In `production` it must verify the server certificate (see [database TLS](#database-tls)). |
+| `FORGE_MIGRATION_DATABASE_URL` | none | PostgreSQL schema-owner/migration URL used only by `migrate`, `rollback` and application commands such as `setup` and `seed`. Treated as a secret and redacted. Same TLS rule as `FORGE_DATABASE_URL`. |
+| `FORGE_DATABASE_MAX_CONNS` | `10` | Connections of the serving pool (`serve`, `jobs work`), `1` to `1000`. Background jobs in `serve` share it. |
+| `FORGE_DATABASE_CONNECT_TIMEOUT` | `5s` | How long a query waits for a pooled connection, opening one included; a positive duration (`500ms`, `5s`, `1m`). Beyond it the query fails with a retryable error. |
+| `FORGE_DATABASE_STATEMENT_TIMEOUT` | `30s` | Server-side bound of every statement of the serving pool, `1ms` to `596h`: `statement_timeout` on PostgreSQL, `max_statement_time` on MariaDB, `max_execution_time` (read-only `SELECT` only) on MySQL, none on SQLite. Migrations, `setup`, `seed` and the `db` commands run without it. |
+| `FORGE_DATABASE_ALLOW_PLAINTEXT` | `false` | `true` lets `production` use database URLs that do not verify the server certificate. Only for a database reached over a trusted private network. |
 | `FORGE_SETUP_PASSWORD` | none | Owner password read only by `setup` when it is neither typed nor piped with `--password-stdin`. Never set it for the serving process. |
 | `FORGE_RATE_LIMIT_MAX_KEYS` | `100000` | Live buckets of the in-memory rate limiter, `1` to `10000000` ([rate limiting](rate-limiting.md)). |
 | `FORGE_CACHE_MAX_ENTRIES` | `10000` | Entry bound of every cache ([caching](caching.md)). |
@@ -165,6 +169,31 @@ Do not put secrets in the image or in build arguments. Both database URLs contai
 credentials and must come from the deployment platform's secret mechanism.
 Forge's typed configuration redacts them from normal Debug/serialization output,
 but adapters must still avoid logging exposed URLs.
+
+### Database TLS
+
+Production refuses a PostgreSQL or MySQL/MariaDB URL whose connection does
+not verify the server's TLS certificate, for `FORGE_DATABASE_URL` and
+`FORGE_MIGRATION_DATABASE_URL` alike (Forge-Go's rule). The error names the
+variable and the fix, never the URL.
+
+| Backend | Production needs | Refused |
+| --- | --- | --- |
+| PostgreSQL | `sslmode=verify-full` or `verify-ca` (`sslrootcert=/path/ca.pem` for a private CA) | no `sslmode` (SQLx's `prefer` falls back to plaintext), `disable`, `allow`, `prefer`, `require` (encrypts without checking the certificate) |
+| MySQL / MariaDB | `ssl-mode=VERIFY_IDENTITY` or `VERIFY_CA` (`ssl-ca=/path/ca.pem` for a private CA) | no `ssl-mode`, `DISABLED`, `PREFERRED`, `REQUIRED`; Forge-Go's `tls=true` is not SQLx's key |
+| Any | a Unix socket the URL names (`host=/run/postgresql`, `socket=/run/mysqld/mysqld.sock`) | |
+| SQLite | nothing (a local file) | |
+
+The mode is read the way SQLx reads it: `sslmode` or `ssl-mode`, the last
+occurrence wins, any case. `PGSSLMODE` is not consulted; put the mode in the
+URL.
+
+```sh
+export FORGE_DATABASE_URL='postgres://app_runtime:PASSWORD@db.internal:5432/shop?sslmode=verify-full&sslrootcert=/etc/ssl/db-ca.pem'
+export FORGE_MIGRATION_DATABASE_URL='postgres://app_migrator:PASSWORD@db.internal:5432/shop?sslmode=verify-full&sslrootcert=/etc/ssl/db-ca.pem'
+# a database reachable only over a trusted private network:
+export FORGE_DATABASE_ALLOW_PLAINTEXT=true
+```
 
 Do **not** inject `FORGE_MIGRATION_DATABASE_URL` into the long-running serving
 process. Run migrations as a separate deployment job/task with the migration

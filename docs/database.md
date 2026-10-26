@@ -89,7 +89,35 @@ precedence over `App::migrations`.
 | `rollback(&Migrator) -> Option<i64>` | reverts the latest applied migration; `IrreversibleMigration` without a down migration |
 | `expect_rows(result, n)` | `DbError::Conflict` unless exactly `n` rows were affected; accepts every backend's query result (optimistic locking) |
 
-Defaults: 10 connections, 5 second acquire timeout (`PoolSettings`).
+Defaults: 10 connections, 5 second acquire timeout, no statement timeout
+(`PoolSettings`). `PoolSettings::with_statement_timeout` bounds every
+statement on the server, set on each new connection; `PoolSettings::from_config`
+is the serving pool of the configuration (below).
+
+### Connection pool and TLS
+
+`serve` and `jobs work` size their pool from Forge-Go's keys
+([deployment](deployment.md#configuration)):
+
+| Key | Default | Effect |
+| --- | --- | --- |
+| `FORGE_DATABASE_MAX_CONNS` | `10` | Pool size, `1` to `1000`; in-serve jobs share it. |
+| `FORGE_DATABASE_CONNECT_TIMEOUT` | `5s` | The acquire timeout: waiting for a free connection and opening one. |
+| `FORGE_DATABASE_STATEMENT_TIMEOUT` | `30s` | `SET statement_timeout` (PostgreSQL), `SET SESSION max_statement_time` (MariaDB, every statement), `SET SESSION max_execution_time` (MySQL, read-only `SELECT` only) on each new connection; nothing on SQLite. `1ms` to `596h`. |
+| `FORGE_DATABASE_ALLOW_PLAINTEXT` | `false` | Lifts the production TLS rule. |
+
+Migrations, `setup`, `seed` and the `db` commands connect with the default
+`PoolSettings`, without the statement timeout, so long schema changes are not
+cancelled. In production both URLs must verify the server certificate
+(`sslmode=verify-full|verify-ca`, `ssl-mode=VERIFY_IDENTITY|VERIFY_CA`, a Unix
+socket, or SQLite) unless `FORGE_DATABASE_ALLOW_PLAINTEXT=true`
+([database TLS](deployment.md#database-tls)).
+
+```sh
+export FORGE_DATABASE_URL='postgres://app_runtime:PASSWORD@db.internal:5432/shop?sslmode=verify-full'
+export FORGE_DATABASE_MAX_CONNS=20 FORGE_DATABASE_CONNECT_TIMEOUT=2s FORGE_DATABASE_STATEMENT_TIMEOUT=10s
+cargo run
+```
 
 A URL whose scheme does not belong to the chosen backend fails with
 `DbError::Configuration`, naming the expected schemes and never the URL.

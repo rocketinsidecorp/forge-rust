@@ -24,9 +24,11 @@ pub type SqliteDatabase = Database<sqlx::Sqlite>;
 
 /// Pool sizing shared by every backend.
 ///
-/// The defaults suit a small service: 10 connections and a 5 second wait for
-/// one. A request that cannot get a connection in time fails with the
-/// retryable [`DbError::PoolTimeout`] instead of queueing indefinitely.
+/// The defaults suit a small service: 10 connections, a 5 second wait for
+/// one and no statement timeout. A request that cannot get a connection in
+/// time fails with the retryable [`DbError::PoolTimeout`] instead of queueing
+/// indefinitely. The serving process takes its settings from the
+/// configuration ([`PoolSettings::from_config`]).
 ///
 /// ```
 /// use std::time::Duration;
@@ -34,14 +36,17 @@ pub type SqliteDatabase = Database<sqlx::Sqlite>;
 ///
 /// let settings = PoolSettings::default()
 ///     .with_max_connections(20)
-///     .with_acquire_timeout(Duration::from_secs(2));
+///     .with_acquire_timeout(Duration::from_secs(2))
+///     .with_statement_timeout(Some(Duration::from_secs(30)));
 /// assert_eq!(settings.max_connections(), 20);
+/// assert_eq!(settings.statement_timeout(), Some(Duration::from_secs(30)));
 /// ```
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct PoolSettings {
     max_connections: u32,
     acquire_timeout: Duration,
+    statement_timeout: Option<Duration>,
 }
 
 impl PoolSettings {
@@ -74,6 +79,40 @@ impl PoolSettings {
         self.acquire_timeout = acquire_timeout;
         self
     }
+
+    /// The server-side bound of every statement, if any.
+    #[must_use]
+    pub const fn statement_timeout(&self) -> Option<Duration> {
+        self.statement_timeout
+    }
+
+    /// Bounds every statement on the server, set on each new connection:
+    /// `statement_timeout` on PostgreSQL, `max_statement_time` on MariaDB,
+    /// `max_execution_time` (read-only `SELECT` only) on MySQL. SQLite has no
+    /// server-side bound and ignores it. It counts whole milliseconds; a
+    /// shorter duration becomes one millisecond, never "no timeout". `None`
+    /// leaves the server's setting.
+    #[must_use]
+    pub const fn with_statement_timeout(mut self, statement_timeout: Option<Duration>) -> Self {
+        self.statement_timeout = statement_timeout;
+        self
+    }
+
+    /// The serving pool of `config`: `FORGE_DATABASE_MAX_CONNS`,
+    /// `FORGE_DATABASE_CONNECT_TIMEOUT` (the acquire timeout, which bounds
+    /// opening a connection too) and `FORGE_DATABASE_STATEMENT_TIMEOUT`.
+    #[must_use]
+    pub const fn from_config(config: &forge_config::DatabaseConfig) -> Self {
+        Self {
+            max_connections: if config.max_connections == 0 {
+                1
+            } else {
+                config.max_connections
+            },
+            acquire_timeout: config.connect_timeout,
+            statement_timeout: Some(config.statement_timeout),
+        }
+    }
 }
 
 impl Default for PoolSettings {
@@ -81,8 +120,17 @@ impl Default for PoolSettings {
         Self {
             max_connections: 10,
             acquire_timeout: Duration::from_secs(5),
+            statement_timeout: None,
         }
     }
+}
+
+/// Whole milliseconds of a statement timeout, at least 1 (0 means "no
+/// timeout" to every server) and at most what PostgreSQL accepts.
+pub(crate) fn statement_timeout_millis(timeout: Duration) -> u64 {
+    u64::try_from(timeout.as_millis())
+        .unwrap_or(u64::MAX)
+        .clamp(1, i32::MAX as u64)
 }
 
 /// A connection pool for one backend with Forge's error, migration and
@@ -173,6 +221,13 @@ impl<B: Backend> Database<B> {
             .max_connections(settings.max_connections())
             .acquire_timeout(settings.acquire_timeout());
         let pool_options = <B as crate::backend::sealed::Hooks>::pool_options(raw, pool_options);
+        let pool_options = match settings.statement_timeout() {
+            Some(timeout) => <B as crate::backend::sealed::Hooks>::bound_statements(
+                pool_options,
+                statement_timeout_millis(timeout),
+            ),
+            None => pool_options,
+        };
         Ok((options, pool_options))
     }
 
@@ -330,5 +385,46 @@ pub fn expect_rows(result: impl RowsAffected, expected: u64) -> Result<(), DbErr
         Ok(())
     } else {
         Err(DbError::Conflict)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::{PoolSettings, statement_timeout_millis};
+
+    #[test]
+    fn statement_timeouts_are_whole_milliseconds_never_zero() {
+        assert_eq!(statement_timeout_millis(Duration::ZERO), 1);
+        assert_eq!(statement_timeout_millis(Duration::from_micros(999)), 1);
+        assert_eq!(statement_timeout_millis(Duration::from_millis(1500)), 1500);
+        assert_eq!(
+            statement_timeout_millis(Duration::from_secs(u64::MAX)),
+            i32::MAX as u64
+        );
+    }
+
+    #[test]
+    fn the_serving_pool_follows_the_configuration() {
+        let defaults = PoolSettings::from_config(&forge_config::DatabaseConfig::default());
+        assert_eq!(defaults.max_connections(), 10);
+        assert_eq!(defaults.acquire_timeout(), Duration::from_secs(5));
+        assert_eq!(defaults.statement_timeout(), Some(Duration::from_secs(30)));
+        let config = forge_config::DatabaseConfig {
+            max_connections: 40,
+            connect_timeout: Duration::from_secs(2),
+            statement_timeout: Duration::from_millis(250),
+            ..forge_config::DatabaseConfig::default()
+        };
+        let settings = PoolSettings::from_config(&config);
+        assert_eq!(settings.max_connections(), 40);
+        assert_eq!(settings.acquire_timeout(), Duration::from_secs(2));
+        assert_eq!(
+            settings.statement_timeout(),
+            Some(Duration::from_millis(250))
+        );
+        // Commands and tests keep the old defaults: no statement bound.
+        assert_eq!(PoolSettings::default().statement_timeout(), None);
     }
 }

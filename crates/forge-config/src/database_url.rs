@@ -461,6 +461,73 @@ fn sqlite_path(url: &str) -> &str {
     rest.split('?').next().unwrap_or(rest)
 }
 
+/// What a PostgreSQL URL needs in production, as the configuration error
+/// says it. It never contains the URL.
+pub const POSTGRES_TLS_REQUIRED: &str = "a URL with sslmode=verify-full (or verify-ca) in \
+     production, so the server certificate is verified: append ?sslmode=verify-full (and \
+     sslrootcert=/path/to/ca.pem for a private CA). A Unix socket (host=/run/postgresql) needs no \
+     TLS; FORGE_DATABASE_ALLOW_PLAINTEXT=true accepts an unverified or plaintext connection, only \
+     on a trusted private network";
+
+/// What a MySQL/MariaDB URL needs in production, as the configuration error
+/// says it. It never contains the URL.
+pub const MYSQL_TLS_REQUIRED: &str = "a URL with ssl-mode=VERIFY_IDENTITY (or VERIFY_CA) in \
+     production, so the server certificate is verified: append ?ssl-mode=VERIFY_IDENTITY (and \
+     ssl-ca=/path/to/ca.pem for a private CA). A Unix socket (socket=/run/mysqld/mysqld.sock) \
+     needs no TLS; FORGE_DATABASE_ALLOW_PLAINTEXT=true accepts an unverified or plaintext \
+     connection, only on a trusted private network";
+
+/// Checks that a connection to `url` authenticates the server with TLS, the
+/// rule production applies to both database URLs (Forge-Go's
+/// `config/database.go`).
+///
+/// PostgreSQL needs `sslmode=verify-full` or `verify-ca`: SQLx's default,
+/// `prefer`, falls back to plaintext, and `require` encrypts without checking
+/// the certificate, so both can be intercepted. MySQL/MariaDB needs
+/// `ssl-mode=VERIFY_IDENTITY` or `VERIFY_CA` (`PREFERRED` and `REQUIRED` do
+/// not verify). The mode is read as the driver reads it: either spelling of
+/// the key (`sslmode`, `ssl-mode`), the last occurrence winning, the value in
+/// any case. A Unix socket the URL names has no network path to intercept
+/// (and the servers offer no TLS on it), and SQLite is a local file: both
+/// pass. A URL that is not well formed fails.
+///
+/// # Errors
+///
+/// The contract the URL misses ([`POSTGRES_TLS_REQUIRED`],
+/// [`MYSQL_TLS_REQUIRED`] or [`MALFORMED`]); it never contains the URL.
+///
+/// ```
+/// use forge_config::{SecretString, database_url::require_verified_tls};
+///
+/// let verified = SecretString::new("postgres://app:pw@db.internal/shop?sslmode=verify-full");
+/// assert!(require_verified_tls(&verified).is_ok());
+/// let downgradable = SecretString::new("postgres://app:pw@db.internal/shop");
+/// assert!(require_verified_tls(&downgradable).is_err());
+/// ```
+pub fn require_verified_tls(url: &SecretString) -> Result<(), &'static str> {
+    let raw = url.expose();
+    let (verified, required): (&[&str], _) = match DatabaseScheme::of_url(raw) {
+        Some(DatabaseScheme::Sqlite) => return Ok(()),
+        Some(DatabaseScheme::Postgres) => (&["verify-full", "verify-ca"], POSTGRES_TLS_REQUIRED),
+        Some(DatabaseScheme::MySql) => (&["verify_identity", "verify_ca"], MYSQL_TLS_REQUIRED),
+        None => return Err(MALFORMED),
+    };
+    let found = location(raw).ok_or(MALFORMED)?;
+    if found.socket {
+        return Ok(());
+    }
+    let parsed = Url::parse(raw.trim()).map_err(|_| MALFORMED)?;
+    let mode = parsed
+        .query_pairs()
+        .filter(|(key, _)| matches!(&**key, "sslmode" | "ssl-mode"))
+        .last()
+        .map(|(_, value)| value.to_ascii_lowercase());
+    match mode {
+        Some(mode) if verified.contains(&mode.as_str()) => Ok(()),
+        _ => Err(required),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -878,5 +945,103 @@ mod tests {
             assert_eq!(sqlite_file(&secret(url)).as_deref(), Some(file), "{url}");
         }
         assert_eq!(sqlite_file(&secret("postgres://h/app")), None);
+    }
+
+    #[test]
+    fn production_needs_tls_that_verifies_the_server() {
+        for verified in [
+            "postgres://app:pw@db.internal/shop?sslmode=verify-full",
+            "postgresql://app:pw@db.internal/shop?sslmode=verify-ca&sslrootcert=/ca.pem",
+            "postgres://app:pw@db.internal/shop?ssl-mode=VERIFY-FULL",
+            // The driver applies the last occurrence.
+            "postgres://app:pw@db.internal/shop?sslmode=disable&sslmode=verify-full",
+            "mysql://app:pw@db.internal/shop?ssl-mode=VERIFY_IDENTITY",
+            "mariadb://app:pw@db.internal/shop?sslmode=verify_ca&ssl-ca=/ca.pem",
+            // A Unix socket has no network path; SQLite is a local file.
+            "postgres:///shop?host=/var/run/postgresql",
+            "postgres://%2Fvar%2Frun%2Fpostgresql/shop",
+            "mysql://app:pw@localhost/shop?socket=/run/mysqld/mysqld.sock",
+            "sqlite:///var/lib/app/app.db",
+        ] {
+            assert_eq!(
+                require_verified_tls(&secret(verified)),
+                Ok(()),
+                "{verified}"
+            );
+        }
+    }
+
+    #[test]
+    fn production_refuses_downgradable_tls_and_says_how_to_fix_it() {
+        for (refused, contract) in [
+            // SQLx's default, prefer, falls back to plaintext.
+            (
+                "postgres://app:hunter2@db.internal/shop",
+                POSTGRES_TLS_REQUIRED,
+            ),
+            (
+                "postgres://app:hunter2@db.internal/shop?sslmode=prefer",
+                POSTGRES_TLS_REQUIRED,
+            ),
+            (
+                "postgres://app:hunter2@db.internal/shop?sslmode=require",
+                POSTGRES_TLS_REQUIRED,
+            ),
+            (
+                "postgres://app:hunter2@db.internal/shop?sslmode=disable",
+                POSTGRES_TLS_REQUIRED,
+            ),
+            (
+                "postgres://app:hunter2@db.internal/shop?sslmode=allow",
+                POSTGRES_TLS_REQUIRED,
+            ),
+            // The last occurrence wins, as in the driver.
+            (
+                "postgres://app:hunter2@db.internal/shop?sslmode=verify-full&ssl-mode=disable",
+                POSTGRES_TLS_REQUIRED,
+            ),
+            // Keys are case-sensitive in the driver: this one is ignored.
+            (
+                "postgres://app:hunter2@db.internal/shop?SSLMODE=verify-full",
+                POSTGRES_TLS_REQUIRED,
+            ),
+            (
+                "postgres://app:hunter2@db.internal/shop?sslmode=verify-full%20",
+                POSTGRES_TLS_REQUIRED,
+            ),
+            // No host: SQLx tries a default socket, then localhost over TCP.
+            ("postgres:///shop", POSTGRES_TLS_REQUIRED),
+            (
+                "postgres://app:hunter2@127.0.0.1/shop",
+                POSTGRES_TLS_REQUIRED,
+            ),
+            ("mysql://app:hunter2@db.internal/shop", MYSQL_TLS_REQUIRED),
+            (
+                "mysql://app:hunter2@db.internal/shop?ssl-mode=PREFERRED",
+                MYSQL_TLS_REQUIRED,
+            ),
+            (
+                "mariadb://app:hunter2@db.internal/shop?ssl-mode=REQUIRED",
+                MYSQL_TLS_REQUIRED,
+            ),
+            // Forge-Go's spelling is not SQLx's: it would be ignored.
+            (
+                "mysql://app:hunter2@db.internal/shop?tls=true",
+                MYSQL_TLS_REQUIRED,
+            ),
+            (
+                "postgres://app:hunter2/x@db/shop?sslmode=verify-full",
+                MALFORMED,
+            ),
+            ("redis://cache", MALFORMED),
+        ] {
+            let error = require_verified_tls(&secret(refused)).expect_err(refused);
+            assert_eq!(error, contract, "{refused}");
+            assert!(!error.contains("hunter2"), "{error}");
+        }
+        assert!(POSTGRES_TLS_REQUIRED.contains("sslmode=verify-full"));
+        assert!(POSTGRES_TLS_REQUIRED.contains("FORGE_DATABASE_ALLOW_PLAINTEXT=true"));
+        assert!(MYSQL_TLS_REQUIRED.contains("ssl-mode=VERIFY_IDENTITY"));
+        assert!(MYSQL_TLS_REQUIRED.contains("FORGE_DATABASE_ALLOW_PLAINTEXT=true"));
     }
 }

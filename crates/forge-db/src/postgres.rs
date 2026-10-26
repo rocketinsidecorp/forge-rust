@@ -12,6 +12,23 @@ impl Hooks for Postgres {
     const SCHEME: DatabaseScheme = DatabaseScheme::Postgres;
     const TEST_URL_ENV: &'static str = "FORGE_TEST_DATABASE_URL";
 
+    fn bound_statements(
+        options: sqlx::pool::PoolOptions<Self>,
+        millis: u64,
+    ) -> sqlx::pool::PoolOptions<Self> {
+        options.after_connect(move |connection, _| {
+            Box::pin(async move {
+                // Audited: `millis` is an integer Forge computed, not input.
+                sqlx::Executor::execute(
+                    connection,
+                    sqlx::AssertSqlSafe(format!("SET statement_timeout = {millis}")),
+                )
+                .await
+                .map(|_| ())
+            })
+        })
+    }
+
     fn endpoint(url: &str) -> Result<crate::admin::Endpoint, crate::DbError> {
         // The parser that connects: `host`, `hostaddr`, `port` and `dbname`
         // query parameters, and PG* environment defaults, count.

@@ -73,6 +73,14 @@ pub(crate) mod sealed {
             options
         }
 
+        /// Bounds every statement of each new connection to `millis`
+        /// (1 to `i32::MAX`) on the server. The default, for a backend
+        /// without a server-side bound (SQLite), keeps the pool.
+        fn bound_statements(options: PoolOptions<Self>, millis: u64) -> PoolOptions<Self> {
+            let _ = millis;
+            options
+        }
+
         /// Creates an empty, uniquely named database for a test. Server
         /// backends use the administrative URL in the environment variable
         /// `admin_env`; file backends ignore it.

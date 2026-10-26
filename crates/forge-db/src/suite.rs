@@ -433,6 +433,61 @@ macro_rules! common_suite {
 
             #[tokio::test]
             $(#[$attr])*
+            async fn the_statement_timeout_bounds_every_pooled_connection() {
+                let test = fresh().await;
+                let settings = PoolSettings::default()
+                    .with_max_connections(2)
+                    .with_statement_timeout(Some(Duration::from_millis(250)));
+                let db = Database::<Db>::connect_with(test.url(), settings).await.expect("connect");
+                // Two connections at once: the setting holds on each new one.
+                let mut first = db.pool().acquire().await.expect("first");
+                let mut second = db.pool().acquire().await.expect("second");
+                for connection in [&mut first, &mut second] {
+                    match <Db as Backend>::SCHEME {
+                        DatabaseScheme::Postgres => {
+                            let shown: String = sqlx::query_scalar("SHOW statement_timeout")
+                                .fetch_one(&mut **connection)
+                                .await
+                                .expect("show");
+                            assert_eq!(shown, "250ms");
+                        }
+                        DatabaseScheme::MySql => {
+                            let version: String = sqlx::query_scalar("SELECT VERSION()")
+                                .fetch_one(&mut **connection)
+                                .await
+                                .expect("version");
+                            let (variable, expected) = if version.to_ascii_lowercase().contains("mariadb") {
+                                ("max_statement_time", "0.250000")
+                            } else {
+                                ("max_execution_time", "250")
+                            };
+                            let shown: String = sqlx::query_scalar(AssertSqlSafe(format!(
+                                "SELECT CAST(@@SESSION.{variable} AS CHAR)"
+                            )))
+                            .fetch_one(&mut **connection)
+                            .await
+                            .expect("variable");
+                            assert_eq!(shown, expected, "{version}");
+                        }
+                        // No server: the setting is ignored, the pool works.
+                        DatabaseScheme::Sqlite => {}
+                    }
+                }
+                drop((first, second));
+                if <Db as Backend>::SCHEME == DatabaseScheme::Postgres {
+                    let error = sqlx::query("SELECT pg_sleep(5)")
+                        .execute(db.pool())
+                        .await
+                        .expect_err("cancelled by statement_timeout");
+                    assert!(error.to_string().contains("statement timeout"), "{error}");
+                }
+                db.ping().await.expect("the pool keeps working");
+                db.pool().close().await;
+                test.cleanup().await.expect("cleanup");
+            }
+
+            #[tokio::test]
+            $(#[$attr])*
             async fn pool_exhaustion_is_a_retryable_timeout() {
                 let test = fresh().await;
                 let settings = PoolSettings::default()

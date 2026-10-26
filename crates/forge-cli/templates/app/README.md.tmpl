@@ -135,6 +135,30 @@ forge dev                     # rebuilds and restarts when files change; or: car
 
 `serve` requires `FORGE_DATABASE_URL`; a URL for another database engine exits
 with code 78.
+%%if !sqlite%%
+
+With `FORGE_ENV=production` (the container image's default) both URLs must
+verify the server's TLS certificate, or start-up stops and says how to fix
+the URL:
+
+```bash
+%%if postgresql%%
+export FORGE_DATABASE_URL='postgres://app_runtime:PASSWORD@db.internal:5432/DATABASE?sslmode=verify-full'
+# private CA: append &sslrootcert=/etc/ssl/db-ca.pem
+%%end%%
+%%if !postgresql%%
+export FORGE_DATABASE_URL='mysql://app:PASSWORD@db.internal:3306/DATABASE?ssl-mode=VERIFY_IDENTITY'
+# private CA: append &ssl-ca=/etc/ssl/db-ca.pem
+%%end%%
+# only for a database reached over a trusted private network:
+export FORGE_DATABASE_ALLOW_PLAINTEXT=true
+```
+
+The serving pool is tuned with `FORGE_DATABASE_MAX_CONNS` (default `10`),
+`FORGE_DATABASE_CONNECT_TIMEOUT` (default `5s`) and
+`FORGE_DATABASE_STATEMENT_TIMEOUT` (default `30s`, cancels longer statements;
+migrations and commands run without it).
+%%end%%
 
 The `forge db` commands run this application's own subcommands (the CLI builds
 it with Cargo and never reads the database URL), like Rails' `db:*` tasks:

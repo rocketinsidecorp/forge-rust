@@ -1254,7 +1254,7 @@ fn compose(
     #[cfg_attr(not(feature = "jobs"), allow(unused_mut, clippy::let_unit_value))]
     let mut jobs = jobs;
     let database = match declared {
-        Some((declaration, url)) => match declaration.connect_lazy(url) {
+        Some((declaration, url)) => match declaration.connect_lazy(url, &config.database) {
             Ok(database) => Some(database),
             Err(error) => {
                 error!(app = name, error = %ErrorChain(&error), "failed to create the database pool");

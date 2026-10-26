@@ -410,7 +410,16 @@ Environment:
   FORGE_LOG_FORMAT            json | text (default: json in production, text otherwise)
   FORGE_DATABASE_URL           least-privilege runtime URL: postgres://, mysql://, mariadb:// or sqlite:
   FORGE_MIGRATION_DATABASE_URL migration URL, same schemes (required for migrate/rollback
-                               and application commands that use the database)
+                               and application commands that use the database); in
+                               production both must verify the server certificate:
+                               sslmode=verify-full|verify-ca or ssl-mode=VERIFY_IDENTITY|VERIFY_CA
+  FORGE_DATABASE_ALLOW_PLAINTEXT true accepts production URLs without verified TLS, only
+                               on a trusted private network (default: false)
+  FORGE_DATABASE_MAX_CONNS     connections of the serving pool, 1-1000 (default: 10)
+  FORGE_DATABASE_CONNECT_TIMEOUT wait for a pooled connection, opening one included
+                               (default: 5s)
+  FORGE_DATABASE_STATEMENT_TIMEOUT server-side bound of every statement, 1ms-596h; not
+                               for migrations and commands (default: 30s)
   FORGE_SETUP_PASSWORD         owner password for setup when not typed or piped (never for serve)
   FORGE_RATE_LIMIT_MAX_KEYS   live buckets of the in-memory rate limiter (default: 100000)
   FORGE_CACHE_MAX_ENTRIES     entry bound of every cache (default: 10000)

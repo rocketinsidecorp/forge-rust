@@ -329,6 +329,38 @@ counts the running version, so 1 would prune the previous one and leave
 nothing to roll back to); use 2 to 100, default 5. The deploy lock also needs
 `~/.forge` on the hosts to be on a file system with hard links.
 
+### Database TLS and connection pool
+
+In production (`FORGE_ENV=production`, the container image's default) both
+`FORGE_DATABASE_URL` and `FORGE_MIGRATION_DATABASE_URL` must verify the
+database server's certificate, Forge-Go's rule: SQLx's default `sslmode=prefer`
+falls back to plaintext and `require` checks no certificate, so either could be
+intercepted. A URL that does not verify stops start-up with an error that says
+how to fix it and never prints the URL. Unix sockets and SQLite files need no
+TLS.
+
+```sh
+# PostgreSQL: verify-full (or verify-ca); sslrootcert for a private CA
+export FORGE_DATABASE_URL='postgres://app_runtime:PASSWORD@db.internal:5432/shop?sslmode=verify-full&sslrootcert=/etc/ssl/db-ca.pem'
+# MySQL/MariaDB: VERIFY_IDENTITY (or VERIFY_CA); ssl-ca for a private CA
+export FORGE_DATABASE_URL='mysql://app:PASSWORD@db.internal:3306/shop?ssl-mode=VERIFY_IDENTITY'
+# only for a database reached over a trusted private network (the generated
+# compose.yaml sets it for its own db service)
+export FORGE_DATABASE_ALLOW_PLAINTEXT=true
+
+# the serving pool (Forge-Go's keys and defaults)
+export FORGE_DATABASE_MAX_CONNS=10                # 1 to 1000
+export FORGE_DATABASE_CONNECT_TIMEOUT=5s          # wait for a connection, opening one included
+export FORGE_DATABASE_STATEMENT_TIMEOUT=30s       # server-side bound of every statement, at least 1ms
+cargo run
+FORGE_ENV=production FORGE_DATABASE_URL='postgres://app:pw@db.internal/shop' cargo run -- healthcheck   # refused: no sslmode=verify-full
+```
+
+The statement timeout is PostgreSQL's `statement_timeout`, MariaDB's
+`max_statement_time` and MySQL's `max_execution_time` (read-only `SELECT`s
+only); SQLite has none. Migrations, `setup`, `seed` and the `db` commands run
+without it ([database](docs/database.md#connection-pool-and-tls)).
+
 ### Client addresses behind a proxy
 
 Sign-in and reset throttles, `forge::ratelimit::by_client_ip` and the
