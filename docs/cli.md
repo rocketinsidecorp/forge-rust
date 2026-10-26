@@ -546,7 +546,7 @@ application's database backend, with tests, plus the JSON API under
 | `<name>` | Singular resource name, `snake_case` or `PascalCase` (`line_item`, `LineItem`). It names the entity type (`LineItem`), the table, routes and modules use the plural. |
 | `<field:type>...` | At least one field. Types: `string` (at most 255 characters), `text` (at most 65,535), `integer` (`i64`; store money as integer minor units, there is no float), `boolean`, `timestamp` (`forge::core::Timestamp`, UTC; the form edits whole seconds and refuses sub-second input), `uuid` (`forge::core::Uuid`, any version). Append `?` for an optional (nullable) field: `due_at:timestamp?`. |
 | `--global` | Rows are shared by every tenant. Routes `/<plural>/...`, closed by `DenyAll` until the application decides who may use them. |
-| `--tenant-scoped` | Rows belong to a tenant. Routes `/tenants/{tenant_id}/<plural>/...`, `tenant_id` bound from the authorized `TenantContext` in every statement, plus forced row-level security on PostgreSQL. Exactly one of `--global` and `--tenant-scoped` is required. |
+| `--tenant-scoped` | Rows belong to a tenant. Routes `/<plural>/...` for the tenant the session signed in to, `tenant_id` bound from the authorized `TenantContext` in every statement, plus forced row-level security on PostgreSQL. Exactly one of `--global` and `--tenant-scoped` is required. |
 | `--plural <PLURAL>` | The plural when the English rules (`-y` to `-ies`; `-s`, `-x`, `-z`, `-ch`, `-sh` take `-es`; otherwise `-s`) get it wrong. A name that already looks plural is refused unless `--plural` is given. |
 | `--broadcast` | Live updates ([ADR 0031](adr/0031-live-updates-over-server-sent-events.md)): create, update and delete publish Turbo Streams and the index page subscribes over Server-Sent Events. Writes `src/adapters/http/streams.rs` once and `templates/<plural>/_row.html`; production needs `FORGE_STREAMS_KEY` ([views](views.md#live-updates); [rotation](views.md#rotating-the-stream-signing-key) with `FORGE_STREAMS_PREVIOUS_KEYS`). |
 | `--dry-run` | Print the files that would be created and the wiring; write nothing. |
@@ -1198,8 +1198,8 @@ account to, or take over, a running installation. The password is typed
 twice at a terminal with echo off, piped as one line with
 `--password-stdin`, or read from `FORGE_SETUP_PASSWORD`; it is never an
 argument, never printed or logged, and must have at least 12 characters.
-`setup` prints the tenant id: tenant-scoped scaffold pages live under
-`/tenants/<tenant id>/`.
+`setup` prints the tenant id; tenant-scoped scaffold pages are at
+`/<plural>`, for the tenant the session signed in to.
 
 `seed` is like `rails db:seed`: write idempotent statements (`INSERT ... ON
 CONFLICT DO NOTHING`) so seeding twice changes nothing. Seeds are not for

@@ -165,9 +165,9 @@ number of workers. The sign-in happens once, before measuring.
 | --- | --- | --- |
 | `health` | `GET /health/ready` (readiness: pings the database) | `200` |
 | `welcome` | `GET /` (the generated welcome page, no database) | `200` |
-| `index_html` | `GET /tenants/{tenant_id}/posts` with the session cookie: a scaffold index of 50 rows from PostgreSQL, rendered with layout, i18n and CSRF tags | `200` |
+| `index_html` | `GET /posts` with the session and tenant cookies: a scaffold index of 50 rows from PostgreSQL, rendered with layout, i18n and CSRF tags | `200` |
 | `show_json` | not run: see below | |
-| `create_form` | `POST /tenants/{tenant_id}/posts` with the session cookie and the CSRF token in the form: validates, inserts one row, redirects | `303` |
+| `create_form` | `POST /posts` with the session and tenant cookies and the CSRF token in the form: validates, inserts one row, redirects | `303` |
 
 The application is a tenant-scoped scaffold, so every request that touches the
 table runs the session lookup, the membership and permission check, the tenant
@@ -194,8 +194,9 @@ Differences from Forge-Go's scenarios, none of them a hidden change:
   before it measures.
 - The sign-in and the form use Forge-Rust's names: the hidden field is
   `csrf_token` (Forge-Go's `authenticity_token`), the scaffold lives under
-  `/tenants/{tenant_id}/posts` and the load generator needs the tenant's id
-  (`-tenant-id`, which `scripts/bench.sh` reads from the output of `setup`).
+  `/posts` for the tenant of the session, and the load generator takes the
+  tenant's id (`-tenant-id`, which `scripts/bench.sh` reads from the output
+  of `setup`) for the tenant cookie when sign-in sets none.
 - Forge-Rust separates the migration and runtime database credentials
   ([ADR 0011](adr/0011-postgresql-runtime-migration-roles-and-rls-context.md)), so the rig
   creates two non-superuser roles (the owner that migrates, and a runtime role

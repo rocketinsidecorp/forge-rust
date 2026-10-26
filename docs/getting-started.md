@@ -395,86 +395,39 @@ the wiring (not repeated here).
   `timestamp`, `uuid`; a trailing `?` (quoted: `'subtitle:string?'`) makes a
   field optional.
 - `--tenant-scoped` binds every query to the signed-in organization (routes
-  live under `/tenants/{tenant_id}/`) and, on PostgreSQL, enforces it again
+  at `/posts`, for the organization signed in to) and, on PostgreSQL, enforces it again
   with row-level security. `--global` is for data every tenant shares.
 - `--broadcast` adds live updates over Server-Sent Events (section 5.2; it
   needs the `FORGE_STREAMS_KEY` setting in production, see [views](views.md)).
   Leave it out for a resource that does not change under the reader.
 - Add `--dry-run` to any generator to list its files without writing them.
 
-### 5.1 Wire it into the application
+### 5.1 Nothing to wire
 
-The wiring has two parts: eight `pub mod` lines, and a block of code at the
-end of `fn compose` in `src/bootstrap/mod.rs`, before its `Ok(())`. First a
-helper for the second part. It takes the code on standard input and inserts it
-at the end of `compose` (or of the function you name; section 9 uses
-`jobs_configure`). Define it once in terminal 2. The generators print the same
-code, and you may paste it into your editor instead:
+The generator declared its modules (the `declare` lines of its output: `pub
+mod post;` in `src/domain/entities/mod.rs` and so on, in sorted order) and
+mounted the routes in `src/bootstrap/routes_gen.rs` (the `wire` line), which
+`compose` calls last. That file belongs to the generators; read it to see the
+code they wrote:
+
+```sh
+cat src/bootstrap/routes_gen.rs
+```
+
+Its `protect` guard grants the `owner` role (the role `setup` gave you) both
+`posts:read` (index, show) and `posts:write` (new, create, edit, update,
+delete); permissions match exactly and every other role is denied. To grant
+another role, declare your own `fn protect` with the same signature in
+`src/bootstrap/mod.rs` and run the generator again
+([generators](generators.md#the-routes-seam)).
+
+Section 9 pastes the registration of a job into `jobs_configure` (the job
+generator prints it, as Forge-Go's does) with this helper; define it once in
+terminal 2. It takes the code on standard input and inserts it at the end of
+`compose` (or of the function you name):
 
 ```sh
 wire() { FN=${1:-compose} W=$(cat) perl -0pi -e 's/(fn $ENV{FN}\(.*?\n)(    Ok\(\(\)\)\n\})/$1$ENV{W}\n$2/s' src/bootstrap/mod.rs; }
-```
-
-The module lines (keeping each file's `mod` lines sorted):
-
-```sh
-echo 'pub mod post;' >> src/domain/entities/mod.rs
-echo 'pub mod post_repository;' >> src/application/ports/mod.rs
-echo 'pub mod posts;' >> src/application/use_cases/mod.rs
-perl -0pi -e 's/\n\nuse forge::tenancy/\n\npub mod posts;\n\nuse forge::tenancy/' src/infrastructure/database/mod.rs
-perl -0pi -e 's/^pub mod authentication;/pub mod access;\npub mod authentication;\npub mod posts;\npub mod streams;/m' src/adapters/http/mod.rs
-perl -0pi -e 's/^pub mod welcome;/pub mod posts;\npub mod welcome;/m' src/adapters/http/views/mod.rs
-```
-
-The composition. It grants the `owner` role (the role `setup` gave you) both
-`posts:read` (index, show) and `posts:write` (new, create, edit, update,
-delete); permissions match exactly and every other role is denied until you
-name it here:
-
-```sh
-wire <<'EOF'
-    // posts: tenant-scoped, under /tenants/{tenant_id}/posts.
-    let mut policy = forge::security::RbacPolicy::new();
-    let owner = forge::security::Role::new("owner").map_err(forge::ComposeError::other)?;
-    for permission in [
-        crate::application::use_cases::posts::READ_PERMISSION,
-        crate::application::use_cases::posts::WRITE_PERMISSION,
-    ] {
-        let permission =
-            forge::security::Permission::new(permission).map_err(forge::ComposeError::other)?;
-        policy.allow(owner.clone(), permission);
-    }
-    let pool = composition.postgres()?.pool().clone();
-    // Sessions end after FORGE_AUTH_SESSION_IDLE_TIMEOUT without a request.
-    let sessions = crate::infrastructure::auth::PostgresSessionStore::new(pool.clone())
-        .with_idle_timeout(
-            forge::auth::SessionIdleTimeout::new(composition.config().auth.session_idle_timeout)
-                .map_err(forge::ComposeError::other)?,
-        );
-    let access = crate::adapters::http::access::SessionTenantAccess::new(
-        std::sync::Arc::new(sessions),
-        std::sync::Arc::new(crate::infrastructure::tenancy::PgMembershipStore::new(pool)),
-        policy,
-    );
-    // Live updates, once for every broadcasting resource. FORGE_STREAMS_KEY
-    // (`openssl rand -base64 32`, the same on every replica) is required in
-    // production.
-    let streams =
-        crate::adapters::http::streams::Streams::register(composition, forge::Fanout::Postgres)?;
-    let posts = crate::application::use_cases::posts::PostService::new(std::sync::Arc::new(
-        crate::infrastructure::database::posts::PgPostRepository::new(
-            composition.postgres()?.clone(),
-        ),
-    ));
-    crate::adapters::http::posts::routes(
-        composition.router(),
-        &site,
-        posts,
-        std::sync::Arc::new(access),
-        &streams,
-    )?;
-EOF
-forge format
 ```
 
 Apply the migration (terminal 2 has the migration URL) and look at the routes.
@@ -490,14 +443,14 @@ forge routes | grep -E 'METHOD|posts'
 ... INFO forge::database::commands: applied migration app="blog" version=1792538664283175633 description="create posts"
 ... INFO forge::database::commands: migrations applied app="blog" count=1
 METHOD  PATH                                          ACTION  SOURCE
-GET     /tenants/{tenant_id}/posts                    -       src/adapters/http/posts.rs:99
-POST    /tenants/{tenant_id}/posts                    -       src/adapters/http/posts.rs:99
-GET     /tenants/{tenant_id}/posts/new                -       src/adapters/http/posts.rs:99
-DELETE  /tenants/{tenant_id}/posts/{id}               -       src/adapters/http/posts.rs:99
-GET     /tenants/{tenant_id}/posts/{id}               -       src/adapters/http/posts.rs:99
-PATCH   /tenants/{tenant_id}/posts/{id}               -       src/adapters/http/posts.rs:99
-PUT     /tenants/{tenant_id}/posts/{id}               -       src/adapters/http/posts.rs:99
-GET     /tenants/{tenant_id}/posts/{id}/edit          -       src/adapters/http/posts.rs:99
+GET     /posts                                        -       src/adapters/http/posts.rs:99
+POST    /posts                                        -       src/adapters/http/posts.rs:99
+GET     /posts/new                                    -       src/adapters/http/posts.rs:99
+DELETE  /posts/{id}                                   -       src/adapters/http/posts.rs:99
+GET     /posts/{id}                                   -       src/adapters/http/posts.rs:99
+PATCH   /posts/{id}                                   -       src/adapters/http/posts.rs:99
+PUT     /posts/{id}                                   -       src/adapters/http/posts.rs:99
+GET     /posts/{id}/edit                              -       src/adapters/http/posts.rs:99
 ```
 
 Look up your tenant id if you lost it (section 4 printed it):
@@ -511,8 +464,7 @@ psql "$FORGE_MIGRATION_DATABASE_URL" -Atc "select id from forge_tenants where sl
 ```
 
 Open <http://localhost:3000/session/new?tenant=acme>, sign in as
-`owner@example.com`, then open `http://localhost:3000/tenants/TENANT_ID/posts`
-with your id, click **New post**, fill in a title and a body and save. A blank
+`owner@example.com`, then open `http://localhost:3000/posts`, click **New post**, fill in a title and a body and save. A blank
 title shows the form again with `422` and the message beside the field.
 Signed-out visitors are sent to the sign-in page and back. Use `localhost` or
 `127.0.0.1`: the session cookies are `__Host-` cookies, which browsers accept
@@ -530,9 +482,9 @@ printf 'Owner password: '; read -rs OWNER_PASSWORD; echo   # bash or zsh
 T=$(curl -s -c $JAR -b $JAR "$B/session/new?tenant=acme" | token)
 printf '%s' "$OWNER_PASSWORD" | curl -s -o /dev/null -c $JAR -b $JAR -d "csrf_token=$T" -d tenant=acme -d email=owner@example.com --data-urlencode 'password@-' $B/session
 unset OWNER_PASSWORD
-T=$(curl -s -c $JAR -b $JAR $B/tenants/$TENANT_ID/posts/new | token)
-curl -si -c $JAR -b $JAR -d "csrf_token=$T" --data-urlencode "title=Hello Forge" --data-urlencode "body=My first post" $B/tenants/$TENANT_ID/posts | grep -iE '^(HTTP|location)'
-curl -s -b $JAR $B/tenants/$TENANT_ID/posts | grep '<td>Hello'
+T=$(curl -s -c $JAR -b $JAR $B/posts/new | token)
+curl -si -c $JAR -b $JAR -d "csrf_token=$T" --data-urlencode "title=Hello Forge" --data-urlencode "body=My first post" $B/posts | grep -iE '^(HTTP|location)'
+curl -s -b $JAR $B/posts | grep '<td>Hello'
 rm -f "$JAR"
 ```
 
@@ -548,7 +500,7 @@ to `/session/mfa` and this script stops there; use the browser.)
 ### 5.2 Live updates
 
 Because the posts were scaffolded with `--broadcast`, the index page
-subscribes to a stream: open `/tenants/TENANT_ID/posts` in two browser windows,
+subscribes to a stream: open `/posts` in two browser windows,
 signed in to the same organization, and create, edit or delete a post in one;
 the other changes without a reload. The server pushes Turbo Streams over
 Server-Sent Events, on a channel whose name is signed (HMAC-SHA256, expiring
@@ -569,7 +521,7 @@ printf 'Owner password: '; read -rs OWNER_PASSWORD; echo   # bash or zsh
 T=$(curl -s -c $JAR -b $JAR "$B/session/new?tenant=acme" | token)
 printf '%s' "$OWNER_PASSWORD" | curl -s -o /dev/null -c $JAR -b $JAR -d "csrf_token=$T" -d tenant=acme -d email=owner@example.com --data-urlencode 'password@-' $B/session
 unset OWNER_PASSWORD
-SRC=$(curl -s -b $JAR $B/tenants/$TENANT_ID/posts | sed -n 's/.*<turbo-stream-source src="\([^"]*\)".*/\1/p')
+SRC=$(curl -s -b $JAR $B/posts | sed -n 's/.*<turbo-stream-source src="\([^"]*\)".*/\1/p')
 curl -sN -b $JAR "$B$SRC"        # stays open; Ctrl-C ends it
 ```
 
@@ -577,8 +529,8 @@ In a third terminal, with the same `$B`, `$JAR`, `$TENANT_ID` and `token`
 (run it from the same shell session, or define them again):
 
 ```sh
-T=$(curl -s -c $JAR -b $JAR $B/tenants/$TENANT_ID/posts/new | token)
-curl -s -o /dev/null -c $JAR -b $JAR -d "csrf_token=$T" --data-urlencode "title=Hello Forge" --data-urlencode "body=My first post" $B/tenants/$TENANT_ID/posts
+T=$(curl -s -c $JAR -b $JAR $B/posts/new | token)
+curl -s -o /dev/null -c $JAR -b $JAR -d "csrf_token=$T" --data-urlencode "title=Hello Forge" --data-urlencode "body=My first post" $B/posts
 ```
 
 The first terminal prints the keep-alive and then the change, as the

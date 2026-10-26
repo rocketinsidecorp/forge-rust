@@ -124,108 +124,88 @@ change), reset links now allow 3 submissions per link and address per hour,
 and generated applications should port four files; see
 [upgrading](docs/mfa.md#upgrading-an-existing-application).
 
-### From `forge new` to a working CRUD resource
+### End to end: a CRUD with sign-in, no code edited
 
-1. Generate the resource (the migration, entity, use cases, repository,
-   HTML handlers, views, the JSON API under `/v1/invoices` and tests;
-   `--dry-run` lists the files without writing):
+The generated README carries this sequence too. PostgreSQL (the default):
 
-   ```sh
-   forge generate scaffold invoice number:string total_cents:integer due_at:timestamp? --tenant-scoped
-   ```
+```bash
+forge new shop
+cd shop
+docker compose up -d --wait db
+forge migrate
+forge setup --tenant acme --email you@example.com --organization "Acme Inc"
+forge generate scaffold product name:string price:integer --tenant-scoped
+forge migrate
+forge dev
+```
 
-2. Wire it. The generator never edits existing files; it prints these lines.
-   Add each `pub mod` line to the named file (keep the `mod` lines sorted):
+`forge setup` asks for the owner's password twice (or reads
+`FORGE_SETUP_PASSWORD`). Open `http://localhost:3000/session/new`, sign in
+with organization `acme`, then list, create, edit and delete products at
+`http://localhost:3000/products`. The scaffold declared its modules in the
+`mod.rs` files and mounted its routes in `src/bootstrap/routes_gen.rs`, behind
+sign-in and the `products:read` and `products:write` permissions its
+`protect` guard grants to the owner role. The JSON API at `/v1/products`
+authenticates the same session cookie (and, in an application created with
+`--api-auth`, bearer tokens); changes send the CSRF token in the
+`X-CSRF-Token` header:
 
-   ```text
-   src/domain/entities/mod.rs             pub mod invoice;
-   src/application/ports/mod.rs           pub mod invoice_repository;
-   src/application/use_cases/mod.rs       pub mod invoices;
-   src/infrastructure/database/mod.rs     pub mod invoices;
-   src/adapters/http/mod.rs               pub mod access;      (first scaffold only)
-   src/adapters/http/mod.rs               pub mod api_access;  (first scaffold or resource only)
-   src/adapters/http/mod.rs               pub mod invoices;
-   src/adapters/http/mod.rs               pub mod invoices_api;
-   src/adapters/http/views/mod.rs         pub mod invoices;
-   ```
+```bash
+jar=$(mktemp)
+token=$(curl -s -c "$jar" -H 'Accept: text/html' http://localhost:3000/session/new | sed -n 's/.*name="csrf_token" value="\([^"]*\)".*/\1/p' | head -n 1)
+read -rsp 'Password: ' password; echo
+curl -s -o /dev/null -b "$jar" -c "$jar" -H 'Accept: text/html' --data-urlencode "csrf_token=$token" --data-urlencode tenant=acme --data-urlencode email=you@example.com --data-urlencode "password=$password" http://localhost:3000/session
+curl -s -b "$jar" http://localhost:3000/v1/products
+curl -s -b "$jar" -c "$jar" -H "X-CSRF-Token: $(awk '$6 == "__Host-forge_csrf" {print $7}' "$jar")" -H 'Content-Type: application/json' -d '{"name":"Lamp","price":1999}' http://localhost:3000/v1/products
+```
 
-   and paste the printed statements at the end of `fn compose` in
-   `src/bootstrap/mod.rs`, before `Ok(())`. They grant the `owner` role
-   (the role `setup` gave the first member) both `invoices:read` (index,
-   show) and `invoices:write` (new, create, edit, update, delete); RBAC
-   matches exactly and denies every other role until you grant it:
+SQLite (also MySQL and MariaDB, with `docker compose up -d --wait db` after
+`cd`) has no Forge identity: the sign-in pages and `forge setup` are
+PostgreSQL-only, so generated routes are closed (`403`) unless generated with
+`--public`, which serves them to anyone who can reach the server (forms still
+need their CSRF token) and needs `--global`:
 
-   ```rust
-   let mut policy = forge::security::RbacPolicy::new();
-   let owner = forge::security::Role::new("owner").map_err(forge::ComposeError::other)?;
-   for permission in [
-       crate::application::use_cases::invoices::READ_PERMISSION,
-       crate::application::use_cases::invoices::WRITE_PERMISSION,
-   ] {
-       let permission =
-           forge::security::Permission::new(permission).map_err(forge::ComposeError::other)?;
-       policy.allow(owner.clone(), permission);
-   }
-   let pool = composition.postgres()?.pool().clone();
-   // Sessions end after FORGE_AUTH_SESSION_IDLE_TIMEOUT without a request.
-   let sessions = crate::infrastructure::auth::PostgresSessionStore::new(pool.clone())
-       .with_idle_timeout(
-           forge::auth::SessionIdleTimeout::new(composition.config().auth.session_idle_timeout)
-               .map_err(forge::ComposeError::other)?,
-       );
-   let access = crate::adapters::http::access::SessionTenantAccess::new(
-       std::sync::Arc::new(sessions),
-       std::sync::Arc::new(crate::infrastructure::tenancy::PgMembershipStore::new(pool)),
-       policy,
-   );
-   let invoices =
-       crate::application::use_cases::invoices::InvoiceService::new(std::sync::Arc::new(
-           crate::infrastructure::database::invoices::PgInvoiceRepository::new(
-               composition.postgres()?.clone(),
-           ),
-       ));
-   crate::adapters::http::invoices::routes(
-       composition.router(),
-       &site,
-       invoices.clone(),
-       std::sync::Arc::new(access),
-   )?;
-   // invoices JSON API (/v1/invoices): tenant-scoped, for bearer tokens. This
-   // application issues none yet, so DenyAll refuses every request: run
-   // `forge generate authentication --api-auth`, then pass BearerTenantAccess
-   // (src/adapters/http/api_access.rs) here.
-   crate::adapters::http::invoices_api::routes(
-       composition.router(),
-       invoices,
-       std::sync::Arc::new(crate::adapters::http::api_access::DenyAll),
-   )?;
-   ```
+```bash
+forge new shop -d sqlite3
+cd shop
+forge migrate
+forge generate scaffold product name:string price:integer --global --public
+forge migrate
+forge dev
+```
 
-   In an application created with `forge new --api-auth` the JSON API is
-   wired with `BearerTenantAccess` instead, sharing the pages' `policy`
-   (see [A JSON API with bearer tokens](#a-json-api-with-bearer-tokens)).
+Then open `http://localhost:3000/products`, or
+`curl -s http://localhost:3000/v1/products`. To grant other roles, or to put
+your own authentication in front, declare `fn protect` (or `fn public`, for
+routes generated with `--public`) with the signature of the generated one in
+`src/bootstrap/mod.rs`; the generators then use yours (until you run the
+generator again the build fails, `protect` being ambiguous, rather than
+silently ignoring your guard). CI runs both sequences as written, with a real
+`forge` binary, and drives them over HTTP
+(`cargo test -p forge-cli --test readme_quickstart -- --ignored`).
 
-   A `--global` resource (`forge generate scaffold post title:string
-   body:text published:boolean --global`) is wired with `DenyAll` and
-   answers `403` until you replace it with your own `GlobalAccess` (see
-   [docs/views.md](docs/views.md#scaffolding-a-resource)).
+`forge g` and `forge d` are `forge generate` and `forge destroy`, as in
+Rails. Running a generator again with the same arguments changes nothing
+(`identical`); `forge destroy` takes the declarations and the routes back out.
+A hand edit of `routes_gen.rs` is detected by its checksum and refused, never
+overwritten. Applications generated before the seam (no `generated_routes`
+call in `compose`) still get the wiring printed to paste; the mailer and job
+generators print their registration, as Forge-Go's do
+([docs/generators.md](docs/generators.md#the-routes-seam)).
 
-3. Migrate, test, run and use it as the owner:
+A migration named `add_COLUMNS_to_TABLE` with `field:type` arguments writes
+the `ALTER TABLE` statements for the application's database (and
+`remove_COLUMNS_from_TABLE` the reverse, with a warning: the values are
+lost); any other name writes a blank pair to fill in:
 
-   ```sh
-   forge migrate           # URLs from .env.development
-   forge test
-   forge dev
-   # open http://127.0.0.1:3000/tenants/<tenant id printed by setup>/invoices
-   ```
+```sh
+forge g migration add_sku_to_products sku:string 'note:text?'
+forge g migration remove_note_from_products 'note:text?'
+forge g migration backfill_products   # blank: fill in both files before forge migrate
+```
 
-   A signed-out browser is sent to `/session/new` and comes back to the
-   invoices after signing in; the sign-in page also has the sign-out button.
-   `forge rollback` reverts the application's latest migration (never a
-   framework table such as the cache or rate-limit store). Repository and
-   authentication tests against a database server are ignored by default;
-   run them with
-   `FORGE_TEST_DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5432/postgres cargo test -- --include-ignored`.
+Tests against a database server are ignored by default; run them with
+`FORGE_TEST_DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5432/postgres forge test -- --include-ignored`.
 
 ### A JSON API with bearer tokens
 
@@ -240,7 +220,6 @@ docker compose up -d db
 forge db prepare                                      # create and migrate the database
 forge setup --tenant acme --email owner@example.com   # the owner; password prompted
 forge generate resource product name:string 'summary:text?' price_cents:integer --tenant-scoped
-# add the printed `pub mod` lines, and the statements at the end of `fn compose`
 forge migrate
 forge dev
 
@@ -279,7 +258,7 @@ implement `ApiGlobalAccess`. Details: [generators](docs/generators.md#resource),
 translations or browser middleware) with a `compose` function in
 `src/bootstrap/mod.rs`, so `forge generate resource` and
 `forge generate controller NAME ACTION --api` work in it as in a full-stack
-application, and write JSON layers only. It has no identity, so the printed
+application, and write JSON layers only. It has no identity, so the generated
 wiring keeps every route closed (`DenyAll`, `403`) until you implement
 `ApiGlobalAccess` (`src/adapters/http/api_access.rs`) or `GlobalAccess`
 (`src/adapters/http/access.rs`) with the authentication of your API clients.
@@ -290,7 +269,6 @@ Generators that write pages (`view`, `scaffold`, `authentication`, and
 forge new shop --api -d sqlite3 --skip-docker && cd shop
 forge generate resource product name:string price_cents:integer --global
 forge generate controller status_checks index --api
-# add the printed `pub mod` lines, and the statements at the end of `fn compose`
 forge migrate
 forge test
 forge dev
@@ -328,7 +306,7 @@ forge generate controller pages index about_us --public            # read-only G
 forge generate controller reports monthly                          # guarded by reports:read (DenyAll until you decide)
 forge generate controller status_checks index --api                # JSON endpoints under /v1
 forge generate mailer user welcome:name,url password_reset         # typed emails, templates, /_mail/user previews
-forge generate job send_welcome user_id:uuid 'note:string?' --queue  # persistent PostgreSQL queue job
+forge generate job send_welcome user_id:uuid 'note:string?'  # persistent PostgreSQL queue job (--queue optional)
 forge generate view welcome --dry-run                              # one page: templates/pages/welcome.html, view model, test
 forge generate view admin/audit_log                                # templates/admin/audit_log.html
 forge destroy view admin/audit_log                                 # removes the page while unchanged
@@ -886,7 +864,8 @@ Kubernetes and systemd deployment is covered in
   a health-ordered Compose database, and `forge generate migration <name>`.
 - `forge generate model|controller|mailer|job --queue|view` and `forge destroy`
   ([generators](docs/generators.md), [ADR 0038](docs/adr/0038-generators-and-destroy.md)):
-  the rest of `rails g` in the hexagonal rings, with printed wiring, one owner
+  the rest of `rails g` in the hexagonal rings, registering their modules and
+  routes themselves (`src/bootstrap/routes_gen.rs`; `forge g`/`forge d`), one owner
   per permission, and a `rails d` that removes only files still identical to
   what the generator writes and keeps migrations unless `--migrations`.
 - `forge generate resource <name> field:type... --global|--tenant-scoped`:
@@ -898,8 +877,9 @@ Kubernetes and systemd deployment is covered in
 - `forge generate scaffold <name> field:type... --global|--tenant-scoped`:
   migration, entity, port, use cases, SQLx repository, HTML handlers, views,
   the resource's JSON API and tests for the application's backend, deny-by-default access, tenant
-  predicates plus forced RLS on PostgreSQL, and printed wiring instead of
-  edits to existing files ([ADR 0024](docs/adr/0024-scaffold-generator.md)).
+  predicates plus forced RLS on PostgreSQL, its modules declared and its
+  routes mounted in the generator-owned `src/bootstrap/routes_gen.rs`
+  ([ADR 0024](docs/adr/0024-scaffold-generator.md)).
   With `--broadcast`, open index pages update live: Turbo Streams over
   Server-Sent Events with signed, tenant-bound stream names and PostgreSQL
   `LISTEN/NOTIFY` fanout across replicas
@@ -1293,7 +1273,7 @@ MariaDB and SQLite)
 
 ```sh
 forge generate scaffold event name:string starts_at:timestamp --tenant-scoped --broadcast
-# add the printed wiring (it registers the streams once), then:
+# the scaffold mounts itself in src/bootstrap/routes_gen.rs (the streams once), then:
 export FORGE_MIGRATION_DATABASE_URL='postgres://app_migrator:app_migrator@127.0.0.1:5432/shop'
 cargo run -- migrate
 cargo run -- setup --tenant acme --email owner@example.com
@@ -1304,7 +1284,7 @@ export FORGE_STREAMS_KEY=$(openssl rand -base64 32)   # required in production; 
 # verify-only keys (docs/deployment.md#rotating-the-stream-signing-key has the two-step recipe)
 cargo run
 # sign in at http://127.0.0.1:3000/session/new?tenant=acme in two browsers,
-# open /tenants/<tenant id>/events in both and create an event in one
+# open /events in both and create an event in one
 cargo test changes_are_broadcast   # the generated live-update tests
 ```
 
