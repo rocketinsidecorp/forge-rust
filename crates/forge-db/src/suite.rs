@@ -830,6 +830,7 @@ mod postgres_specific {
                 result
             },
             async {
+                // real-clock: gives the other session time to block on the row lock held in the database, which has no 'is waiting' hook here
                 tokio::time::sleep(Duration::from_millis(300)).await;
                 let result = cross(&mut tx_b, first).await;
                 drop(tx_b);
@@ -992,6 +993,7 @@ macro_rules! mysql_specific {
                         result
                     },
                     async {
+                        // real-clock: gives the other session time to block on the row lock held in the database, which has no 'is waiting' hook here
                         tokio::time::sleep(Duration::from_millis(300)).await;
                         let result = cross(&mut tx_b, first).await;
                         drop(tx_b);

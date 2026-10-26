@@ -315,6 +315,73 @@ async fn encoded_slash_in_a_capture_is_a_bad_request() {
     assert_eq!(escaped_percent.status, StatusCode::OK);
 }
 
+/// The rule as it was written before it was made allocation-free: the
+/// optimised one must agree with it on every path.
+fn reference_is_invalid_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower.contains("%2f")
+        || lower.contains("%5c")
+        || path.contains('\\')
+        || path.split('/').any(|segment| {
+            crate::encoding::percent_decode(segment, false)
+                .is_ok_and(|decoded| decoded == "." || decoded == "..")
+        })
+}
+
+#[test]
+fn the_invalid_path_rule_agrees_with_its_reference_on_every_short_path() {
+    // Every string of up to five characters (about 800 000 paths) over the
+    // characters that matter: separators, dots, escape starts, the digits and
+    // letters of %2f, %5c and %2e in both cases, a backslash, and characters
+    // that matter to none (an ASCII letter and a multi-byte one).
+    const ALPHABET: [char; 15] = [
+        '/', '.', '%', '2', '5', 'e', 'E', 'f', 'F', 'c', 'C', '\\', 'a', 'z', '\u{e9}',
+    ];
+    let mut path = String::new();
+    let mut checked = 0_u32;
+    let mut digits = Vec::new();
+    for length in 0..=5_usize {
+        // An odometer over `length` base-15 digits.
+        digits.clear();
+        digits.resize(length, 0_usize);
+        loop {
+            path.clear();
+            path.extend(digits.iter().map(|&digit| ALPHABET[digit]));
+            assert_eq!(
+                is_invalid_path(&path),
+                reference_is_invalid_path(&path),
+                "{path:?}"
+            );
+            checked += 1;
+            let Some(position) = digits.iter().rposition(|&digit| digit + 1 < ALPHABET.len())
+            else {
+                break;
+            };
+            digits[position] += 1;
+            for digit in &mut digits[position + 1..] {
+                *digit = 0;
+            }
+        }
+    }
+    assert!(checked > 800_000, "{checked}");
+    for refused in [
+        "/a/./b", "/a/..", "/%2e/x", "/%2E%2e", "/%2e%2E", "/a%2Fb", "/a%5cb", "/a\\b",
+    ] {
+        assert!(is_invalid_path(refused), "{refused}");
+    }
+    for allowed in [
+        "/",
+        "/a/b.c",
+        "/a/.b",
+        "/a/b..",
+        "/a%252Fb",
+        "/%e2%82%ac",
+        "/a%zz",
+    ] {
+        assert!(!is_invalid_path(allowed), "{allowed}");
+    }
+}
+
 #[tokio::test]
 async fn a_catch_all_captures_the_rest_of_the_path_like_forge_go() {
     let mut router = Router::new();
@@ -872,6 +939,7 @@ fn test_router() -> Router {
         .expect("echo route must register");
     router
         .route(Method::GET, "/slow", |_| async {
+            // real-clock: real sockets: the handler must outlive the timeout under test, so a paused clock would skip it instantly
             tokio::time::sleep(Duration::from_secs(60)).await;
             Response::empty(StatusCode::OK)
         })
@@ -1171,6 +1239,7 @@ fn counting(count: u8, pause: Duration) -> Response {
         if sent == count {
             return None;
         }
+        // real-clock: real sockets: a slow stream is paced by real time between chunks
         tokio::time::sleep(pause).await;
         Some((Bytes::from(format!("line {sent}\n")), sent + 1))
     })
@@ -1324,6 +1393,7 @@ async fn a_short_request_timeout_does_not_disconnect_a_slow_reader() {
             .expect("request must be written");
         // Not reading: the socket buffers fill and the server's writes
         // stall for ten request timeouts.
+        // real-clock: real sockets: the client stops reading so the server's writes stall against the socket buffers
         std::thread::sleep(Duration::from_secs(1));
         let mut buffer = vec![0_u8; 64 * 1024];
         let mut received = 0;
@@ -1372,6 +1442,7 @@ async fn a_client_that_stops_reading_a_stream_is_disconnected() {
             tokio::time::Instant::now() < deadline,
             "a stalled stream must be dropped"
         );
+        // real-clock: polls a real TCP listener or connection, which a fake clock cannot advance, until a deadline
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     drop(client);
@@ -1714,6 +1785,7 @@ async fn budget_reaches(budget: &Semaphore, bytes: usize) {
             "budget stuck at {} free, expected {bytes}",
             budget.available_permits()
         );
+        // real-clock: polls a real TCP listener or connection, which a fake clock cannot advance, until a deadline
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
 }

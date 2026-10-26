@@ -107,6 +107,7 @@ async fn logged(needles: &[&str]) -> String {
             "never logged {needles:?}: {:#?}",
             lines().lock().expect("lock")
         );
+        // real-clock: polls the logs of a task or process that runs on its own threads, until a deadline
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
@@ -273,6 +274,7 @@ impl Rig {
         let deadline = tokio::time::Instant::now() + PATIENCE;
         while self.state(id).await != "completed" {
             assert!(tokio::time::Instant::now() < deadline, "never completed");
+            // real-clock: polls state written by a background task through a real database, until a deadline
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }

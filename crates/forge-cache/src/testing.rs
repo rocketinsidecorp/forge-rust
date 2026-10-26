@@ -131,8 +131,10 @@ async fn binary_and_empty_values(subject: Subject) {
 
 async fn overwrite_replaces_value_and_ttl(subject: Subject) {
     set(&subject, "k", b"one", Some(SHORT_TTL)).await;
+    // real-clock: TTLs and windows run on the backing store's clock (SQL now() on the database backends), which no injected clock reaches
     tokio::time::sleep(SHORT_TTL / 2).await;
     set(&subject, "k", b"two", MINUTE).await;
+    // real-clock: TTLs and windows run on the backing store's clock (SQL now() on the database backends), which no injected clock reaches
     tokio::time::sleep(SHORT_TTL).await;
     assert_eq!(
         get(&subject, "k").await.as_deref(),
@@ -156,6 +158,7 @@ async fn values_expire(subject: Subject) {
     let stored = Instant::now();
     set(&subject, "k", b"v", Some(SHORT_TTL)).await;
     readable_before_short_ttl(&subject, "k", stored).await;
+    // real-clock: TTLs and windows run on the backing store's clock (SQL now() on the database backends), which no injected clock reaches
     tokio::time::sleep(SHORT_TTL + Duration::from_millis(150)).await;
     assert!(
         get(&subject, "k").await.is_none(),
@@ -167,6 +170,7 @@ async fn default_ttl_applies(subject: Subject) {
     let stored = Instant::now();
     set(&subject, "k", b"v", None).await;
     readable_before_short_ttl(&subject, "k", stored).await;
+    // real-clock: TTLs and windows run on the backing store's clock (SQL now() on the database backends), which no injected clock reaches
     tokio::time::sleep(SHORT_TTL + Duration::from_millis(150)).await;
     assert!(
         get(&subject, "k").await.is_none(),
@@ -274,6 +278,7 @@ async fn fetch_collapses_concurrent_misses(subject: Subject) {
         });
     }
     // Let every caller reach the flight, then release the one computation.
+    // real-clock: the suite runs on a multi-threaded runtime and the flight has no hook that counts waiters, so the callers get real time to join
     tokio::time::sleep(Duration::from_millis(300)).await;
     release.notify_one();
     while let Some(result) = tasks.join_next().await {
@@ -356,6 +361,7 @@ async fn fetch_waiter_survives_a_cancelled_leader(subject: Subject) {
             .await
         })
     };
+    // real-clock: as above: the waiter needs real time to join the leader's flight before the leader is aborted
     tokio::time::sleep(Duration::from_millis(200)).await;
     leader.abort(); // the leader is cancelled: its future is dropped
     assert!(leader.await.expect_err("aborted").is_cancelled());
@@ -373,6 +379,7 @@ async fn enforces_the_entry_bound(subject: Subject) {
     for i in 0..TOTAL {
         set(&subject, &format!("k{i:02}"), b"v", HOUR).await;
         // Distinct write times: eviction is oldest-write-first.
+        // real-clock: gives each write a distinct millisecond timestamp: the stores order eviction by write time
         tokio::time::sleep(Duration::from_millis(3)).await;
     }
     if let Some(pruner) = &subject.pruner {
@@ -408,6 +415,7 @@ async fn prunes_expired_entries(subject: Subject) {
         set(&subject, &format!("short-{i}"), b"v", Some(SHORT_TTL)).await;
     }
     set(&subject, "long", b"v", HOUR).await;
+    // real-clock: TTLs and windows run on the backing store's clock (SQL now() on the database backends), which no injected clock reaches
     tokio::time::sleep(SHORT_TTL + Duration::from_millis(150)).await;
     assert_eq!(
         pruner.prune().await.expect("prune"),

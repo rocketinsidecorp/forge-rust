@@ -16,6 +16,12 @@ use libfuzzer_sys::fuzz_target;
 
 const KEY_BYTES: [u8; 32] = [0x42; 32];
 
+// The closed set of `parse_keys` failure messages, with its tests in
+// crates/forge-credentials/tests/key_error_oracle.rs.
+#[path = "../oracles/credentials_key_errors.rs"]
+mod key_errors;
+use key_errors::is_fixed_message;
+
 fuzz_target!(|data: &[u8]| {
     let mut fields = data.splitn(3, |byte| *byte == 0);
     let file = fields.next().unwrap_or_default();
@@ -26,8 +32,8 @@ fuzz_target!(|data: &[u8]| {
     if let Err(error) = parse_keys(&key_text) {
         let shown = error.to_string();
         assert!(
-            key_text.trim().len() < 8 || !shown.contains(key_text.trim()),
-            "an error echoed the key"
+            is_fixed_message(&shown),
+            "a key error carries text outside its fixed wording: {key_text:?} -> {shown:?}"
         );
     }
 

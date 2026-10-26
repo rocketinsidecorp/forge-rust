@@ -143,7 +143,9 @@ Notes on the choices:
   request id is not generated per iteration). That cost is inside the figures.
   The reference rows `request_build/get` and `request_build/post_form`, which
   are **not** part of Forge-Go's catalog and are printed apart, time the
-  building alone, so it can be subtracted.
+  building alone, so it can be subtracted. The Rust-only reference rows
+  `router_match/escaped/<routes>` route `/param/rN/a%20b`, the one request
+  shape whose invalid-path check decodes a segment; Forge-Go has no such case.
 - `csrf_verify/match`: `forge-views` compares tokens with
   `subtle::ConstantTimeEq` in a private function; the benchmark runs the same
   expression on two `CsrfToken`s.

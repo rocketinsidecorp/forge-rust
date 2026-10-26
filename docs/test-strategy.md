@@ -245,6 +245,42 @@ Flaky tests are defects. Quarantine requires an owner, linked issue, expiry, and
 separate non-blocking job; retries do not turn a red test green. Timeouts capture
 task, thread, log, and dependency diagnostics without secrets.
 
+### Sleeps in tests (the sleep budget)
+
+A test that sleeps waits on the real clock: it is slow, and on a loaded runner it
+is flaky. A test waits for an event (`Notify`, channel, counter, `Barrier`), polls
+with a deadline, or runs on the tokio paused clock
+(`#[tokio::test(start_paused = true)]` or `tokio::time::pause()`), where `sleep`
+costs nothing. A component takes an injectable clock when the test needs to expire
+something (`Signer::with_clock`, the cache and rate-limit memory stores).
+
+Where none of these can work (a child process, a real socket, the database's own
+clock, a "this does NOT happen" check over a debounce window) the `sleep(` call
+carries a comment on its line or in the comment block directly above it:
+
+```rust
+// real-clock: polls a child process until a deadline
+std::thread::sleep(Duration::from_millis(20));
+```
+
+`crates/forge/tests/test_sleeps.rs` (the twin of Forge-Go's `test_sleeps_test.go`)
+scans test code (`tests/` directories, `tests.rs`, `*_tests.rs`, `testing.rs`,
+`suite.rs` and `#[cfg(test)]` / `#[cfg(all(test, ...))]` items) for `sleep(` and
+fails for a sleep that has neither a paused clock nor a reason. It also counts
+the real-clock sleeps against the ceiling `BUDGET`: a new sleep fails the test,
+and when the count is below `BUDGET` the test prints a hint to lower it (and
+passes, so two branches that each remove a sleep can merge), so the budget only
+goes down.
+
+### Fuzz harness invariants
+
+A fuzz target that asserts "the output never repeats the input" must read the
+input the way the code under test does (the URL parser removes tab, LF and CR and
+lowercases hosts) and must not treat text that belongs to a fixed message
+template as an echo; otherwise the nightly run reports a harness false positive
+and hides real findings. Every failing input, real or not, is committed under
+`fuzz/seeds/<target>/` with its fix and replayed by each run.
+
 Coverage identifies blind spots but is not a correctness proxy. Critical policy,
 tenant isolation, migration, execution, and error branches require explicit tests;
 coverage is measured and gated as described in [Coverage](#coverage).

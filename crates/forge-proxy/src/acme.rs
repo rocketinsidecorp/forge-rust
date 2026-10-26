@@ -678,6 +678,7 @@ mod tests {
             // Published while the CA validates.
             let published = async {
                 while lock(&challenges).is_empty() {
+                    // real-clock: polls until the mock CA's validation publishes the challenge
                     tokio::time::sleep(Duration::from_millis(5)).await;
                 }
             };

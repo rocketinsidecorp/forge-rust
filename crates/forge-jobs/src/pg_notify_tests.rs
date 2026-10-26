@@ -89,6 +89,7 @@ where
     let deadline = Instant::now() + limit;
     while !condition().await {
         assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        // real-clock: polls state written by background tasks through a real database, until a deadline
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
@@ -321,6 +322,7 @@ async fn an_announcement_wakes_an_idle_worker_well_before_its_poll() {
     })
     .await;
     // The catch-up claim after subscribing found nothing.
+    // real-clock: settles: the catch-up claim after subscribing runs on a background task against a real database
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     for _ in 0..3 {
@@ -331,6 +333,7 @@ async fn an_announcement_wakes_an_idle_worker_well_before_its_poll() {
             latency < Duration::from_secs(2),
             "an announced job started after {latency:?}"
         );
+        // real-clock: paces the announcements so each one finds the idle worker waiting again
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
@@ -413,6 +416,7 @@ async fn shutdown_closes_an_active_listener_promptly_and_plain_runtimes_never_li
     let announcing = announcing_pool(&db).await;
     let (jobs, _started) = started_runtime(slow_polling(Duration::from_secs(60)));
     let (shutdown, handle) = spawn_runtime(jobs, &PgJobStore::new(announcing.clone()));
+    // real-clock: proves no LISTEN session opens (an absence): a real interval of the runtime's loops must pass first
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert!(listen_backends(&db).await.is_empty());
     stop(shutdown, handle).await;
@@ -506,6 +510,7 @@ async fn claims_never_exceed_the_batch_or_the_free_slots() {
             most.load(Ordering::SeqCst) == slots
         })
         .await;
+        // real-clock: settles: lets real claim polls pass to show no further claim follows once every slot is full
         tokio::time::sleep(Duration::from_millis(200)).await;
         let sizes = claim_sizes(&db).await;
         assert_eq!(

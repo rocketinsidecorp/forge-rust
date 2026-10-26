@@ -465,6 +465,7 @@ mod tests {
             connection.send(&get("/"), true).map(|r| r.status).ok(),
             Some(200)
         );
+        // real-clock: lets the server side of a real socket close an idle keep-alive connection
         thread::sleep(Duration::from_millis(100));
         assert_eq!(
             connection.send(&get("/"), true).map(|r| r.status).ok(),

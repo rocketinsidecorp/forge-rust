@@ -142,8 +142,12 @@ impl Signer {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn with_clock(mut self, clock: Clock) -> Self {
+    /// Reads the current time from `clock` instead of the system clock, so a
+    /// test expires a link by moving a fake clock instead of waiting for it.
+    /// Only available to tests (`cfg(test)` or the `testing` feature).
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub fn with_clock(mut self, clock: Clock) -> Self {
         self.clock = clock;
         self
     }

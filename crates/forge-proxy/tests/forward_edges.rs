@@ -48,6 +48,7 @@ impl Captured {
                 "{needle:?} never logged: {}",
                 self.text()
             );
+            // real-clock: polls the logs of a task or process that runs on its own threads, until a deadline
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         self.text()
@@ -206,6 +207,7 @@ async fn an_application_that_is_gone_is_a_bad_gateway_with_the_dial_error_logged
             break;
         }
         assert!(tokio::time::Instant::now() < deadline, "still {status}");
+        // real-clock: polls a real TCP listener or connection, which a fake clock cannot advance, until a deadline
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     let text = logs.contains("\"msg\":\"upstream error\"").await;

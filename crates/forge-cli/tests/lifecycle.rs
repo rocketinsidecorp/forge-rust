@@ -774,6 +774,7 @@ fn wait_for(fixture: &Fixture, line: &str, count: usize) {
             "timed out waiting for {count} x {line:?}: {:?}",
             fixture.lines()
         );
+        // real-clock: polls the logs of a task or process that runs on its own threads, until a deadline
         std::thread::sleep(Duration::from_millis(20));
     }
 }
@@ -814,6 +815,7 @@ fn dev_rebuilds_and_restarts_on_change_and_stops_its_child_on_sigterm() {
 
     // A change outside the watched files does nothing.
     fs::write(fixture.project().join("README.md"), "notes\n").expect("write");
+    // real-clock: proves a rebuild does NOT happen: the file watcher's real debounce window must pass first
     std::thread::sleep(Duration::from_millis(400));
     assert_eq!(
         fixture.lines().iter().filter(|l| *l == "started").count(),
@@ -863,6 +865,7 @@ fn dev_keeps_the_running_application_when_a_build_fails() {
         "cargo build --locked --message-format=json-render-diagnostics --bin shop",
         2,
     );
+    // real-clock: proves a rebuild does NOT happen: the file watcher's real debounce window must pass first
     std::thread::sleep(Duration::from_millis(300));
     assert_eq!(
         fixture.lines().iter().filter(|l| *l == "started").count(),

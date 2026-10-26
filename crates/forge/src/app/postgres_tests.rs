@@ -143,6 +143,7 @@ fn refused_in_production(app: App, command: &'static [&'static str], url: &str) 
     let running = start(app, command, vars);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     while !running.is_finished() && std::time::Instant::now() < deadline {
+        // real-clock: polls a child process (an OS resource a fake clock cannot advance) until a deadline
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
     if !running.is_finished() {
@@ -379,6 +380,7 @@ mod jobs {
                 std::time::Instant::now() < deadline,
                 "the runtime did not run the work"
             );
+            // real-clock: polls state written by a background task through a real database, until a deadline
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
     }

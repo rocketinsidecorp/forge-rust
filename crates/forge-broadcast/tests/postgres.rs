@@ -46,6 +46,7 @@ impl Replica {
     async fn until_listening(&self) {
         tokio::time::timeout(WAIT, async {
             while !self.broker.listening() {
+                // real-clock: polls the broker's LISTEN connection, which a background task opens against a real database, until WAIT
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
         })

@@ -786,6 +786,7 @@ mod tests {
         let began = Instant::now();
         while !running.exited() {
             assert!(began.elapsed() < Duration::from_secs(5), "never exited");
+            // real-clock: polls a child process (an OS resource a fake clock cannot advance) until a deadline
             std::thread::sleep(Duration::from_millis(10));
         }
         let helper: u32 = fs::read_to_string(&pid_file)
@@ -804,6 +805,7 @@ mod tests {
         };
         let waited = Instant::now();
         while alive(helper) && waited.elapsed() < Duration::from_secs(5) {
+            // real-clock: polls a child process (an OS resource a fake clock cannot advance) until a deadline
             std::thread::sleep(Duration::from_millis(20));
         }
         assert!(!alive(helper), "the helper outlived the application");

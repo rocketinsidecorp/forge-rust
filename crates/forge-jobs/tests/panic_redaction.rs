@@ -120,6 +120,7 @@ async fn job_handler_panics_are_withheld_from_the_previous_hook() {
             break;
         }
         assert!(tokio::time::Instant::now() < deadline, "the job never died");
+        // real-clock: polls state written by a background task through a real database, until a deadline
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     shutdown.cancel();
