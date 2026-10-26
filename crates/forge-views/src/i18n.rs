@@ -730,11 +730,17 @@ mod tests {
             ("/pt/", StatusCode::OK, "/|pt|Olá, Ana!"),
             ("/PT-br/posts?x=1", StatusCode::OK, "/posts|pt-BR|Oi, Ana!"),
             ("/posts", StatusCode::OK, "/posts|en|Hello, Ana!"),
-            ("/pt/a%2Fb", StatusCode::OK, "/a%2Fb|pt|Olá, Ana!"),
+            // The stripped path still goes through the router's rules: an
+            // encoded slash is refused (Forge-Go's invalid_path).
+            ("/pt/a%2Fb", StatusCode::BAD_REQUEST, "bad request"),
             // Not a locale segment: nothing is stripped, the escaped path
-            // is routed as is.
+            // is routed as is (and refused for its encoded slashes).
             ("/pt-BRx/posts", StatusCode::NOT_FOUND, "not found"),
-            ("/pt-BR%2F..%2Fadmin", StatusCode::NOT_FOUND, "not found"),
+            (
+                "/pt-BR%2F..%2Fadmin",
+                StatusCode::BAD_REQUEST,
+                "bad request",
+            ),
         ] {
             let response = router.dispatch(request(target, "", "")).await;
             assert_eq!(response.status(), status, "{target}");

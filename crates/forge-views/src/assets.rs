@@ -524,7 +524,17 @@ mod tests {
             "/etc/passwd",
         ] {
             let response = router.dispatch(get(path)).await;
-            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+            // The router refuses dot segments and encoded separators with
+            // `400` (Forge-Go's rule); everything else finds no asset.
+            let refused = path.contains("..")
+                || path.contains("%2e")
+                || path.to_ascii_lowercase().contains("%2f");
+            let want = if refused {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::NOT_FOUND
+            };
+            assert_eq!(response.status(), want, "{path}");
         }
     }
 
