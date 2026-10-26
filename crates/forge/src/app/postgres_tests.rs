@@ -88,6 +88,8 @@ fn db_commands_fail_cleanly_when_the_server_is_unreachable() {
         config(&[
             ("FORGE_ENV", "production"),
             ("FORGE_MIGRATION_DATABASE_URL", url),
+            // The test server has no TLS; the refusal is about the flag.
+            ("FORGE_DATABASE_ALLOW_PLAINTEXT", "true"),
         ])
     });
     assert_eq!(production, ExitCode::FAILURE);

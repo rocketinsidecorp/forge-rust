@@ -499,6 +499,12 @@ if mail_error="$(FORGE_ENV=production FORGE_MAIL_URL="smtp://mailer:sk-mail-secr
 fi
 [[ "$mail_error" == *"FORGE_MAIL_ALLOW_PLAINTEXT"* && "$mail_error" != *"sk-mail-secret"* ]] \
   || fail "mail configuration errors must not echo the URL"
+if db_error="$(FORGE_ENV=production FORGE_DATABASE_URL="postgres://app:sk-db-secret@db.example.com/app" \
+  "$app_bin" healthcheck 2>&1)"; then
+  fail "production must refuse a database URL that does not verify the server certificate"
+fi
+[[ "$db_error" == *"sslmode=verify-full"* && "$db_error" != *"sk-db-secret"* ]] \
+  || fail "database TLS errors must say how to fix the URL and not echo it"
 if FORGE_ENV=production FORGE_MAIL_PREVIEW=true "$app_bin" healthcheck 2>/dev/null; then
   fail "production must refuse FORGE_MAIL_PREVIEW"
 fi

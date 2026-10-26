@@ -329,6 +329,38 @@ counts the running version, so 1 would prune the previous one and leave
 nothing to roll back to); use 2 to 100, default 5. The deploy lock also needs
 `~/.forge` on the hosts to be on a file system with hard links.
 
+### Database TLS and connection pool
+
+In production (`FORGE_ENV=production`, the container image's default) both
+`FORGE_DATABASE_URL` and `FORGE_MIGRATION_DATABASE_URL` must verify the
+database server's certificate, Forge-Go's rule: SQLx's default `sslmode=prefer`
+falls back to plaintext and `require` checks no certificate, so either could be
+intercepted. A URL that does not verify stops start-up with an error that says
+how to fix it and never prints the URL. Unix sockets and SQLite files need no
+TLS.
+
+```sh
+# PostgreSQL: verify-full; sslrootcert for a private CA
+export FORGE_DATABASE_URL='postgres://app_runtime:PASSWORD@db.internal:5432/shop?sslmode=verify-full&sslrootcert=/etc/ssl/db-ca.pem'
+# MySQL/MariaDB: VERIFY_IDENTITY; ssl-ca for a private CA
+export FORGE_DATABASE_URL='mysql://app:PASSWORD@db.internal:3306/shop?ssl-mode=VERIFY_IDENTITY'
+# only for a database reached over a trusted private network (the generated
+# compose.yaml sets it for its own db service)
+export FORGE_DATABASE_ALLOW_PLAINTEXT=true
+
+# the serving pool (Forge-Go's keys and defaults)
+export FORGE_DATABASE_MAX_CONNS=10                # 1 to 1000
+export FORGE_DATABASE_CONNECT_TIMEOUT=5s          # wait for a connection, opening one included
+export FORGE_DATABASE_STATEMENT_TIMEOUT=30s       # server-side bound of every statement, at least 1ms
+cargo run
+FORGE_ENV=production FORGE_DATABASE_URL='postgres://app:pw@db.internal/shop' cargo run -- healthcheck   # refused: no sslmode=verify-full
+```
+
+The statement timeout is PostgreSQL's `statement_timeout`, MariaDB's
+`max_statement_time` and MySQL's `max_execution_time` (read-only `SELECT`s
+only); SQLite has none. Migrations, `setup`, `seed` and the `db` commands run
+without it ([database](docs/database.md#connection-pool-and-tls)).
+
 ### Client addresses behind a proxy
 
 Sign-in and reset throttles, `forge::ratelimit::by_client_ip` and the
@@ -585,7 +617,9 @@ Kubernetes and systemd deployment is covered in
 - PostgreSQL-first generation with SQLx confined to the generated
   infrastructure/bootstrap boundary, reversible embedded migrations, separate
   least-privilege runtime/migration roles, transaction-local tenant/principal
-  RLS context, Argon2id password authentication with optimistic policy upgrades,
+  RLS context, Argon2id password authentication with optimistic policy upgrades
+  (at most one hash per CPU, 16 at most, at once: `503` instead of a memory
+  spike under a burst of sign-ins),
   independent 256-bit session/CSRF secrets, secure host-only cookie helpers,
   digest-only persisted
   sessions, tenant membership persistence, append-only PostgreSQL audit storage,
@@ -697,6 +731,19 @@ forge dev
 A code and a backup code work once, the code step allows five attempts per
 account and 60 per address in five minutes, and a challenge only works in the
 browser that entered the password.
+
+The sign-in, reset and two-factor counters live in PostgreSQL
+(`forge::auth::PgLoginThrottle`, table `forge_login_throttle`), so every
+replica shares one guessing budget and a restart or deploy resets nothing.
+Watch them, or add them to an application generated before
+([upgrading](docs/mfa.md#shared-attempt-throttles-forge-rust-qr2)):
+
+```sh
+psql "$FORGE_MIGRATION_DATABASE_URL" -c \
+  'SELECT scope, attempt_count, reset_at FROM forge_login_throttle ORDER BY reset_at DESC LIMIT 20'
+(cd /tmp && forge new shop-new -d postgresql --skip-docker --skip-ci --skip-lockfile)
+cp /tmp/shop-new/migrations/00000000000000000005_forge_login_throttle.*.sql migrations/ && forge migrate
+```
 
 ## Credentials and encrypted columns
 

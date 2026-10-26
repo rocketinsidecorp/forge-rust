@@ -266,8 +266,10 @@ Request layers (`forge_http::Middleware`) run before the route table. See
 Browser sign-in is generated application code in the HTTP adapter ring
 (`src/adapters/http/authentication.rs`, like Rails' authentication
 generator) over framework rules: `forge-auth` throttles attempts per account
-and source (`MemoryLoginThrottle`, bounded; when full it evicts idle
-counters and refuses only if every counter is blocking), defines the
+and source (`PgLoginThrottle` in PostgreSQL, shared by every replica, in
+generated applications; `MemoryLoginThrottle`, bounded, per process: when
+full it evicts idle counters and refuses only if every counter is blocking),
+bounds concurrent password hashing (`PasswordWorkLimiter`), defines the
 canonical ASCII login used for lookup, throttling and delivery, sets
 the new-password policy and issues one-time reset tokens persisted only as
 SHA-256 digests; `forge-tenancy` resolves tenants by slug and defines the

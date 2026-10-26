@@ -18,12 +18,23 @@ hmac.workspace = true
 ring.workspace = true
 sha1.workspace = true
 sha2.workspace = true
+sqlx = { workspace = true, features = ["postgres"], optional = true }
 subtle.workspace = true
 thiserror.workspace = true
+# PasswordWorkLimiter: a semaphore in front of the blocking pool.
+tokio.workspace = true
 zeroize.workspace = true
 
+[features]
+# `PgLoginThrottle`: the attempt throttle shared by every replica, in
+# PostgreSQL. `forge`'s `postgres` feature turns it on.
+postgres = ["dep:sqlx"]
+
 [dev-dependencies]
-tokio.workspace = true
+# The PostgreSQL throttle's contract tests (tests/throttle_contract.rs)
+# provision their own database.
+forge-auth = { path = ".", features = ["postgres"] }
+forge-db = { path = "../forge-db", features = ["postgres", "testing"] }
 
 [lints]
 workspace = true

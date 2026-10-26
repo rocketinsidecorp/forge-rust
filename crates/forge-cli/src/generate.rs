@@ -357,6 +357,14 @@ const TEMPLATES: &[Template] = &[
     ),
     template!(
         Group::Authentication,
+        "migrations/00000000000000000005_forge_login_throttle.up.sql" => "migrations/00000000000000000005_forge_login_throttle.up.sql.tmpl"
+    ),
+    template!(
+        Group::Authentication,
+        "migrations/00000000000000000005_forge_login_throttle.down.sql" => "migrations/00000000000000000005_forge_login_throttle.down.sql.tmpl"
+    ),
+    template!(
+        Group::Authentication,
         "src/infrastructure/accounts/mod.rs" => "src/infrastructure/accounts/mod.rs.tmpl"
     ),
     template!(

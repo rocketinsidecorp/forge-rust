@@ -106,7 +106,14 @@ only hex-encodes random bytes and selects parameters/attributes.
 The initial Argon2id policy is version 19, m=19456 KiB, t=2, p=1, 32-byte output.
 This matches the current OWASP minimum profile and is a floor, not a permanent
 performance target. Production sizing must benchmark authentication latency and
-memory concurrency before raising parameters.
+memory concurrency before raising parameters. Concurrency is bounded: every hash
+and verification of the process goes through one
+`forge::auth::PasswordWorkLimiter` (one slot per CPU, at most 16, about
+300 MiB; an attempt that waits more than two seconds for a slot is
+unavailable, `503`), so Tokio's 512 blocking threads can never hold 19 MiB
+each. The limiter is a Tokio semaphore: `forge-auth` now depends on `tokio`
+(previously only a dev-dependency there, already in the locked graph), so
+no crate is added.
 
 The RustSec review recorded during admission found historical advisories in old
 `cookie` and `sha2` releases (RUSTSEC-2017-0005 and RUSTSEC-2021-0100);

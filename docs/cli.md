@@ -416,7 +416,7 @@ tests/authentication_postgres.rs            setup and reset tokens against TestD
 It refuses to overwrite any of them (or an existing
 `*_forge_authentication.up.sql`), never edits an existing file and prints
 the wiring: four `pub mod` lines, the statements to append to `fn compose`
-(the stores, Argon2id, two `MemoryLoginThrottle`s, the reset notifier from
+(the stores, Argon2id, the PostgreSQL `PgLoginThrottle`s, the reset notifier from
 `forge::mail::password_reset_notifier`, the `/_mail` reset-email preview and
 the audit sink) and the
 `.command("setup", setup::SUMMARY, setup::run)` line for `fn run`.

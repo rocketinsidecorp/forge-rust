@@ -19,8 +19,10 @@
 //! Counters are indexed in expiry order, so an attempt removes only the
 //! counters that expired since the last one and never scans the table under
 //! its lock (Forge-Go's `MemoryLoginThrottler` keeps a creation-order list).
-//! A horizontally scaled deployment needs a shared [`LoginThrottle`]
-//! implementation; counters of one process do not limit another.
+//! Counters of one process do not limit another, and a restart forgets them:
+//! a horizontally scaled or regularly redeployed application needs a shared
+//! [`LoginThrottle`], such as `PgLoginThrottle` (feature `postgres`), which
+//! generated PostgreSQL applications use.
 
 use std::{
     collections::{BTreeMap, HashMap, hash_map::Entry},
@@ -163,6 +165,69 @@ impl Default for ThrottleConfig {
             source_limit: 300,
             max_entries: 20_000,
         }
+    }
+}
+
+impl ThrottleConfig {
+    /// Positive window and limits, and room for one attempt's three keys.
+    pub(crate) fn validate(&self) -> Result<(), ThrottleConfigError> {
+        if self.window.is_zero()
+            || self.pair_limit == 0
+            || self.account_limit == 0
+            || self.source_limit == 0
+            || self.max_entries < 3
+        {
+            return Err(ThrottleConfigError);
+        }
+        Ok(())
+    }
+}
+
+/// One counter an attempt touches, as a shared store keeps it: Forge-Go's
+/// scope numbers (1 account, 2 source, 3 pair), the key's digest and the
+/// scope's limit.
+#[cfg(feature = "postgres")]
+#[derive(Clone, Copy)]
+pub(crate) struct StoredCounter {
+    pub(crate) scope: i16,
+    pub(crate) digest: [u8; 32],
+    pub(crate) limit: u32,
+}
+
+#[cfg(feature = "postgres")]
+impl ThrottleKey {
+    /// The counters of this key under `config`, in scope order.
+    pub(crate) fn stored_counters(&self, config: &ThrottleConfig) -> Vec<StoredCounter> {
+        let mut counters = vec![StoredCounter {
+            scope: 1,
+            digest: self.account,
+            limit: config.account_limit,
+        }];
+        if let Some(source) = self.source {
+            counters.push(StoredCounter {
+                scope: 2,
+                digest: source,
+                limit: config.source_limit,
+            });
+        }
+        if let Some(pair) = self.pair {
+            counters.push(StoredCounter {
+                scope: 3,
+                digest: pair,
+                limit: config.pair_limit,
+            });
+        }
+        counters
+    }
+
+    /// The counters [`LoginThrottle::success`] clears: the account's and
+    /// the pair's, never the source's.
+    pub(crate) fn cleared_on_success(&self) -> Vec<(i16, [u8; 32])> {
+        let mut cleared = vec![(1, self.account)];
+        if let Some(pair) = self.pair {
+            cleared.push((3, pair));
+        }
+        cleared
     }
 }
 
@@ -332,14 +397,7 @@ impl MemoryLoginThrottle {
         config: ThrottleConfig,
         clock: impl Fn() -> Instant + Send + Sync + 'static,
     ) -> Result<Self, ThrottleConfigError> {
-        if config.window.is_zero()
-            || config.pair_limit == 0
-            || config.account_limit == 0
-            || config.source_limit == 0
-            || config.max_entries < 3
-        {
-            return Err(ThrottleConfigError);
-        }
+        config.validate()?;
         Ok(Self {
             config,
             clock: Arc::new(clock),

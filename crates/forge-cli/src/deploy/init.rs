@@ -54,7 +54,10 @@ env:
   # `migrate` runs with the same env file, so the role's containers also
   # hold FORGE_MIGRATION_DATABASE_URL. To keep the schema-owner credential
   # out of them, drop it here, set migrate.enabled: false and run
-  # migrations as a separate job (docs/deployment.md).
+  # migrations as a separate job (docs/deployment.md). In production both
+  # URLs must verify the server certificate: ?sslmode=verify-full
+  # (PostgreSQL) or ?ssl-mode=VERIFY_IDENTITY (MySQL/MariaDB), unless
+  # FORGE_DATABASE_ALLOW_PLAINTEXT is "true" for a trusted private network.
   secret:
     - FORGE_DATABASE_URL
     - FORGE_MIGRATION_DATABASE_URL

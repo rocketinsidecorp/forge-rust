@@ -62,19 +62,30 @@ impl Declaration {
         }
     }
 
-    /// Creates the lazily connecting pool for `serve`. Must run inside the
-    /// Tokio runtime.
-    pub(crate) fn connect_lazy(&self, url: &SecretString) -> Result<DatabaseHandle, DbError> {
-        let _ = url;
+    /// Creates the lazily connecting pool for `serve` and `jobs work`, sized
+    /// and bounded by `FORGE_DATABASE_MAX_CONNS`,
+    /// `FORGE_DATABASE_CONNECT_TIMEOUT` and `FORGE_DATABASE_STATEMENT_TIMEOUT`.
+    /// Must run inside the Tokio runtime.
+    pub(crate) fn connect_lazy(
+        &self,
+        url: &SecretString,
+        config: &DatabaseConfig,
+    ) -> Result<DatabaseHandle, DbError> {
+        let settings = forge_db::PoolSettings::from_config(config);
+        let _ = (url, settings);
         match *self {
             #[cfg(feature = "postgres")]
             Self::Postgres(_) => {
-                forge_db::Database::connect_lazy(url).map(DatabaseHandle::Postgres)
+                forge_db::Database::connect_lazy_with(url, settings).map(DatabaseHandle::Postgres)
             }
             #[cfg(feature = "mysql")]
-            Self::MySql(_) => forge_db::Database::connect_lazy(url).map(DatabaseHandle::MySql),
+            Self::MySql(_) => {
+                forge_db::Database::connect_lazy_with(url, settings).map(DatabaseHandle::MySql)
+            }
             #[cfg(feature = "sqlite")]
-            Self::Sqlite(_) => forge_db::Database::connect_lazy(url).map(DatabaseHandle::Sqlite),
+            Self::Sqlite(_) => {
+                forge_db::Database::connect_lazy_with(url, settings).map(DatabaseHandle::Sqlite)
+            }
         }
     }
 

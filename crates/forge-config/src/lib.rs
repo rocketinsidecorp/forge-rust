@@ -69,6 +69,14 @@ const STREAMS_KEY_CONTRACT: &str = "base64 (standard or URL-safe, padded or not)
      random bytes, such as `openssl rand -base64 32` prints";
 /// Bounds of the decoded storage signing key, in bytes.
 pub const STORAGE_SIGNING_KEY_BYTES: std::ops::RangeInclusive<usize> = 32..=1024;
+const DEFAULT_DATABASE_MAX_CONNS: u32 = 10;
+/// Forge-Go's bound of `FORGE_DATABASE_MAX_CONNS`.
+const MAX_DATABASE_MAX_CONNS: u32 = 1000;
+const DEFAULT_DATABASE_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_DATABASE_STATEMENT_TIMEOUT: Duration = Duration::from_secs(30);
+/// The largest `statement_timeout` PostgreSQL accepts (an `int` of
+/// milliseconds, about 24.8 days).
+const MAX_DATABASE_STATEMENT_TIMEOUT: Duration = Duration::from_millis(i32::MAX as u64);
 const DATABASE_URL_CONTRACT: &str =
     "a connection URL starting with postgres://, postgresql://, mysql://, mariadb:// or sqlite:";
 
@@ -93,6 +101,10 @@ pub const KNOWN_KEYS: &[&str] = &[
     "FORGE_LOG_FORMAT",
     "FORGE_DATABASE_URL",
     "FORGE_MIGRATION_DATABASE_URL",
+    "FORGE_DATABASE_MAX_CONNS",
+    "FORGE_DATABASE_CONNECT_TIMEOUT",
+    "FORGE_DATABASE_STATEMENT_TIMEOUT",
+    "FORGE_DATABASE_ALLOW_PLAINTEXT",
     SETUP_PASSWORD_KEY,
     "FORGE_RATE_LIMIT_MAX_KEYS",
     "FORGE_CACHE_MAX_ENTRIES",
@@ -713,13 +725,50 @@ impl Serialize for SecretString {
 }
 
 /// Database settings after validation.
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+///
+/// The pool keys (`FORGE_DATABASE_MAX_CONNS`, `FORGE_DATABASE_CONNECT_TIMEOUT`,
+/// `FORGE_DATABASE_STATEMENT_TIMEOUT`) are Forge-Go's, with its defaults and
+/// bounds; they size the serving process's pool. In `production` both URLs
+/// must verify the server's TLS certificate
+/// ([`database_url::require_verified_tls`]) unless
+/// `FORGE_DATABASE_ALLOW_PLAINTEXT=true`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct DatabaseConfig {
     /// Least-privilege runtime URL (PostgreSQL, MySQL/MariaDB or SQLite).
     /// Optional for database-free apps.
     pub url: Option<SecretString>,
     /// Privileged URL used only by migrate/rollback commands.
     pub migration_url: Option<SecretString>,
+    /// Most connections of the serving pool (`FORGE_DATABASE_MAX_CONNS`,
+    /// 1 to 1000, default 10).
+    pub max_connections: u32,
+    /// How long a query waits for a pooled connection, opening one included
+    /// (`FORGE_DATABASE_CONNECT_TIMEOUT`, positive, default 5 s).
+    pub connect_timeout: Duration,
+    /// Server-side bound of every statement of the serving pool
+    /// (`FORGE_DATABASE_STATEMENT_TIMEOUT`, 1 ms to about 24 days, default
+    /// 30 s): `statement_timeout` on PostgreSQL, `max_statement_time` on
+    /// MariaDB, `max_execution_time` (`SELECT` only) on MySQL, none on
+    /// SQLite. Migrations and application commands run without it.
+    pub statement_timeout: Duration,
+    /// Accepts a `production` URL that does not verify the server's TLS
+    /// certificate (`FORGE_DATABASE_ALLOW_PLAINTEXT`), for a database reached
+    /// only over a trusted private network.
+    pub allow_plaintext: bool,
+}
+
+impl Default for DatabaseConfig {
+    fn default() -> Self {
+        Self {
+            url: None,
+            migration_url: None,
+            max_connections: DEFAULT_DATABASE_MAX_CONNS,
+            connect_timeout: DEFAULT_DATABASE_CONNECT_TIMEOUT,
+            statement_timeout: DEFAULT_DATABASE_STATEMENT_TIMEOUT,
+            allow_plaintext: false,
+        }
+    }
 }
 
 impl DatabaseConfig {
@@ -1068,6 +1117,7 @@ impl AppConfig {
             config.database.migration_url =
                 Some(parse_secret_url("FORGE_MIGRATION_DATABASE_URL", value)?);
         }
+        apply_database(&lookup, &mut config)?;
         apply_services(&lookup, &mut config)?;
         if let Some(value) = lookup(I18N_DEFAULT_LOCALE_KEY)
             && !value.is_empty()
@@ -1110,6 +1160,67 @@ fn parse_locale(value: String) -> Result<String, ConfigError> {
             expected: "a locale such as en or pt-BR (language[-Script][-REGION])",
         }),
     }
+}
+
+/// Reads the pool and transport keys of the database and applies the
+/// production TLS rule to both URLs (Forge-Go's `config/database.go`).
+fn apply_database(
+    lookup: &impl Fn(&str) -> Option<String>,
+    config: &mut AppConfig,
+) -> Result<(), ConfigError> {
+    let database = &mut config.database;
+    if let Some(value) = lookup("FORGE_DATABASE_MAX_CONNS") {
+        database.max_connections = parse_bounded(
+            "FORGE_DATABASE_MAX_CONNS",
+            value.trim(),
+            1..=MAX_DATABASE_MAX_CONNS,
+            "an integer from 1 to 1000",
+        )?;
+    }
+    if let Some(value) = lookup("FORGE_DATABASE_CONNECT_TIMEOUT") {
+        database.connect_timeout = telemetry::parse_go_duration(value.trim())
+            .filter(|timeout| !timeout.is_zero())
+            .ok_or_else(|| ConfigError::InvalidValue {
+                key: "FORGE_DATABASE_CONNECT_TIMEOUT",
+                value: value.clone(),
+                expected: "a positive duration such as 5s",
+            })?;
+    }
+    if let Some(value) = lookup("FORGE_DATABASE_STATEMENT_TIMEOUT") {
+        // The databases take milliseconds and read 0 as "no timeout", so a
+        // sub-millisecond value would silently turn the bound off.
+        database.statement_timeout = telemetry::parse_go_duration(value.trim())
+            .filter(|timeout| {
+                (Duration::from_millis(1)..=MAX_DATABASE_STATEMENT_TIMEOUT).contains(timeout)
+            })
+            .ok_or_else(|| ConfigError::InvalidValue {
+                key: "FORGE_DATABASE_STATEMENT_TIMEOUT",
+                value: value.clone(),
+                expected: "a duration such as 30s, from 1ms to 596h",
+            })?;
+    }
+    if let Some(value) = lookup("FORGE_DATABASE_ALLOW_PLAINTEXT") {
+        database.allow_plaintext = telemetry::parse_bool("FORGE_DATABASE_ALLOW_PLAINTEXT", &value)?;
+    }
+    if config.environment != Environment::Production || database.allow_plaintext {
+        return Ok(());
+    }
+    for (key, url) in [
+        ("FORGE_DATABASE_URL", &database.url),
+        ("FORGE_MIGRATION_DATABASE_URL", &database.migration_url),
+    ] {
+        if let Some(url) = url {
+            database_url::require_verified_tls(url).map_err(|expected| {
+                // The rejected value is a credential-bearing URL: never echo it.
+                ConfigError::InvalidValue {
+                    key,
+                    value: REDACTED.to_owned(),
+                    expected,
+                }
+            })?;
+        }
+    }
+    Ok(())
 }
 
 /// Reads the rate limit, cache, storage and streams keys.
@@ -1860,8 +1971,12 @@ mod tests {
             "trusted-proxy",
             "debug",
             "json",
-            "postgres://runtime:secret@localhost/app",
-            "postgres://migrator:secret@localhost/app",
+            "postgres://runtime:secret@localhost/app?sslmode=verify-full",
+            "postgres://migrator:secret@localhost/app?sslmode=verify-full",
+            "50",
+            "2s",
+            "15s",
+            "false",
             "correct horse battery staple",
             "1000",
             "100",
@@ -1942,6 +2057,134 @@ mod tests {
             .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
             .collect();
         AppConfig::from_lookup(|key| values.get(key).cloned())
+    }
+
+    #[test]
+    fn database_pool_keys_default_to_forge_gos_values_and_are_bounded() {
+        let config = load(&[]).expect("defaults are valid");
+        assert_eq!(config.database.max_connections, 10);
+        assert_eq!(config.database.connect_timeout, Duration::from_secs(5));
+        assert_eq!(config.database.statement_timeout, Duration::from_secs(30));
+        assert!(!config.database.allow_plaintext);
+
+        let config = load(&[
+            ("FORGE_DATABASE_MAX_CONNS", "1000"),
+            ("FORGE_DATABASE_CONNECT_TIMEOUT", "1m30s"),
+            ("FORGE_DATABASE_STATEMENT_TIMEOUT", "1ms"),
+        ])
+        .expect("valid");
+        assert_eq!(config.database.max_connections, 1000);
+        assert_eq!(config.database.connect_timeout, Duration::from_secs(90));
+        assert_eq!(config.database.statement_timeout, Duration::from_millis(1));
+        let config = load(&[("FORGE_DATABASE_STATEMENT_TIMEOUT", "596h")]).expect("valid");
+        assert_eq!(
+            config.database.statement_timeout,
+            Duration::from_secs(596 * 3600)
+        );
+
+        for (key, value) in [
+            ("FORGE_DATABASE_MAX_CONNS", "0"),
+            ("FORGE_DATABASE_MAX_CONNS", "1001"),
+            ("FORGE_DATABASE_MAX_CONNS", "-1"),
+            ("FORGE_DATABASE_MAX_CONNS", "ten"),
+            ("FORGE_DATABASE_CONNECT_TIMEOUT", "0"),
+            ("FORGE_DATABASE_CONNECT_TIMEOUT", "0s"),
+            ("FORGE_DATABASE_CONNECT_TIMEOUT", "5"),
+            ("FORGE_DATABASE_CONNECT_TIMEOUT", "-1s"),
+            // 0 is "no timeout" to the databases; under 1ms rounds to it.
+            ("FORGE_DATABASE_STATEMENT_TIMEOUT", "0"),
+            ("FORGE_DATABASE_STATEMENT_TIMEOUT", "999us"),
+            ("FORGE_DATABASE_STATEMENT_TIMEOUT", "597h"),
+            ("FORGE_DATABASE_STATEMENT_TIMEOUT", "soon"),
+            ("FORGE_DATABASE_ALLOW_PLAINTEXT", "yes"),
+        ] {
+            match load(&[(key, value)]) {
+                Err(ConfigError::InvalidValue { key: refused, .. }) => {
+                    assert_eq!(refused, key, "{key}={value}");
+                }
+                other => panic!("{key}={value} must be refused, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn production_database_urls_must_verify_the_server_certificate() {
+        let production = |pairs: &[(&str, &str)]| {
+            let mut all = vec![("FORGE_ENV", "production")];
+            all.extend_from_slice(pairs);
+            load(&all)
+        };
+        for key in ["FORGE_DATABASE_URL", "FORGE_MIGRATION_DATABASE_URL"] {
+            for (url, contract) in [
+                (
+                    "postgres://app:hunter2@db.internal/shop",
+                    database_url::POSTGRES_TLS_REQUIRED,
+                ),
+                (
+                    "postgres://app:hunter2@db.internal/shop?sslmode=require",
+                    database_url::POSTGRES_TLS_REQUIRED,
+                ),
+                (
+                    "mariadb://app:hunter2@db.internal/shop?ssl-mode=REQUIRED",
+                    database_url::MYSQL_TLS_REQUIRED,
+                ),
+            ] {
+                let error = production(&[(key, url)]).expect_err(url);
+                assert_eq!(
+                    error,
+                    ConfigError::InvalidValue {
+                        key,
+                        value: REDACTED.to_owned(),
+                        expected: contract,
+                    }
+                );
+                let message = error.to_string();
+                assert!(!message.contains("hunter2"), "{message}");
+                assert!(message.contains(key), "{message}");
+                assert!(
+                    message.contains("FORGE_DATABASE_ALLOW_PLAINTEXT=true"),
+                    "{message}"
+                );
+
+                // The escape hatch, and the rule applies only to production.
+                let allowed = production(&[(key, url), ("FORGE_DATABASE_ALLOW_PLAINTEXT", "true")])
+                    .expect("plaintext allowed");
+                assert!(allowed.database.allow_plaintext);
+                assert!(
+                    production(&[(key, url), ("FORGE_DATABASE_ALLOW_PLAINTEXT", "false")]).is_err()
+                );
+                for environment in ["development", "test"] {
+                    load(&[("FORGE_ENV", environment), (key, url)]).expect(environment);
+                }
+            }
+            for url in [
+                "postgres://app:pw@db.internal/shop?sslmode=verify-full&sslrootcert=/ca.pem",
+                "mysql://app:pw@db.internal/shop?ssl-mode=VERIFY_IDENTITY",
+                "postgres:///shop?host=/var/run/postgresql",
+                "sqlite:///var/lib/app/app.db",
+            ] {
+                production(&[(key, url)]).expect(url);
+            }
+        }
+        // One verified URL does not excuse the other.
+        let error = production(&[
+            (
+                "FORGE_DATABASE_URL",
+                "postgres://app:pw@db/shop?sslmode=verify-full",
+            ),
+            (
+                "FORGE_MIGRATION_DATABASE_URL",
+                "postgres://owner:pw@db/shop",
+            ),
+        ])
+        .expect_err("migration URL is plaintext");
+        assert!(matches!(
+            error,
+            ConfigError::InvalidValue {
+                key: "FORGE_MIGRATION_DATABASE_URL",
+                ..
+            }
+        ));
     }
 
     #[test]

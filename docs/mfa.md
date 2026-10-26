@@ -78,12 +78,13 @@ authenticator: both sign out everywhere.
 2. The code step accepts a code of the current period or one period before or
    after, or an unused backup code. It counts five attempts per account and 60
    per network address in five minutes before checking anything.
-   The counters, like the sign-in ones, live in the memory of each process
-   (`MemoryLoginThrottle`): with several replicas the limits multiply by the
-   number of replicas, a restart clears them, and under pressure counters
-   below their limit can be evicted. A deployment that scales out needs a
-   shared `forge::auth::LoginThrottle` implementation; Forge-Rust does not
-   ship one yet (Forge-Go has a PostgreSQL one).
+   The counters, like the sign-in and reset ones, live in PostgreSQL
+   (`forge::auth::PgLoginThrottle`, the `forge_login_throttle` table of
+   migration `00000000000000000005_forge_login_throttle`, Forge-Go's table):
+   every replica counts against the same rows and a restart or deploy clears
+   nothing. Each attempt deletes up to eight expired counters, so the table
+   stays at the size of the live windows. If the table cannot be reached
+   the attempt is refused (`503`), never let through.
 3. The challenge and the code are consumed in one transaction: a code (its
    period) and a backup code work once, also under concurrent requests. Then
    the session and a new CSRF token are issued as for a password sign-in.
@@ -141,14 +142,15 @@ deadlocking. Custom `MfaStore` implementations should keep that order.
 
 ```rust
 use std::sync::Arc;
-use forge::auth::{Aes256GcmSecretCipher, MemoryLoginThrottle, TotpSecret};
+use forge::auth::{Aes256GcmSecretCipher, PgLoginThrottle, TotpSecret};
 use forge::tenancy::{MfaChangeRequest, MfaService, mfa_throttle_config};
 
 let cipher = Aes256GcmSecretCipher::from_base64url(&key)?;
 let mfa = MfaService::new(
-    Arc::new(PgMfaStore::new(pool)),
+    Arc::new(PgMfaStore::new(pool.clone())),
     Some(Arc::new(cipher)),
-    Arc::new(MemoryLoginThrottle::new(mfa_throttle_config())?),
+    // Shared by every replica; MemoryLoginThrottle counts per process.
+    Arc::new(PgLoginThrottle::new(pool, mfa_throttle_config())?),
 );
 let enrollment = mfa.begin(principal, MfaChangeRequest::Enrollment, "shop", "ada@example.com", now).await?;
 let backup_codes = mfa.confirm(principal, MfaChangeRequest::Enrollment, "123456", now).await?;
@@ -223,6 +225,28 @@ done
   link) and source, 10 per login (or link), 30 per source. Three rejected new
   passwords on one link from one address lock that link for an hour (a new
   link can be requested); without a mailer a reset request queues nothing.
+
+### Shared attempt throttles (forge-rust QR2)
+
+Sign-in, reset and two-factor counters moved from each process's memory to
+PostgreSQL (`forge::auth::PgLoginThrottle`). New applications get the
+migration and the wiring. An application generated before keeps its
+per-process `MemoryLoginThrottle`s until it adds the migration and changes
+three lines of `fn compose` in `src/bootstrap/mod.rs`:
+
+```bash
+(cd /tmp && forge new shop-new -d postgresql --skip-docker --skip-ci --skip-lockfile)
+cp /tmp/shop-new/migrations/00000000000000000005_forge_login_throttle.*.sql migrations/
+forge migrate
+diff -u src/bootstrap/mod.rs /tmp/shop-new/src/bootstrap/mod.rs   # the `throttle` closure
+```
+
+Each `forge::auth::MemoryLoginThrottle::new(CONFIG)` becomes
+`forge::auth::PgLoginThrottle::new(pool.clone(), CONFIG)` with the same
+`CONFIG` (`ThrottleConfig::default()`, `password_reset_throttle_config()`,
+`mfa_throttle_config()`). The migration's runtime grant names `app_runtime`;
+grant `SELECT, INSERT, UPDATE, DELETE ON forge_login_throttle` to another
+runtime role yourself. Without the table every attempt is refused (`503`).
 
 ## Not included
 

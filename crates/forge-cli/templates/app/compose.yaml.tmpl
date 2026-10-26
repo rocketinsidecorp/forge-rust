@@ -77,6 +77,12 @@ services:
     command: ["migrate"]
     environment:
       FORGE_MIGRATION_DATABASE_URL: %%DATABASE_MIGRATION_URL_CONTAINER%%
+%%if !sqlite%%
+      # The image runs with FORGE_ENV=production, which requires a verified
+      # TLS database URL; the db service is reached only over this private
+      # compose network.
+      FORGE_DATABASE_ALLOW_PLAINTEXT: "true"
+%%end%%
     read_only: true
 %%if sqlite%%
     tmpfs:
@@ -104,6 +110,10 @@ services:
       FORGE_LOG: info
 %%if database%%
       FORGE_DATABASE_URL: %%DATABASE_RUNTIME_URL_CONTAINER%%
+%%if !sqlite%%
+      # Plaintext only over the private compose network (see migrate).
+      FORGE_DATABASE_ALLOW_PLAINTEXT: "true"
+%%end%%
 %%end%%
 %%if authentication%%
       # Two-factor authentication (ADR 0040): export a key before

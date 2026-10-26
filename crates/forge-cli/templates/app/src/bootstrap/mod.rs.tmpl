@@ -74,8 +74,9 @@ fn compose(composition: &mut forge::Composition<'_>) -> Result<(), forge::Compos
     crate::adapters::http::routes(composition.router(), &site)?;
 %%if authentication%%
     // Sign-in, sign-out, password-reset and two-factor pages (ADR 0026,
-    // ADR 0040), with the PostgreSQL identity stores, Argon2id and
-    // per-process attempt throttles.
+    // ADR 0040), with the PostgreSQL identity stores, Argon2id and attempt
+    // throttles kept in PostgreSQL (forge_login_throttle), so every replica
+    // shares one budget and a restart resets nothing.
     // Reset links are emailed (ADR 0035) once FORGE_MAIL_URL, FORGE_MAIL_FROM
     // and FORGE_AUTH_PASSWORD_RESET_URL are set; without FORGE_MAIL_URL the
     // notifier fails closed and delivers nothing, and FORGE_MAIL_URL without
@@ -102,8 +103,8 @@ fn compose(composition: &mut forge::Composition<'_>) -> Result<(), forge::Compos
         composition.router().layer(previews);
     }
     let pool = composition.postgres()?.pool().clone();
-    let throttle = || {
-        forge::auth::MemoryLoginThrottle::new(forge::auth::ThrottleConfig::default())
+    let throttle = |config| {
+        forge::auth::PgLoginThrottle::new(pool.clone(), config)
             .map(std::sync::Arc::new)
             .map_err(forge::ComposeError::other)
     };
@@ -125,10 +126,7 @@ fn compose(composition: &mut forge::Composition<'_>) -> Result<(), forge::Compos
             pool.clone(),
         )),
         mfa_cipher,
-        std::sync::Arc::new(
-            forge::auth::MemoryLoginThrottle::new(forge::tenancy::mfa_throttle_config())
-                .map_err(forge::ComposeError::other)?,
-        ),
+        throttle(forge::tenancy::mfa_throttle_config())?,
     );
     let ports = crate::adapters::http::authentication::AuthenticationPorts {
         credentials: std::sync::Arc::new(
@@ -148,14 +146,11 @@ fn compose(composition: &mut forge::Composition<'_>) -> Result<(), forge::Compos
             pool.clone(),
         )),
         notifier,
-        audit: std::sync::Arc::new(crate::infrastructure::audit::PgAuditSink::new(pool)),
-        sign_in_throttle: throttle()?,
+        audit: std::sync::Arc::new(crate::infrastructure::audit::PgAuditSink::new(pool.clone())),
+        sign_in_throttle: throttle(forge::auth::ThrottleConfig::default())?,
         // Forge-Go's recovery limits: 3 per login and source, 10 per login
         // and 30 per source in an hour.
-        reset_throttle: std::sync::Arc::new(
-            forge::auth::MemoryLoginThrottle::new(forge::auth::password_reset_throttle_config())
-                .map_err(forge::ComposeError::other)?,
-        ),
+        reset_throttle: throttle(forge::auth::password_reset_throttle_config())?,
         mfa,
     };
     crate::adapters::http::authentication::routes(composition, &site, ports)?;
