@@ -1,0 +1,35 @@
+-- Forge's shared attempt throttle for sign-in, password reset and two-factor
+-- steps (forge::auth::PgLoginThrottle, Forge-Go's forge_login_throttle):
+-- every replica counts against the same rows, and a restart or deploy
+-- forgets nothing. A counter is keyed by its scope (1 account, 2 network
+-- source, 3 account and source together) and a SHA-256 digest of the
+-- throttle's name with the login, the client address or both, so no login,
+-- address or tenant is stored; the table holds no tenant data and needs no
+-- row-level security (sign-in runs before a tenant context exists). A row
+-- lives for one window: each attempt deletes up to 8 expired rows, so the
+-- table stays at the size of the live windows.
+
+CREATE TABLE forge_login_throttle (
+    scope smallint NOT NULL CHECK (scope IN (1, 2, 3)),
+    key_hash bytea NOT NULL CHECK (octet_length(key_hash) = 32),
+    -- 0 only inside the attempt that creates the row: it is created empty,
+    -- locked, then counted, so concurrent first attempts serialize on it.
+    attempt_count integer NOT NULL CHECK (attempt_count >= 0),
+    reset_at timestamptz NOT NULL,
+    PRIMARY KEY (scope, key_hash)
+);
+
+CREATE INDEX forge_login_throttle_reset_at_idx
+ON forge_login_throttle (reset_at);
+
+REVOKE ALL ON TABLE forge_login_throttle FROM PUBLIC;
+
+-- The runtime role counts, clears and prunes counters.
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'app_runtime') THEN
+        REVOKE ALL ON TABLE forge_login_throttle FROM app_runtime;
+        GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE forge_login_throttle TO app_runtime;
+    END IF;
+END
+$$;

@@ -732,6 +732,19 @@ A code and a backup code work once, the code step allows five attempts per
 account and 60 per address in five minutes, and a challenge only works in the
 browser that entered the password.
 
+The sign-in, reset and two-factor counters live in PostgreSQL
+(`forge::auth::PgLoginThrottle`, table `forge_login_throttle`), so every
+replica shares one guessing budget and a restart or deploy resets nothing.
+Watch them, or add them to an application generated before
+([upgrading](docs/mfa.md#shared-attempt-throttles-forge-rust-qr2)):
+
+```sh
+psql "$FORGE_MIGRATION_DATABASE_URL" -c \
+  'SELECT scope, attempt_count, reset_at FROM forge_login_throttle ORDER BY reset_at DESC LIMIT 20'
+(cd /tmp && forge new shop-new -d postgresql --skip-docker --skip-ci --skip-lockfile)
+cp /tmp/shop-new/migrations/00000000000000000005_forge_login_throttle.*.sql migrations/ && forge migrate
+```
+
 ## Credentials and encrypted columns
 
 Secrets live encrypted in `config/credentials/<environment>.json.enc`, which is

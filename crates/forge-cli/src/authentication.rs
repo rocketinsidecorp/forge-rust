@@ -203,6 +203,7 @@ fn refuse_collisions(root: &Path, files: &[File]) -> Result<(), CliError> {
             .filter(|name| {
                 name.ends_with("_forge_authentication.up.sql")
                     || name.ends_with("_forge_mfa.up.sql")
+                    || name.ends_with("_forge_login_throttle.up.sql")
             })
             .map(|name| format!("migrations/{name}"))
             .filter(|path| !existing.contains(path))
@@ -366,7 +367,7 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("refusing to overwrite"), "{message}");
         assert!(message.contains("... and "), "{message}");
-        assert!(message.contains("\n  src/"), "{message}");
+        assert!(message.contains("\n  migrations/"), "{message}");
 
         // A renamed authentication migration also counts.
         strip(&root);

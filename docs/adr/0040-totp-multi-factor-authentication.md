@@ -90,6 +90,6 @@ secrets redacted everywhere, and sign-in pages generated into the application
 - Forge-Rust has no JSON login API, so there is no `POST /auth/mfa/complete`
   bearer route; the browser code step is the only completion path.
 - Counters are per process (`MemoryLoginThrottle`); horizontally scaled
-  deployments need a shared `LoginThrottle`, as for sign-in.
+  deployments need a shared `LoginThrottle`, as for sign-in. Update (2026-10-26): generated applications now use the shared `PgLoginThrottle` (the `forge_login_throttle` table, Forge-Go's schema); `MemoryLoginThrottle` remains for tests and custom wiring.
 - Expired enrollments and consumed challenges stay in their tables until a
   cleanup job removes them (Forge-Go's `PruneMFA` is not ported yet).

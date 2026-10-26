@@ -20,6 +20,8 @@ the work is finished and waiting for its review; **Planned** means not started.
 | Persistent jobs, cron, outbox | Solid Queue | Done | Done (framework crates); In review (`forge new` wires the job queue into PostgreSQL applications: `jobs` feature, `.jobs(WorkerMode::InServe)`, `jobs_configure`) |
 | Mailer with previews | Action Mailer | Done | Done (`forge::mail`, password-reset emails, `/_mail` previews, [ADR 0035](adr/0035-mail.md); `forge generate mailer`, [ADR 0038](adr/0038-generators-and-destroy.md)) |
 | Rate limiting | `rate_limit` | Done | Done |
+| Sign-in, reset and MFA throttles shared by replicas | `rate_limit` with a shared cache store | Done (`auth/postgres` `LoginThrottler`, `forge_login_throttle`) | In review (`forge::auth::PgLoginThrottle`, same table and transaction, wired in generated PostgreSQL applications; see follow-ups) |
+| Bounded memory-hard password hashing | — | Not needed (PBKDF2, no per-hash memory) | In review (`forge::auth::PasswordWorkLimiter`: one Argon2id hash per CPU, at most 16, then `503`) |
 | Client address behind trusted proxies | `request.remote_ip`, `trusted_proxies` | Done (`FORGE_HTTP_TRUSTED_PROXIES`, ADR 0037) | Done (`FORGE_HTTP_TRUSTED_PROXIES`, ADR 0032; `forge deploy` sets it for the proxied role, [ADR 0042](adr/0042-forge-deploy.md)) |
 | `HEAD` on every `GET` route | `HEAD` routed to `GET` | Done (`http.ServeMux`) | In review (the router serves `HEAD` with the `GET` route unless a `HEAD` route exists, the server drops the body, `Allow` lists `HEAD`) |
 | Handler panic answered with `500` | `ShowExceptions` | Done (`recoverer`: JSON error body with the request id) | In review (text body `internal server error`, `x-request-id`, logged with the request id) |
@@ -99,9 +101,23 @@ the work is finished and waiting for its review; **Planned** means not started.
   backup-code and disable pages behind password and code step-up match
   Forge-Go (its ADR 0045). Both use a step-up backup code up only with the
   change it authorizes. Forge-Rust has no JSON login API, so it has no
-  `/auth/mfa/complete` bearer route, does not port `PruneMFA` yet, and has no
-  shared (PostgreSQL) login throttle: its MFA and sign-in counters are per
-  process ([MFA](mfa.md#how-sign-in-works)).
+  `/auth/mfa/complete` bearer route and does not port `PruneMFA` yet. Its
+  sign-in, reset and MFA counters are in PostgreSQL since QR2 (below).
+
+- Shared attempt throttle (forge-rust QR2, 2026-10-26): `PgLoginThrottle`
+  ports Forge-Go's `auth/postgres` `LoginThrottler`: the same
+  `forge_login_throttle` table (scope 1 account, 2 source, 3 pair; 32-byte
+  key digest; count; `reset_at`; primary key `(scope, key_hash)`, no
+  surrogate id), the same transaction (create empty, lock in order, refuse
+  without counting, count, prune up to 8 expired rows), the database clock,
+  and success clearing the account and pair. Differences: (1) the table is a
+  generated application migration (`00000000000000000005_forge_login_throttle`)
+  like Forge-Rust's other identity tables, where Forge-Go embeds it in its
+  framework migrations; (2) the digests are Forge-Rust's `ThrottleKey`
+  digests, so the two frameworks' rows are not interchangeable (no database
+  is shared between them); (3) Forge-Rust authentication is PostgreSQL-only,
+  so no MySQL/MariaDB/SQLite store exists; `MemoryLoginThrottle` remains for
+  tests and custom wiring, counting per process.
 
 - Benchmarks ([benchmarks](benchmarks.md), rocketinsidecorp/forge-rust#41): the
   scenario names, variants and output formats are Forge-Go's, and results are

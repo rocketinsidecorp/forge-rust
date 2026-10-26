@@ -100,7 +100,7 @@ change, not routes the framework mounts.
   on the submitted identity whether or not it exists, and separately for
   reset requests and reset submissions. The default is per process; a
   persistent shared throttle is a follow-up (there was no existing
-  persistent pattern to follow).
+  persistent pattern to follow). Update (2026-10-26): generated applications now use the shared `PgLoginThrottle` (the `forge_login_throttle` table, Forge-Go's schema); `MemoryLoginThrottle` remains for tests and custom wiring.
 - **Reset requests are not timed by the account.** The page validates and
   queues the request on a bounded `WorkQueue` (`Composition::work_queue`,
   owned by the server's lifecycle, stopped at shutdown, full queue drops and
@@ -178,7 +178,7 @@ wrapper because the CLI wraps Cargo, not application commands (there is no
   every credential change fails closed with `403`.
 - Throttle counters are per process; multiple replicas multiply the budget
   until a shared throttle exists. The socket peer is the source, so clients
-  behind one proxy share a budget.
+  behind one proxy share a budget. Update (2026-10-26): generated applications now use the shared `PgLoginThrottle` (the `forge_login_throttle` table, Forge-Go's schema); `MemoryLoginThrottle` remains for tests and custom wiring.
 - Password resets are not delivered until a notifier adapter is wired.
 - New direct dependency: `rustix` (facade, Unix only, `termios`); `forge-auth`
   now uses `getrandom` and `sha2` (see

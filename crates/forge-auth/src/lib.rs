@@ -13,8 +13,10 @@
 //! it.
 //!
 //! It also owns the framework rules of the sign-in and password-reset flows
-//! (ADR 0026): [`LoginThrottle`] with the bounded [`MemoryLoginThrottle`],
-//! the [`NewPassword`] policy, and one-time [`PasswordResetToken`]s (256
+//! (ADR 0026): [`LoginThrottle`] with the bounded, per-process
+//! [`MemoryLoginThrottle`] and, with the `postgres` feature, the
+//! `PgLoginThrottle` every replica shares; the [`NewPassword`] policy, and
+//! one-time [`PasswordResetToken`]s (256
 //! bits from the OS CSPRNG through `getrandom`, persisted only as SHA-256
 //! digests through `sha2`) delivered by a [`PasswordResetNotifier`].
 //!
@@ -27,6 +29,8 @@ pub mod mfa;
 mod password_policy;
 mod password_reset;
 mod password_work;
+#[cfg(feature = "postgres")]
+mod postgres;
 mod throttle;
 
 use std::num::NonZeroU64;
@@ -55,6 +59,8 @@ pub use password_reset::{
 pub use password_work::{
     DEFAULT_PASSWORD_WORK_WAIT, MAX_DEFAULT_PASSWORD_WORK, PasswordWorkLimiter,
 };
+#[cfg(feature = "postgres")]
+pub use postgres::{INLINE_PRUNE_BATCH, PgLoginThrottle};
 pub use throttle::{
     LoginThrottle, MemoryLoginThrottle, ThrottleConfig, ThrottleConfigError, ThrottleDecision,
     ThrottleError, ThrottleKey,
