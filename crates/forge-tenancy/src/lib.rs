@@ -31,7 +31,7 @@ pub use accounts::{
     RedeemedPasswordReset, TenantDirectory, TenantSlug, TenantSlugError,
 };
 
-pub use bearer::{BearerDenied, BearerSession, BearerSessionStore};
+pub use bearer::{BearerDenied, BearerSession, BearerSessionStore, resolve_bearer};
 pub use mfa::{
     ActiveTotp, IssuedMfaChallenge, MFA_CHALLENGE_LIFETIME_SECS, MFA_ENROLLMENT_LIFETIME_SECS,
     MfaChallengeGrant, MfaChallengeRecord, MfaChange, MfaChangeRequest, MfaError, MfaRejection,

@@ -285,6 +285,59 @@ fn cause_chain(failure: &ForgeError) -> String {
     chain
 }
 
+/// The JSON refusal of a route that authenticates an API client's bearer
+/// token (`forge::tenancy::resolve_bearer`, `BearerSession::authorize`),
+/// with Forge-Go's codes: `401 credentials_required` without an
+/// `Authorization` header, `401 credentials_invalid` for a malformed,
+/// unknown, expired, idle or revoked token (both with `WWW-Authenticate:
+/// Bearer realm="forge"`), `403 permission_denied`, and `503
+/// authentication_unavailable` when a store failed. The body never says
+/// which proof failed.
+#[must_use]
+pub fn bearer_refusal(denied: forge_tenancy::BearerDenied) -> Response {
+    use forge_tenancy::BearerDenied;
+
+    let (status, category, code, message) = match denied {
+        BearerDenied::MissingCredentials => (
+            StatusCode::UNAUTHORIZED,
+            ErrorCategory::Unauthenticated,
+            "credentials_required",
+            "authentication is required",
+        ),
+        BearerDenied::InvalidCredentials => (
+            StatusCode::UNAUTHORIZED,
+            ErrorCategory::Unauthenticated,
+            "credentials_invalid",
+            "credentials are invalid or expired",
+        ),
+        BearerDenied::Forbidden => (
+            StatusCode::FORBIDDEN,
+            ErrorCategory::Forbidden,
+            "permission_denied",
+            "permission denied",
+        ),
+        BearerDenied::Unavailable => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            ErrorCategory::Infrastructure,
+            "authentication_unavailable",
+            "service temporarily unavailable",
+        ),
+    };
+    let failure = ForgeError::new(category, code, message)
+        .with_retryable(denied == BearerDenied::Unavailable);
+    if denied == BearerDenied::Unavailable {
+        warn!(code, "bearer authentication unavailable");
+    }
+    let mut response = json(status, &failure.report());
+    if status == StatusCode::UNAUTHORIZED {
+        response.headers_mut().insert(
+            forge_http::header::WWW_AUTHENTICATE,
+            forge_http::HeaderValue::from_static(forge_auth::BEARER_CHALLENGE),
+        );
+    }
+    response
+}
+
 #[cfg(test)]
 mod web_tests;
 
@@ -296,6 +349,47 @@ mod tests {
     use bytes::Bytes;
     use forge_http::{HeaderMap, Method, Request, Response, StatusCode, Uri};
     use uuid::Uuid;
+
+    #[test]
+    fn bearer_refusals_carry_go_codes_and_the_bearer_challenge() {
+        use forge_tenancy::BearerDenied;
+
+        for (denied, status, code) in [
+            (
+                BearerDenied::MissingCredentials,
+                StatusCode::UNAUTHORIZED,
+                "credentials_required",
+            ),
+            (
+                BearerDenied::InvalidCredentials,
+                StatusCode::UNAUTHORIZED,
+                "credentials_invalid",
+            ),
+            (
+                BearerDenied::Forbidden,
+                StatusCode::FORBIDDEN,
+                "permission_denied",
+            ),
+            (
+                BearerDenied::Unavailable,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "authentication_unavailable",
+            ),
+        ] {
+            let response = bearer_refusal(denied);
+            assert_eq!(response.status(), status, "{denied:?}");
+            assert_eq!(body(&response)["code"], code, "{denied:?}");
+            let challenge = response
+                .headers()
+                .get(forge_http::header::WWW_AUTHENTICATE)
+                .and_then(|value| value.to_str().ok());
+            if status == StatusCode::UNAUTHORIZED {
+                assert_eq!(challenge, Some("Bearer realm=\"forge\""));
+            } else {
+                assert_eq!(challenge, None);
+            }
+        }
+    }
 
     #[tokio::test]
     async fn at_least_pads_fast_work_and_never_shortens_it() {

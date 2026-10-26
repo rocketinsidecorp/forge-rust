@@ -85,6 +85,38 @@ impl BearerSession {
     }
 }
 
+/// The live bearer session of a request's `Authorization` header values
+/// (`request.headers().get_all(AUTHORIZATION)`), read with
+/// [`forge_auth::bearer_credential`] and found by its digest.
+///
+/// No header is [`BearerDenied::MissingCredentials`]; a malformed header,
+/// an unknown digest or a session that expired or was revoked at `now` is
+/// [`BearerDenied::InvalidCredentials`]; a store failure is
+/// [`BearerDenied::Unavailable`]. The tenant and permissions are checked
+/// afterwards with [`BearerSession::authorize`].
+pub async fn resolve_bearer<'a>(
+    store: &dyn BearerSessionStore,
+    authorization: impl IntoIterator<Item = &'a [u8]>,
+    now: UnixTimestamp,
+) -> Result<BearerSession, BearerDenied> {
+    let token = forge_auth::bearer_credential(authorization).map_err(|error| match error {
+        forge_auth::BearerCredentialError::Missing => BearerDenied::MissingCredentials,
+        forge_auth::BearerCredentialError::Invalid => BearerDenied::InvalidCredentials,
+    })?;
+    let session = store
+        .find_by_credential(&token.digest())
+        .await
+        .map_err(|error| match error {
+            SessionStoreError::Unavailable => BearerDenied::Unavailable,
+            SessionStoreError::Conflict | SessionStoreError::CorruptRecord => {
+                BearerDenied::InvalidCredentials
+            }
+        })?
+        .ok_or(BearerDenied::InvalidCredentials)?;
+    session.authenticate(now)?;
+    Ok(session)
+}
+
 /// Why a bearer request was refused. The response says only the status.
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 pub enum BearerDenied {
@@ -263,6 +295,63 @@ mod tests {
                 .await
                 .map(|_| ()),
             Err(BearerDenied::Forbidden)
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_bearer_finds_only_a_live_session_by_its_header() {
+        use forge_auth::SessionBearerToken;
+
+        use crate::testing::MemoryBearerSessionStore;
+
+        let fixture = setup(true).await;
+        let store = MemoryBearerSessionStore::default();
+        let token = SessionBearerToken::generate().expect("token");
+        store
+            .insert(&fixture.bearer, &token.digest())
+            .await
+            .expect("insert");
+        let header = format!("Bearer {}", token.expose());
+        let resolve = |values: Vec<&'static [u8]>, now| {
+            let store = &store;
+            async move { resolve_bearer(store, values, now).await.map(|_| ()) }
+        };
+        assert_eq!(
+            resolve_bearer(&store, [header.as_bytes()], time(20)).await,
+            Ok(fixture.bearer.clone())
+        );
+        assert_eq!(
+            resolve_bearer(&store, [header.as_bytes()], time(100))
+                .await
+                .map(|_| ()),
+            Err(BearerDenied::InvalidCredentials),
+            "expired"
+        );
+        assert_eq!(
+            resolve(vec![], time(20)).await,
+            Err(BearerDenied::MissingCredentials)
+        );
+        assert_eq!(
+            resolve(vec![b"Bearer nope".as_slice()], time(20)).await,
+            Err(BearerDenied::InvalidCredentials)
+        );
+        let unknown = format!("Bearer {}", "ab".repeat(32));
+        assert_eq!(
+            resolve_bearer(&store, [unknown.as_bytes()], time(20))
+                .await
+                .map(|_| ()),
+            Err(BearerDenied::InvalidCredentials)
+        );
+        store
+            .revoke(fixture.bearer.session().id(), time(30))
+            .await
+            .expect("revoke");
+        assert_eq!(
+            resolve_bearer(&store, [header.as_bytes()], time(40))
+                .await
+                .map(|_| ()),
+            Err(BearerDenied::InvalidCredentials),
+            "revoked"
         );
     }
 
