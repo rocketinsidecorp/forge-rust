@@ -317,6 +317,7 @@ forge credentials rotate-key -e production --keep-old --print-key   # re-encrypt
 forge check && forge lint && forge test        # cargo check / clippy -D warnings / test
 forge test --lib orders -- --nocapture         # arguments replace the defaults and go to cargo test
 forge format                                   # cargo fmt --all
+forge format --check                           # list unformatted files, write nothing, exit 1 (CI)
 forge build                                    # cargo build --release --locked
 forge build shop                               # ... of one binary (cargo build --bin shop)
 forge dev                                      # run; rebuild and restart gracefully when files change
@@ -357,6 +358,7 @@ forge app exec migrate status                  # one-off container of the deploy
 forge app shell --image busybox:1.37           # debug sidecar (distroless has no shell)
 forge routes                                   # every route, HTML and JSON: METHOD, PATH, ACTION, SOURCE
 forge routes | grep /v1                        # filter it like `rails routes | grep`
+forge routes admin                             # ... of one binary of the package (--bin admin)
 cargo run -- healthcheck                       # application binary: serve, healthcheck, version, help,
 cargo run -- migrate                           #   migrate [status], rollback [--steps N], db create|exists|drop,
 cargo run -- seed                              #   setup, seed, openapi: what the forge commands above run
@@ -489,6 +491,9 @@ export FORGE_DATABASE_ALLOW_PLAINTEXT=true
 export FORGE_DATABASE_MAX_CONNS=10                # 1 to 1000
 export FORGE_DATABASE_CONNECT_TIMEOUT=5s          # wait for a connection, opening one included
 export FORGE_DATABASE_STATEMENT_TIMEOUT=30s       # server-side bound of every statement, at least 1ms
+export FORGE_DATABASE_MIN_CONNS=0                 # connections kept open, 0 to FORGE_DATABASE_MAX_CONNS
+export FORGE_DATABASE_MAX_CONN_LIFETIME=30m       # replace a connection this old
+export FORGE_DATABASE_MAX_CONN_IDLE_TIME=5m       # close an idle connection above the minimum
 cargo run
 FORGE_ENV=production FORGE_DATABASE_URL='postgres://app:pw@db.internal/shop' cargo run -- healthcheck   # refused: no sslmode=verify-full
 ```
@@ -511,8 +516,18 @@ the role, never the URL) when the role `FORGE_DATABASE_URL` logs in as, or
 acts as, is a superuser, has `BYPASSRLS`, `CREATEROLE` or `REPLICATION`, is
 a member of such a role or of `pg_execute_server_program`,
 `pg_write_server_files` or `pg_read_server_files`, owns (or can `SET ROLE` to
-the owner of) a table with row-level security, or when the URL switches it to
-another role (`options=-c role=...`):
+the owner of) a table with row-level security, holds `TRUNCATE`, `REFERENCES`
+or `TRIGGER` on such a table (directly, through `PUBLIC` or a role it belongs
+to: a `GRANT ALL` does it), holds a privilege on a partition without
+row-level security of such a table, or when the URL switches it to another
+role (`options=-c role=...`). Every other pool on `FORGE_DATABASE_URL`
+(`routes`, `openapi`, your own) checks each connection the same way, and a
+`PoolSettings` with no environment is checked too; the migration credential's
+pools (`migrate`, `rollback` and the application commands, `setup`, `seed`
+and your own `App::command`s, which connect with the migration credential)
+opt out, since that role owns
+the tables. No pool but the migrator's opens while `PGOPTIONS` is set (it
+would give every session a default tenant):
 
 ```sh
 docker compose up -d db           # first start: init.sql creates app_migrator, app_runtime and the database
@@ -525,6 +540,13 @@ FORGE_ENV=production FORGE_DATABASE_ALLOW_PLAINTEXT=true \
 FORGE_ENV=production FORGE_DATABASE_ALLOW_PLAINTEXT=true \
   FORGE_DATABASE_URL='postgres://app_runtime:app_runtime@127.0.0.1:5432/shop' \
   cargo run -- jobs status        # accepted: the runtime role
+psql -U postgres -d shop -c 'GRANT TRUNCATE ON ALL TABLES IN SCHEMA public TO app_runtime'
+FORGE_ENV=production FORGE_DATABASE_ALLOW_PLAINTEXT=true \
+  FORGE_DATABASE_URL='postgres://app_runtime:app_runtime@127.0.0.1:5432/shop' \
+  cargo run -- jobs status        # refused: holds TRUNCATE, REFERENCES or TRIGGER, which RLS does not confine
+psql -U postgres -d shop -c 'REVOKE TRUNCATE, REFERENCES, TRIGGER ON ALL TABLES IN SCHEMA public FROM app_runtime'
+PGOPTIONS='-c forge.tenant_id=0190...' forge dev   # refused: PGOPTIONS is set in the environment
+PGOPTIONS='-c lock_timeout=5s' forge migrate       # the migrator still reads PGOPTIONS
 FORGE_TEST_DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5432/postgres \
   forge test -- --include-ignored # repository tests as a fresh runtime role (RlsTestDatabase)
 ```
@@ -585,6 +607,7 @@ same collector, Prometheus and dashboards serve both frameworks.
 # Prometheus text on a separate, private listener (never on the app port)
 FORGE_TELEMETRY_METRICS_ADDR=127.0.0.1:9464 cargo run
 curl -s http://127.0.0.1:9464/metrics | grep http_server_request_duration_seconds_count
+FORGE_TELEMETRY_METRICS_ADDR=127.0.0.1:0 cargo run   # a free port; the log says which (metrics listening ... address=)
 
 # Spans in the development log
 FORGE_TELEMETRY_EXPORTER=log cargo run
@@ -745,6 +768,12 @@ cargo run -- jobs dead-events           # dead outbox events (feature `events`)
 cargo run -- jobs retry-event <EVENT_ID>
 ```
 
+A schedule that falls behind (a stall, an unreachable database) does not
+replay its missed ticks: only the latest due tick runs, once, while it is at
+most one interval of the schedule late (`Schedule::max_lateness(d)` sets
+another bound, at least a minute); the skipped ones are reported in a
+warning, as in Forge-Go ([docs/jobs.md](docs/jobs.md#cron-schedules)).
+
 Workers claim up to `WorkerSettings::batch` jobs (default 10, never more than
 their free slots) per round trip, and the outbox dispatcher claims
 `DispatcherSettings::batch` events (default 10) per transaction.
@@ -854,7 +883,17 @@ Kubernetes and systemd deployment is covered in
   connections, `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`,
   UUIDv7 `x-request-id`, `Strict-Transport-Security` behind TLS termination
   (`FORGE_HTTP_TRANSPORT`), `HEAD` on every `GET` route, and a `500` with the
-  request id when a handler panics.
+  request id when a handler panics. The timeouts and the head bound are
+  Forge-Go's keys and defaults:
+
+  ```sh
+  export FORGE_HTTP_READ_HEADER_TIMEOUT=5s   # request head, from accept or the next request's first byte
+  export FORGE_HTTP_READ_TIMEOUT=15s         # request body; 408 beyond
+  export FORGE_HTTP_WRITE_TIMEOUT=30s        # body + handler; 504 beyond (was FORGE_REQUEST_TIMEOUT_SECS=30)
+  export FORGE_HTTP_IDLE_TIMEOUT=60s         # kept-alive wait for the next request
+  export FORGE_HTTP_MAX_HEADER_BYTES=1048576 # largest request head; 431 beyond
+  cargo run
+  ```
 - A multi-stage `Dockerfile`, `.dockerignore`, `compose.yaml`, the opt-in
   observability overlay (`compose.observability.yaml` and `observability/`:
   Collector, Prometheus, Tempo, Loki, Grafana) and a
@@ -1113,6 +1152,10 @@ router.route(Method::POST, "/comments", limit.wrap(create_comment))?;
 // Cache with stampede protection (shared PostgreSQL/MySQL/SQLite stores: docs/caching.md)
 let cache = Arc::new(MemoryCache::new(MemoryOptions::from_config(&config.cache))?);
 let price = fetch(cache.as_ref(), &key("price", &[sku]), Some(Duration::from_secs(600)), || async { catalog.price(sku).await }).await?;
+// Typed: a stale entry that no longer decodes is recomputed, counted and logged
+// once per key by an HMAC of the key, never the key or value (docs/caching.md)
+let profile: Profile = fetch_json(cache.as_ref(), &key("profile", &["v2", id]), None, || async { load(id).await }).await?;
+let undecodable = forge::cache::decode_failures();
 
 // Signed, sandboxed file serving and strict uploads
 let store: Arc<dyn Storage> = Arc::new(DiskStorage::from_config(&config.storage)?);

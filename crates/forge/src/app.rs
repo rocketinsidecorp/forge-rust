@@ -821,8 +821,9 @@ impl App {
         let shutdown = Cancellation::new();
         let composed = {
             let _guard = runtime.enter();
-            // Inspection never queries, so the role is not checked.
-            open_pool(name, declaration.zip(url), &config).and_then(|database| {
+            // The lazy pool connects only if something queries, and then
+            // checks each connection's role like the serving pool.
+            open_pool_with(name, declaration.zip(url), &config, true).and_then(|database| {
                 compose(
                     name,
                     &config,
@@ -881,9 +882,10 @@ impl App {
             }
         };
         let name = self.name;
+        let environment = config.environment;
         let result = runtime.block_on(async move {
             let database = match declaration.zip(url) {
-                Some((declaration, url)) => match declaration.connect(&url).await {
+                Some((declaration, url)) => match declaration.connect(&url, environment).await {
                     Ok(database) => Some(database),
                     Err(error) => {
                         return Err(CommandError::caused_by(
@@ -1332,17 +1334,27 @@ struct Built {
     pool: Option<PoolObservation>,
 }
 
-/// Creates the lazily connecting pool of the declared database. Must run
-/// inside the Tokio runtime context.
+/// Creates the lazily connecting serving pool of the declared database.
+/// Must run inside the Tokio runtime context.
 fn open_pool(
     name: &'static str,
     declared: Option<(Declaration, &forge_config::SecretString)>,
     config: &AppConfig,
 ) -> Result<Option<DatabaseHandle>, ExitCode> {
+    open_pool_with(name, declared, config, false)
+}
+
+/// [`open_pool`], for inspection (`routes`, `openapi`) when `inspecting`
+/// (see [`serving_pool`](crate::database::serving_pool)).
+fn open_pool_with(
+    name: &'static str,
+    declared: Option<(Declaration, &forge_config::SecretString)>,
+    config: &AppConfig,
+    inspecting: bool,
+) -> Result<Option<DatabaseHandle>, ExitCode> {
     match declared {
         Some((declaration, url)) => {
-            match declaration.connect_lazy(url, &config.database, config.jobs.notify == Some(true))
-            {
+            match declaration.connect_lazy(url, crate::database::serving_pool(config, inspecting)) {
                 Ok(database) => Ok(Some(database)),
                 Err(error) => {
                     error!(app = name, error = %ErrorChain(&error), "failed to create the database pool");

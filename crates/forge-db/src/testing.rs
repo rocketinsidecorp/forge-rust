@@ -177,6 +177,13 @@ pub(crate) fn provision_file() -> Result<Provision, DbError> {
     })
 }
 
+/// The pool settings of every test database: the test environment, so an
+/// administrator may connect (no row-level security check).
+#[must_use]
+pub fn test_settings() -> crate::PoolSettings {
+    crate::PoolSettings::default().with_environment(forge_config::Environment::Test)
+}
+
 #[cfg(any(feature = "postgres", feature = "mysql"))]
 /// Runs one administrative statement on a dedicated connection.
 ///
@@ -247,7 +254,9 @@ impl<B: Backend> TestDatabase<B> {
         let Provision { url, cleanup } =
             <B as crate::backend::sealed::Hooks>::provision(admin_env).await?;
         // From here on `cleanup` removes the database on every exit path.
-        let database = Database::connect(&url).await?;
+        // A test database is the test environment's: an administrator may
+        // connect (no row-level security check).
+        let database = Database::connect_with(&url, test_settings()).await?;
         Ok(Self {
             database,
             url,
@@ -394,7 +403,7 @@ impl RlsTestDatabase {
         )
         .await?;
         // From here on `cleanup` drops the database and the roles.
-        let admin = Database::<sqlx::Postgres>::connect(&url).await?;
+        let admin = Database::<sqlx::Postgres>::connect_with(&url, test_settings()).await?;
         let name: String = sqlx::query_scalar("SELECT current_database()")
             .fetch_one(admin.pool())
             .await?;
@@ -546,7 +555,7 @@ async fn connect_as(
     url: &SecretString,
     role: &str,
 ) -> Result<Database<sqlx::Postgres>, DbError> {
-    let database = Database::<sqlx::Postgres>::connect(url).await?;
+    let database = Database::<sqlx::Postgres>::connect_with(url, test_settings()).await?;
     let login: String = sqlx::query_scalar("SELECT session_user")
         .fetch_one(database.pool())
         .await?;

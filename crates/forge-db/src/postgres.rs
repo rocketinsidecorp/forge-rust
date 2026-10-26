@@ -15,17 +15,32 @@ impl Hooks for Postgres {
     fn connection_setup(
         options: sqlx::pool::PoolOptions<Self>,
         settings: &crate::PoolSettings,
+        lazy: bool,
     ) -> sqlx::pool::PoolOptions<Self> {
         let millis = settings
             .statement_timeout()
             .map(crate::database::statement_timeout_millis);
         let announce = settings.job_announcements();
-        if millis.is_none() && !announce {
+        // An eager pool is checked once it is connected (`verify`); a lazy
+        // one, which checked nothing when it was created, checks every
+        // connection before its first use, like Forge-Go's `postgres.Lazy`.
+        let check = lazy && settings.checks_row_security();
+        if millis.is_none() && !announce && !check {
             return options;
         }
         // One hook: SQLx keeps only the last `after_connect`.
         options.after_connect(move |connection, _| {
             Box::pin(async move {
+                if check {
+                    // First: nothing runs on a refused connection.
+                    if let Err(error) = crate::rowsecurity::check_connection(connection).await {
+                        tracing::error!(
+                            error = %error,
+                            "refusing a database connection: its role could bypass row-level security, or could not be checked"
+                        );
+                        return Err(sqlx::Error::Configuration(Box::new(error)));
+                    }
+                }
                 if let Some(millis) = millis {
                     // Audited: `millis` is an integer Forge computed, not input.
                     sqlx::Executor::execute(
@@ -43,6 +58,32 @@ impl Hooks for Postgres {
         })
     }
 
+    fn session(
+        url: &str,
+        options: sqlx::postgres::PgConnectOptions,
+        settings: &crate::PoolSettings,
+    ) -> Result<sqlx::postgres::PgConnectOptions, DbError> {
+        if settings.environment_session() {
+            return Ok(options);
+        }
+        refuse_environment_options(&|key| std::env::var(key).ok())?;
+        Ok(own_application_name(url, options))
+    }
+
+    fn verify(
+        pool: &sqlx::Pool<Self>,
+        settings: &crate::PoolSettings,
+    ) -> impl std::future::Future<Output = Result<(), DbError>> + Send {
+        let check = settings.checks_row_security();
+        async move {
+            if check {
+                crate::rowsecurity::check_pool(pool).await
+            } else {
+                Ok(())
+            }
+        }
+    }
+
     fn endpoint(url: &str) -> Result<crate::admin::Endpoint, crate::DbError> {
         // The parser that connects: `host`, `hostaddr`, `port` and `dbname`
         // query parameters, and PG* environment defaults, count.
@@ -56,6 +97,43 @@ impl Hooks for Postgres {
         admin_env: &str,
     ) -> impl std::future::Future<Output = Result<crate::testing::Provision, DbError>> + Send {
         crate::testing::provision_server(admin_env, create_database, drop_database)
+    }
+}
+
+/// Why a pool refuses to open while `PGOPTIONS` is set. Names the variable,
+/// never its value.
+pub(crate) const PGOPTIONS_REFUSED: &str = "PGOPTIONS is set in the environment, and SQLx \
+     would add its session settings to every connection of this pool (PGOPTIONS='-c \
+     forge.tenant_id=...' gives every session a default tenant): unset it for the application \
+     and name session settings in the URL's options parameter instead; only migrate and \
+     rollback read PGOPTIONS";
+
+/// Refuses the options `PGOPTIONS` (read through `env`) would add to every
+/// connection. SQLx reads the variable when it parses a URL and appends the
+/// URL's own `options` to it, and has no way to drop it afterwards, so a
+/// pool that must not take session settings from the environment refuses
+/// instead of ignoring it (Forge-Go strips it). Empty or blank is no
+/// setting.
+pub(crate) fn refuse_environment_options(
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Result<(), DbError> {
+    match env("PGOPTIONS") {
+        Some(value) if !value.trim().is_empty() => Err(DbError::configuration(PGOPTIONS_REFUSED)),
+        _ => Ok(()),
+    }
+}
+
+/// `options` named after the URL's `application_name`, or `forge` when the
+/// URL names none, so `PGAPPNAME` never names the session (Forge-Go's
+/// default too).
+fn own_application_name(
+    url: &str,
+    options: sqlx::postgres::PgConnectOptions,
+) -> sqlx::postgres::PgConnectOptions {
+    if database_url::names_parameter(url, "application_name") {
+        options
+    } else {
+        options.application_name("forge")
     }
 }
 
@@ -199,6 +277,39 @@ mod tests {
             Some(host) => options.host(host),
             None => options,
         }
+    }
+
+    #[test]
+    fn pgoptions_is_refused_by_name_and_blank_is_no_setting() {
+        let set =
+            |value: &'static str| move |key: &str| (key == "PGOPTIONS").then(|| value.to_owned());
+        let refused = refuse_environment_options(&set("-c forge.tenant_id=0190"));
+        match refused {
+            Err(DbError::Configuration { reason }) => {
+                assert!(reason.contains("PGOPTIONS is set"), "{reason}");
+                assert!(
+                    !reason.contains("0190"),
+                    "the value is never echoed: {reason}"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        for blank in ["", "  "] {
+            assert!(refuse_environment_options(&set(blank)).is_ok(), "{blank:?}");
+        }
+        assert!(refuse_environment_options(&|_| None).is_ok());
+    }
+
+    #[test]
+    fn the_session_is_named_after_the_url_else_forge() {
+        let named = own_application_name(
+            "postgres://u@db/app?application_name=shop",
+            options("postgres://u@db/app?application_name=shop", None),
+        );
+        assert_eq!(named.get_application_name(), Some("shop"));
+        let unnamed =
+            own_application_name("postgres://u@db/app", options("postgres://u@db/app", None));
+        assert_eq!(unnamed.get_application_name(), Some("forge"));
     }
 
     #[test]

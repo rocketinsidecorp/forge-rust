@@ -115,8 +115,13 @@ pub(crate) enum Command {
         )]
         args: Vec<String>,
     },
-    /// Format the current application's Rust code.
-    Format,
+    /// Format the current application's Rust code (`cargo fmt --all`).
+    Format {
+        /// Write nothing: list the files that are not formatted and exit 1
+        /// when there are any (for CI).
+        #[arg(long)]
+        check: bool,
+    },
     /// Run Clippy with warnings treated as errors.
     Lint,
     /// Build the optimized release binary from the locked dependency graph.
@@ -208,7 +213,10 @@ pub(crate) enum Command {
     /// routes alike, with the source line that registered each. It composes
     /// the application without listening, so it needs the configuration
     /// `serve` needs.
-    Routes,
+    Routes {
+        /// The binary to run, when the package has several.
+        name: Option<String>,
+    },
     /// Encrypted per-environment credentials in
     /// config/credentials/ENV.json.enc (like `rails credentials:edit`, ADR
     /// 0041). The key is FORGE_MASTER_KEY or config/credentials/ENV.key.

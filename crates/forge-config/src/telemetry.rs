@@ -419,7 +419,9 @@ pub(crate) fn validate(
         });
     }
     if let Some(address) = config.metrics_addr {
-        let overlaps = address.port() == bind.port()
+        // Two kernel-chosen ports (port 0) never collide.
+        let overlaps = address.port() != 0
+            && address.port() == bind.port()
             && (address.ip() == bind.ip()
                 || address.ip().is_unspecified()
                 || bind.ip().is_unspecified());
@@ -605,18 +607,17 @@ pub(crate) fn parse_bool(key: &'static str, value: &str) -> Result<bool, ConfigE
     }
 }
 
-/// `localhost:PORT` or an IP socket address.
+/// `localhost:PORT` or an IP socket address. Port 0 asks the kernel for a
+/// free port, as in Forge-Go; the bound address is logged (`metrics
+/// listening on GET /metrics`).
 fn parse_listen_address(value: &str) -> Option<SocketAddr> {
     if let Some(port) = value.strip_prefix("localhost:") {
         return Some(SocketAddr::new(
             IpAddr::V4(Ipv4Addr::LOCALHOST),
-            port.parse::<u16>().ok().filter(|port| *port != 0)?,
+            port.parse::<u16>().ok()?,
         ));
     }
-    value
-        .parse::<SocketAddr>()
-        .ok()
-        .filter(|address| address.port() != 0)
+    value.parse::<SocketAddr>().ok()
 }
 
 fn parse_duration(key: &'static str, value: &str) -> Result<Duration, ConfigError> {
@@ -878,6 +879,14 @@ mod tests {
         assert!(load(&[("FORGE_TELEMETRY_METRICS_ADDR", "0.0.0.0:3000")]).is_err());
         assert!(load(&[("FORGE_TELEMETRY_METRICS_ADDR", "metrics.internal:9464")]).is_err());
         assert!(load(&[("FORGE_TELEMETRY_METRICS_ADDR", "0.0.0.0:9464")]).is_ok());
+        // Port 0: the kernel picks a free port (Forge-Go accepts it too).
+        for ephemeral in ["127.0.0.1:0", "localhost:0", "[::1]:0"] {
+            let config = load(&[("FORGE_TELEMETRY_METRICS_ADDR", ephemeral)]).expect(ephemeral);
+            assert_eq!(
+                config.telemetry.metrics_addr.map(|address| address.port()),
+                Some(0)
+            );
+        }
         let production = [
             ("FORGE_ENV", "production"),
             ("FORGE_TELEMETRY_METRICS_ADDR", "0.0.0.0:9464"),

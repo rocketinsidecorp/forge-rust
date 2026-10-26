@@ -41,7 +41,18 @@ let price: Price = fetch_json(
   write is logged (without key or value) and the computed value is returned.
   Direct `get`/`set`/`delete` report store errors.
 - A cached value that no longer decodes (`get_json`/`fetch_json`; for example the
-  struct changed in a deploy) is a miss and is recomputed.
+  struct changed in a deploy, or an entry written by something else) is a miss
+  and is recomputed. It is not silent: every such value is counted
+  (`forge_cache::decode_failures()`, for the process; `fetch_json` counts an
+  entry once although it reads it twice) and the first one of each key, up to
+  1024 keys, is logged at warn level as `cached value does not decode`, with
+  `key_hmac`: an HMAC-SHA256 prefix of the key under a random per-process
+  secret, never the key or the value, so a low-entropy key such as an email
+  address cannot be recovered by hashing guesses (the same key logs a
+  different `key_hmac` in each process). A growing count after a deploy means
+  a type changed without a new key version: put a version in the key
+  (`forge_cache::key("price", &["v2", sku])`). Forge-Go's
+  `cache.DecodeFailures` (forge-rust#85).
 - `ttl` of `None` means the store's default; zero or more than a year is an
   error. Nothing lives forever.
 - Values are copied. Keys are 1 to 1024 bytes without NUL; values at most

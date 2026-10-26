@@ -61,6 +61,31 @@ pub(crate) mod sealed {
             options
         }
 
+        /// Applies `settings` to the session the options open: on
+        /// PostgreSQL, unless [`PoolSettings::environment_session`](crate::PoolSettings::environment_session),
+        /// refuses `PGOPTIONS` and replaces `PGAPPNAME`. The default keeps
+        /// the options.
+        fn session(
+            url: &str,
+            options: ConnectOptions<Self>,
+            settings: &crate::PoolSettings,
+        ) -> Result<ConnectOptions<Self>, crate::DbError> {
+            let _ = (url, settings);
+            Ok(options)
+        }
+
+        /// Checks a pool [`Database::connect_with`](crate::Database::connect_with)
+        /// has just connected: on PostgreSQL, the row-level security check
+        /// when [`PoolSettings::checks_row_security`](crate::PoolSettings::checks_row_security).
+        /// The default accepts every pool.
+        fn verify(
+            pool: &sqlx::Pool<Self>,
+            settings: &crate::PoolSettings,
+        ) -> impl std::future::Future<Output = Result<(), crate::DbError>> + Send {
+            let _ = (pool, settings);
+            async { Ok(()) }
+        }
+
         /// What `url` really names once the driver has applied its query
         /// overrides and environment defaults: the database, the server and
         /// whether that is this machine. Never echoes the URL in an error.
@@ -82,12 +107,15 @@ pub(crate) mod sealed {
         }
 
         /// Prepares each new connection of a pool built from `settings`:
-        /// the statement bound, and on PostgreSQL the job announcements.
-        /// The default applies only the statement bound.
+        /// the statement bound, and on PostgreSQL the job announcements and,
+        /// for a `lazy` pool, the row-level security check. The default
+        /// applies only the statement bound.
         fn connection_setup(
             options: PoolOptions<Self>,
             settings: &crate::PoolSettings,
+            lazy: bool,
         ) -> PoolOptions<Self> {
+            let _ = lazy;
             match settings.statement_timeout() {
                 Some(timeout) => Self::bound_statements(
                     options,

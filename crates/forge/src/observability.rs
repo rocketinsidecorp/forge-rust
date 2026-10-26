@@ -134,6 +134,8 @@ pub(crate) fn metrics_server(telemetry: &Telemetry, bind: SocketAddr) -> Server 
         trusted_proxies: Vec::new(),
         // A private plain-HTTP listener scraped by Prometheus.
         transport: forge_config::HttpTransport::Plain,
+        // The head, body and idle bounds of every server.
+        ..ServerConfig::default()
     };
     Server::new(config, router)
 }

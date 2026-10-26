@@ -394,7 +394,13 @@ Commands:
 Environment:
   FORGE_ENV                   development | test | production (default: development)
   FORGE_HTTP_ADDR             listen socket address (default: 127.0.0.1:3000)
-  FORGE_REQUEST_TIMEOUT_SECS  per-request deadline in seconds (default: 30)
+  FORGE_HTTP_WRITE_TIMEOUT    deadline of a request once its head is read: body and handler,
+                              then 504 (default: 30s; was FORGE_REQUEST_TIMEOUT_SECS, seconds)
+  FORGE_HTTP_READ_HEADER_TIMEOUT time to send a request head, from the connection's start or
+                              the next request's first byte (default: 5s)
+  FORGE_HTTP_READ_TIMEOUT     time to send a request body, then 408 (default: 15s)
+  FORGE_HTTP_IDLE_TIMEOUT     wait of a kept-alive connection for its next request (default: 60s)
+  FORGE_HTTP_MAX_HEADER_BYTES largest request head in bytes, then 431 (default: 1048576)
   FORGE_HTTP_SHUTDOWN_TIMEOUT connection drain period on shutdown, a duration (default: 15s)
   FORGE_HTTP_MAX_BODY_BYTES   maximum request body size in bytes (default: 1048576)
   FORGE_MAX_CONNECTIONS       maximum concurrent connections (default: 10000)
@@ -416,8 +422,13 @@ Environment:
   FORGE_DATABASE_ALLOW_PLAINTEXT true accepts production URLs without verified TLS, only
                                on a trusted private network (default: false)
   FORGE_DATABASE_MAX_CONNS     connections of the serving pool, 1-1000 (default: 10)
+  FORGE_DATABASE_MIN_CONNS     connections the serving pool keeps open, 0 to
+                               FORGE_DATABASE_MAX_CONNS (default: 0)
   FORGE_DATABASE_CONNECT_TIMEOUT wait for a pooled connection, opening one included
                                (default: 5s)
+  FORGE_DATABASE_MAX_CONN_LIFETIME age at which a pooled connection is replaced (default: 30m)
+  FORGE_DATABASE_MAX_CONN_IDLE_TIME idle time after which a connection above the minimum
+                               is closed (default: 5m)
   FORGE_DATABASE_STATEMENT_TIMEOUT server-side bound of every statement, 1ms-596h; not
                                for migrations and commands (default: 30s)
   FORGE_JOBS_NOTIFY            true | false: enqueues announce due jobs and job workers

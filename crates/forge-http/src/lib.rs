@@ -75,7 +75,7 @@ pub use query::{QueryError, QueryErrorKind};
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(50);
 /// The shortest time a response write may make no progress before the
 /// connection is ended (the stalled-write guard). The guard is the request
-/// timeout, but never less than this, so lowering `FORGE_REQUEST_TIMEOUT_SECS`
+/// timeout, but never less than this, so lowering `FORGE_HTTP_WRITE_TIMEOUT`
 /// for a fast API does not cut off clients that read a large download or an
 /// event stream slowly; those are only disconnected when they stop reading.
 const MIN_WRITE_STALL_TIMEOUT: Duration = Duration::from_secs(30);
@@ -1044,25 +1044,39 @@ impl Server {
         cancellation: CancellationToken,
     ) {
         let app = Arc::clone(&self.app);
-        let max_body_bytes = self.config.max_body_bytes;
-        let request_timeout = self.config.request_timeout;
-        let write_stall = write_stall_timeout(request_timeout, self.min_write_stall);
+        let limits = ConnectionLimits {
+            max_body_bytes: self.config.max_body_bytes,
+            request_timeout: self.config.request_timeout,
+            read_timeout: self.config.read_timeout,
+            read_header_timeout: self.config.read_header_timeout,
+            idle_timeout: self.config.idle_timeout,
+            max_header_bytes: self.config.max_header_bytes,
+            write_stall: write_stall_timeout(self.config.request_timeout, self.min_write_stall),
+        };
         connections.spawn(async move {
-            serve_connection(
-                stream,
-                remote_addr,
-                app,
-                max_body_bytes,
-                request_timeout,
-                write_stall,
-                cancellation,
-            )
-            .await;
+            serve_connection(stream, remote_addr, app, limits, cancellation).await;
             // The connection slot is released only once the connection ends.
             drop(permit);
         });
     }
 }
+
+/// The bounds of one connection, from [`ServerConfig`].
+#[derive(Clone, Copy, Debug)]
+struct ConnectionLimits {
+    max_body_bytes: usize,
+    /// The deadline of the body and the handler (`FORGE_HTTP_WRITE_TIMEOUT`).
+    request_timeout: Duration,
+    /// The deadline of the body alone (`FORGE_HTTP_READ_TIMEOUT`).
+    read_timeout: Duration,
+    read_header_timeout: Duration,
+    idle_timeout: Duration,
+    max_header_bytes: usize,
+    write_stall: Duration,
+}
+
+/// hyper's smallest read buffer (`max_buf_size` panics below it).
+const MIN_READ_BUFFER: usize = 8192;
 
 /// How long a response write may make no progress: the request timeout, but
 /// at least `floor` ([`MIN_WRITE_STALL_TIMEOUT`]).
@@ -1132,27 +1146,40 @@ async fn serve_connection(
     stream: tokio::net::TcpStream,
     remote_addr: SocketAddr,
     app: Arc<ServedApp>,
-    max_body_bytes: usize,
-    request_timeout: Duration,
-    write_stall: Duration,
+    limits: ConnectionLimits,
     cancellation: CancellationToken,
 ) {
-    let service = service_fn(move |request| {
-        handle_request(
-            request,
-            remote_addr,
-            Arc::clone(&app),
-            max_body_bytes,
-            request_timeout,
-        )
-    });
+    let awaiting = io::AwaitingHead::new();
+    let service = {
+        let awaiting = awaiting.clone();
+        service_fn(move |request| {
+            // hyper has the head: the head deadline stops until the handler
+            // returned.
+            awaiting.set(false);
+            let awaiting = awaiting.clone();
+            let app = Arc::clone(&app);
+            async move {
+                let response = handle_request(request, remote_addr, app, limits).await;
+                awaiting.set(true);
+                response
+            }
+        })
+    };
     // A write that makes no progress for `write_stall` (the request timeout,
     // at least 30 seconds) means the peer stopped reading; end the connection
     // rather than hold its slot. Slow writes that progress never trip it.
-    let stream = io::StallTimeout::new(stream, write_stall);
+    let stream = io::StallTimeout::new(stream, limits.write_stall);
+    // A head must arrive within the read-header timeout, counted from the
+    // connection's start or the next request's first byte; hyper's own
+    // header timer, which also runs while a kept-alive connection waits for
+    // that byte, is the idle timeout.
+    let stream = io::HeadDeadline::new(stream, limits.read_header_timeout, awaiting);
     let connection = hyper::server::conn::http1::Builder::new()
         .timer(TokioTimer::new())
-        .header_read_timeout(request_timeout)
+        .header_read_timeout(limits.idle_timeout.max(limits.read_header_timeout))
+        // A larger head is answered 431 and the connection closed.
+        .max_header_size(limits.max_header_bytes)
+        .max_buf_size(limits.max_header_bytes.max(MIN_READ_BUFFER))
         .serve_connection(TokioIo::new(stream), service);
     tokio::pin!(connection);
 
@@ -1175,9 +1202,14 @@ async fn handle_request(
     request: hyper::Request<Incoming>,
     remote_addr: SocketAddr,
     app: Arc<ServedApp>,
-    max_body_bytes: usize,
-    request_timeout: Duration,
+    limits: ConnectionLimits,
 ) -> Result<hyper::Response<OutgoingBody>, Infallible> {
+    let ConnectionLimits {
+        max_body_bytes,
+        request_timeout,
+        read_timeout,
+        ..
+    } = limits;
     let request_id = Uuid::now_v7();
     let method = request.method().clone();
     let path = request.uri().path().to_owned();
@@ -1200,7 +1232,13 @@ async fn handle_request(
             // the handler returned; dropping it on any other way out (a
             // rejection, the timeout, a panic, the client leaving) releases
             // it too.
-            let (body, charged) = match collect_body(body, max_body_bytes, &app.body_budget).await {
+            let collected = tokio::time::timeout(
+                read_timeout,
+                collect_body(body, max_body_bytes, &app.body_budget),
+            )
+            .await
+            .unwrap_or(Err(BodyRejection::Slow));
+            let (body, charged) = match collected {
                 Ok(collected) => collected,
                 Err(rejection) => return rejection.into_response(),
             };
@@ -1321,6 +1359,9 @@ enum BodyRejection {
     Unreadable,
     /// The in-flight body budget has no room for the body.
     Busy,
+    /// The body did not arrive within the read timeout
+    /// (`FORGE_HTTP_READ_TIMEOUT`).
+    Slow,
 }
 
 impl BodyRejection {
@@ -1332,6 +1373,7 @@ impl BodyRejection {
             Self::Unreadable => {
                 Response::text(StatusCode::BAD_REQUEST, "request body could not be read")
             }
+            Self::Slow => Response::text(StatusCode::REQUEST_TIMEOUT, "request body timed out"),
             Self::Busy => {
                 let mut response =
                     Response::text(StatusCode::SERVICE_UNAVAILABLE, "server busy, retry later");

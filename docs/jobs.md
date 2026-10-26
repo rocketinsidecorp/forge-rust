@@ -312,8 +312,17 @@ day fields are restricted, a day matches either (Vixie cron).
 
 Every replica may run the scheduler: a tick fires **exactly once** because
 the replica that advances the schedule's `last_tick_at` row enqueues the job
-in the same transaction. Missed ticks are not replayed; the latest due tick
-is skipped when it is older than `max_lateness` (default 5 minutes).
+in the same transaction. Missed ticks (a stall, an unreachable database) are
+not replayed back to back: only the latest due tick is a candidate, and it
+runs once while it is at most `max_lateness` late (database clock). The
+default is one interval of the schedule, the gap from the tick to the
+following one (`*/5 * * * *`: 5 minutes; `@daily`: 24 hours; `0 9 * * 1-5`
+on a Friday: 72 hours), so after a stall the latest missed tick still runs
+once; `Schedule::max_lateness(d)` sets another bound, at least one minute.
+The earlier missed ticks a scheduler notices are skipped and reported in a
+warning (`skipped missed ticks instead of replaying them`, with `skipped`),
+and a tick older than the bound is skipped with a warning too. Forge-Go's
+`SchedulerOptions.MaxLateness` has the same default (forge-rust#85, D14).
 
 ## Outbox and idempotent consumers
 

@@ -16,7 +16,13 @@ const FORGE: &str = env!("CARGO_BIN_EXE_forge");
 
 const FAKE_CARGO: &str = r#"#!/bin/sh
 echo "cargo $*" >> "$RECORD"
-printf '{"reason":"compiler-artifact","target":{"kind":["bin"],"name":"shop"},"executable":"%s"}\n' "$FAKE_APP"
+bin=shop
+previous=
+for argument in "$@"; do
+    if [ "$previous" = "--bin" ]; then bin="$argument"; fi
+    previous="$argument"
+done
+printf '{"reason":"compiler-artifact","target":{"kind":["bin"],"name":"%s"},"executable":"%s"}\n' "$bin" "$FAKE_APP"
 exit "${CARGO_EXIT:-0}"
 "#;
 
@@ -644,6 +650,26 @@ fn routes_runs_the_applications_command() {
     assert_eq!(failed.status.code(), Some(1), "{}", stderr(&failed));
     let extra = fixture.run(&["routes", "--json"]);
     assert_eq!(extra.status.code(), Some(2), "{}", stderr(&extra));
+}
+
+#[test]
+fn routes_runs_the_named_binary_like_dev() {
+    let fixture = Fixture::new(FAKE_APP);
+    let output = fixture.run(&["routes", "admin"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(fixture.app_calls(), ["routes".to_owned()]);
+    assert!(
+        fixture
+            .lines()
+            .iter()
+            .any(|line| line.starts_with("cargo build") && line.ends_with("--bin admin")),
+        "{:?}",
+        fixture.lines()
+    );
+    // The same refusal as `forge dev ../evil`: nothing is built.
+    let invalid = fixture.run(&["routes", "../evil"]);
+    assert_eq!(invalid.status.code(), Some(1), "{}", stderr(&invalid));
+    assert!(stderr(&invalid).contains("invalid binary name"));
 }
 
 #[test]

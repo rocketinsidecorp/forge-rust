@@ -16,8 +16,8 @@ use sqlx::{
 use uuid::Uuid;
 
 use crate::{
-    Backend, Database, DbError, FRAMEWORK_MIGRATIONS, PoolSettings, Transaction,
-    TransactionManager, combine_migrations, expect_rows, testing::TestDatabase,
+    Backend, Database, DbError, FRAMEWORK_MIGRATIONS, Transaction, TransactionManager,
+    combine_migrations, expect_rows, testing::TestDatabase,
 };
 
 enum Owner {}
@@ -435,7 +435,7 @@ macro_rules! common_suite {
             $(#[$attr])*
             async fn the_statement_timeout_bounds_every_pooled_connection() {
                 let test = fresh().await;
-                let settings = PoolSettings::default()
+                let settings = crate::testing::test_settings()
                     .with_max_connections(2)
                     .with_statement_timeout(Some(Duration::from_millis(250)))
                     .with_job_announcements(true);
@@ -492,8 +492,8 @@ macro_rules! common_suite {
                 if <Db as Backend>::SCHEME == DatabaseScheme::Postgres {
                     // Each setting holds without the other; neither is on by default.
                     for (settings, timeout, notify) in [
-                        (PoolSettings::default().with_job_announcements(true), "0", "on"),
-                        (PoolSettings::default(), "0", ""),
+                        (crate::testing::test_settings().with_job_announcements(true), "0", "on"),
+                        (crate::testing::test_settings(), "0", ""),
                     ] {
                         let db = Database::<Db>::connect_with(test.url(), settings).await.expect("connect");
                         let shown: (String, String) = sqlx::query_as(
@@ -514,7 +514,7 @@ macro_rules! common_suite {
             $(#[$attr])*
             async fn pool_exhaustion_is_a_retryable_timeout() {
                 let test = fresh().await;
-                let settings = PoolSettings::default()
+                let settings = crate::testing::test_settings()
                     .with_max_connections(1)
                     .with_acquire_timeout(Duration::from_millis(1500));
                 let db = Database::<Db>::connect_with(test.url(), settings).await.expect("connect");
@@ -584,7 +584,7 @@ async fn database_exists<B: Backend>(url: &str) -> bool {
         let path = location.split('?').next().unwrap_or(location);
         return std::path::Path::new(path).exists();
     }
-    Database::<B>::connect(&SecretString::new(url))
+    Database::<B>::connect_with(&SecretString::new(url), crate::testing::test_settings())
         .await
         .is_ok()
 }

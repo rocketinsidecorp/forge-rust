@@ -924,7 +924,169 @@ fn test_config(request_timeout: Duration) -> ServerConfig {
         max_in_flight_body_bytes: 1024,
         trusted_proxies: Vec::new(),
         transport: forge_config::HttpTransport::Plain,
+        // The head is due as fast as the request, so slow-head tests stay
+        // short.
+        read_header_timeout: request_timeout,
+        ..ServerConfig::default()
     }
+}
+
+/// Reads until the server closes the connection; returns what arrived and
+/// how long it took.
+fn read_to_close(stream: &mut StdTcpStream) -> (String, Duration) {
+    let started = std::time::Instant::now();
+    let mut received = Vec::new();
+    let _ = stream.read_to_end(&mut received);
+    (
+        String::from_utf8_lossy(&received).into_owned(),
+        started.elapsed(),
+    )
+}
+
+/// A connection must send its first head within the read-header timeout,
+/// counted from its start; a later head is due from its first byte, and
+/// until that byte the kept-alive connection may wait for the idle timeout
+/// (Forge-Go's `ReadHeaderTimeout` and `IdleTimeout`).
+#[tokio::test]
+async fn heads_are_due_within_the_read_header_timeout_and_idle_connections_within_the_idle_timeout()
+{
+    let header = Duration::from_millis(300);
+    let idle = Duration::from_secs(2);
+    let config = ServerConfig {
+        read_header_timeout: header,
+        idle_timeout: idle,
+        ..test_config(Duration::from_secs(10))
+    };
+    let server = TestServer::start(config, test_router()).await;
+    let addr = server.addr;
+    tokio::task::spawn_blocking(move || {
+        // Nothing at all: closed after the read-header timeout, not idle.
+        let mut silent = connect(addr);
+        let (text, waited) = read_to_close(&mut silent);
+        assert!(text.is_empty(), "{text}");
+        assert!(waited >= header && waited < idle, "{waited:?}");
+
+        // A head that never ends: closed after the read-header timeout.
+        let mut stalled = connect(addr);
+        stalled
+            .write_all(b"GET /health/live HTTP/1.1\r\nHost: localhost\r\n")
+            .expect("partial head");
+        let (text, waited) = read_to_close(&mut stalled);
+        assert!(!text.contains(" 200 "), "{text}");
+        assert!(waited >= header && waited < idle, "{waited:?}");
+
+        // Kept alive: the wait for the next request is idle time, longer
+        // than the read-header timeout, and the next head is then due from
+        // its first byte.
+        let mut kept = connect(addr);
+        kept.write_all(b"GET /health/live HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .expect("first request");
+        read_until(&mut kept, r#"{"status":"live"}"#);
+        // The server must not close the idle connection within twice the
+        // read-header timeout: a read with that deadline times out instead
+        // of seeing the end of the stream.
+        kept.set_read_timeout(Some(header * 2))
+            .expect("read timeout must be settable");
+        let mut probe = [0_u8; 1];
+        let idle_read = kept.read(&mut probe);
+        assert!(
+            matches!(&idle_read, Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)),
+            "the idle connection was closed early: {idle_read:?}"
+        );
+        kept.set_read_timeout(Some(CLIENT_TIMEOUT))
+            .expect("read timeout must be settable");
+        kept.write_all(b"GET /health/live HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .expect("second request after an idle wait");
+        let second = read_until(&mut kept, r#"{"status":"live"}"#);
+        assert!(second.starts_with("HTTP/1.1 200 "), "{second}");
+        // Then idle until the idle timeout closes it.
+        let (text, waited) = read_to_close(&mut kept);
+        assert!(text.is_empty(), "{text}");
+        assert!(waited >= idle - header, "{waited:?}");
+    })
+    .await
+    .expect("client task must not panic");
+    server.stop().await;
+}
+
+/// A pipelined head that waits in the server's buffer while a slow handler
+/// runs gets its own read-header deadline: the first head's deadline, long
+/// expired by then, does not cut it.
+#[tokio::test]
+async fn a_pipelined_head_after_a_slow_handler_gets_its_own_deadline() {
+    let header = Duration::from_millis(200);
+    let config = ServerConfig {
+        read_header_timeout: header,
+        // `/slow` ends with 504 after this, well past the head deadline.
+        ..test_config(Duration::from_millis(800))
+    };
+    let server = TestServer::start(config, test_router()).await;
+    let addr = server.addr;
+    tokio::task::spawn_blocking(move || {
+        let mut stream = connect(addr);
+        // The second head arrives with the first, unfinished.
+        stream
+            .write_all(
+                b"GET /slow HTTP/1.1\r\nHost: localhost\r\n\r\n\
+                  GET /health/live HTTP/1.1\r\nHost: localhost\r\n",
+            )
+            .expect("pipelined requests");
+        let first = read_until(&mut stream, "request timed out");
+        assert!(first.starts_with("HTTP/1.1 504 "), "{first}");
+        stream
+            .write_all(b"Connection: close\r\n\r\n")
+            .expect("the rest of the second head");
+        let (second, _) = read_to_close(&mut stream);
+        assert!(
+            second.contains("HTTP/1.1 200 ") && second.ends_with(r#"{"status":"live"}"#),
+            "the pipelined head was cut: {second:?}"
+        );
+    })
+    .await
+    .expect("client task must not panic");
+    server.stop().await;
+}
+
+/// A head larger than `FORGE_HTTP_MAX_HEADER_BYTES` is answered `431`.
+#[tokio::test]
+async fn an_oversized_request_head_is_refused_with_431() {
+    let config = ServerConfig {
+        max_header_bytes: 1024,
+        ..test_config(Duration::from_secs(10))
+    };
+    let server = TestServer::start(config, test_router()).await;
+    let big = format!(
+        "GET /health/live HTTP/1.1\r\nHost: localhost\r\nX-Padding: {}\r\nConnection: close\r\n\r\n",
+        "a".repeat(2048)
+    );
+    let response = exchange_owned(server.addr, big).await;
+    assert!(response.starts_with("HTTP/1.1 431 "), "{response}");
+    let small = exchange(
+        server.addr,
+        "GET /health/live HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(small.starts_with("HTTP/1.1 200 "), "{small}");
+    server.stop().await;
+}
+
+/// A body that does not arrive within `FORGE_HTTP_READ_TIMEOUT` is answered
+/// `408`, before the longer request deadline.
+#[tokio::test]
+async fn a_body_slower_than_the_read_timeout_is_answered_408() {
+    let config = ServerConfig {
+        read_timeout: Duration::from_millis(200),
+        ..test_config(Duration::from_secs(10))
+    };
+    let server = TestServer::start(config, test_router()).await;
+    let response = exchange(
+        server.addr,
+        "POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 10\r\n\
+         Connection: close\r\n\r\nab",
+    )
+    .await;
+    assert!(response.starts_with("HTTP/1.1 408 "), "{response}");
+    server.stop().await;
 }
 
 fn test_router() -> Router {

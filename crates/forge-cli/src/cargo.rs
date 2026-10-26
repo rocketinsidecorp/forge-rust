@@ -8,7 +8,11 @@ pub(crate) enum CargoCommand {
     /// `cargo test`; arguments replace the default `--all-targets
     /// --all-features`, like `forge test ARGS` replaces `./...` in Forge-Go.
     Test(Vec<String>),
-    Format,
+    /// `cargo fmt --all`; with `check`, `-- --check --files-with-diff`:
+    /// lists the unformatted files, writes nothing, exits 1 on drift.
+    Format {
+        check: bool,
+    },
     Lint,
     /// The optimized, locked release build, of one binary when named.
     Build(Option<String>),
@@ -68,7 +72,11 @@ impl CargoCommand {
                 all.extend(arguments);
                 ("test", all)
             }
-            Self::Format => fixed("fmt", &["fmt", "--all"]),
+            Self::Format { check: false } => fixed("fmt", &["fmt", "--all"]),
+            Self::Format { check: true } => fixed(
+                "fmt",
+                &["fmt", "--all", "--", "--check", "--files-with-diff"],
+            ),
             Self::Build(None) => fixed("build", &["build", "--release", "--locked"]),
             Self::Build(Some(name)) => {
                 let (display, mut all) =
@@ -126,6 +134,14 @@ mod tests {
         assert_eq!(
             arguments(CargoCommand::Build(Some("shop".to_owned()))),
             ["build", "--release", "--locked", "--bin", "shop"]
+        );
+        assert_eq!(
+            arguments(CargoCommand::Format { check: false }),
+            ["fmt", "--all"]
+        );
+        assert_eq!(
+            arguments(CargoCommand::Format { check: true }),
+            ["fmt", "--all", "--", "--check", "--files-with-diff"]
         );
     }
 }

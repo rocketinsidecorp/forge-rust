@@ -57,6 +57,15 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Clippy (warnings denied)
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      # --all-features hides a cfg that only compiles with every backend on:
+      # the test helpers must also build with one backend, or none.
+      - name: Feature subsets of the test helpers
+        run: |
+          cargo check --locked -p forge-db --features testing
+          cargo check --locked -p forge-db --features testing,sqlite
+          cargo check --locked -p forge-db --features testing,mysql
+          cargo check --locked -p forge-db --features testing,postgres
+          cargo check --locked -p forge --no-default-features --features sqlite,testing
 
   test:
     name: test

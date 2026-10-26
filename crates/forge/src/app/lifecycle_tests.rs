@@ -218,22 +218,13 @@ pub(super) fn start(
     let thread = thread::spawn(move || {
         REPORT.with(|slot| *slot.borrow_mut() = Some(report));
         app.run_boxed(command, move || {
-            // FORGE_TELEMETRY_METRICS_ADDR refuses port 0 on purpose (a
-            // metrics endpoint must be addressable by a scraper), so a test
-            // asking for an ephemeral one sets the field after loading.
-            let ephemeral = vars
-                .iter()
-                .any(|(key, value)| *key == METRICS_ADDR && value == EPHEMERAL);
+            // FORGE_TELEMETRY_METRICS_ADDR=127.0.0.1:0 asks the kernel for a
+            // port, read back from the bound listener.
             let vars: Vec<(&str, &str)> = vars
                 .iter()
-                .filter(|(key, value)| !(*key == METRICS_ADDR && value == EPHEMERAL))
                 .map(|(key, value)| (*key, value.as_str()))
                 .collect();
-            let mut config = config(&vars)?;
-            if ephemeral {
-                config.telemetry.metrics_addr = Some(SocketAddr::from(([127, 0, 0, 1], 0)));
-            }
-            Ok(config)
+            config(&vars)
         })
     });
     Running {
