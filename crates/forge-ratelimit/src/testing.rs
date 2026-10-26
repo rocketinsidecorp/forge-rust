@@ -17,7 +17,12 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::{any::Any, future::Future, sync::Arc, time::Duration};
+use std::{
+    any::Any,
+    future::Future,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use crate::{Limit, LimitError, Limiter, MAX_PER, Pruner};
 
@@ -86,17 +91,35 @@ async fn keys_are_independent(subject: Subject) {
 
 async fn window_resets(subject: Subject) {
     let l = limit(2, WINDOW);
-    allow(&subject.limiter, "k", l).await;
-    allow(&subject.limiter, "k", l).await;
+    // The third hit is refused only inside the window. A store that took the
+    // whole window to answer three hits (a loaded CI runner) may rightly have
+    // opened a new one, so the refusal is asserted on the first attempt, each
+    // on a fresh key, whose hits finished inside the window (it opens at the
+    // first hit, after `started`). If no attempt does, the test fails: the
+    // assertion cannot be skipped silently.
+    let mut asserted = false;
+    for attempt in 0..5 {
+        let key = format!("k{attempt}");
+        let started = Instant::now();
+        allow(&subject.limiter, &key, l).await;
+        allow(&subject.limiter, &key, l).await;
+        let third = allow(&subject.limiter, &key, l).await;
+        if started.elapsed() >= WINDOW {
+            continue;
+        }
+        assert!(!third.allowed, "third hit in the window");
+        tokio::time::sleep(WINDOW + Duration::from_millis(150)).await;
+        let d = allow(&subject.limiter, &key, l).await;
+        assert!(
+            d.allowed && d.remaining == 1,
+            "first hit of a new window: {d:?}"
+        );
+        asserted = true;
+        break;
+    }
     assert!(
-        !allow(&subject.limiter, "k", l).await.allowed,
-        "third hit in the window"
-    );
-    tokio::time::sleep(WINDOW + Duration::from_millis(150)).await;
-    let d = allow(&subject.limiter, "k", l).await;
-    assert!(
-        d.allowed && d.remaining == 1,
-        "first hit of a new window: {d:?}"
+        asserted,
+        "no attempt finished its three hits inside a {WINDOW:?} window in 5 tries"
     );
 }
 

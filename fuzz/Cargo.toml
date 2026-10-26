@@ -38,9 +38,15 @@ forge-i18n = { path = "../crates/forge-i18n" }
 forge-mail = { path = "../crates/forge-mail" }
 forge-openapi = { path = "../crates/forge-openapi" }
 forge-proxy = { path = "../crates/forge-proxy" }
+forge-storage = { path = "../crates/forge-storage" }
 forge-telemetry = { path = "../crates/forge-telemetry" }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+# Already in the locked graph (forge-http, forge-storage); named here because
+# the http and storage targets build a `Request` and implement `Storage`.
+async-trait = "0.1.92"
+bytes = "1.12.1"
+uuid = "1.26.1"
 
 [lints.rust]
 # fuzz_target! expands to `unsafe extern "C"` glue, so unsafe_code is not
@@ -86,6 +92,27 @@ bench = false
 [[bin]]
 name = "deploy_yaml"
 path = "fuzz_targets/deploy_yaml.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "http_form"
+path = "fuzz_targets/http_form.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "http_query"
+path = "fuzz_targets/http_query.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "http_router"
+path = "fuzz_targets/http_router.rs"
 test = false
 doc = false
 bench = false
@@ -149,6 +176,20 @@ bench = false
 [[bin]]
 name = "proxy_timestamps"
 path = "fuzz_targets/proxy_timestamps.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "storage_key"
+path = "fuzz_targets/storage_key.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "storage_multipart"
+path = "fuzz_targets/storage_multipart.rs"
 test = false
 doc = false
 bench = false

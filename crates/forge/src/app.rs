@@ -1116,6 +1116,8 @@ async fn bind_metrics(
         .await
         .map_err(|source| ServeError::Bind { address, source })?;
     let local = listener.local_addr().unwrap_or(address);
+    #[cfg(test)]
+    lifecycle_tests::listening(lifecycle_tests::Bound::Metrics, local);
     info!(address = %local, "metrics listening on GET /metrics");
     Ok(Some((
         process_telemetry::metrics_server(telemetry, address),
@@ -1534,6 +1536,8 @@ async fn serve(
         })?;
     let metrics = bind_metrics(telemetry, config.telemetry.metrics_addr).await?;
     let address = listener.local_addr().unwrap_or(bind);
+    #[cfg(test)]
+    lifecycle_tests::listening(lifecycle_tests::Bound::Http, address);
     info!(
         app = name,
         version,

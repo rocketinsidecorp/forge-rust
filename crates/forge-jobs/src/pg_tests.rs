@@ -1383,10 +1383,15 @@ struct HolderProbe {
     quick_done: AtomicUsize,
     cancelled_after_commit: AtomicUsize,
     lease: Mutex<Option<(JobId, LeaseToken)>>,
+    /// Ends the hold: the test releases the transaction once it has seen
+    /// what must happen while it is open, instead of the holder guessing how
+    /// long that takes.
+    release: tokio::sync::Notify,
 }
 
-/// `hold: true` completes in its own transaction and keeps it open across
-/// several heartbeats; `hold: false` finishes immediately.
+/// `hold: true` completes in its own transaction and keeps it open, across
+/// several heartbeats, until the probe's `release`; `hold: false` finishes
+/// immediately.
 struct HoldsCompletion {
     database: PgDatabase,
     probe: Arc<HolderProbe>,
@@ -1405,7 +1410,7 @@ impl JobHandler for HoldsCompletion {
         complete_in(&mut transaction, context).await?;
         *self.probe.lease.lock().expect("lock") = Some((context.id(), context.lease));
         self.probe.locked.fetch_add(1, Ordering::SeqCst);
-        tokio::time::sleep(Duration::from_secs(4)).await;
+        self.probe.release.notified().await;
         transaction.commit().await?;
         self.probe.committed.fetch_add(1, Ordering::SeqCst);
         // Heartbeats after the commit see the lease gone; that is not a loss.
@@ -1468,6 +1473,7 @@ async fn renewal_skips_rows_locked_by_transactional_completion() {
         0,
         "the second job ran while the first transaction still held its row"
     );
+    probe.release.notify_one();
     wait_until("the holder to finish", || async {
         count_state(&db, "completed").await == 2
     })

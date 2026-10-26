@@ -123,8 +123,18 @@ async fn shutdown_during_accept_errors_returns_every_permit() {
         shutdown.clone(),
         Arc::clone(&permits),
     ));
-    // The loop keeps retrying, holding one permit for the retry.
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // The loop keeps retrying, holding one permit for the retry: wait until
+    // it holds it, however long a loaded runner takes to start the task.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while permits.available_permits() != 1 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the accept loop never took its retry permit"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    // And it keeps only that one while it retries.
+    tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(permits.available_permits(), 1);
 
     shutdown.cancel();

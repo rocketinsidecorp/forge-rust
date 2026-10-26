@@ -425,11 +425,28 @@ mod tests {
     fn a_child_that_ignores_the_request_is_killed_after_the_grace() {
         let shutdown = Shutdown::new();
         shutdown.request();
+        let directory = tempfile::tempdir().expect("tempdir");
+        let trapped = directory.path().join("trapped");
         let mut command = Command::new("sh");
-        command.args(["-c", "trap '' TERM; while :; do sleep 1; done"]);
+        command
+            .args([
+                "-c",
+                "trap '' TERM; : > \"$1\"; while :; do sleep 1; done",
+                "sh",
+            ])
+            .arg(&trapped);
         let mut child = OwnedChild::spawn(command, true).expect("spawn");
-        // Give the shell time to install the trap.
-        std::thread::sleep(Duration::from_millis(200));
+        // The shell creates the file once the trap is installed: wait for it
+        // instead of for a duration, or a slow start would be killed by the
+        // request itself and the grace never exercised.
+        let waited = Instant::now();
+        while !trapped.exists() {
+            assert!(
+                waited.elapsed() < Duration::from_secs(20),
+                "the shell never installed its trap"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
         let (status, interrupted) = child
             .wait(&shutdown, Duration::from_millis(300))
             .expect("wait");

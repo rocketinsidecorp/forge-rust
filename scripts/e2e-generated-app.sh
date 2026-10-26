@@ -386,15 +386,51 @@ fi
 
 log "Host run: serve, probe and graceful shutdown"
 cargo build --quiet --locked
-port="$(free_port)"
-metrics_port="$(free_port)"
-env_args=(FORGE_HTTP_ADDR="127.0.0.1:$port" FORGE_HTTP_SHUTDOWN_TIMEOUT=5s
-  FORGE_TELEMETRY_METRICS_ADDR="127.0.0.1:$metrics_port")
-if [[ -n "$runtime_database_url" ]]; then
-  env_args+=(FORGE_DATABASE_URL="$runtime_database_url")
+# The application listens on an ephemeral port and says which one in its log:
+# probing a free port, closing it and passing it on races with every other
+# process that binds a port. The metrics address refuses port 0 by design, so
+# that one is probed; losing the race ends the process before it reports, and
+# the next attempt probes another.
+app_log="$work_dir/app.log"
+port=""
+for _ in 1 2 3 4 5; do
+  metrics_port="$(free_port)"
+  env_args=(FORGE_HTTP_SHUTDOWN_TIMEOUT=5s
+    FORGE_TELEMETRY_METRICS_ADDR="127.0.0.1:$metrics_port")
+  if [[ -n "$runtime_database_url" ]]; then
+    env_args+=(FORGE_DATABASE_URL="$runtime_database_url")
+  fi
+  env "${env_args[@]}" FORGE_HTTP_ADDR="127.0.0.1:0" "$app_bin" >"$app_log" 2>&1 &
+  server_pid=$!
+  exited=0
+  for _ in $(seq 1 600); do
+    port="$(sed -n 's/.*forge::app: listening app=.*address=127\.0\.0\.1:\([0-9][0-9]*\)[^0-9].*/\1/p' "$app_log" | head -n 1)"
+    [[ -n "$port" ]] && break
+    if ! kill -0 "$server_pid" 2>/dev/null; then
+      exited=1
+      break
+    fi
+    sleep 0.1
+  done
+  [[ -n "$port" ]] && break
+  if [[ "$exited" == 0 ]]; then
+    # Alive but silent for 60 s: waiting for it would hang the job.
+    kill -KILL "$server_pid" 2>/dev/null || true
+    wait "$server_pid" 2>/dev/null || true
+    server_pid=""
+    cat "$app_log" >&2
+    fail "the application is running but did not report where it listens within 60 s"
+  fi
+  # It exited before reporting (a lost metrics port race): try another port.
+  wait "$server_pid" 2>/dev/null || true
+  server_pid=""
+done
+if [[ -z "$port" ]]; then
+  cat "$app_log" >&2
+  fail "the application did not report where it listens"
 fi
-env "${env_args[@]}" "$app_bin" &
-server_pid=$!
+# `healthcheck` probes FORGE_HTTP_ADDR, so it names the port that was bound.
+env_args+=(FORGE_HTTP_ADDR="127.0.0.1:$port")
 wait_for_http "http://127.0.0.1:$port/health/live"
 curl --silent --fail "http://127.0.0.1:$port/health/ready" | grep -q '"ready"' || fail "readiness body"
 

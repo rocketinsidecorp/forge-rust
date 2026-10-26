@@ -687,10 +687,13 @@ fn version_prints_the_cli_version() {
 
 #[test]
 fn doctor_reports_an_unreachable_database_without_leaking_the_url() {
-    let free = {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-        listener.local_addr().expect("address").port()
-    };
+    // Bound and never listening: connecting is refused, and unlike a probed
+    // port that was closed, nobody else can take it while the test runs.
+    let refusing = tokio::net::TcpSocket::new_v4().expect("socket");
+    refusing
+        .bind("127.0.0.1:0".parse().expect("address"))
+        .expect("bind");
+    let free = refusing.local_addr().expect("address").port();
     let url = format!("postgres://app_runtime:hunter2@127.0.0.1:{free}/shop");
     let output = forge_command()
         .arg("doctor")

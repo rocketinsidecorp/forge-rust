@@ -261,7 +261,10 @@ mod tests {
         let second = cipher.encrypt(b"123-45-6789", &PEOPLE).expect("encrypt");
         assert_ne!(first, second);
         assert!(first.starts_with("fg1.k1."));
-        assert!(!first.contains("123-45"));
+        // The whole plaintext, not a prefix: "123-45" occurs by chance in about
+        // 50 random base64 characters with probability ~7e-10, above the
+        // 1e-12 a test may flake at; these 11 characters ~1e-18.
+        assert!(!first.contains("123-45-6789"));
         assert_eq!(
             &*cipher.decrypt(&first, &PEOPLE).expect("decrypt"),
             b"123-45-6789"

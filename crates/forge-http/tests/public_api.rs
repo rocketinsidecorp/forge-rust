@@ -340,9 +340,61 @@ async fn eventually_serving(address: SocketAddr, path: &str) -> Option<u16> {
     None
 }
 
+/// A running `Server::run`, as `run_on_a_free_address` starts it.
+struct Running {
+    address: SocketAddr,
+    stop: oneshot::Sender<()>,
+    task: tokio::task::JoinHandle<Result<(), ServerError>>,
+}
+
+/// Runs `Server::run` on a loopback address nobody had bound yet. `run` binds
+/// the address itself and reports nothing, so a free one is probed first, and
+/// another process may take it between the probe and the bind. That loss is a
+/// bind error that ends the task before it served: the next attempt probes a
+/// fresh address instead of failing the test.
+async fn run_on_a_free_address() -> Running {
+    for _ in 0..10 {
+        let address = {
+            let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            probe.local_addr().expect("address")
+        };
+        let mut router = Router::new();
+        router.standard_health_routes().expect("health routes");
+        let (stop, stopped) = oneshot::channel::<()>();
+        let task = tokio::spawn(async move {
+            Server::new(config(address), router)
+                .run(async {
+                    let _ = stopped.await;
+                })
+                .await
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !task.is_finished() && tokio::time::Instant::now() < deadline {
+            if status_of(address, "/health/live").await == Some(200) && !task.is_finished() {
+                return Running {
+                    address,
+                    stop,
+                    task,
+                };
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let outcome = tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("a run that did not serve ends")
+            .expect("task");
+        assert!(
+            matches!(outcome, Err(ServerError::Bind(_))),
+            "only a lost bind race may end the run before it serves: {outcome:?}"
+        );
+    }
+    panic!("no free address could be bound in ten attempts");
+}
+
 #[tokio::test]
 async fn run_binds_the_configured_address_and_a_taken_one_is_an_error() {
-    // A taken address: the bind error is reported, not swallowed.
+    // A taken address, held for the whole check: the bind error is reported,
+    // not swallowed.
     let taken = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     let address = taken.local_addr().expect("address");
     let error = Server::new(config(address), Router::new())
@@ -352,20 +404,14 @@ async fn run_binds_the_configured_address_and_a_taken_one_is_an_error() {
     assert!(matches!(error, ServerError::Bind(_)), "{error:?}");
     drop(taken);
 
-    // Once it is free, `run` serves there until the shutdown future resolves.
-    let mut router = Router::new();
-    router.standard_health_routes().expect("health routes");
-    let (stop, stopped) = oneshot::channel::<()>();
-    let task = tokio::spawn(async move {
-        Server::new(config(address), router)
-            .run(async {
-                let _ = stopped.await;
-            })
-            .await
-    });
-    assert_eq!(eventually_serving(address, "/health/live").await, Some(200));
-    let _ = stop.send(());
-    let outcome = tokio::time::timeout(Duration::from_secs(10), task)
+    // A free one: `run` serves there until the shutdown future resolves.
+    let running = run_on_a_free_address().await;
+    assert_eq!(
+        eventually_serving(running.address, "/health/live").await,
+        Some(200)
+    );
+    let _ = running.stop.send(());
+    let outcome = tokio::time::timeout(Duration::from_secs(10), running.task)
         .await
         .expect("stops in time");
     outcome.expect("task").expect("serves cleanly");

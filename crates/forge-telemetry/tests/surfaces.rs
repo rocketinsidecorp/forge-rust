@@ -126,13 +126,14 @@ async fn export_failures_have_stable_codes_and_never_name_the_endpoint() {
     assert_eq!(timeout.error_type(), "timeout");
     assert!(!timeout.to_string().contains("127.0.0.1"));
 
-    // Nothing listens: a transport failure.
-    let closed = {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind");
-        format!("http://{}", listener.local_addr().expect("addr"))
-    };
+    // Nothing listens: a transport failure. The port is bound and never
+    // listening, so connecting is refused and nobody else can take it while
+    // the test runs.
+    let refusing = tokio::net::TcpSocket::new_v4().expect("socket");
+    refusing
+        .bind("127.0.0.1:0".parse().expect("address"))
+        .expect("bind");
+    let closed = format!("http://{}", refusing.local_addr().expect("addr"));
     let client = OtlpClient::new(&closed, HeaderMap::new(), false, Duration::from_secs(5))
         .expect("valid endpoint")
         .with_initial_backoff(Duration::from_millis(1));

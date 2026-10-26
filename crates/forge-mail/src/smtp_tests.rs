@@ -688,9 +688,13 @@ async fn a_silent_server_hits_the_deadline() {
 
 #[tokio::test]
 async fn a_closed_port_is_transient() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-    let address = listener.local_addr().expect("address");
-    drop(listener);
+    // Bound and never listening: connecting is refused, and unlike a probed
+    // port that was closed, nobody else can take it while the test runs.
+    let refusing = tokio::net::TcpSocket::new_v4().expect("socket");
+    refusing
+        .bind("127.0.0.1:0".parse().expect("address"))
+        .expect("bind");
+    let address = refusing.local_addr().expect("address");
     let error = sender(config("localhost", address.port()), address)
         .send(&message())
         .await

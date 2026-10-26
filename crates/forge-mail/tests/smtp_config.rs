@@ -87,10 +87,11 @@ fn smtp_settings_are_validated_without_touching_the_network() {
 
 #[tokio::test]
 async fn a_server_that_is_not_there_is_a_retryable_connect_failure() {
-    let closed = {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        listener.local_addr().unwrap().port()
-    };
+    // Bound and never listening: connecting is refused, and unlike a probed
+    // port that was closed, nobody else can take it while the test runs.
+    let refusing = tokio::net::TcpSocket::new_v4().unwrap();
+    refusing.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let closed = refusing.local_addr().unwrap().port();
     let sender = config(|c| {
         c.host = "127.0.0.1".to_owned();
         c.port = closed;
