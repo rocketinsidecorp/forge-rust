@@ -216,6 +216,7 @@ routing: the strict Content-Security-Policy, `CsrfProtection` and
 | Threat | Control | Verification |
 | --- | --- | --- |
 | Cross-site form or `fetch` submission | Every unsafe request needs exactly one 256-bit token (header or form field) equal to the `__Host-forge_csrf` cookie (`Secure`, `HttpOnly`, `SameSite=Lax`, no `Domain`); constant-time comparison; repeated/malformed values refused; `403` with a generic body | missing, wrong, repeated, malformed, query-string and header/field-mismatch tests in `forge-views`; generated `tests/http.rs`; e2e |
+| CSRF token recovered through compressed responses (BREACH) | Pages never embed the token itself: `csrf_meta` and `csrf_field` write it masked with a fresh 32-byte one-time pad from the OS CSPRNG on every render (pad, then token XOR pad, 86 characters of unpadded base64url, Forge-Go's and Rails' layout), so no two responses carry the same token bytes; verification unmasks (exact length, strict base64url, canonical re-encoding) and compares with the cookie in constant time. The cookie keeps the raw token, which no compressed body reflects; the unmasked token stays accepted in the header for good (scripts read the cookie) and in the form field until v0.2.0 (pages rendered before the upgrade); a CSPRNG failure renders an empty value that is refused | `forge-views` masking tests (fresh masks, both forms accepted, tampered, truncated, padded, foreign and arbitrary input refused without panics); generated `tests/http.rs` (`home_page_is_html_with_layout_csp_and_csrf_token`, `form_posts_need_the_csrf_token_of_the_page`); e2e |
 | Cookie tossing from a sibling subdomain or plain-HTTP attacker | `__Host-` prefix; `Sec-Fetch-Site: same-site` refused | cookie attribute tests; cross-site tests |
 | Login CSRF / anonymous forms | Token issued before any session, independent of the database | first-visit issuance test |
 | Tunnelled `DELETE` without CSRF | `_method` honored only on `POST`, only `PATCH`/`PUT`/`DELETE`, only after verification (`CsrfVerified` witness), repeated field refused, `GET` never overridden | method-override negative tests |
@@ -224,9 +225,9 @@ routing: the strict Content-Security-Policy, `CsrfProtection` and
 | Form parser abuse | Exactly one UTF-8 form `Content-Type`, body bounded by `FORGE_MAX_BODY_BYTES`, at most 1000 pairs, strict grammar, duplicate scalar fields refused, caller-safe errors | `forge-http` form tests |
 | Asset path traversal or MIME confusion | Exact digested routes only, closed extension allowlist, `nosniff`, SVG sandbox CSP | existing asset tests |
 
-Residual risks: tokens are not masked per response, so HTML compression by a
-proxy combined with reflected input could enable BREACH-style recovery; the
-flash cookie is unsigned (display text only); the `Origin`/`Host` fallback can
+Residual risks: until v0.2.0 the form field also accepts the unmasked token,
+which only matters for pages that still embed it (rendered before the
+upgrade); the flash cookie is unsigned (display text only); the `Origin`/`Host` fallback can
 refuse legitimate requests behind `Host`-rewriting proxies for browsers without
 Fetch Metadata; `__Host-` cookies require HTTPS outside `localhost`; a full-stack
 router requires the token on JSON endpoints too (no reviewed exemption mechanism
@@ -251,13 +252,16 @@ commands, and the framework rules they rely on.
 | Account and tenant enumeration | One `422` message for a wrong organization, email or password, a disabled account or an inactive membership; unknown logins still cost one Argon2id hash; reset requests answer the same `303` and flash whether or not the account exists or the link was delivered | `every_wrong_field_gets_the_same_answer`, `reset_requests_answer_the_same_whether_or_not_the_account_exists` |
 | Login CSRF and forged sign-out | Handlers refuse (`403`) unless `CsrfProtection` verified the request (`csrf_verified`); the sign-in form's token is issued before any session; sign-out also checks the session-bound CSRF token (ADR 0014) | `sign_in_without_the_csrf_token_is_forbidden`, `signing_out_needs_the_csrf_token_and_revokes_the_session` |
 | Session fixation and token planting | Sign-in issues a new server-side session and a new CSRF token in fresh cookies and revokes the session the browser held; sign-out and reset clear the session cookie and rotate the CSRF token | `signing_in_issues_a_fresh_session_and_csrf_token_and_returns_to_the_page`, `signing_in_again_revokes_the_previous_session` |
+| Unattended or stolen session used long after its last use | Besides the absolute lifetime (24 hours), a session ends after `FORGE_AUTH_SESSION_IDLE_TIMEOUT` (default `2h`, `5m` to `720h`, no way to turn it off) without a request: `PostgresSessionStore` refuses a stale `last_seen_at` like a revocation (`401`, or the sign-in page), and the refused attempt does not revive it. The use is written at most once a minute per session by a conditional `UPDATE` that re-checks that the session is live, decided by the database clock; a failed write fails the request (`503`) | generated PostgreSQL `sessions_end_after_the_idle_timeout_and_record_their_use`, `sessions_use_the_default_idle_timeout_of_two_hours`, `a_session_use_is_written_at_most_once_a_minute` (16 concurrent resolutions of a stale session write once, counted by a trigger), `the_idle_timeout_migration_keeps_open_sessions_and_reverts`; `forge-config` bounds test |
+| Process-local throttle in a replicated production | Generated applications count in PostgreSQL (`PgLoginThrottle`); custom wiring that passes the in-memory `MemoryLoginThrottle` for sign-in, two-factor or password reset logs one warning at start-up when `FORGE_ENV=production` (`Composition::warn_if_process_local_throttle`, Forge-Go's wording). A warning, not a refusal: a single-process application may count in memory on purpose | `forge` `process_local_throttles_warn_in_production_only`; `forge-auth` `is_process_local` tests |
 | Open redirect through `return_to` | `return_path` accepts only local paths (single leading `/`, visible ASCII, no backslash, at most 2048 bytes) when rendering, posting and redirecting; `see_other` re-checks | `forge-views` return-path tests; `return_paths_off_the_site_are_ignored` |
 | Reset token theft or replay | 256-bit CSPRNG token, SHA-256 digest persisted, single use (row lock, every outstanding token of the account used up), 15-minute expiry, bound to principal and tenant membership, never logged or in `Debug`; reset pages `no-store` and `Referrer-Policy: no-referrer`; every session revoked on reset | `forge-auth` token tests; `a_reset_link_works_once_changes_the_password_and_revokes_sessions`; PostgreSQL `reset_tokens_work_once_expire_and_revoke_every_session` |
 | Takeover through `setup` | Runs only with the migration credential, one transaction under an advisory lock, refuses once any tenant exists; password never an argument (`--password-stdin`, `FORGE_SETUP_PASSWORD` or an echo-off prompt), at least 12 characters, never printed; audited | `setup_creates_one_owner_who_can_sign_in_and_refuses_afterwards`, `concurrent_setups_create_exactly_one_tenant`, `setup_refuses_password_arguments_and_short_passwords_before_touching_a_database` |
 | Signed-out browser leaks a protected page | Access policies answer `401`; `SignInRedirect` turns it into a `303` to sign in for HTML clients only; JSON keeps `401` | `forge-views` sign-in redirect tests; `signed_out_browsers_are_sent_to_sign_in_and_api_clients_get_401`; slow scaffold e2e |
 
-Residual risks: throttle counters live in one process (a restart or several
-replicas multiply the budget; a shared store is a follow-up); behind a
+Residual risks: custom wiring with the in-memory throttle counts in one
+process (a restart or several replicas multiply the budget; production logs
+a warning); behind a
 reverse proxy clients share one source budget until `FORGE_HTTP_TRUSTED_PROXIES`
 lists the proxy, and anything inside a listed network can choose its source
 (see the trusted-proxy review below); an attacker who controls 50 sources (or /64s)
@@ -269,8 +273,10 @@ worker's database load still depends on whether accounts exist, observable
 only through server load; sign-in still does slightly more work (session
 issuance) when it succeeds; without `FORGE_MAIL_URL` the notifier is
 `UndeliverablePasswordResets`, reset requests are not queued (no link, no
-token row) and only logged (see the mail review below); a session lasts 24 hours without
-idle expiry. Two-factor authentication has its own review below.
+token row) and only logged (see the mail review below); within the idle
+timeout a stolen session cookie stays usable as long as it is used, up to
+the 24-hour lifetime, and an application generated before the idle timeout
+has none until it adopts it. Two-factor authentication has its own review below.
 
 ## Phase 4 review: jobs, schedules and the outbox
 

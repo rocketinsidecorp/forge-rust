@@ -762,6 +762,52 @@ error: cannot generate authentication: refusing to overwrite existing files; not
   config/locales/authentication.en.json
 ```
 
+### Session idle timeout
+
+A session ends 24 hours after sign-in, or earlier after two hours without a
+request (Forge-Go's default and variable). The next request is refused
+exactly as with a revoked session: pages send the browser to
+`/session/new`, JSON clients get `401`; signing in again creates a new
+session. Change the idle limit, from `5m` to `720h` (there is no way to turn
+it off; `720h` is the longest session lifetime), in your env file or the
+deployment's environment:
+
+```sh
+echo "FORGE_AUTH_SESSION_IDLE_TIMEOUT=30m" >> .env.development
+```
+
+`PostgresSessionStore` (`src/infrastructure/auth/mod.rs`) keeps each
+session's last use in `forge_sessions.last_seen_at` and writes it at most
+once a minute per session: a conditional `UPDATE` runs only when the stored
+use is more than a minute old and the session is still live (not revoked,
+not expired, not idle), so most requests only read and concurrent requests
+record one use. The database clock decides both, so replicas with skewed
+clocks agree. If that write fails, the request fails with `503` (fail
+closed) instead of passing unrecorded.
+
+An application generated before the idle timeout keeps its sessions until it
+adds migration `00000000000000000006_forge_session_idle_timeout` and the new
+session store, and passes the timeout in `fn compose`. Run the migration
+before deploying the new code, which reads the column; sessions open at the
+upgrade count as used then, so nobody is signed out:
+
+```sh
+(cd /tmp && forge new shop-new -d postgresql --skip-docker --skip-ci --skip-lockfile)
+cp /tmp/shop-new/migrations/00000000000000000006_forge_session_idle_timeout.*.sql migrations/
+diff -u src/infrastructure/auth/mod.rs /tmp/shop-new/src/infrastructure/auth/mod.rs   # PostgresSessionStore
+diff -u src/bootstrap/mod.rs /tmp/shop-new/src/bootstrap/mod.rs                       # the idle_timeout lines
+PGOPTIONS='-c lock_timeout=5s' forge migrate   # or: cargo run -- migrate
+```
+
+`ALTER TABLE ... ADD COLUMN` rewrites nothing (the default `now()` is stored
+once), but it takes a brief `ACCESS EXCLUSIVE` lock on `forge_sessions`,
+which waits behind every open transaction that touched the table and blocks
+sign-ins meanwhile. `lock_timeout` bounds that wait: if it expires the
+migration rolls back and can be run again at a quieter moment. The runtime
+role's table-wide `UPDATE` on `forge_sessions` covers the new column, so no
+grant changes. `forge generate authentication` refuses an application whose
+session store or migrations predate the idle timeout and points here.
+
 ### Two-factor authentication
 
 Accounts can require a code from an authenticator app (TOTP) at every sign-in

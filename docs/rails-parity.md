@@ -21,6 +21,9 @@ the work is finished and waiting for its review; **Planned** means not started.
 | Mailer with previews | Action Mailer | Done | Done (`forge::mail`, password-reset emails, `/_mail` previews, [ADR 0035](adr/0035-mail.md); `forge generate mailer`, [ADR 0038](adr/0038-generators-and-destroy.md)) |
 | Rate limiting | `rate_limit` | Done | Done |
 | Sign-in, reset and MFA throttles shared by replicas | `rate_limit` with a shared cache store | Done (`auth/postgres` `LoginThrottler`, `forge_login_throttle`) | In review (`forge::auth::PgLoginThrottle`, same table and transaction, wired in generated PostgreSQL applications; see follow-ups) |
+| Session idle timeout | (gems, e.g. Devise `timeoutable`) | In review ([forge-go#62](https://github.com/rocketinsidecorp/forge-go/pull/62): `FORGE_AUTH_SESSION_IDLE_TIMEOUT`, default 2h; `last_seen_at` written at most once a minute) | Done (`FORGE_AUTH_SESSION_IDLE_TIMEOUT`, default 2h, `5m` to `720h`; `forge_sessions.last_seen_at` written at most once a minute, migration `00000000000000000006_forge_session_idle_timeout`, [forge-rust#75](https://github.com/rocketinsidecorp/forge-rust/issues/75); see follow-ups) |
+| CSRF token masked per render (BREACH) | `masked_authenticity_token` | In review ([forge-go#62](https://github.com/rocketinsidecorp/forge-go/pull/62): `csrf.Token`, `csrf.MaskToken`) | Done (`csrf_meta`, `csrf_field`, `forge::views::mask_csrf_token`/`unmask_csrf_token`; same encoding) |
+| Production warning for a per-process attempt throttle | — | In review ([forge-go#62](https://github.com/rocketinsidecorp/forge-go/pull/62): `auth.MemoryLoginThrottler` in `NewLoginService`, `NewMFAService`, `NewRecoveryService`) | Done (`MemoryLoginThrottle` passed to the generated sign-in, reset or two-factor wiring, `Composition::warn_if_process_local_throttle`) |
 | Bounded memory-hard password hashing | — | Not needed (PBKDF2, no per-hash memory) | In review (`forge::auth::PasswordWorkLimiter`: one Argon2id hash per CPU, at most 16, then `503`) |
 | Client address behind trusted proxies | `request.remote_ip`, `trusted_proxies` | Done (`FORGE_HTTP_TRUSTED_PROXIES`, ADR 0037) | Done (`FORGE_HTTP_TRUSTED_PROXIES`, ADR 0032; `forge deploy` sets it for the proxied role, [ADR 0042](adr/0042-forge-deploy.md)) |
 | `HEAD` on every `GET` route | `HEAD` routed to `GET` | Done (`http.ServeMux`) | In review (the router serves `HEAD` with the `GET` route unless a `HEAD` route exists, the server drops the body, `Allow` lists `HEAD`) |
@@ -159,6 +162,34 @@ the work is finished and waiting for its review; **Planned** means not started.
   is shared between them); (3) Forge-Rust authentication is PostgreSQL-only,
   so no MySQL/MariaDB/SQLite store exists; `MemoryLoginThrottle` remains for
   tests and custom wiring, counting per process.
+
+- Security defaults (forge-rust#75, port of Forge-Go QG4a, audit findings
+  S-3, S-7 and PF-3; Forge-Go's side is
+  [forge-go#62](https://github.com/rocketinsidecorp/forge-go/pull/62)):
+  (1) the session idle timeout: the same variable, default, bounds (`5m` to
+  `720h`, no way to turn it off) and error, the same conditional `UPDATE`
+  (at most once a minute per session, re-checking that the session is live
+  and not idle, decided by the database clock), sessions open at the
+  upgrade counted as used then. Differences: the column comes from a
+  generated application migration (`00000000000000000006_forge_session_idle_timeout`)
+  in the generated `PostgresSessionStore`, like Forge-Rust's other identity
+  tables, where Forge-Go has a framework migration and repository option;
+  the store re-checks `expires_at` too and still returns a revoked session
+  to `Session::authenticate`, which refuses it, so an idle and a revoked
+  session both end as `RequestAuthError::InvalidSession`. (2) Masked CSRF
+  tokens: the same layout (32-byte pad, then token XOR pad, unpadded
+  base64url, 86 characters); Forge-Rust's unmasked token is its canonical
+  64 lowercase hex digits where Forge-Go's is 43 base64url characters, so
+  each framework accepts its own unmasked form; the masked forms of the same
+  32 bytes are identical. `csrf_token` still returns the raw token (the
+  masking happens in `csrf_meta`, `csrf_field` and `mask_csrf_token`),
+  where Forge-Go's `csrf.Token` returns it masked. The unmasked token stays
+  accepted in the header for good and in the form field until v0.2.0.
+  (3) The production warning has Forge-Go's wording with Forge-Rust's type
+  names; Forge-Rust has no framework sign-in or recovery service, so the
+  generated `authentication::routes` asks `Composition` to check the three
+  throttles it receives. `--api-auth` needs nothing in Forge-Rust while it
+  has no JSON login.
 
 - Benchmarks ([benchmarks](benchmarks.md), rocketinsidecorp/forge-rust#41): the
   scenario names, variants and output formats are Forge-Go's, and results are
