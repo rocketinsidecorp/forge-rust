@@ -484,9 +484,12 @@ fn api_application_with_a_model_passes_its_gates() {
         &["generate", "controller", "status_checks", "index", "--api"],
     ] {
         let printed = stdout(&run(&root, forge, arguments, &[]));
-        assert!(printed.contains("DenyAll"), "{printed}");
-        assert!(!printed.contains("&site"), "{printed}");
         apply_wiring(&root, &printed);
+        // Mounted in the seam, which has no `site` in an API application.
+        let seam = fs::read_to_string(root.join("src/bootstrap/routes_gen.rs"))
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert!(seam.contains("DenyAll"), "{seam}");
+        assert!(!seam.contains("site"), "{seam}");
     }
     for page in ["templates", "assets", "config/locales"] {
         assert!(!root.join(page).exists(), "{page}");

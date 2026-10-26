@@ -1597,6 +1597,67 @@ mod tests {
     }
 
     #[test]
+    fn migration_names_infer_column_changes() {
+        assert_eq!(
+            column_change("add_sku_to_products"),
+            Some(("products", false))
+        );
+        assert_eq!(
+            column_change("add_to_date_to_order_items"),
+            Some(("order_items", false))
+        );
+        assert_eq!(
+            column_change("remove_note_from_orders"),
+            Some(("orders", true))
+        );
+        for blank in [
+            "create_widgets",
+            "add_sku",
+            "add__to_x",
+            "remove_x_from_",
+            "backfill",
+        ] {
+            assert_eq!(column_change(blank), None, "{blank}");
+        }
+
+        let root = tempfile::tempdir().expect("temporary directory");
+        let fields = ["sku:string".to_owned()];
+        // No database dependency: the statements cannot be written.
+        fs::write(root.path().join("Cargo.toml"), "[package]\nname = \"x\"\n").expect("write");
+        let refused = generate_migration(root.path(), "add_sku_to_products", &fields)
+            .expect_err("no database")
+            .to_string();
+        assert!(refused.contains("selects none"), "{refused}");
+        fs::write(
+            root.path().join("Cargo.toml"),
+            "[dependencies]\nsqlx = { version = \"0.8\", features = [\"sqlite\"] }\n",
+        )
+        .expect("write");
+        let added =
+            generate_migration(root.path(), "add_sku_to_products", &fields).expect("inferred");
+        assert_eq!(added.inferred, Some(false));
+        let up = fs::read_to_string(&added.up).expect("up");
+        assert!(
+            up.contains("ALTER TABLE \"products\" ADD COLUMN \"sku\" TEXT NOT NULL DEFAULT ''"),
+            "{up}"
+        );
+        let removed =
+            generate_migration(root.path(), "remove_sku_from_products", &fields).expect("inferred");
+        assert_eq!(removed.inferred, Some(true));
+        let blank = generate_migration(root.path(), "backfill_products", &[]).expect("blank");
+        assert_eq!(blank.inferred, None);
+        let refused = generate_migration(root.path(), "create_widgets", &fields)
+            .expect_err("fields need an inferring name")
+            .to_string();
+        assert!(refused.contains("forge generate model"), "{refused}");
+        let refused =
+            generate_migration(root.path(), "add_id_to_products", &["id:uuid".to_owned()])
+                .expect_err("reserved field")
+                .to_string();
+        assert!(refused.contains("reserved"), "{refused}");
+    }
+
+    #[test]
     fn creates_reversible_migration_files() {
         let root = tempfile::tempdir().expect("temporary directory should be available");
         let (up, down) =

@@ -731,3 +731,93 @@ fn assert_every_session_store_has_the_idle_timeout(wiring: &str) {
         );
     }
 }
+
+/// `forge generate migration add_X_to_TABLE` (D26): one ALTER TABLE per
+/// field in each dialect, required columns defaulting to their type's zero
+/// value, and the reverse for remove_X_from_TABLE.
+#[test]
+fn column_migrations_follow_each_dialect() {
+    let fields = spec::parse_columns(
+        "orders",
+        &[
+            "sku:string".to_owned(),
+            "note:text".to_owned(),
+            "total:int".to_owned(),
+            "paid:bool".to_owned(),
+            "shipped_at:time?".to_owned(),
+        ],
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
+    let (up, down) = column_migration(
+        "orders",
+        &fields,
+        Backend::Postgresql,
+        false,
+        "add_x_to_orders",
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
+    assert!(up.starts_with("-- add_x_to_orders\n"), "{up}");
+    for expected in [
+        "ALTER TABLE \"orders\" ADD COLUMN \"sku\" text NOT NULL DEFAULT '' CONSTRAINT",
+        "ALTER TABLE \"orders\" ADD COLUMN \"note\" text NOT NULL DEFAULT ''",
+        "ALTER TABLE \"orders\" ADD COLUMN \"total\" bigint NOT NULL DEFAULT 0;",
+        "ALTER TABLE \"orders\" ADD COLUMN \"paid\" boolean NOT NULL DEFAULT FALSE;",
+        "ALTER TABLE \"orders\" ADD COLUMN \"shipped_at\" timestamptz;",
+    ] {
+        assert!(up.contains(expected), "{expected}\n{up}");
+    }
+    assert!(
+        down.contains("ALTER TABLE \"orders\" DROP COLUMN \"shipped_at\";"),
+        "{down}"
+    );
+
+    let (up, _) = column_migration("orders", &fields, Backend::MySql, false, "add_x_to_orders")
+        .unwrap_or_else(|error| panic!("{error}"));
+    assert!(
+        up.contains("`note` MEDIUMTEXT NOT NULL DEFAULT ('')"),
+        "{up}"
+    );
+    assert!(up.contains("`paid` BOOLEAN NOT NULL DEFAULT FALSE"), "{up}");
+
+    let (up, down) = column_migration(
+        "orders",
+        &fields,
+        Backend::Sqlite,
+        true,
+        "remove_x_from_orders",
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
+    assert!(
+        up.contains("ALTER TABLE \"orders\" DROP COLUMN \"paid\";"),
+        "{up}"
+    );
+    assert!(
+        down.starts_with("-- Reverts remove_x_from_orders: the columns come back"),
+        "{down}"
+    );
+    assert!(
+        down.contains("\"paid\" INTEGER NOT NULL DEFAULT 0 CONSTRAINT"),
+        "{down}"
+    );
+
+    for required in ["at:timestamp", "token:uuid"] {
+        let fields = spec::parse_columns("orders", &[required.to_owned()])
+            .unwrap_or_else(|error| panic!("{error}"));
+        let error = column_migration("orders", &fields, Backend::Postgresql, false, "add")
+            .err()
+            .unwrap_or_default();
+        assert!(error.contains("existing rows need a value"), "{error}");
+        assert!(error.contains("?)"), "{error}");
+    }
+    for (table, fields) in [
+        ("forge_users", vec!["a:string".to_owned()]),
+        ("orders", vec!["a:string".to_owned(), "a:text".to_owned()]),
+        ("orders", vec!["a:float".to_owned()]),
+        ("Orders", vec!["a:string".to_owned()]),
+    ] {
+        assert!(
+            spec::parse_columns(table, &fields).is_err(),
+            "{table} {fields:?}"
+        );
+    }
+}
