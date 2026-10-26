@@ -7,6 +7,11 @@
 //! are resolved separately so authorization changes do not remain stale inside
 //! credentials.
 //!
+//! [`PasswordWorkLimiter`] bounds how many password hashes run at once in the
+//! process, so a burst of sign-in attempts cannot reserve the memory of
+//! hundreds of memory-hard hashes; the hashing adapter runs its work through
+//! it.
+//!
 //! It also owns the framework rules of the sign-in and password-reset flows
 //! (ADR 0026): [`LoginThrottle`] with the bounded [`MemoryLoginThrottle`],
 //! the [`NewPassword`] policy, and one-time [`PasswordResetToken`]s (256
@@ -21,6 +26,7 @@ mod login;
 pub mod mfa;
 mod password_policy;
 mod password_reset;
+mod password_work;
 mod throttle;
 
 use std::num::NonZeroU64;
@@ -45,6 +51,9 @@ pub use password_reset::{
     PASSWORD_RESET_LIFETIME_SECS, PASSWORD_RESET_PATH, PasswordResetDelivery,
     PasswordResetDeliveryError, PasswordResetNotifier, PasswordResetToken,
     PasswordResetTokenDigest, UndeliverablePasswordResets, password_reset_throttle_config,
+};
+pub use password_work::{
+    DEFAULT_PASSWORD_WORK_WAIT, MAX_DEFAULT_PASSWORD_WORK, PasswordWorkLimiter,
 };
 pub use throttle::{
     LoginThrottle, MemoryLoginThrottle, ThrottleConfig, ThrottleConfigError, ThrottleDecision,
@@ -402,7 +411,8 @@ impl AuthenticatedPrincipal {
 ///
 /// Implementations must use a password-specific memory-hard algorithm. The
 /// initial generated adapter uses Argon2id and executes work off the async
-/// executor's core worker threads.
+/// executor's core worker threads, at most [`PasswordWorkLimiter`]'s bound at
+/// once.
 #[async_trait]
 pub trait PasswordHasher: Send + Sync {
     /// Hashes one password into a self-describing PHC string.

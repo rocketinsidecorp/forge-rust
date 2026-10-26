@@ -617,7 +617,9 @@ Kubernetes and systemd deployment is covered in
 - PostgreSQL-first generation with SQLx confined to the generated
   infrastructure/bootstrap boundary, reversible embedded migrations, separate
   least-privilege runtime/migration roles, transaction-local tenant/principal
-  RLS context, Argon2id password authentication with optimistic policy upgrades,
+  RLS context, Argon2id password authentication with optimistic policy upgrades
+  (at most one hash per CPU, 16 at most, at once: `503` instead of a memory
+  spike under a burst of sign-ins),
   independent 256-bit session/CSRF secrets, secure host-only cookie helpers,
   digest-only persisted
   sessions, tenant membership persistence, append-only PostgreSQL audit storage,

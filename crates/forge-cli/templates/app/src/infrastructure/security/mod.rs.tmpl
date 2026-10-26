@@ -4,6 +4,8 @@
 //! algorithm parameters, random credential generation, digesting, and HTTP
 //! cookie serialization/parsing.
 
+use std::sync::OnceLock;
+
 use argon2::{
     Algorithm, Argon2, Params, Version,
     password_hash::{PasswordHasher as _, PasswordVerifier as _},
@@ -13,8 +15,8 @@ use cookie::{Cookie, SameSite};
 use forge::auth::{
     AuthenticatedPrincipal, CsrfToken, CsrfTokenDigest, PasswordCredentialStore,
     PasswordCredentialStoreError, PasswordCredentialVersion, PasswordHash, PasswordHashError,
-    PasswordHasher, Session, SessionBearerToken, SessionCredentialDigest, SessionError,
-    SessionStore, SessionStoreError, UnixTimestamp,
+    PasswordHasher, PasswordWorkLimiter, Session, SessionBearerToken, SessionCredentialDigest,
+    SessionError, SessionStore, SessionStoreError, UnixTimestamp,
 };
 use forge::http::{Method, Request, header};
 use forge::security::PrincipalId;
@@ -36,8 +38,19 @@ const ARGON2_OUTPUT_BYTES: usize = 32;
 const MAX_PASSWORD_BYTES: usize = 1024;
 
 /// Password hashing adapter using Argon2id v19 with the project policy.
+///
+/// Every hash and verification runs on the blocking pool through one
+/// process-wide [`PasswordWorkLimiter`]: at most one per CPU (up to 16) at
+/// once, each holding about 19 MiB, and an attempt that waits more than two
+/// seconds for a slot fails as unavailable (`503`) instead of queueing.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Argon2idPasswordHasher;
+
+/// The bound shared by every [`Argon2idPasswordHasher`] of the process.
+fn password_work() -> &'static PasswordWorkLimiter {
+    static LIMITER: OnceLock<PasswordWorkLimiter> = OnceLock::new();
+    LIMITER.get_or_init(PasswordWorkLimiter::default)
+}
 
 #[async_trait]
 impl PasswordHasher for Argon2idPasswordHasher {
@@ -46,9 +59,9 @@ impl PasswordHasher for Argon2idPasswordHasher {
             return Err(PasswordHashError::InvalidPassword);
         }
         let password = password.to_vec();
-        tokio::task::spawn_blocking(move || hash_password_blocking(&password))
-            .await
-            .map_err(|_| PasswordHashError::Unavailable)?
+        password_work()
+            .run(move || hash_password_blocking(&password))
+            .await?
     }
 
     async fn verify(
@@ -61,9 +74,9 @@ impl PasswordHasher for Argon2idPasswordHasher {
         }
         let password = password.to_vec();
         let expected = expected.expose().to_owned();
-        tokio::task::spawn_blocking(move || verify_password_blocking(&password, &expected))
-            .await
-            .map_err(|_| PasswordHashError::Unavailable)?
+        password_work()
+            .run(move || verify_password_blocking(&password, &expected))
+            .await?
     }
 
     fn needs_rehash(&self, expected: &PasswordHash) -> Result<bool, PasswordHashError> {
