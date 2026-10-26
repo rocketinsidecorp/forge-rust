@@ -13,6 +13,7 @@ use crate::generate::{Database, ForgeSource, Locale, NewApplication, create_appl
 use crate::job::{self, JobOptions};
 use crate::mailer::{self, MailerOptions};
 use crate::scaffold::{self, Layers, ScaffoldOptions, Scope};
+use crate::view::{self, ViewOptions};
 
 const VERSION: &str = "1760832000000000000";
 
@@ -1122,4 +1123,167 @@ fn the_shared_helpers_tell_apart_what_they_scan() {
         String::from_utf8_lossy(&output),
         "  create       src/a.rs\n  create       src/b.rs\n  would create src/a.rs\n"
     );
+}
+
+fn view_options(name: &str) -> ViewOptions {
+    ViewOptions {
+        name: name.to_owned(),
+        dry_run: false,
+    }
+}
+
+fn destroy_view(root: &Path, options: &ViewOptions, flags: DestroyFlags) -> Result<String, String> {
+    let (files, unwire, owned_elsewhere) =
+        view::plan_destroy(root, options).map_err(|error| error.to_string())?;
+    destroyed(
+        root,
+        DestroyPlan {
+            files,
+            unwire,
+            owned_elsewhere,
+        },
+        flags,
+    )
+}
+
+#[test]
+fn a_view_is_one_page_in_the_layout_and_destroy_takes_it_back() {
+    let (_parent, root) = application(Database::Disabled, true, Locale::En);
+    let before = tree(&root);
+
+    let dry = view::generate(
+        &root,
+        &ViewOptions {
+            dry_run: true,
+            ..view_options("welcome_back")
+        },
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(tree(&root), before, "--dry-run writes nothing");
+
+    let outcome = view::generate(&root, &view_options("welcome_back"))
+        .unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(outcome.files, dry.files);
+    let paths: Vec<&str> = outcome
+        .files
+        .iter()
+        .map(|file| file.path.as_str())
+        .collect();
+    assert_eq!(
+        paths,
+        [
+            "templates/pages/welcome_back.html",
+            "src/adapters/http/views/pages_welcome_back_view.rs",
+            "tests/pages_welcome_back_view.rs",
+        ]
+    );
+    let page =
+        fs::read_to_string(root.join("templates/pages/welcome_back.html")).unwrap_or_default();
+    assert!(
+        page.starts_with("{% extends \"layouts/application.html\" %}"),
+        "{page}"
+    );
+    assert!(page.contains("{{ content }}"), "{page}");
+    let model = fs::read_to_string(root.join("src/adapters/http/views/pages_welcome_back_view.rs"))
+        .unwrap_or_default();
+    assert!(
+        model.contains("#[template(path = \"pages/welcome_back.html\")]"),
+        "{model}"
+    );
+    assert!(
+        model.contains("pub struct PagesWelcomeBackView<'a> {"),
+        "{model}"
+    );
+    let test =
+        fs::read_to_string(root.join("tests/pages_welcome_back_view.rs")).unwrap_or_default();
+    assert!(
+        test.contains(
+            "use app::adapters::http::views::pages_welcome_back_view::PagesWelcomeBackView;"
+        ),
+        "{test}"
+    );
+    assert!(
+        outcome
+            .wiring
+            .contains("src/adapters/http/views/mod.rs         pub mod pages_welcome_back_view;"),
+        "{}",
+        outcome.wiring
+    );
+    assert!(
+        outcome.wiring.contains("site.layout(&request)"),
+        "{}",
+        outcome.wiring
+    );
+
+    // Never overwrites; another directory is another page.
+    let again = view::generate(&root, &view_options("welcome_back"))
+        .err()
+        .map(|error| error.to_string())
+        .unwrap_or_default();
+    assert!(again.contains("refusing to overwrite"), "{again}");
+    view::generate(&root, &view_options("admin/audit_log"))
+        .unwrap_or_else(|error| panic!("{error}"));
+    assert!(root.join("templates/admin/audit_log.html").is_file());
+
+    // An edited page is kept unless --force; then the tree is the original.
+    fs::write(root.join("templates/pages/welcome_back.html"), "mine")
+        .unwrap_or_else(|error| panic!("{error}"));
+    let kept = destroy_view(
+        &root,
+        &view_options("welcome_back"),
+        DestroyFlags::default(),
+    )
+    .err()
+    .unwrap_or_default();
+    assert!(kept.contains("templates/pages/welcome_back.html"), "{kept}");
+    let forced = DestroyFlags {
+        force: true,
+        ..DestroyFlags::default()
+    };
+    destroy_view(&root, &view_options("welcome_back"), forced)
+        .unwrap_or_else(|error| panic!("{error}"));
+    destroy_view(
+        &root,
+        &view_options("admin/audit_log"),
+        DestroyFlags::default(),
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
+    assert!(
+        !root.join("templates/admin").exists(),
+        "the generator's directory goes"
+    );
+    assert_eq!(tree(&root), before);
+}
+
+#[test]
+fn a_controllers_page_is_not_destroyed_as_a_view_and_api_applications_have_no_views() {
+    let (_parent, root) = application(Database::Postgresql, true, Locale::En);
+    let options = controller("pages", &["index", "about_us"]);
+    controller::generate(&root, &options).unwrap_or_else(|error| panic!("{error}"));
+    let refused = view::generate(&root, &view_options("about_us"))
+        .err()
+        .map(|error| error.to_string())
+        .unwrap_or_default();
+    assert!(refused.contains("refusing to overwrite"), "{refused}");
+    let owned = destroy_view(
+        &root,
+        &view_options("pages/about_us"),
+        DestroyFlags::default(),
+    )
+    .err()
+    .unwrap_or_default();
+    assert!(
+        owned.contains("is a page of the pages controller")
+            && owned.contains("forge destroy controller pages"),
+        "{owned}"
+    );
+    assert!(root.join("templates/pages/about_us.html").is_file());
+
+    let (_api_parent, api) = application(Database::Postgresql, false, Locale::En);
+    let refused = view::generate(&api, &view_options("welcome"))
+        .err()
+        .map(|error| error.to_string())
+        .unwrap_or_default();
+    assert!(refused.contains("forge new --api"), "{refused}");
+    assert!(!api.join("templates").exists());
 }

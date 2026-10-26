@@ -590,6 +590,13 @@ pub(crate) enum GenerateCommand {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Create one server-rendered page, templates/DIR/NAME.html (DIR
+    /// defaults to pages), in the application layout, with its view model
+    /// and a test (like Forge-Go's `forge generate view`).
+    View {
+        #[command(flatten)]
+        view: ViewArgs,
+    },
     /// Create a reversible SQL migration in migrations/.
     Migration {
         /// Human-readable migration name.
@@ -687,6 +694,17 @@ pub(crate) struct ResourceArgs {
     pub(crate) dry_run: bool,
 }
 
+/// The arguments of `forge generate view` (and `forge destroy view`).
+#[derive(Debug, Args)]
+pub(crate) struct ViewArgs {
+    /// NAME or DIR/NAME, snake_case (`welcome`, `admin/audit_log`).
+    #[arg(value_name = "[DIR/]NAME")]
+    pub(crate) name: String,
+    /// List the files without writing (or removing) anything.
+    #[arg(long)]
+    pub(crate) dry_run: bool,
+}
+
 /// The arguments of `forge generate controller` (and `forge destroy
 /// controller`).
 #[derive(Debug, Args)]
@@ -776,6 +794,14 @@ pub(crate) enum DestroyCommand {
     Controller {
         #[command(flatten)]
         controller: ControllerArgs,
+        #[command(flatten)]
+        flags: DestroyArgs,
+    },
+    /// Remove what `forge generate view` created; a page a controller
+    /// renders is refused without --force.
+    View {
+        #[command(flatten)]
+        view: ViewArgs,
         #[command(flatten)]
         flags: DestroyArgs,
     },

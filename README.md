@@ -233,6 +233,9 @@ forge generate controller reports monthly                          # guarded by 
 forge generate controller status_checks index --api                # JSON endpoints under /v1
 forge generate mailer user welcome:name,url password_reset         # typed emails, templates, /_mail/user previews
 forge generate job send_welcome user_id:uuid 'note:string?' --queue  # persistent PostgreSQL queue job
+forge generate view welcome --dry-run                              # one page: templates/pages/welcome.html, view model, test
+forge generate view admin/audit_log                                # templates/admin/audit_log.html
+forge destroy view admin/audit_log                                 # removes the page while unchanged
 forge destroy controller pages index about_us --public --dry-run   # what destroy would remove
 forge destroy controller pages index about_us --public             # removes only files still as generated
 forge rollback && forge destroy model book title:string 'pages:integer?' --global --migrations
@@ -728,7 +731,7 @@ Kubernetes and systemd deployment is covered in
   digest-only persisted
   sessions, tenant membership persistence, append-only PostgreSQL audit storage,
   a health-ordered Compose database, and `forge generate migration <name>`.
-- `forge generate model|controller|mailer|job --queue` and `forge destroy`
+- `forge generate model|controller|mailer|job --queue|view` and `forge destroy`
   ([generators](docs/generators.md), [ADR 0038](docs/adr/0038-generators-and-destroy.md)):
   the rest of `rails g` in the hexagonal rings, with printed wiring, one owner
   per permission, and a `rails d` that removes only files still identical to

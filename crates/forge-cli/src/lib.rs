@@ -35,6 +35,7 @@ mod mailer;
 mod process;
 mod project;
 mod scaffold;
+mod view;
 
 use std::env;
 use std::io::{self, IsTerminal as _};
@@ -49,7 +50,7 @@ use crate::cli::{
     AppCommand, Cli, Command, ControllerArgs, CredentialsCommand, DbCommand, DeployArgs,
     DeployCommand, DestroyArgs, DestroyCommand, DestructiveArgs, GenerateCommand, I18nCommand,
     JobArgs, LockActionArg, LogsArgs, MailerArgs, MigrateView, RemoteCommon, ResourceArgs, Toggle,
-    UuidCount,
+    UuidCount, ViewArgs,
 };
 use crate::controller::ControllerOptions;
 use crate::destroy::{DestroyFlags, DestroyPlan};
@@ -218,6 +219,12 @@ fn execute(
                     writeln!(output, "  {:<12} {}", "reuse", scaffold::ACCESS_PATH)
                         .map_err(CliError::Output)?;
                 }
+                write!(output, "{}", outcome.wiring).map_err(CliError::Output)
+            }
+            GenerateCommand::View { view } => {
+                let options = view_options(view);
+                let outcome = view::generate(current_dir, &options)?;
+                generators::report(output, options.dry_run, &outcome.files)?;
                 write!(output, "{}", outcome.wiring).map_err(CliError::Output)
             }
             GenerateCommand::Mailer { mailer } => {
@@ -541,6 +548,13 @@ fn controller_options(arguments: ControllerArgs) -> ControllerOptions {
     }
 }
 
+fn view_options(arguments: ViewArgs) -> view::ViewOptions {
+    view::ViewOptions {
+        name: arguments.name,
+        dry_run: arguments.dry_run,
+    }
+}
+
 fn mailer_options(arguments: MailerArgs) -> MailerOptions {
     MailerOptions {
         name: arguments.name,
@@ -607,6 +621,18 @@ fn run_destroy(
                     files,
                     unwire,
                     owned_elsewhere: None,
+                },
+                destroy_flags(options.dry_run, flags),
+            )
+        }
+        DestroyCommand::View { view, flags } => {
+            let options = view_options(view);
+            let (files, unwire, owned_elsewhere) = view::plan_destroy(root, &options)?;
+            (
+                DestroyPlan {
+                    files,
+                    unwire,
+                    owned_elsewhere,
                 },
                 destroy_flags(options.dry_run, flags),
             )

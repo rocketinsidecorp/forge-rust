@@ -25,7 +25,8 @@ forge generate model <name> <field:type>... (--global | --tenant-scoped) [--plur
 forge generate controller <name> <action>... [--api] [--public] [--dry-run]
 forge generate mailer <name> <method[:field,...]>... [--dry-run]
 forge generate job <name> [<field:type>...] --queue [--dry-run]
-forge destroy model|scaffold|controller|mailer|job <arguments of the generator> [--dry-run] [--force] [--migrations]
+forge generate view [<dir>/]<name> [--dry-run]
+forge destroy model|scaffold|controller|mailer|job|view <arguments of the generator> [--dry-run] [--force] [--migrations]
 forge check
 forge test [ARGS]
 forge format
@@ -650,6 +651,7 @@ forge generate controller reports monthly                             # guarded:
 forge generate controller status_checks index --api                   # JSON under /v1
 forge generate mailer user welcome:name,url password_reset            # typed emails, templates, previews
 forge generate job send_welcome user_id:uuid 'note:string?' --queue   # persistent PostgreSQL queue job
+forge generate view admin/audit_log                                   # one page: templates/admin/audit_log.html
 forge destroy controller pages index about_us --public --dry-run      # what would be removed
 forge destroy model post title:string 'body:text?' --global --migrations
 ```
