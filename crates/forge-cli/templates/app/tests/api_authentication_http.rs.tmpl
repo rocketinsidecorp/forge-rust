@@ -1,0 +1,625 @@
+//! The JSON authentication API (`forge new --api-auth`) through the router,
+//! without a network or database: in-memory identity ports that follow the
+//! PostgreSQL adapters' contracts and a fast stand-in for Argon2id. Every
+//! response is also checked against the OpenAPI document.
+
+use std::collections::HashMap;
+use std::error::Error;
+use std::sync::{Arc, Mutex, MutexGuard};
+
+use async_trait::async_trait;
+use forge::audit::{AuditError, AuditEvent, AuditOutcome, AuditReceipt, AuditSink};
+use forge::auth::{
+    MemoryLoginThrottle, PasswordCredential, PasswordCredentialStore, PasswordCredentialStoreError,
+    PasswordCredentialVersion, PasswordHash, PasswordHashError, PasswordHasher, SealedTotpSecret,
+    ThrottleConfig, TotpSecretDigest, UnixTimestamp,
+};
+use forge::http::{HeaderMap, HeaderValue, Method, Request, Response, Router, StatusCode, header};
+use forge::security::{PrincipalId, Role};
+use forge::tenancy::testing::{MemoryBearerSessionStore, MemoryMembershipStore, MemoryMfaStore};
+use forge::tenancy::{
+    AccountStoreError, Membership, MembershipStore as _, MfaChange, MfaStore as _, PendingTotp,
+    TenantDirectory, TenantId, TenantSlug,
+};
+use serde_json::{Value, json};
+
+use app::adapters::http::api_authentication::{ApiAuthenticationPorts, routes};
+
+type TestResult = Result<(), Box<dyn Error>>;
+
+const PASSWORD: &str = "correct horse battery";
+
+struct Account {
+    principal: PrincipalId,
+    login: String,
+    hash: PasswordHash,
+    disabled: bool,
+}
+
+/// Accounts, tenants and the audit trail, over one shared state.
+#[derive(Default)]
+struct World {
+    accounts: Mutex<Vec<Account>>,
+    tenants: Mutex<HashMap<String, TenantId>>,
+    audit: Mutex<Vec<(String, AuditOutcome)>>,
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+fn fake_hash(password: &[u8]) -> Result<PasswordHash, PasswordHashError> {
+    let hex: String = password.iter().map(|byte| format!("{byte:02x}")).collect();
+    PasswordHash::new(format!("$argon2id$fake${hex}")).map_err(|_| PasswordHashError::InvalidHash)
+}
+
+#[async_trait]
+impl PasswordHasher for World {
+    async fn hash(&self, password: &[u8]) -> Result<PasswordHash, PasswordHashError> {
+        fake_hash(password)
+    }
+
+    async fn verify(
+        &self,
+        password: &[u8],
+        expected: &PasswordHash,
+    ) -> Result<bool, PasswordHashError> {
+        Ok(fake_hash(password)? == *expected)
+    }
+}
+
+impl World {
+    fn credential(
+        &self,
+        account: &Account,
+    ) -> Result<PasswordCredential, PasswordCredentialStoreError> {
+        let version =
+            PasswordCredentialVersion::new(1).ok_or(PasswordCredentialStoreError::CorruptRecord)?;
+        Ok(PasswordCredential::new(
+            account.principal,
+            account.hash.clone(),
+            account.disabled,
+            version,
+        )
+        .with_login(account.login.clone()))
+    }
+}
+
+#[async_trait]
+impl PasswordCredentialStore for World {
+    async fn find_by_login(
+        &self,
+        login: &str,
+    ) -> Result<Option<PasswordCredential>, PasswordCredentialStoreError> {
+        lock(&self.accounts)
+            .iter()
+            .find(|account| account.login.eq_ignore_ascii_case(login))
+            .map(|account| self.credential(account))
+            .transpose()
+    }
+
+    async fn find_by_principal(
+        &self,
+        principal_id: PrincipalId,
+    ) -> Result<Option<PasswordCredential>, PasswordCredentialStoreError> {
+        lock(&self.accounts)
+            .iter()
+            .find(|account| account.principal == principal_id)
+            .map(|account| self.credential(account))
+            .transpose()
+    }
+
+    async fn replace_password_hash(
+        &self,
+        _: PrincipalId,
+        _: PasswordCredentialVersion,
+        _: &PasswordHash,
+    ) -> Result<(), PasswordCredentialStoreError> {
+        Err(PasswordCredentialStoreError::Unavailable)
+    }
+}
+
+#[async_trait]
+impl TenantDirectory for World {
+    async fn find_by_slug(&self, slug: &TenantSlug) -> Result<Option<TenantId>, AccountStoreError> {
+        Ok(lock(&self.tenants).get(slug.as_str()).copied())
+    }
+}
+
+#[async_trait]
+impl AuditSink for World {
+    async fn append(&self, event: &AuditEvent) -> Result<AuditReceipt, AuditError> {
+        lock(&self.audit).push((event.action().as_str().to_owned(), event.outcome()));
+        Ok(AuditReceipt::stored(event.id()))
+    }
+}
+
+/// `acme` with the owner Ada, the disabled Eve and the suspended Sam;
+/// `globex`, where nobody is a member.
+struct Fixture {
+    world: Arc<World>,
+    sessions: Arc<MemoryBearerSessionStore>,
+    factors: Arc<MemoryMfaStore>,
+    router: Router,
+    ada: PrincipalId,
+    acme: TenantId,
+}
+
+async fn fixture() -> Result<Fixture, Box<dyn Error>> {
+    let world = Arc::new(World::default());
+    let memberships = Arc::new(MemoryMembershipStore::default());
+    let acme = TenantId::new();
+    lock(&world.tenants).insert("acme".to_owned(), acme);
+    lock(&world.tenants).insert("globex".to_owned(), TenantId::new());
+    let owner = Role::new("owner")?;
+    let mut ada = PrincipalId::new();
+    for (login, disabled, suspended) in [
+        ("ada@example.com", false, false),
+        ("eve@example.com", true, false),
+        ("sam@example.com", false, true),
+    ] {
+        let principal = PrincipalId::new();
+        if login.starts_with("ada") {
+            ada = principal;
+        }
+        lock(&world.accounts).push(Account {
+            principal,
+            login: login.to_owned(),
+            hash: fake_hash(PASSWORD.as_bytes())?,
+            disabled,
+        });
+        memberships
+            .upsert(&Membership::active(acme, principal, vec![owner.clone()]))
+            .await?;
+        if suspended {
+            memberships.suspend(acme, principal).await?;
+        }
+    }
+    let sessions = Arc::new(MemoryBearerSessionStore::default());
+    let factors = Arc::new(MemoryMfaStore::new());
+    let mut router = Router::new();
+    routes(
+        &mut router,
+        ApiAuthenticationPorts {
+            credentials: world.clone(),
+            hasher: world.clone(),
+            sessions: sessions.clone(),
+            memberships,
+            tenants: world.clone(),
+            factors: factors.clone(),
+            audit: world.clone(),
+            sign_in_throttle: Arc::new(MemoryLoginThrottle::new(ThrottleConfig::default())?),
+        },
+    )?;
+    let document = router.openapi(&forge::openapi::Info::new("app", "0.0.0"))?;
+    router.layer(forge::openapi::CheckResponses::new(document, |failure| {
+        panic!("{failure}")
+    }));
+    Ok(Fixture {
+        world,
+        sessions,
+        factors,
+        router,
+        ada,
+        acme,
+    })
+}
+
+fn request(
+    method: Method,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: &str,
+) -> Result<Request, Box<dyn Error>> {
+    let mut map = HeaderMap::new();
+    for (name, value) in headers {
+        map.append(
+            header::HeaderName::from_bytes(name.as_bytes())?,
+            HeaderValue::from_str(value)?,
+        );
+    }
+    Ok(Request::new_for_test(
+        method,
+        path.parse()?,
+        map,
+        body.to_owned().into(),
+        "127.0.0.1:4000".parse()?,
+        forge::core::Id::<Request>::new().into_uuid(),
+    ))
+}
+
+fn json_body(response: &Response) -> Value {
+    serde_json::from_slice(response.body()).unwrap_or(Value::Null)
+}
+
+fn header_of<'a>(response: &'a Response, name: &str) -> Option<&'a str> {
+    response
+        .headers()
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+}
+
+impl Fixture {
+    async fn sign_in(
+        &self,
+        email: &str,
+        password: &str,
+        tenant: &str,
+    ) -> Result<Response, Box<dyn Error>> {
+        let body = json!({"email": email, "password": password, "tenant": tenant}).to_string();
+        Ok(self
+            .router
+            .dispatch(request(
+                Method::POST,
+                "/auth/login",
+                &[("content-type", "application/json")],
+                &body,
+            )?)
+            .await)
+    }
+
+    async fn token(&self) -> Result<String, Box<dyn Error>> {
+        let response = self.sign_in("ada@example.com", PASSWORD, "acme").await?;
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "{:?}",
+            json_body(&response)
+        );
+        Ok(json_body(&response)["access_token"]
+            .as_str()
+            .ok_or("a token")?
+            .to_owned())
+    }
+
+    async fn with_token(
+        &self,
+        method: Method,
+        path: &str,
+        authorization: Option<&str>,
+    ) -> Result<Response, Box<dyn Error>> {
+        let headers: Vec<(&str, &str)> = authorization
+            .map(|value| vec![("authorization", value)])
+            .unwrap_or_default();
+        Ok(self
+            .router
+            .dispatch(request(method, path, &headers, "")?)
+            .await)
+    }
+
+    fn audited(&self) -> Vec<(String, AuditOutcome)> {
+        lock(&self.world.audit).clone()
+    }
+}
+
+#[tokio::test]
+async fn sign_in_issues_a_bearer_token_bound_to_the_tenant() -> TestResult {
+    let fixture = fixture().await?;
+    let response = fixture.sign_in("Ada@Example.com", PASSWORD, "acme").await?;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(header_of(&response, "cache-control"), Some("no-store"));
+    let body = json_body(&response);
+    let token = body["access_token"].as_str().ok_or("a token")?;
+    assert_eq!(token.len(), 64);
+    assert!(token.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    assert_eq!(body["token_type"], "Bearer");
+    assert!(body["expires_at"].is_string());
+    let stored = fixture.sessions.all()?;
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].tenant_id(), fixture.acme);
+    assert_eq!(stored[0].session().principal_id(), fixture.ada);
+    assert_eq!(
+        fixture.audited(),
+        [("auth.sign_in".to_owned(), AuditOutcome::Succeeded)]
+    );
+
+    let session = fixture
+        .with_token(
+            Method::GET,
+            "/v1/auth/session",
+            Some(&format!("Bearer {token}")),
+        )
+        .await?;
+    assert_eq!(session.status(), StatusCode::OK);
+    assert_eq!(
+        json_body(&session),
+        json!({
+            "subject_id": fixture.ada.to_string(),
+            "tenant_id": fixture.acme.to_string(),
+            "roles": ["owner"],
+        })
+    );
+    Ok(())
+}
+
+/// A wrong organization, email or password, a disabled account and an
+/// inactive membership all answer the same, and issue nothing.
+#[tokio::test]
+async fn every_wrong_sign_in_is_the_same_401_and_issues_nothing() -> TestResult {
+    let fixture = fixture().await?;
+    for (email, password, tenant) in [
+        ("ada@example.com", "wrong password!", "acme"),
+        ("nobody@example.com", PASSWORD, "acme"),
+        ("ada@example.com", PASSWORD, "initech"),
+        ("ada@example.com", PASSWORD, "globex"),
+        ("ada@example.com", PASSWORD, "Not A Slug!"),
+        ("eve@example.com", PASSWORD, "acme"),
+        ("sam@example.com", PASSWORD, "acme"),
+        ("ad\u{0430}@example.com", PASSWORD, "acme"),
+    ] {
+        let response = fixture.sign_in(email, password, tenant).await?;
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "{email} {tenant}"
+        );
+        assert_eq!(json_body(&response)["code"], "credentials_invalid");
+        assert_eq!(
+            header_of(&response, "www-authenticate"),
+            Some("Bearer realm=\"forge\"")
+        );
+        assert!(
+            !response
+                .body()
+                .windows(PASSWORD.len())
+                .any(|window| window == PASSWORD.as_bytes())
+        );
+    }
+    assert!(fixture.sessions.all()?.is_empty());
+    assert!(
+        fixture
+            .audited()
+            .iter()
+            .all(|(action, outcome)| action == "auth.sign_in" && *outcome == AuditOutcome::Failed)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn sign_in_is_throttled_with_the_pages_budget() -> TestResult {
+    let fixture = fixture().await?;
+    for _ in 0..5 {
+        let response = fixture
+            .sign_in("ada@example.com", "wrong password!", "acme")
+            .await?;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+    // Even the right password waits once the pair is blocked.
+    let response = fixture.sign_in("ada@example.com", PASSWORD, "acme").await?;
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(json_body(&response)["code"], "login_throttled");
+    assert!(
+        header_of(&response, "retry-after")
+            .is_some_and(|seconds| seconds.parse::<u64>().is_ok_and(|seconds| seconds > 0))
+    );
+    assert!(fixture.sessions.all()?.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_account_with_two_factor_authentication_gets_no_token() -> TestResult {
+    let fixture = fixture().await?;
+    let far = UnixTimestamp::from_secs(u64::from(u32::MAX));
+    let digest = TotpSecretDigest::from_bytes([7; 32]);
+    let pending = PendingTotp {
+        sealed: SealedTotpSecret::new(vec![1, 2, 3], digest),
+        expires_at: far,
+    };
+    assert!(
+        fixture
+            .factors
+            .begin(fixture.ada, MfaChange::Enrollment, &pending, None)
+            .await?
+    );
+    assert!(
+        fixture
+            .factors
+            .activate(
+                fixture.ada,
+                MfaChange::Enrollment,
+                &digest,
+                0,
+                &[],
+                None,
+                UnixTimestamp::from_secs(1)
+            )
+            .await?
+    );
+
+    let response = fixture.sign_in("ada@example.com", PASSWORD, "acme").await?;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(json_body(&response)["code"], "mfa_required");
+    assert!(fixture.sessions.all()?.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn malformed_sign_in_bodies_are_refused() -> TestResult {
+    let fixture = fixture().await?;
+    for body in [
+        "not json",
+        r#"{"email": "ada@example.com", "password": "x"}"#,
+        r#"{"email": "ada@example.com", "password": "x", "tenant": "acme", "role": "admin"}"#,
+    ] {
+        let response = fixture
+            .router
+            .dispatch(request(
+                Method::POST,
+                "/auth/login",
+                &[("content-type", "application/json")],
+                body,
+            )?)
+            .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{body}"
+        );
+        assert_eq!(json_body(&response)["code"], "invalid_json");
+    }
+    assert!(fixture.sessions.all()?.is_empty());
+    Ok(())
+}
+
+/// Only `Authorization: Bearer` authenticates: no header, another scheme,
+/// a malformed or unknown token and a token in a cookie are refused.
+#[tokio::test]
+async fn missing_malformed_and_unknown_tokens_are_refused() -> TestResult {
+    let fixture = fixture().await?;
+    let token = fixture.token().await?;
+    let unknown = format!("Bearer {}", "ab".repeat(32));
+    for (authorization, code) in [
+        (None, "credentials_required"),
+        (Some("Basic dXNlcjpwYXNz"), "credentials_invalid"),
+        (Some("Bearer nope"), "credentials_invalid"),
+        (Some(&format!("bearer {token}")), "credentials_invalid"),
+        (Some(unknown.as_str()), "credentials_invalid"),
+    ] {
+        let response = fixture
+            .with_token(Method::GET, "/v1/auth/session", authorization)
+            .await?;
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "{authorization:?}"
+        );
+        assert_eq!(json_body(&response)["code"], code, "{authorization:?}");
+        assert_eq!(
+            header_of(&response, "www-authenticate"),
+            Some("Bearer realm=\"forge\"")
+        );
+    }
+    let cookie = fixture
+        .router
+        .dispatch(request(
+            Method::GET,
+            "/v1/auth/session",
+            &[("cookie", &format!("__Host-forge_session={token}"))],
+            "",
+        )?)
+        .await;
+    assert_eq!(cookie.status(), StatusCode::UNAUTHORIZED);
+    Ok(())
+}
+
+#[tokio::test]
+async fn sign_out_revokes_the_token_and_is_idempotent() -> TestResult {
+    let fixture = fixture().await?;
+    let token = fixture.token().await?;
+    let bearer = format!("Bearer {token}");
+
+    let response = fixture
+        .with_token(Method::POST, "/auth/logout", Some(&bearer))
+        .await?;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let session = fixture
+        .with_token(Method::GET, "/v1/auth/session", Some(&bearer))
+        .await?;
+    assert_eq!(session.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(json_body(&session)["code"], "credentials_invalid");
+
+    // Again, and with an unknown token: still 204, nothing revealed.
+    let again = fixture
+        .with_token(Method::POST, "/auth/logout", Some(&bearer))
+        .await?;
+    assert_eq!(again.status(), StatusCode::NO_CONTENT);
+    let unknown = format!("Bearer {}", "cd".repeat(32));
+    let unknown = fixture
+        .with_token(Method::POST, "/auth/logout", Some(&unknown))
+        .await?;
+    assert_eq!(unknown.status(), StatusCode::NO_CONTENT);
+    // A missing or malformed header is not a token at all.
+    for authorization in [None, Some("Bearer nope")] {
+        let refused = fixture
+            .with_token(Method::POST, "/auth/logout", authorization)
+            .await?;
+        assert_eq!(
+            refused.status(),
+            StatusCode::UNAUTHORIZED,
+            "{authorization:?}"
+        );
+    }
+    assert_eq!(
+        fixture
+            .audited()
+            .iter()
+            .filter(|(action, _)| action == "auth.sign_out")
+            .count(),
+        1
+    );
+    Ok(())
+}
+
+/// In the application the site's CSRF layer runs first: it lets the JSON
+/// sign-in and bearer requests through without a CSRF token.
+#[tokio::test]
+async fn the_csrf_layer_lets_json_and_bearer_requests_through() -> TestResult {
+    let world = fixture().await?;
+    let mut router = Router::new();
+    let translator =
+        app::adapters::http::views::locales::translator(&forge::config::AppConfig::default())?;
+    app::adapters::http::site(&mut router, translator)?;
+    let memberships = Arc::new(MemoryMembershipStore::default());
+    memberships
+        .upsert(&Membership::active(
+            world.acme,
+            world.ada,
+            vec![Role::new("owner")?],
+        ))
+        .await?;
+    routes(
+        &mut router,
+        ApiAuthenticationPorts {
+            credentials: world.world.clone(),
+            hasher: world.world.clone(),
+            sessions: world.sessions.clone(),
+            memberships,
+            tenants: world.world.clone(),
+            factors: world.factors.clone(),
+            audit: world.world.clone(),
+            sign_in_throttle: Arc::new(MemoryLoginThrottle::new(ThrottleConfig::default())?),
+        },
+    )?;
+    let body =
+        json!({"email": "ada@example.com", "password": PASSWORD, "tenant": "acme"}).to_string();
+    let signed_in = router
+        .dispatch(request(
+            Method::POST,
+            "/auth/login",
+            &[("content-type", "application/json")],
+            &body,
+        )?)
+        .await;
+    assert_eq!(signed_in.status(), StatusCode::OK);
+    let token = json_body(&signed_in)["access_token"]
+        .as_str()
+        .ok_or("a token")?
+        .to_owned();
+    let signed_out = router
+        .dispatch(request(
+            Method::POST,
+            "/auth/logout",
+            &[("authorization", &format!("Bearer {token}"))],
+            "",
+        )?)
+        .await;
+    assert_eq!(signed_out.status(), StatusCode::NO_CONTENT);
+    // A cross-site page cannot sign in, even with JSON.
+    let cross_site = router
+        .dispatch(request(
+            Method::POST,
+            "/auth/login",
+            &[
+                ("content-type", "application/json"),
+                ("sec-fetch-site", "cross-site"),
+            ],
+            &body,
+        )?)
+        .await;
+    assert_eq!(cross_site.status(), StatusCode::FORBIDDEN);
+    Ok(())
+}

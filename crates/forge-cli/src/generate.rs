@@ -224,6 +224,9 @@ pub(crate) struct NewApplication {
     pub(crate) forge: ForgeSource,
     /// The default locale of a full-stack application.
     pub(crate) locale: Locale,
+    /// `--api-auth`: the JSON authentication API beside the sign-in pages
+    /// (full-stack PostgreSQL applications).
+    pub(crate) api_auth: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -244,6 +247,10 @@ enum Group {
     /// Full-stack PostgreSQL applications: sign-in pages and `setup`
     /// (ADR 0026). Also the files of `forge generate authentication`.
     Authentication,
+    /// `--api-auth`: the JSON authentication API (bearer tokens) of a
+    /// full-stack PostgreSQL application. Also the files of `forge generate
+    /// authentication --api-auth`.
+    ApiAuthentication,
 }
 
 struct Template {
@@ -432,6 +439,30 @@ const TEMPLATES: &[Template] = &[
         Group::Authentication,
         "tests/authentication_postgres.rs" => "tests/authentication_postgres.rs.tmpl"
     ),
+    template!(
+        Group::ApiAuthentication,
+        "migrations/00000000000000000007_forge_bearer_sessions.up.sql" => "migrations/00000000000000000007_forge_bearer_sessions.up.sql.tmpl"
+    ),
+    template!(
+        Group::ApiAuthentication,
+        "migrations/00000000000000000007_forge_bearer_sessions.down.sql" => "migrations/00000000000000000007_forge_bearer_sessions.down.sql.tmpl"
+    ),
+    template!(
+        Group::ApiAuthentication,
+        "src/infrastructure/bearer_sessions/mod.rs" => "src/infrastructure/bearer_sessions/mod.rs.tmpl"
+    ),
+    template!(
+        Group::ApiAuthentication,
+        "src/adapters/http/api_authentication.rs" => "src/adapters/http/api_authentication.rs.tmpl"
+    ),
+    template!(
+        Group::ApiAuthentication,
+        "tests/api_authentication_http.rs" => "tests/api_authentication_http.rs.tmpl"
+    ),
+    template!(
+        Group::ApiAuthentication,
+        "tests/api_authentication_postgres.rs" => "tests/api_authentication_postgres.rs.tmpl"
+    ),
     template!(Group::Database, "src/bootstrap/seeds.rs" => "src/bootstrap/seeds.rs.tmpl"),
     template!(
         Group::Postgres,
@@ -527,7 +558,42 @@ const AUTHENTICATION_CONDITIONS: Conditions = Conditions {
     docker: false,
     database: Database::Postgresql,
     views: true,
+    api_auth: false,
 };
+
+const API_AUTHENTICATION_CONDITIONS: Conditions = Conditions {
+    api_auth: true,
+    ..AUTHENTICATION_CONDITIONS
+};
+
+/// The files of the JSON authentication API (`--api-auth`), exactly as
+/// `forge new --api-auth` writes them.
+pub(crate) fn api_authentication_files() -> Vec<(&'static str, String)> {
+    TEMPLATES
+        .iter()
+        .filter(|template| template.group == Group::ApiAuthentication)
+        .map(|template| {
+            (
+                template.path,
+                render(template.content, &[], API_AUTHENTICATION_CONDITIONS),
+            )
+        })
+        .collect()
+}
+
+/// The statements `forge new --api-auth` puts in `compose` to wire the JSON
+/// authentication API, from the comment that introduces them to the end of
+/// the call of `api_authentication::routes`.
+pub(crate) fn api_authentication_compose_statements() -> Option<String> {
+    let bootstrap = TEMPLATES
+        .iter()
+        .find(|template| template.path == "src/bootstrap/mod.rs")?;
+    let rendered = render(bootstrap.content, &[], API_AUTHENTICATION_CONDITIONS);
+    let start = rendered.find("    // JSON authentication API")?;
+    let call = rendered[start..].find("crate::adapters::http::api_authentication::routes(")?;
+    let end = start + call + rendered[start + call..].find("\n    )?;\n")? + "\n    )?;\n".len();
+    Some(rendered[start..end].to_owned())
+}
 
 /// Modules that exist to make each ring's responsibilities discoverable.
 /// Each is a documented, empty module until a feature needs it.
@@ -939,6 +1005,9 @@ fn write_application(
         Group::Api => !options.views,
         Group::BuildScript => options.views || options.database.is_enabled(),
         Group::Authentication => options.database == Database::Postgresql && options.views,
+        Group::ApiAuthentication => {
+            options.database == Database::Postgresql && options.views && options.api_auth
+        }
     };
     for template in TEMPLATES {
         if enabled(template.group) {
@@ -949,6 +1018,7 @@ fn write_application(
                     docker: options.docker,
                     database: options.database,
                     views: options.views,
+                    api_auth: options.api_auth,
                 },
             );
             write_file(&root.join(template.path), &content)?;
@@ -1109,13 +1179,15 @@ struct Conditions {
     docker: bool,
     database: Database,
     views: bool,
+    api_auth: bool,
 }
 
 /// Substitutes template variables and evaluates nested capability conditionals.
 ///
 /// `%%if name%%` / `%%if !name%%` ... `%%end%%` blocks nest. Known names are
 /// `docker`, `views` (full-stack, not `--api`), `authentication` (full-stack
-/// PostgreSQL: sign-in pages and `setup`), `database` (any backend),
+/// PostgreSQL: sign-in pages and `setup`), `api_auth` (`--api-auth` on top
+/// of `authentication`), `database` (any backend),
 /// `postgresql`, `mysql`, `mariadb`, `mysql_family` (MySQL or MariaDB) and
 /// `sqlite`. Unknown names are false.
 fn render(template: &str, variables: &[(&str, &str)], conditions: Conditions) -> String {
@@ -1123,11 +1195,13 @@ fn render(template: &str, variables: &[(&str, &str)], conditions: Conditions) ->
         docker,
         database,
         views,
+        api_auth,
     } = conditions;
     let condition = |name: &str| match name {
         "docker" => docker,
         "views" => views,
         "authentication" => views && database == Database::Postgresql,
+        "api_auth" => api_auth && views && database == Database::Postgresql,
         "database" => database.is_enabled(),
         "postgresql" => database == Database::Postgresql,
         "mysql" => database == Database::Mysql,
@@ -1284,6 +1358,7 @@ mod tests {
             views: true,
             forge: ForgeSource::GitTag,
             locale: Locale::En,
+            api_auth: false,
         }
     }
 

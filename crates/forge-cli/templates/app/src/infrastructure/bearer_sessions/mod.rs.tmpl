@@ -1,0 +1,218 @@
+//! PostgreSQL bearer sessions of API clients (`forge::tenancy::BearerSession`,
+//! migration `00000000000000000007_forge_bearer_sessions`), issued by the JSON
+//! sign-in of `crate::adapters::http::api_authentication`.
+//!
+//! Only SHA-256 digests of tokens are stored. A session is found only while
+//! it is live and its account still stands as it was at sign-in: the same
+//! password credential version (a reset or a hash upgrade ends it), not
+//! disabled, and without a two-factor factor (the JSON sign-in issues no
+//! session to such an account, so turning two-factor on ends the earlier
+//! ones). Like browser sessions, it also ends after the idle timeout without
+//! a request (`FORGE_AUTH_SESSION_IDLE_TIMEOUT`), and each use is recorded
+//! at most once per `SESSION_TOUCH_INTERVAL`, decided by the database clock.
+
+use std::time::Duration;
+
+use async_trait::async_trait;
+use forge::auth::{
+    SESSION_TOUCH_INTERVAL, Session, SessionCredentialDigest, SessionId, SessionIdleTimeout,
+    SessionStoreError, UnixTimestamp,
+};
+use forge::security::PrincipalId;
+use forge::tenancy::{BearerSession, BearerSessionStore, TenantId};
+use sqlx::{PgPool, types::Uuid};
+
+/// SQLx-backed [`BearerSessionStore`].
+#[derive(Clone)]
+pub struct PostgresBearerSessionStore {
+    pool: PgPool,
+    idle_timeout: SessionIdleTimeout,
+}
+
+impl PostgresBearerSessionStore {
+    /// A store on the least-privilege runtime pool, with the default idle
+    /// timeout (two hours).
+    #[must_use]
+    pub fn new(pool: PgPool) -> Self {
+        Self {
+            pool,
+            idle_timeout: SessionIdleTimeout::default(),
+        }
+    }
+
+    /// Ends sessions unused for `idle_timeout` (`FORGE_AUTH_SESSION_IDLE_TIMEOUT`).
+    #[must_use]
+    pub fn with_idle_timeout(mut self, idle_timeout: SessionIdleTimeout) -> Self {
+        self.idle_timeout = idle_timeout;
+        self
+    }
+}
+
+/// `duration` in whole microseconds, for `$n::bigint * interval '1 microsecond'`.
+fn micros(duration: Duration) -> i64 {
+    i64::try_from(duration.as_micros()).unwrap_or(i64::MAX)
+}
+
+#[async_trait]
+impl BearerSessionStore for PostgresBearerSessionStore {
+    /// Issues `session`, bound to the account's current password credential
+    /// version in the same statement: a later password change ends it. An
+    /// account that is disabled or gone is a conflict. A sign-in checks
+    /// afterwards that the version is still the one it verified (a reset in
+    /// between would otherwise leave the session on the new version).
+    async fn insert(
+        &self,
+        session: &BearerSession,
+        credential: &SessionCredentialDigest,
+    ) -> Result<(), SessionStoreError> {
+        let inner = session.session();
+        let revoked_at = inner.revoked_at().map(seconds).transpose()?;
+        let inserted = sqlx::query(
+            "INSERT INTO forge_bearer_sessions (
+                id, principal_id, tenant_id, credential_digest, credential_version,
+                issued_at, expires_at, revoked_at
+             )
+             SELECT
+                $1, p.id, $3, $4, p.version,
+                to_timestamp($5::double precision),
+                to_timestamp($6::double precision),
+                CASE
+                    WHEN $7::bigint IS NULL THEN NULL
+                    ELSE to_timestamp($7::double precision)
+                END
+             FROM forge_principals p
+             WHERE p.id = $2
+               AND p.disabled_at IS NULL",
+        )
+        .bind(inner.id().into_uuid())
+        .bind(inner.principal_id().into_uuid())
+        .bind(session.tenant_id().into_uuid())
+        .bind(credential.as_bytes().as_slice())
+        .bind(seconds(inner.issued_at())?)
+        .bind(seconds(inner.expires_at())?)
+        .bind(revoked_at)
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx_error)?;
+        if inserted.rows_affected() == 1 {
+            Ok(())
+        } else {
+            Err(SessionStoreError::Conflict)
+        }
+    }
+
+    /// A session unused for the idle timeout, of a changed, disabled or
+    /// two-factor account, is not found, like an unknown token. A live one
+    /// whose recorded use is more than a minute old records this one.
+    async fn find_by_credential(
+        &self,
+        credential: &SessionCredentialDigest,
+    ) -> Result<Option<BearerSession>, SessionStoreError> {
+        let idle = self.idle_timeout.as_micros();
+        let touch = micros(SESSION_TOUCH_INTERVAL);
+        let row = sqlx::query_as::<_, (Uuid, Uuid, Uuid, i64, i64, Option<i64>, bool)>(
+            "SELECT
+                s.id,
+                s.principal_id,
+                s.tenant_id,
+                EXTRACT(EPOCH FROM s.issued_at)::bigint,
+                EXTRACT(EPOCH FROM s.expires_at)::bigint,
+                EXTRACT(EPOCH FROM s.revoked_at)::bigint,
+                s.revoked_at IS NULL
+                    AND s.expires_at > now()
+                    AND s.last_seen_at <= now() - $3::bigint * interval '1 microsecond'
+             FROM forge_bearer_sessions s
+             JOIN forge_principals p ON p.id = s.principal_id
+             WHERE s.credential_digest = $1
+               AND s.last_seen_at > now() - $2::bigint * interval '1 microsecond'
+               AND p.version = s.credential_version
+               AND p.disabled_at IS NULL
+               AND NOT EXISTS (
+                   SELECT 1 FROM forge_totp_factors f WHERE f.principal_id = s.principal_id
+               )
+             LIMIT 1",
+        )
+        .bind(credential.as_bytes().as_slice())
+        .bind(idle)
+        .bind(touch)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx_error)?;
+
+        let Some((id, principal, tenant, issued_at, expires_at, revoked_at, stale)) = row else {
+            return Ok(None);
+        };
+        if stale {
+            // One of many concurrent requests writes, and only while the
+            // session is still live.
+            sqlx::query(
+                "UPDATE forge_bearer_sessions
+                 SET last_seen_at = now()
+                 WHERE id = $1
+                   AND revoked_at IS NULL
+                   AND expires_at > now()
+                   AND last_seen_at > now() - $2::bigint * interval '1 microsecond'
+                   AND last_seen_at <= now() - $3::bigint * interval '1 microsecond'",
+            )
+            .bind(id)
+            .bind(idle)
+            .bind(touch)
+            .execute(&self.pool)
+            .await
+            .map_err(map_sqlx_error)?;
+        }
+        let session = Session::restore(
+            SessionId::from_uuid(id).map_err(|_| SessionStoreError::CorruptRecord)?,
+            PrincipalId::from_uuid(principal).map_err(|_| SessionStoreError::CorruptRecord)?,
+            timestamp(issued_at)?,
+            timestamp(expires_at)?,
+            revoked_at.map(timestamp).transpose()?,
+        )
+        .map_err(|_| SessionStoreError::CorruptRecord)?;
+        let tenant = TenantId::from_uuid(tenant).map_err(|_| SessionStoreError::CorruptRecord)?;
+        Ok(Some(BearerSession::new(session, tenant)))
+    }
+
+    /// Idempotent: the earliest revocation time is kept.
+    async fn revoke(
+        &self,
+        session_id: SessionId,
+        revoked_at: UnixTimestamp,
+    ) -> Result<(), SessionStoreError> {
+        sqlx::query(
+            "UPDATE forge_bearer_sessions
+             SET revoked_at = GREATEST(issued_at, to_timestamp($2::double precision))
+             WHERE id = $1
+               AND revoked_at IS NULL",
+        )
+        .bind(session_id.into_uuid())
+        .bind(seconds(revoked_at)?)
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx_error)?;
+        Ok(())
+    }
+}
+
+fn seconds(timestamp: UnixTimestamp) -> Result<i64, SessionStoreError> {
+    i64::try_from(timestamp.as_secs()).map_err(|_| SessionStoreError::CorruptRecord)
+}
+
+fn timestamp(seconds: i64) -> Result<UnixTimestamp, SessionStoreError> {
+    u64::try_from(seconds)
+        .map(UnixTimestamp::from_secs)
+        .map_err(|_| SessionStoreError::CorruptRecord)
+}
+
+fn map_sqlx_error(error: sqlx::Error) -> SessionStoreError {
+    if error.as_database_error().is_some_and(|database| {
+        database
+            .code()
+            .as_deref()
+            .is_some_and(|code| code == "23505" || code == "23503" || code == "23514")
+    }) {
+        SessionStoreError::Conflict
+    } else {
+        SessionStoreError::Unavailable
+    }
+}

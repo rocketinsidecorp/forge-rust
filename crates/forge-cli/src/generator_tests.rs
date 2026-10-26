@@ -27,6 +27,7 @@ fn application(database: Database, views: bool, locale: Locale) -> (tempfile::Te
         views,
         forge: ForgeSource::Path("../forge/crates/forge".to_owned()),
         locale,
+        api_auth: false,
     };
     let root = create_application(parent.path(), &options)
         .unwrap_or_else(|error| panic!("application: {error}"));
@@ -1046,7 +1047,9 @@ fn authentication_refuses_applications_without_what_its_pages_need() {
     edit(&no_testing, "Cargo.toml", |manifest| {
         manifest.replace("\"testing\"", "\"other\"")
     });
-    assert!(refused(authentication::generate(&no_testing, true)).contains("forge::db::testing"));
+    assert!(
+        refused(authentication::generate(&no_testing, false, true)).contains("forge::db::testing")
+    );
 
     let (_parent, no_compose) = application(Database::Postgresql, true, Locale::En);
     edit(&no_compose, "src/bootstrap/mod.rs", |source| {
@@ -1056,12 +1059,16 @@ fn authentication_refuses_applications_without_what_its_pages_need() {
         )
     });
     assert!(
-        refused(authentication::generate(&no_compose, true)).contains("has no `compose` function")
+        refused(authentication::generate(&no_compose, false, true))
+            .contains("has no `compose` function")
     );
 
     let (_parent, no_locales) = application(Database::Postgresql, true, Locale::En);
     fs::remove_file(no_locales.join("src/adapters/http/views/locales.rs")).expect("remove");
-    assert!(refused(authentication::generate(&no_locales, true)).contains("locales.rs is missing"));
+    assert!(
+        refused(authentication::generate(&no_locales, false, true))
+            .contains("locales.rs is missing")
+    );
 }
 
 #[test]

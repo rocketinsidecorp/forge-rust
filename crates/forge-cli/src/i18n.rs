@@ -499,6 +499,7 @@ mod tests {
                 views: true,
                 forge: ForgeSource::GitTag,
                 locale,
+                api_auth: false,
             };
             let root = create_application(parent.path(), &options).expect("application");
             for (name, fields, broadcast) in [

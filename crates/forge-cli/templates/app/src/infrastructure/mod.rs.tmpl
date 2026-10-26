@@ -7,6 +7,9 @@ pub mod accounts;
 pub mod audit;
 pub mod auth;
 %%end%%
+%%if api_auth%%
+pub mod bearer_sessions;
+%%end%%
 pub mod cache;
 pub mod database;
 pub mod queue;

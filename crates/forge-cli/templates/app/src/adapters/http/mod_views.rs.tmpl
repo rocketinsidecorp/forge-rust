@@ -2,6 +2,9 @@
 //! map the result to a response, usually an HTML page rendered from a view
 //! model in `views` (or a `303` redirect after a form submission).
 
+%%if api_auth%%
+pub mod api_authentication;
+%%end%%
 %%if authentication%%
 pub mod authentication;
 %%end%%

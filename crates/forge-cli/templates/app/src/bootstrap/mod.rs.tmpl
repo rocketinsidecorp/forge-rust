@@ -160,6 +160,50 @@ fn compose(composition: &mut forge::Composition<'_>) -> Result<(), forge::Compos
         mfa,
     };
     crate::adapters::http::authentication::routes(composition, &site, ports)?;
+%%if api_auth%%
+    // JSON authentication API (`forge new --api-auth`, Forge-Go's
+    // apiAuthRoutes): POST /auth/login issues bearer tokens to API clients for
+    // the tenant they name, POST /auth/logout revokes them and
+    // GET /v1/auth/session shows the signed-in client. It is another place a
+    // password is entered: remove these lines if no API client signs in.
+    // Attempts count in the pages' sign-in throttle; tokens end after
+    // FORGE_AUTH_SESSION_IDLE_TIMEOUT without a request.
+    let pool = composition.postgres()?.pool().clone();
+    let idle_timeout =
+        forge::auth::SessionIdleTimeout::new(composition.config().auth.session_idle_timeout)
+            .map_err(forge::ComposeError::other)?;
+    crate::adapters::http::api_authentication::routes(
+        composition.router(),
+        crate::adapters::http::api_authentication::ApiAuthenticationPorts {
+            credentials: std::sync::Arc::new(
+                crate::infrastructure::auth::PostgresPasswordCredentialStore::new(pool.clone()),
+            ),
+            hasher: std::sync::Arc::new(crate::infrastructure::security::Argon2idPasswordHasher),
+            sessions: std::sync::Arc::new(
+                crate::infrastructure::bearer_sessions::PostgresBearerSessionStore::new(
+                    pool.clone(),
+                )
+                .with_idle_timeout(idle_timeout),
+            ),
+            memberships: std::sync::Arc::new(
+                crate::infrastructure::tenancy::PgMembershipStore::new(pool.clone()),
+            ),
+            tenants: std::sync::Arc::new(crate::infrastructure::accounts::PgTenantDirectory::new(
+                pool.clone(),
+            )),
+            factors: std::sync::Arc::new(crate::infrastructure::accounts::PgMfaStore::new(
+                pool.clone(),
+            )),
+            audit: std::sync::Arc::new(crate::infrastructure::audit::PgAuditSink::new(
+                pool.clone(),
+            )),
+            sign_in_throttle: std::sync::Arc::new(
+                forge::auth::PgLoginThrottle::new(pool, forge::auth::ThrottleConfig::default())
+                    .map_err(forge::ComposeError::other)?,
+            ),
+        },
+    )?;
+%%end%%
 %%end%%
     Ok(())
 }

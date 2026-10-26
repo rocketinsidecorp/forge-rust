@@ -1,0 +1,214 @@
+//! `PostgresBearerSessionStore` against a real database served like
+//! production (`RlsTestDatabase`: the migration role creates the owner, the
+//! runtime role runs the store): bearer sessions are bound to their tenant,
+//! found only by their digest, revoked for good, and end when the account's
+//! password changes, the account is disabled or turns two-factor
+//! authentication on, or after the idle timeout.
+//!
+//! PostgreSQL tests need `FORGE_TEST_DATABASE_URL` (a role that may create
+//! roles and databases) and are ignored by default:
+//! `cargo test -- --include-ignored`.
+
+use std::error::Error;
+use std::time::Duration;
+
+use app::infrastructure::accounts::{OwnerAccount, ProvisionedOwner, provision_owner};
+use app::infrastructure::bearer_sessions::PostgresBearerSessionStore;
+use forge::auth::{
+    CanonicalLogin, PasswordHash, Session, SessionBearerToken, SessionIdleTimeout,
+    SessionStoreError, UnixTimestamp,
+};
+use forge::db::testing::RlsTestDatabase;
+use forge::tenancy::{BearerDenied, BearerSession, BearerSessionStore, TenantSlug, resolve_bearer};
+
+type TestResult = Result<(), Box<dyn Error>>;
+
+static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!();
+
+fn now() -> Result<UnixTimestamp, Box<dyn Error>> {
+    Ok(UnixTimestamp::from_secs(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs(),
+    ))
+}
+
+struct Fixture {
+    database: RlsTestDatabase,
+    sessions: PostgresBearerSessionStore,
+    owner: ProvisionedOwner,
+}
+
+async fn fixture(idle: Option<Duration>) -> Result<Fixture, Box<dyn Error>> {
+    let database = RlsTestDatabase::create([&MIGRATOR]).await?;
+    let owner = provision_owner(
+        database.migrator().pool(),
+        &OwnerAccount {
+            tenant: TenantSlug::new("acme")?,
+            organization: "Acme".to_owned(),
+            login: CanonicalLogin::parse("owner@example.com")?,
+            // Never verified here: the store does not read passwords.
+            password_hash: PasswordHash::new("$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$ZGlnZXN0")?,
+            now: now()?,
+        },
+    )
+    .await?;
+    let mut sessions = PostgresBearerSessionStore::new(database.runtime().pool().clone());
+    if let Some(idle) = idle {
+        sessions = sessions.with_idle_timeout(SessionIdleTimeout::new(idle)?);
+    }
+    Ok(Fixture {
+        database,
+        sessions,
+        owner,
+    })
+}
+
+impl Fixture {
+    /// Issues a session of the owner in its tenant; returns it and its token.
+    async fn issue(&self) -> Result<(BearerSession, SessionBearerToken), Box<dyn Error>> {
+        let now = now()?;
+        let session = BearerSession::new(
+            Session::new(
+                self.owner.principal_id,
+                now,
+                UnixTimestamp::from_secs(now.as_secs() + 3_600),
+            )?,
+            self.owner.tenant_id,
+        );
+        let token = SessionBearerToken::generate()?;
+        self.sessions.insert(&session, &token.digest()).await?;
+        Ok((session, token))
+    }
+
+    async fn resolves(&self, token: &SessionBearerToken) -> Result<bool, Box<dyn Error>> {
+        let header = format!("Bearer {}", token.expose());
+        match resolve_bearer(&self.sessions, [header.as_bytes()], now()?).await {
+            Ok(_) => Ok(true),
+            Err(BearerDenied::InvalidCredentials) => Ok(false),
+            Err(other) => Err(other.into()),
+        }
+    }
+
+    async fn migrator(&self, statement: &'static str) -> TestResult {
+        sqlx::query(statement)
+            .bind(self.owner.principal_id.into_uuid())
+            .execute(self.database.migrator().pool())
+            .await?;
+        Ok(())
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs FORGE_TEST_DATABASE_URL"]
+async fn bearer_sessions_are_tenant_bound_found_by_digest_and_revoked_for_good() -> TestResult {
+    let fixture = fixture(None).await?;
+    let (session, token) = fixture.issue().await?;
+
+    let found = fixture
+        .sessions
+        .find_by_credential(&token.digest())
+        .await?
+        .ok_or("the session is found by its digest")?;
+    assert_eq!(found, session);
+    assert_eq!(found.tenant_id(), fixture.owner.tenant_id);
+    let unknown = SessionBearerToken::generate()?;
+    assert_eq!(
+        fixture
+            .sessions
+            .find_by_credential(&unknown.digest())
+            .await?,
+        None
+    );
+    // Only the digest is stored.
+    let stored: Vec<u8> = sqlx::query_scalar("SELECT credential_digest FROM forge_bearer_sessions")
+        .fetch_one(fixture.database.migrator().pool())
+        .await?;
+    assert_eq!(stored.as_slice(), token.digest().as_bytes().as_slice());
+    assert_ne!(stored.as_slice(), token.expose().as_bytes());
+    // Another session with the same digest is refused.
+    assert_eq!(
+        fixture.sessions.insert(&session, &token.digest()).await,
+        Err(SessionStoreError::Conflict)
+    );
+
+    fixture
+        .sessions
+        .revoke(session.session().id(), now()?)
+        .await?;
+    fixture
+        .sessions
+        .revoke(session.session().id(), now()?)
+        .await?;
+    assert!(!fixture.resolves(&token).await?);
+    // The runtime role cannot move a session to another tenant or revive it.
+    for statement in [
+        "UPDATE forge_bearer_sessions SET tenant_id = gen_random_uuid()",
+        "UPDATE forge_bearer_sessions SET revoked_at = NULL",
+    ] {
+        assert!(
+            sqlx::query(statement)
+                .execute(fixture.database.runtime().pool())
+                .await
+                .is_err(),
+            "{statement}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "needs FORGE_TEST_DATABASE_URL"]
+async fn a_password_change_two_factor_or_a_disabled_account_ends_bearer_sessions() -> TestResult {
+    let fixture = fixture(None).await?;
+
+    let (_, token) = fixture.issue().await?;
+    assert!(fixture.resolves(&token).await?);
+    fixture
+        .migrator("UPDATE forge_principals SET version = version + 1 WHERE id = $1")
+        .await?;
+    assert!(
+        !fixture.resolves(&token).await?,
+        "a password change ends it"
+    );
+
+    let (_, token) = fixture.issue().await?;
+    assert!(fixture.resolves(&token).await?, "a new sign-in works");
+    fixture
+        .migrator(
+            "INSERT INTO forge_totp_factors (principal_id, secret_digest, secret_ciphertext)
+             VALUES ($1, decode(repeat('ab', 32), 'hex'), '\\x01')",
+        )
+        .await?;
+    assert!(!fixture.resolves(&token).await?, "two-factor ends it");
+    fixture
+        .migrator("DELETE FROM forge_totp_factors WHERE principal_id = $1")
+        .await?;
+
+    let (_, token) = fixture.issue().await?;
+    fixture
+        .migrator("UPDATE forge_principals SET disabled_at = now() WHERE id = $1")
+        .await?;
+    assert!(!fixture.resolves(&token).await?, "disabling ends it");
+    assert!(
+        fixture.issue().await.is_err(),
+        "a disabled account gets no session"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "needs FORGE_TEST_DATABASE_URL"]
+async fn bearer_sessions_end_after_the_idle_timeout() -> TestResult {
+    let fixture = fixture(Some(Duration::from_secs(30 * 60))).await?;
+    let (session, token) = fixture.issue().await?;
+    assert!(fixture.resolves(&token).await?);
+    sqlx::query(
+        "UPDATE forge_bearer_sessions SET last_seen_at = now() - interval '31 minutes' WHERE id = $1",
+    )
+    .bind(session.session().id().into_uuid())
+    .execute(fixture.database.migrator().pool())
+    .await?;
+    assert!(!fixture.resolves(&token).await?);
+    Ok(())
+}

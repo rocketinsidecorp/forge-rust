@@ -63,6 +63,12 @@ pub(crate) enum Command {
         /// request layers.
         #[arg(long)]
         api: bool,
+        /// Also mount the JSON authentication API beside the sign-in pages:
+        /// POST /auth/login issues bearer tokens for API clients, POST
+        /// /auth/logout revokes them, GET /v1/auth/session shows the signed-in
+        /// client. Full-stack PostgreSQL applications only.
+        #[arg(long, conflicts_with = "api")]
+        api_auth: bool,
         /// Do not run `cargo generate-lockfile` after generation.
         #[arg(long)]
         skip_lockfile: bool,
@@ -585,6 +591,11 @@ pub(crate) enum GenerateCommand {
     /// authentication`; `forge new` already includes them). Writes only new
     /// files and prints the wiring to add by hand.
     Authentication {
+        /// Add the JSON authentication API (bearer tokens for API clients,
+        /// like `forge new --api-auth`); in an application that already has
+        /// the pages, only its files.
+        #[arg(long)]
+        api_auth: bool,
         /// List the files that would be created and the wiring, without
         /// writing anything.
         #[arg(long)]

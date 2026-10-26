@@ -15,6 +15,7 @@ fn application(database: Database, views: bool) -> (tempfile::TempDir, PathBuf) 
         views,
         forge: ForgeSource::Path("../forge/crates/forge".to_owned()),
         locale: crate::generate::Locale::En,
+        api_auth: false,
     };
     let root = create_application(parent.path(), &options)
         .unwrap_or_else(|error| panic!("application: {error}"));
@@ -459,6 +460,7 @@ fn the_default_locale_gets_the_english_text_too() {
         views: true,
         forge: ForgeSource::Path("../forge/crates/forge".to_owned()),
         locale: crate::generate::Locale::PtBr,
+        api_auth: false,
     };
     let root = create_application(parent.path(), &options)
         .unwrap_or_else(|error| panic!("application: {error}"));
