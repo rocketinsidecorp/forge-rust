@@ -177,10 +177,13 @@ mod tests {
 
     #[test]
     fn refused_connection_fails() {
-        let address = {
-            let listener = TcpListener::bind("127.0.0.1:0").expect("test listener must bind");
-            listener.local_addr().expect("listener has an address")
-        };
+        // Bound and never listening: connecting is refused, and unlike a
+        // probed port that was closed, nobody else can take it meanwhile.
+        let refusing = tokio::net::TcpSocket::new_v4().expect("socket");
+        refusing
+            .bind("127.0.0.1:0".parse().expect("valid address"))
+            .expect("test socket must bind");
+        let address = refusing.local_addr().expect("socket has an address");
 
         let error = probe(address, PROBE_TIMEOUT).expect_err("closed port must be unhealthy");
 
