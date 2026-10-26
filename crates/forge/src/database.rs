@@ -64,14 +64,17 @@ impl Declaration {
 
     /// Creates the lazily connecting pool for `serve` and `jobs work`, sized
     /// and bounded by `FORGE_DATABASE_MAX_CONNS`,
-    /// `FORGE_DATABASE_CONNECT_TIMEOUT` and `FORGE_DATABASE_STATEMENT_TIMEOUT`.
+    /// `FORGE_DATABASE_CONNECT_TIMEOUT` and `FORGE_DATABASE_STATEMENT_TIMEOUT`,
+    /// announcing enqueued jobs when `announce_jobs` (PostgreSQL, ADR 0046).
     /// Must run inside the Tokio runtime.
     pub(crate) fn connect_lazy(
         &self,
         url: &SecretString,
         config: &DatabaseConfig,
+        announce_jobs: bool,
     ) -> Result<DatabaseHandle, DbError> {
-        let settings = forge_db::PoolSettings::from_config(config);
+        let settings =
+            forge_db::PoolSettings::from_config(config).with_job_announcements(announce_jobs);
         let _ = (url, settings);
         match *self {
             #[cfg(feature = "postgres")]
