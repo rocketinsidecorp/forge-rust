@@ -299,7 +299,7 @@ and JSON requests.
 | Second factor bypassed through the API | An account with a TOTP factor gets `403 mfa_required` and no token; its earlier tokens stop resolving | `an_account_with_two_factor_authentication_gets_no_token`; PostgreSQL test above |
 | Long-lived or unattended tokens | 24-hour lifetime, `FORGE_AUTH_SESSION_IDLE_TIMEOUT` (use recorded at most once a minute, fail closed), idempotent revocation at `/auth/logout` (audited `auth.sign_out`) | `bearer_sessions_end_after_the_idle_timeout`, `sign_out_revokes_the_token_and_is_idempotent`; the generator e2e signs out and sees the token refused |
 | CSRF through the API | A browser never adds `Authorization` by itself and sends `application/json` cross-origin only after a CORS preflight Forge does not grant, so the CSRF layer passes such requests without a token **after** its cross-site check, unverified and without `_method`; cookie-authenticated routes keep their session-bound check | `forge-views` `bearer_and_json_requests_pass_unverified_but_never_cross_site`; generated `the_csrf_layer_lets_json_and_bearer_requests_through` |
-| A new resource public by accident | Every route asks its access policy first; the printed wiring is `DenyAll` for global resources, without bearer tokens and on MySQL, MariaDB and SQLite; the use cases re-check the grant | generated `the_generated_deny_all_default_refuses_every_route`, `the_use_cases_refuse_a_context_granted_for_another_permission` |
+| A new resource public by accident | Every route asks its access policy first; the generated wiring is `DenyAll` for global resources (unless `--public`, refused with Forge identity) and on MySQL, MariaDB and SQLite, and the pages' session with the CSRF header for tenant-scoped JSON resources of identity applications without bearer tokens; the use cases re-check the grant | generated `the_generated_deny_all_default_refuses_every_route`, `the_use_cases_refuse_a_context_granted_for_another_permission` |
 
 Residual risks: a stolen token works for anyone who holds it until it
 expires, idles out, is revoked or the password changes (as Forge-Go's);
@@ -722,6 +722,34 @@ grant to `app_runtime` by name (the generated identity tables) do not reach
 the per-test runtime role, which keeps the broader default privileges on
 those tables, and the generated sign-in tests still run as the test server's
 user.
+
+## Generated routes seam and tenant cookie review
+
+Review date: 2026-10-26 (D21, D29; [forge-rust#93](https://github.com/rocketinsidecorp/forge-rust/issues/93)).
+Scope: the routes the generators mount in `src/bootstrap/routes_gen.rs`,
+the module declarations they write, the `protect` and `public` guards,
+`--public`, the generators' lock, and the `__Host-forge_tenant` cookie that
+selects the tenant of tenant-scoped pages at `/<plural>`.
+
+| Threat | Control | Verification |
+| --- | --- | --- |
+| Tenant cookie set or swapped to another tenant | The cookie only selects which membership to check, as the `{tenant_id}` path segment did: every request authenticates the session, loads the principal's membership in that tenant and evaluates the RBAC grant; no membership or no grant is `403`, a missing or malformed cookie (or two of them) is `403` | generated `the_tenant_cookie_selects_a_membership_that_is_checked_every_time`, security-module `the_tenant_cookie_names_one_well_formed_tenant` |
+| Member removed or suspended while the cookie is still set | Nothing about the membership is cached in the cookie or the session: the next request finds no active membership and is refused (`403`), fail closed | generated `a_suspended_member_with_the_tenant_cookie_is_forbidden`, `another_tenant_or_a_malformed_tenant_is_forbidden` |
+| Tenant cookie read by scripts, sent cross-site or to another path | `__Host-` prefix with `Secure`, `HttpOnly`, `SameSite=Lax`, `Path=/` and no `Domain`, like the session cookie; it carries a tenant id, no secret | `the_tenant_cookie_names_one_well_formed_tenant` (attributes) |
+| Tenant cookie outliving the session | Set with the session at sign-in (password and second factor), removed with it at sign-out; without a live session it authorizes nothing | sign-in and sign-out flows in the generated authentication tests; README Quickstart test (sign-in, then every tenant page) |
+| JSON API used cross-site with the session cookie | Unsafe methods need the session's CSRF token in `X-CSRF-Token` (`403` without it); `SameSite=Lax` cookies | README Quickstart test: JSON `POST` `403` without the header, `201` with it, `401` signed out |
+| A generated resource public by accident | Deny-all (`403`) without identity; `--public` needs `--global`, prints a WARNING, and is refused with Forge identity, for tenant-scoped resources and without the seam | `options_public` refusals; README Quickstart test: a global resource answers `403` to the signed-in owner, pages and JSON |
+| An application guard silently ignored | Guards are module-level functions of `mod guards` behind `use super::*`: an application `fn protect`/`fn public` makes the name ambiguous (E0659, the build fails) until the generator runs again and leaves its own out | `a_guard_the_application_declares_replaces_the_generated_one`; scaffold suite `an_application_guard_is_never_silently_ignored` |
+| A resource or plural shadowing a guard | The seam's names (guards, shared blocks, function, module, parameters) are refused as resource, plural and controller names; generated code is built with its arguments in place, never rewritten as text | `rejects_the_names_of_the_routes_seam`, controller refusal tests |
+| Hand edit of the generated seam overwritten, or a forged structure | A `forge:checksum` line (SHA-256) and a re-render of the parsed blocks: a mismatch refuses every generator and destroy, nothing is written | `a_hand_edit_of_the_seam_is_refused_and_nothing_is_written`, `a_structure_the_generators_never_write_is_refused_behind_a_valid_checksum` |
+| Concurrent generators interleaving edits; writes through links | `.forge/generate.lock` created exclusively (any other error refuses the run; a symlinked `.forge` is refused); symlinked seam or `mod.rs` refused; atomic replace (temporary file, fsync, rename, directory fsync, mode kept) with rollback; a stale temporary file is refused first | `concurrent_generators_get_the_lock_one_at_a_time` (100 rounds), `the_lock_is_never_taken_through_a_symlinked_forge_directory`, `symlinked_seams_and_mod_files_are_refused`, `a_temporary_file_left_by_an_interrupted_write_is_refused`, `an_edited_file_keeps_its_mode` |
+| `forge dev` leaving its application serving | The application leads its own process group; SIGINT, SIGTERM, SIGHUP and SIGQUIT all stop and reap it before `forge dev` exits (SIGKILL cannot be handled) | `tests/dev_signals.rs` |
+
+Residual risks: the owner's permissions are granted in code (the `protect`
+guard's RBAC policy), not in a migration as Forge-Go does, so another role
+needs an application `fn protect` (revisited in the AUTH-OPT package); a
+`SIGKILL` of `forge dev` leaves its application running until it is stopped
+by hand.
 
 ## Review cadence
 

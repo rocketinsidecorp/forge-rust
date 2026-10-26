@@ -264,7 +264,9 @@ mod tests {
     };
 
     use super::*;
-    use crate::infrastructure::security::{SESSION_COOKIE_NAME, issue_session_secrets};
+    use crate::infrastructure::security::{
+        SESSION_COOKIE_NAME, TENANT_COOKIE_NAME, issue_session_secrets,
+    };
 
     type TestResult = Result<(), Box<dyn Error>>;
 
@@ -415,13 +417,13 @@ mod tests {
         }
         let access = Arc::new(SessionTenantAccess::new(sessions, memberships, policy));
         let mut router = Router::new();
-        for method in [Method::GET, Method::POST] {
-            let access = Arc::clone(&access);
-            let permission = permission.clone();
-            router.route(
-                method,
-                "/tenants/{tenant_id}/probe",
-                move |request: Request| {
+        // The tenant from the path, and (the scaffold's `/<plural>`) from
+        // the tenant cookie of the session.
+        for path in ["/tenants/{tenant_id}/probe", "/probe"] {
+            for method in [Method::GET, Method::POST] {
+                let access = Arc::clone(&access);
+                let permission = permission.clone();
+                router.route(method, path, move |request: Request| {
                     let access = Arc::clone(&access);
                     let permission = permission.clone();
                     async move {
@@ -433,8 +435,8 @@ mod tests {
                             Err(denied) => denied.response(),
                         }
                     }
-                },
-            )?;
+                })?;
+            }
         }
         Ok(Fixture {
             router,
@@ -476,6 +478,88 @@ mod tests {
         fn tenant(&self) -> String {
             self.tenant.to_string()
         }
+
+        /// The status of `/probe`, whose tenant is the `__Host-forge_tenant`
+        /// cookie (`tenant`), with the session cookie and `csrf`.
+        async fn status_by_cookie(
+            &self,
+            method: Method,
+            tenant: Option<&str>,
+            csrf: Option<&str>,
+        ) -> Result<StatusCode, Box<dyn Error>> {
+            let mut cookie = format!("{SESSION_COOKIE_NAME}={}", self.bearer);
+            if let Some(tenant) = tenant {
+                cookie.push_str(&format!("; {TENANT_COOKIE_NAME}={tenant}"));
+            }
+            let mut headers = HeaderMap::new();
+            headers.insert("cookie", HeaderValue::from_str(&cookie)?);
+            if let Some(csrf) = csrf {
+                headers.insert("x-csrf-token", HeaderValue::from_str(csrf)?);
+            }
+            let request = Request::new_for_test(
+                method,
+                "/probe".parse()?,
+                headers,
+                String::new().into(),
+                "127.0.0.1:4000".parse()?,
+                forge::core::Id::<Request>::new().into_uuid(),
+            );
+            Ok(self.router.dispatch(request).await.status())
+        }
+    }
+
+    /// The tenant cookie only selects the membership to check: the member of
+    /// that tenant with the grant is let in (writes with the CSRF token), and
+    /// a missing, malformed or other tenant's cookie is refused.
+    #[tokio::test]
+    async fn the_tenant_cookie_selects_a_membership_that_is_checked_every_time() -> TestResult {
+        let fixture = fixture(MembershipState::Active, true).await?;
+        let tenant = fixture.tenant();
+        let csrf = Some(fixture.csrf.as_str());
+
+        assert_eq!(
+            fixture
+                .status_by_cookie(Method::GET, Some(&tenant), None)
+                .await?,
+            StatusCode::OK
+        );
+        assert_eq!(
+            fixture
+                .status_by_cookie(Method::POST, Some(&tenant), csrf)
+                .await?,
+            StatusCode::OK
+        );
+        assert_eq!(
+            fixture
+                .status_by_cookie(Method::POST, Some(&tenant), None)
+                .await?,
+            StatusCode::FORBIDDEN
+        );
+        let other = TenantId::new().to_string();
+        for cookie in [None, Some("not-a-tenant"), Some(other.as_str())] {
+            assert_eq!(
+                fixture.status_by_cookie(Method::GET, cookie, None).await?,
+                StatusCode::FORBIDDEN,
+                "{cookie:?}"
+            );
+        }
+        Ok(())
+    }
+
+    /// A member suspended (or removed) while the cookie still names the
+    /// tenant is refused on the next request: nothing is cached.
+    #[tokio::test]
+    async fn a_suspended_member_with_the_tenant_cookie_is_forbidden() -> TestResult {
+        let fixture = fixture(MembershipState::Suspended, true).await?;
+        let tenant = fixture.tenant();
+
+        assert_eq!(
+            fixture
+                .status_by_cookie(Method::GET, Some(&tenant), None)
+                .await?,
+            StatusCode::FORBIDDEN
+        );
+        Ok(())
     }
 
     #[tokio::test]

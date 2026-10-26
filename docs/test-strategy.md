@@ -146,8 +146,11 @@ unit tests for name validation, refusals, `--dry-run`, all-or-nothing writes
 and formatter failure, and a slow end-to-end test
 (`cargo test -p forge-cli --test scaffold -- --ignored`) that generates
 PostgreSQL, SQLite and MySQL applications, scaffolds a global and a
-tenant-scoped resource, applies the printed wiring and runs the
-applications' `cargo fmt --check`, Clippy and tests. With
+tenant-scoped resource (which declare their modules and mount their routes
+themselves) and runs the applications' `cargo fmt --check`, Clippy and
+tests. `--test readme_quickstart -- --ignored` runs a fresh application's
+README Quickstart as written on PostgreSQL and SQLite and drives `forge dev`
+over HTTP (D21). With
 `FORGE_TEST_DATABASE_URL` it also runs the PostgreSQL repository and
 row-level-security tests and the scaffold migrations' `migrate`/`rollback`.
 Every scaffold ships tests: domain validation, the HTML flow through the real

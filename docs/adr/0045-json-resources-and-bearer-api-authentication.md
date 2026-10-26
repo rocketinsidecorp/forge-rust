@@ -1,5 +1,11 @@
 # ADR 0045: JSON resources and bearer-token API authentication
 
+> **Update (2026-10-26, D29, [forge-rust#93](https://github.com/rocketinsidecorp/forge-rust/issues/93)).**
+> Tenant-scoped scaffold pages are now at `/<plural>`, the tenant being the
+> one the session signed in to (the `__Host-forge_tenant` cookie; membership
+> and RBAC are checked on every request); live-update streams keep their
+> `/tenants/{tenant_id}/streams` path. The text below is kept as decided.
+
 - Status: Accepted
 - Date: 2026-10-26
 - Refines: [ADR 0024](0024-scaffold-generator.md),

@@ -521,8 +521,8 @@ authentication (`/session/mfa`, `/mfa`, migration
 `00000000000000000004_forge_mfa`), on once `FORGE_AUTH_MFA_KEY` is set
 ([MFA](mfa.md)). The generator refuses an application whose session store
 (`src/infrastructure/auth/mod.rs`) or migrations predate the session idle
-timeout, since the printed wiring passes `FORGE_AUTH_SESSION_IDLE_TIMEOUT` to
-the store; add both first ([Session idle
+timeout, since the generated wiring passes `FORGE_AUTH_SESSION_IDLE_TIMEOUT`
+to the store; add both first ([Session idle
 timeout](getting-started.md#session-idle-timeout)).
 
 ## `forge generate scaffold`

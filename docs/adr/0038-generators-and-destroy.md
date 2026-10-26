@@ -1,5 +1,12 @@
 # ADR 0038: Model, controller, mailer and queue job generators, and `forge destroy`
 
+> **Update (2026-10-26, D21, [forge-rust#93](https://github.com/rocketinsidecorp/forge-rust/issues/93)).**
+> Generators no longer print wiring to paste for scaffold, resource, model,
+> controller and view: they declare their modules and mount their routes in
+> `src/bootstrap/routes_gen.rs`, and `forge destroy` takes both back out
+> ([generators](../generators.md#the-routes-seam)). Mailer and job still
+> print theirs, as Forge-Go's do. The text below is kept as decided.
+
 - **Status:** Accepted
 - **Date:** 2026-10-20
 - **Port of:** Forge-Go ADR 0041 (rocketinsidecorp/forge-rust#15)
