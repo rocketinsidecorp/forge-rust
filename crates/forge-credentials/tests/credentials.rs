@@ -290,7 +290,6 @@ fn init_creates_a_private_key_and_a_skeleton_and_never_overwrites() {
     );
 }
 
-#[cfg(unix)]
 #[test]
 fn init_refuses_an_unusable_environment_name_before_touching_the_disk() {
     let root = tempfile::tempdir().unwrap();
@@ -312,6 +311,7 @@ fn init_refuses_an_unusable_environment_name_before_touching_the_disk() {
     assert!(!dir.exists(), "nothing was created for a refused name");
 }
 
+#[cfg(unix)]
 #[test]
 fn exposed_or_linked_key_files_are_refused() {
     use std::os::unix::fs::PermissionsExt as _;

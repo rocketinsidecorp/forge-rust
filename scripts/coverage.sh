@@ -206,7 +206,7 @@ if awk -v gross="$gross" -v floor="$gross_floor" 'BEGIN { exit !(gross + 0 < flo
 	echo "gross coverage ${gross}% (kits included) is below the gross floor ${gross_floor}% (gross_floor in scripts/coverage.sh)" >&2
 	status=1
 fi
-below="$(awk -F'|' -v floor="$crate_floor" '$7 ~ /FAIL/ { gsub(/[ `]/, "", $2); gsub(/^ +| +$/, "", $5); print "crate " $2 " is at " $5 ", below its per-crate floor " floor "% (guarded in scripts/coverage.sh)" }' <<< "$guarded_report")"
+below="$(awk -F'|' -v floor="$crate_floor" '$7 ~ /FAIL/ { gsub(/[ `]/, "", $2); gsub(/^ +| +$/, "", $5); print "crate " $2 " is " ($5 == "not measured" ? "not measured" : "at " $5) ", below its per-crate floor " floor "% (guarded in scripts/coverage.sh)" }' <<< "$guarded_report")"
 if [ -n "$below" ]; then
 	printf '%s\n' "$below" >&2
 	status=1
