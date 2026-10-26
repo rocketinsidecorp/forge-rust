@@ -169,21 +169,29 @@ async fn concurrent_misses_share_one_error_and_it_is_not_cached() {
     let cache = Arc::new(MemoryCache::new(MemoryOptions::default()).expect("cache"));
     let calls = Arc::new(AtomicUsize::new(0));
     let release = Arc::new(tokio::sync::Notify::new());
+    let started = Arc::new(tokio::sync::Notify::new());
     let mut tasks = tokio::task::JoinSet::new();
     for _ in 0..8 {
         let cache = Arc::clone(&cache);
         let calls = Arc::clone(&calls);
         let release = Arc::clone(&release);
+        let started = Arc::clone(&started);
         tasks.spawn(async move {
             fetch(cache.as_ref(), "k", MINUTE, || async move {
                 calls.fetch_add(1, Ordering::SeqCst);
+                started.notify_one();
                 release.notified().await;
                 Err::<Vec<u8>, _>(Down)
             })
             .await
         });
     }
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    // The runtime is single-threaded and runs tasks in the order they were
+    // spawned: when the first task has registered its computation and woken
+    // this one, the other seven are already queued ahead of it and wait on
+    // that computation. No time passes. A caller that had not joined by now
+    // would compute again and fail the call count below.
+    started.notified().await;
     release.notify_one();
     while let Some(result) = tasks.join_next().await {
         let error = result
@@ -199,13 +207,15 @@ async fn concurrent_misses_share_one_error_and_it_is_not_cached() {
 async fn a_panicking_computation_releases_its_waiters_and_leaks_no_call() {
     let cache = Arc::new(MemoryCache::new(MemoryOptions::default()).expect("cache"));
     let started = Arc::new(tokio::sync::Notify::new());
+    let panic_now = Arc::new(tokio::sync::Notify::new());
     let leader = {
         let cache = Arc::clone(&cache);
         let started = Arc::clone(&started);
+        let panic_now = Arc::clone(&panic_now);
         tokio::spawn(async move {
             fetch(cache.as_ref(), "k", MINUTE, || async move {
                 started.notify_one();
-                tokio::time::sleep(Duration::from_millis(150)).await;
+                panic_now.notified().await;
                 panic!("boom");
                 #[allow(unreachable_code)]
                 Ok::<_, Never>(Vec::new())
@@ -223,6 +233,10 @@ async fn a_panicking_computation_releases_its_waiters_and_leaks_no_call() {
             .await
         })
     };
+    // One turn of the single-threaded runtime lets the waiter reach the
+    // leader's call before the leader panics.
+    tokio::task::yield_now().await;
+    panic_now.notify_one();
     assert!(leader.await.expect_err("panicked").is_panic());
     let value = tokio::time::timeout(Duration::from_secs(5), waiter)
         .await

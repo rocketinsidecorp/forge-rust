@@ -6,9 +6,9 @@
 use std::{
     sync::{
         Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
-    time::Duration,
+    time::{Duration, UNIX_EPOCH},
 };
 
 use async_trait::async_trait;
@@ -92,12 +92,16 @@ struct Harness {
 }
 
 fn harness(options: HandlerOptions) -> Harness {
+    harness_with(options, Signer::new(&SECRET, &[]).expect("signer"))
+}
+
+fn harness_with(options: HandlerOptions, signer: Signer) -> Harness {
     let dir = tempfile::tempdir().expect("tempdir");
     let store = Arc::new(Counting {
         inner: DiskStorage::open(dir.path().join("root")).expect("open"),
         opens: AtomicUsize::new(0),
     });
-    let signer = Arc::new(Signer::new(&SECRET, &[]).expect("signer"));
+    let signer = Arc::new(signer);
     let handler = StorageHandler::new(store.clone(), signer.clone(), options).expect("handler");
     let mut router = Router::new();
     router.layer(handler);
@@ -409,9 +413,16 @@ async fn invalid_and_expired_links_never_touch_the_store() {
 
 #[tokio::test]
 async fn an_authentic_link_that_expired_is_reported_as_expired() {
-    let h = harness(HandlerOptions::default());
+    // The signer reads a fake clock, so the link expires by moving it.
+    let now = Arc::new(AtomicU64::new(1_800_000_000));
+    let clock = Arc::clone(&now);
+    let signer = Signer::new(&SECRET, &[])
+        .expect("signer")
+        .with_clock(Box::new(move || {
+            UNIX_EPOCH + Duration::from_secs(clock.load(Ordering::SeqCst))
+        }));
+    let h = harness_with(HandlerOptions::default(), signer);
     let k = put(&h, "a.txt", b"x", "text/plain", "").await;
-    // A link signed in the past, with a signer whose clock is an hour behind.
     let url = h
         .signer
         .url(
@@ -420,11 +431,18 @@ async fn an_authentic_link_that_expired_is_reported_as_expired() {
             &SignOptions::default().ttl(Duration::from_secs(1)),
         )
         .expect("url");
-    tokio::time::sleep(Duration::from_millis(2200)).await;
+    let valid = h.router.dispatch(get(&url)).await;
+    assert_eq!(
+        valid.status(),
+        StatusCode::OK,
+        "the link works until it expires"
+    );
+    let opens = h.store.opens.load(Ordering::SeqCst);
+    now.fetch_add(3, Ordering::SeqCst);
     let response = h.router.dispatch(get(&url)).await;
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
     assert!(String::from_utf8_lossy(response.body()).contains("link_expired"));
-    assert_eq!(h.store.opens.load(Ordering::SeqCst), 0);
+    assert_eq!(h.store.opens.load(Ordering::SeqCst), opens);
 }
 
 #[tokio::test]
@@ -1295,8 +1313,13 @@ async fn end_to_end_upload_then_signed_download_through_the_router() {
 }
 
 /// A store whose writes are slow, so a request timeout lands mid-upload.
-#[tokio::test]
-async fn a_cancelled_upload_leaves_no_committed_blob_behind() {
+///
+/// The upload runs on its own runtime. Dropping a runtime waits for the
+/// blocking jobs it started, so once it is gone the cancelled job has
+/// noticed the cancellation and cleaned up, and the check needs no sleep and
+/// no polling.
+#[test]
+fn a_cancelled_upload_leaves_no_committed_blob_behind() {
     let u = uploads();
     let options = UploadOptions::new("avatar", &["image/png"], 8 << 20)
         .expect("options")
@@ -1307,17 +1330,23 @@ async fn a_cancelled_upload_leaves_no_committed_blob_behind() {
         .map(|_| file("avatar", "a.png", "image/png", &big))
         .collect();
     let request = upload_request(multipart(&parts));
-    let outcome = tokio::time::timeout(
-        Duration::from_millis(1),
-        receive(&request, &u.store, &options),
-    )
-    .await;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let outcome = runtime.block_on(async {
+        tokio::time::timeout(
+            Duration::from_millis(1),
+            receive(&request, &u.store, &options),
+        )
+        .await
+    });
     assert!(
         outcome.is_err(),
         "the upload was expected to be cut off by the timeout"
     );
-    // Give the blocking job time to notice the cancellation and clean up.
-    tokio::time::sleep(Duration::from_millis(3000)).await;
+    // Waits for the blocking job to finish.
+    drop(runtime);
     assert_eq!(
         u.blobs(),
         0,
