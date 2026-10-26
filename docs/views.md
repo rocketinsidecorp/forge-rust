@@ -608,11 +608,23 @@ to `FORGE_STREAMS_PREVIOUS_KEYS` (comma-separated, at most 3, same format as
 `FORGE_STREAMS_KEY`). Previous keys only verify, never sign; the current key
 always signs:
 
+`NEW_STREAMS_KEY=$(openssl rand -base64 32)` creates the new key.
+
 ```sh
-export FORGE_STREAMS_PREVIOUS_KEYS=$OLD_STREAMS_KEY      # the key being retired
-export FORGE_STREAMS_KEY=$(openssl rand -base64 32)      # the new key, on every replica
-# redeploy every replica; after 24 hours (the token lifetime) unset FORGE_STREAMS_PREVIOUS_KEYS
+# step 1: every replica learns the new key, but still signs with the old one
+export FORGE_STREAMS_KEY=$OLD_STREAMS_KEY
+export FORGE_STREAMS_PREVIOUS_KEYS=$NEW_STREAMS_KEY
+# redeploy every replica, then
+# step 2: sign with the new key; the old one keeps verifying pages already open
+export FORGE_STREAMS_KEY=$NEW_STREAMS_KEY
+export FORGE_STREAMS_PREVIOUS_KEYS=$OLD_STREAMS_KEY
+# redeploy every replica; after the token lifetime (24 hours by default,
+# up to 7 days with Signer::with_ttl) unset FORGE_STREAMS_PREVIOUS_KEYS and redeploy
 ```
+
+Two steps keep a rolling redeploy safe: after step 1 every replica already
+accepts the new key, so a page signed by a replica that finished step 2 keeps
+updating when it reconnects to one that has not.
 
 `Signer::from_config` (the generated `Streams::register` calls it) reads both
 variables, so an application generated earlier needs no code change, only a

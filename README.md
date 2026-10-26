@@ -1087,8 +1087,8 @@ cargo run -- setup --tenant acme --email owner@example.com
 unset FORGE_MIGRATION_DATABASE_URL
 export FORGE_DATABASE_URL='postgres://app_runtime:app_runtime@127.0.0.1:5432/shop'
 export FORGE_STREAMS_KEY=$(openssl rand -base64 32)   # required in production; same on every replica
-# Rotating it without breaking open pages: the old key verifies for 24 hours (up to 3 keys, comma-separated)
-export FORGE_STREAMS_PREVIOUS_KEYS=$OLD_STREAMS_KEY
+# Rotating it later without breaking open pages: FORGE_STREAMS_PREVIOUS_KEYS holds up to 3
+# verify-only keys (docs/deployment.md#rotating-the-stream-signing-key has the two-step recipe)
 cargo run
 # sign in at http://127.0.0.1:3000/session/new?tenant=acme in two browsers,
 # open /tenants/<tenant id>/events in both and create an event in one

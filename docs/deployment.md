@@ -150,7 +150,7 @@ from env files, Kubernetes manifests and unit files.
 | `FORGE_STORAGE_LINK_TTL_SECS` | `900` | Default lifetime of signed links, `1` to `604800`. |
 | `FORGE_I18N_DEFAULT_LOCALE` | the application's `DEFAULT_LOCALE` (`forge new --locale`, else `en`) | The locale requests that ask for no available locale get, and the one production shows for a missing translation. A locale such as `en` or `pt-BR`, spelled canonically; `config/locales/LOCALE.json` must exist or start-up fails ([i18n](i18n.md)). |
 | `FORGE_STREAMS_KEY` | none | HMAC key of signed live-update stream names: base64 (standard or URL-safe, padded or not) of at least 32 random bytes, as `openssl rand -base64 32` prints; the same on every replica. Redacted. **Required in `production` by applications that serve live updates** (`scaffold --broadcast`); development and test use a random per-process key ([views](views.md#live-updates)). |
-| `FORGE_STREAMS_PREVIOUS_KEYS` | none | While `FORGE_STREAMS_KEY` is rotated: up to 3 older keys, comma-separated, in the same format. They only verify, so pages open during the rotation keep updating; the current key always signs. Remove them after 24 hours, the token lifetime. Redacted; an error names the entry's position, never the key. Needs `FORGE_STREAMS_KEY` ([rotating the key](deployment.md#rotating-the-stream-signing-key)). |
+| `FORGE_STREAMS_PREVIOUS_KEYS` | none | While `FORGE_STREAMS_KEY` is rotated: up to 3 older keys, comma-separated, in the same format. They only verify, so pages open during the rotation keep updating; the current key always signs. Remove them after the token lifetime (24 hours by default). Redacted; an error names the entry's position, never the key. Needs `FORGE_STREAMS_KEY` ([rotating the key](deployment.md#rotating-the-stream-signing-key)). |
 | `FORGE_TELEMETRY_*` | on, exporting nothing | Traces, metrics and log export ([observability](observability.md#configuration)). The ones operators set most: `FORGE_TELEMETRY_METRICS_ADDR` (separate Prometheus listener; in a container `0.0.0.0:9464` with `FORGE_TELEMETRY_METRICS_PUBLIC=true` and the port kept off the internet), `FORGE_TELEMETRY_EXPORTER=otlp` and `FORGE_TELEMETRY_LOGS_EXPORTER=otlp` with `FORGE_TELEMETRY_OTLP_ENDPOINT` (`https` in production unless `FORGE_TELEMETRY_OTLP_ALLOW_PLAINTEXT=true`), `FORGE_TELEMETRY_OTLP_HEADERS` (secret, redacted), `FORGE_TELEMETRY_SERVICE_NAME`, `FORGE_TELEMETRY_TRUST_TRACEPARENT` (only behind a gateway that sets or sanitizes `traceparent`). `FORGE_TELEMETRY_ENABLED=false` turns it off. |
 
 Logs go to standard output, and the platform (Docker, Kubernetes, journald)
@@ -578,14 +578,25 @@ without that, move the old key to `FORGE_STREAMS_PREVIOUS_KEYS`
 (comma-separated, at most 3, same format). Previous keys only verify, the new
 key signs:
 
+`NEW_STREAMS_KEY=$(openssl rand -base64 32)` creates the new key.
+
 ```sh
-export FORGE_STREAMS_PREVIOUS_KEYS=$OLD_STREAMS_KEY   # the key being retired
-export FORGE_STREAMS_KEY=$(openssl rand -base64 32)   # the new key, on every replica
-# redeploy every replica with both; replicas with different keys refuse each other's pages
+# step 1: every replica learns the new key, but still signs with the old one
+export FORGE_STREAMS_KEY=$OLD_STREAMS_KEY
+export FORGE_STREAMS_PREVIOUS_KEYS=$NEW_STREAMS_KEY
+# redeploy every replica, then
+# step 2: sign with the new key; the old one keeps verifying pages already open
+export FORGE_STREAMS_KEY=$NEW_STREAMS_KEY
+export FORGE_STREAMS_PREVIOUS_KEYS=$OLD_STREAMS_KEY
+# redeploy every replica; after the token lifetime (24 hours by default,
+# up to 7 days with Signer::with_ttl) unset FORGE_STREAMS_PREVIOUS_KEYS and redeploy
 ```
 
-Keep the previous key for at least the token lifetime (24 hours), then unset
-`FORGE_STREAMS_PREVIOUS_KEYS` and redeploy. Both variables are redacted, errors
+Two steps keep a rolling redeploy safe: after step 1 every replica already
+accepts the new key, so a page signed by a replica that finished step 2 keeps
+updating when it reconnects to one that has not.
+
+Both variables are redacted, errors
 name an entry's position and never a key, and previous keys without a current
 key are refused. See [views](views.md#rotating-the-stream-signing-key).
 
