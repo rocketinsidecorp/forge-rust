@@ -89,7 +89,9 @@ configuration, and no new crate unless strictly necessary.
    are Forge-Go's. Connections, control requests and tunnels are bounded and
    owned (`JoinSet`, `TaskTracker`) and stop within the shutdown budget.
    `-idle-timeout` closes a keep-alive connection waiting for its next
-   request (hyper's header timer bounds that wait too), a response write
+   request (the next request's headers then have `-read-header-timeout`
+   from their first byte, Go's `IdleTimeout`/`ReadHeaderTimeout` split;
+   before 2026-10-25 hyper's header timer cut that wait at 10 s), a response write
    that makes no progress and an upgraded connection silent in both
    directions, so a client that stops reading cannot hold a connection, a
    tunnel or a drain open. The cache and control directories are kept 0700

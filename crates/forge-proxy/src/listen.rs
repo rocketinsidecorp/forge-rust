@@ -1,16 +1,24 @@
 //! Accepting client connections: plain HTTP and, when configured, TLS.
 //! Connections are bounded, owned by the accept loop and shut down
 //! gracefully within a budget. A client that stops reading is disconnected
-//! once a write to it makes no progress for the idle timeout.
+//! once a write to it makes no progress for the idle timeout; a keep-alive
+//! connection may wait the idle timeout for its next request, which then
+//! has the header timeout to arrive (Go's `IdleTimeout` and
+//! `ReadHeaderTimeout`).
 
 use std::convert::Infallible;
 use std::future::Future as _;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+use bytes::Bytes;
+use http::StatusCode;
+use http_body_util::BodyExt as _;
+use hyper::body::{Body, Frame, SizeHint};
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -20,6 +28,7 @@ use tokio::task::JoinSet;
 use tokio::time::{Instant, Sleep};
 use tokio_util::sync::CancellationToken;
 
+use crate::forward::{BoxError, ProxyBody};
 use crate::log::text;
 use crate::server::Server;
 
@@ -32,11 +41,11 @@ const MAX_CONNECTIONS: usize = 10_000;
 pub struct HttpLimits {
     /// Time allowed to read request headers.
     pub read_header_timeout: Duration,
-    /// How long a keep-alive connection may wait for its next request (hyper
-    /// starts the header timer then, so the shorter of this and
-    /// `read_header_timeout` applies), how long a write to the client may
-    /// make no progress, and how long an upgraded (WebSocket) connection
-    /// may carry no data in either direction.
+    /// How long a keep-alive connection may wait for the first byte of its
+    /// next request (`read_header_timeout` then applies to the rest of the
+    /// headers), how long a write to the client may make no progress, and
+    /// how long an upgraded (WebSocket) connection may carry no data in
+    /// either direction.
     pub idle_timeout: Duration,
     /// Graceful shutdown budget.
     pub shutdown_timeout: Duration,
@@ -165,13 +174,30 @@ async fn serve_connection<S>(
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let idle = limits.idle_timeout;
+    let phase = Arc::new(AtomicU8::new(HEAD));
+    let stream = KeepAlive::new(stream, Arc::clone(&phase), limits.read_header_timeout, idle);
     let service = service_fn(move |request| {
         let server = server.clone();
-        async move { Ok::<_, Infallible>(server.handle(request, peer, tls, idle).await) }
+        let phase = Arc::clone(&phase);
+        async move {
+            phase.store(BUSY, Ordering::SeqCst);
+            let response = server.handle(request, peer, tls, idle).await;
+            // An upgraded connection stays busy: the tunnel has its own
+            // idle limit. Otherwise the connection is idle once the body
+            // has been sent.
+            let response = if response.status() == StatusCode::SWITCHING_PROTOCOLS {
+                response
+            } else {
+                response.map(|body| IdleWhenDone { body, phase }.boxed_unsync())
+            };
+            Ok::<_, Infallible>(response)
+        }
     });
+    // The header and idle limits are KeepAlive's: hyper's own header timer
+    // would also run while the connection waits for its next request.
     let connection = hyper::server::conn::http1::Builder::new()
         .timer(TokioTimer::new())
-        .header_read_timeout(limits.read_header_timeout.min(idle))
+        .header_read_timeout(None)
         .max_buf_size(1 << 20)
         .serve_connection(TokioIo::new(Progress::new(stream, idle)), service)
         .with_upgrades();
@@ -182,6 +208,174 @@ async fn serve_connection<S>(
             connection.as_mut().graceful_shutdown();
             let _ = connection.await;
         }
+    }
+}
+
+#[cfg(test)]
+mod keep_alive_tests;
+
+/// Reading a request head ([`KeepAlive`]).
+const HEAD: u8 = 0;
+/// Serving a request: no read limit here (the body timeouts apply).
+const BUSY: u8 = 1;
+/// The response was sent; waiting for the next request.
+const IDLE: u8 = 2;
+
+/// A response body that marks the connection idle once it is dropped:
+/// hyper drops it when it has been sent (or the exchange failed).
+struct IdleWhenDone {
+    body: ProxyBody,
+    phase: Arc<AtomicU8>,
+}
+
+impl Drop for IdleWhenDone {
+    fn drop(&mut self) {
+        self.phase.store(IDLE, Ordering::SeqCst);
+    }
+}
+
+impl Body for IdleWhenDone {
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
+        Pin::new(&mut self.get_mut().body).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.body.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.body.size_hint()
+    }
+}
+
+/// A client stream whose reads are limited like Go's `http.Server`: a
+/// request head must arrive within `header` (the first one from the start
+/// of the connection, later ones from their first byte), and between
+/// requests the connection may wait `idle` for that first byte, after which
+/// it reads as closed and hyper ends it quietly. While a request is served
+/// (and on an upgraded connection) reads are not limited here.
+pub(crate) struct KeepAlive<S> {
+    inner: S,
+    phase: Arc<AtomicU8>,
+    header: Duration,
+    idle: Duration,
+    timer: Pin<Box<Sleep>>,
+    /// The phase the timer is armed for, or `BUSY` when it is not armed.
+    armed: u8,
+    /// The idle wait ran out: every further read is end of stream.
+    expired: bool,
+}
+
+impl<S> KeepAlive<S> {
+    pub(crate) fn new(inner: S, phase: Arc<AtomicU8>, header: Duration, idle: Duration) -> Self {
+        Self {
+            inner,
+            phase,
+            header,
+            idle,
+            timer: Box::pin(tokio::time::sleep(header)),
+            armed: BUSY,
+            expired: false,
+        }
+    }
+
+    fn arm(&mut self, phase: u8, limit: Duration) {
+        if self.armed != phase {
+            self.armed = phase;
+            self.timer.as_mut().reset(Instant::now() + limit);
+        }
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for KeepAlive<S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        if this.expired {
+            return Poll::Ready(Ok(()));
+        }
+        match this.phase.load(Ordering::SeqCst) {
+            IDLE => {
+                this.arm(IDLE, this.idle);
+                let before = buf.filled().len();
+                match Pin::new(&mut this.inner).poll_read(cx, buf) {
+                    Poll::Ready(Ok(())) if buf.filled().len() > before => {
+                        // The next request started: its head gets `header`.
+                        this.phase.store(HEAD, Ordering::SeqCst);
+                        this.arm(HEAD, this.header);
+                        Poll::Ready(Ok(()))
+                    }
+                    Poll::Ready(result) => Poll::Ready(result),
+                    Poll::Pending => {
+                        if this.timer.as_mut().poll(cx).is_ready() {
+                            // Read as a client that went away: hyper closes
+                            // the idle connection without an error.
+                            this.expired = true;
+                            return Poll::Ready(Ok(()));
+                        }
+                        Poll::Pending
+                    }
+                }
+            }
+            HEAD => {
+                this.arm(HEAD, this.header);
+                match Pin::new(&mut this.inner).poll_read(cx, buf) {
+                    Poll::Ready(result) => Poll::Ready(result),
+                    Poll::Pending => {
+                        if this.timer.as_mut().poll(cx).is_ready() {
+                            return Poll::Ready(Err(std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                "request headers not received in time",
+                            )));
+                        }
+                        Poll::Pending
+                    }
+                }
+            }
+            _ => {
+                this.armed = BUSY;
+                Pin::new(&mut this.inner).poll_read(cx, buf)
+            }
+        }
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for KeepAlive<S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.get_mut().inner).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
     }
 }
 

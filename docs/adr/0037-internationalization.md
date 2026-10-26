@@ -121,10 +121,14 @@ middleware trait, without tower.
 - **Headers** are set by the negotiation layer for responses that used the
   binding, instead of by the renderer; `set_content_language` covers a
   translated response built another way.
-- **Path prefix and security layers.** Layers registered before
-  `LocaleNegotiation` see the prefixed path, so path-sensitive security
-  layers go after it (`Router::layer` runs in registration order), as in
-  Forge-Go's `App.Use` after the i18n middleware. The layer keeps the removed
+- **Path prefix and security layers.** Amended 2026-10-25: the prefix is
+  removed in the router's rewrite step (`Middleware::rewrite`, run for every
+  layer before the first one handles the request), so every layer sees the
+  stripped path whatever the registration order, and a path guard
+  registered before `LocaleNegotiation` can no longer be bypassed with a
+  prefix. (Originally layers registered before it saw the prefixed path and
+  path-sensitive layers had to go after it, as in Forge-Go's `App.Use` after
+  the i18n middleware; Forge-Go keeps that rule, a parity follow-up.) The layer keeps the removed
   segment as a request extension holding the locale's canonical name, read
   with `forge_views::path_prefix` (Forge-Go: `i18n.PathPrefix`), and
   `SignInRedirect` puts it back in `return_to` only when the result still
@@ -176,8 +180,8 @@ middleware trait, without tower.
   path-prefix applications (the sign-in return path already keeps the
   prefix); `forge destroy` (with the generators,
   [forge-rust#15](https://github.com/rocketinsidecorp/forge-rust/issues/15)).
-- Nothing enforces that path-sensitive security layers are registered after
-  the negotiation layer (the same in Forge-Go); a typed layer order or a
-  start-up check would, and needs a design of its own.
+- Resolved 2026-10-25 for Forge-Rust by the rewrite step above; Forge-Go
+  still relies on the registration order of path-sensitive middleware
+  ([forge-go#56](https://github.com/rocketinsidecorp/forge-go/issues/56)).
 - Broadcast fragments render in the default locale for every subscriber, as
   in Forge-Go and Rails.

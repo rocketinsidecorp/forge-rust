@@ -349,7 +349,58 @@ async fn allow_header_lists_registered_methods_sorted() {
     let response = router.dispatch(request(Method::POST, "/customers/1")).await;
 
     assert_eq!(response.status, StatusCode::METHOD_NOT_ALLOWED);
-    assert_eq!(response.headers[header::ALLOW], "DELETE, GET, PUT");
+    assert_eq!(response.headers[header::ALLOW], "DELETE, GET, HEAD, PUT");
+}
+
+#[tokio::test]
+async fn head_is_served_by_the_get_route_with_the_head_method() {
+    let mut router = Router::new();
+    router
+        .route(Method::GET, "/posts/{id}", |request: Request| async move {
+            Response::text(StatusCode::OK, format!("{} post", request.method()))
+        })
+        .expect("GET route must register");
+
+    let response = router.dispatch(request(Method::HEAD, "/posts/7")).await;
+
+    assert_eq!(response.status, StatusCode::OK);
+    // In process the body stays; the server drops it on the wire.
+    assert_eq!(response.body(), "HEAD post");
+}
+
+#[tokio::test]
+async fn an_explicit_head_route_wins_over_the_get_route() {
+    let mut router = Router::new();
+    router
+        .route(Method::GET, "/report", |_| async {
+            Response::new(StatusCode::OK, "get")
+        })
+        .expect("GET route must register")
+        .route(Method::HEAD, "/report", |_| async {
+            Response::empty(StatusCode::NO_CONTENT)
+        })
+        .expect("HEAD route must register");
+
+    let response = router.dispatch(request(Method::HEAD, "/report")).await;
+
+    assert_eq!(response.status, StatusCode::NO_CONTENT);
+    let post = router.dispatch(request(Method::POST, "/report")).await;
+    assert_eq!(post.headers[header::ALLOW], "GET, HEAD");
+}
+
+#[tokio::test]
+async fn head_without_a_get_route_is_not_allowed() {
+    let mut router = Router::new();
+    router
+        .route(Method::POST, "/posts", |_| async {
+            Response::empty(StatusCode::CREATED)
+        })
+        .expect("POST route must register");
+
+    let response = router.dispatch(request(Method::HEAD, "/posts")).await;
+
+    assert_eq!(response.status, StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(response.headers[header::ALLOW], "POST");
 }
 
 #[tokio::test]
@@ -366,7 +417,7 @@ async fn dynamic_route_method_mismatch_reports_allowed_methods() {
         .await;
 
     assert_eq!(response.status, StatusCode::METHOD_NOT_ALLOWED);
-    assert_eq!(response.headers[header::ALLOW], "GET");
+    assert_eq!(response.headers[header::ALLOW], "GET, HEAD");
 }
 
 #[test]
@@ -466,11 +517,80 @@ fn routes_lists_every_registration_with_its_call_site() {
 
 #[test]
 fn security_headers_are_applied_at_transport_boundary() {
-    let outgoing = to_hyper_response(Response::empty(StatusCode::NO_CONTENT), Uuid::now_v7());
+    let outgoing = to_hyper_response(
+        Response::empty(StatusCode::NO_CONTENT),
+        Uuid::now_v7(),
+        false,
+    );
 
     assert_eq!(outgoing.headers()["x-content-type-options"], "nosniff");
     assert_eq!(outgoing.headers()["x-frame-options"], "DENY");
     assert!(outgoing.headers().contains_key("x-request-id"));
+    // Plain HTTP: no HSTS, which browsers would ignore anyway.
+    assert!(
+        !outgoing
+            .headers()
+            .contains_key(header::STRICT_TRANSPORT_SECURITY)
+    );
+}
+
+#[test]
+fn hsts_is_added_when_clients_use_https_and_a_handler_value_is_kept() {
+    let outgoing = to_hyper_response(Response::empty(StatusCode::OK), Uuid::now_v7(), true);
+    assert_eq!(
+        outgoing.headers()[header::STRICT_TRANSPORT_SECURITY],
+        "max-age=31536000; includeSubDomains"
+    );
+
+    let mut preload = Response::empty(StatusCode::OK);
+    preload.headers_mut().insert(
+        header::STRICT_TRANSPORT_SECURITY,
+        HeaderValue::from_static("max-age=63072000; includeSubDomains; preload"),
+    );
+    let outgoing = to_hyper_response(preload, Uuid::now_v7(), true);
+    let values: Vec<_> = outgoing
+        .headers()
+        .get_all(header::STRICT_TRANSPORT_SECURITY)
+        .iter()
+        .collect();
+    assert_eq!(values, ["max-age=63072000; includeSubDomains; preload"]);
+}
+
+#[tokio::test]
+async fn the_server_sends_hsts_only_behind_tls_termination() {
+    for (transport, expected) in [
+        (forge_config::HttpTransport::Plain, None),
+        (
+            forge_config::HttpTransport::TrustedProxy,
+            Some("strict-transport-security: max-age=31536000; includesubdomains"),
+        ),
+    ] {
+        let mut config = test_config(Duration::from_secs(10));
+        config.transport = transport;
+        let server = TestServer::start(config, panicking_router()).await;
+        // Every response, the routed one, a 404 and a recovered panic.
+        for target in ["/health", "/missing", "/panic"] {
+            let raw =
+                format!("GET {target} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            let addr = server.addr;
+            let response =
+                tokio::task::spawn_blocking(move || exchange_blocking(addr, raw.as_bytes()))
+                    .await
+                    .expect("client task must not panic")
+                    .to_ascii_lowercase();
+            match expected {
+                Some(line) => assert!(
+                    response.contains(line),
+                    "{transport:?} {target}: {response}"
+                ),
+                None => assert!(
+                    !response.contains("strict-transport-security"),
+                    "{transport:?} {target}: {response}"
+                ),
+            }
+        }
+        server.stop().await;
+    }
 }
 #[test]
 fn router_debug_lists_routes() {
@@ -555,7 +675,9 @@ fn test_config(request_timeout: Duration) -> ServerConfig {
         shutdown_grace: Duration::from_secs(30),
         max_body_bytes: 64,
         max_connections: 16,
+        max_in_flight_body_bytes: 1024,
         trusted_proxies: Vec::new(),
+        transport: forge_config::HttpTransport::Plain,
     }
 }
 
@@ -1075,4 +1197,654 @@ async fn a_client_that_stops_reading_a_stream_is_disconnected() {
     }
     drop(client);
     server.stop().await;
+}
+
+/// The response head (status line and headers) and everything after it.
+fn split_head(response: &str) -> (&str, &str) {
+    response
+        .split_once("\r\n\r\n")
+        .unwrap_or_else(|| panic!("no header block in {response:?}"))
+}
+
+#[tokio::test]
+async fn head_answers_with_the_get_headers_and_no_body() {
+    let mut router = test_router();
+    router
+        .route(Method::GET, "/ticks", |_| async {
+            counting(3, Duration::from_millis(1))
+        })
+        .expect("stream route must register")
+        .route(Method::HEAD, "/empty", |_| async {
+            Response::empty(StatusCode::OK)
+        })
+        .expect("HEAD route must register");
+    let server = TestServer::start(test_config(Duration::from_secs(10)), router).await;
+
+    let response = exchange(
+        server.addr,
+        "HEAD /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    let (head, body) = split_head(&response);
+    let lower = head.to_ascii_lowercase();
+    assert!(head.starts_with("HTTP/1.1 200 "), "{response}");
+    // The length of the GET body ({"status":"ok"}), which is not sent.
+    assert!(lower.contains("content-length: 15"), "{response}");
+    assert!(
+        lower.contains("content-type: application/json"),
+        "{response}"
+    );
+    assert!(lower.contains("x-request-id: "), "{response}");
+    assert_eq!(body, "", "{response}");
+
+    // A streamed GET: headers only, no length, and the stream is not sent.
+    let response = exchange(
+        server.addr,
+        "HEAD /ticks HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    let (head, body) = split_head(&response);
+    assert!(head.starts_with("HTTP/1.1 200 "), "{response}");
+    assert!(
+        !head.to_ascii_lowercase().contains("content-length"),
+        "{response}"
+    );
+    assert_eq!(body, "", "{response}");
+
+    // An empty body adds no length (hyper adds none for HEAD either).
+    let response = exchange(
+        server.addr,
+        "HEAD /empty HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    let (head, body) = split_head(&response);
+    assert!(head.starts_with("HTTP/1.1 200 "), "{response}");
+    assert!(
+        !head.to_ascii_lowercase().contains("content-length"),
+        "{response}"
+    );
+    assert_eq!(body, "", "{response}");
+
+    // A route without GET still refuses HEAD and lists what it serves.
+    let response = exchange(
+        server.addr,
+        "HEAD /echo HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    let (head, body) = split_head(&response);
+    assert!(head.starts_with("HTTP/1.1 405 "), "{response}");
+    assert!(
+        head.to_ascii_lowercase().contains("allow: post"),
+        "{response}"
+    );
+    assert_eq!(body, "", "{response}");
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn a_keep_alive_connection_continues_cleanly_after_head() {
+    let server = TestServer::start(test_config(Duration::from_secs(10)), test_router()).await;
+    let addr = server.addr;
+
+    tokio::task::spawn_blocking(move || {
+        let mut stream = connect(addr);
+        stream
+            .write_all(
+                b"HEAD /health/live HTTP/1.1\r\nHost: localhost\r\n\r\n\
+                  GET /health/live HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            )
+            .expect("requests must be written");
+        let mut received = Vec::new();
+        stream
+            .read_to_end(&mut received)
+            .expect("server must close after the second response");
+        let text = String::from_utf8_lossy(&received);
+        // Two responses, and only the second carries the body.
+        assert_eq!(text.matches("HTTP/1.1 200 ").count(), 2, "{text}");
+        assert_eq!(text.matches(r#"{"status":"live"}"#).count(), 1, "{text}");
+        assert!(text.ends_with(r#"{"status":"live"}"#), "{text}");
+    })
+    .await
+    .expect("client task must not panic");
+    server.stop().await;
+}
+
+/// A log sink for one test.
+#[derive(Clone, Default)]
+struct CapturedLog(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl Write for CapturedLog {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if let Ok(mut log) = self.0.lock() {
+            log.extend_from_slice(bytes);
+        }
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl CapturedLog {
+    fn text(&self) -> String {
+        self.0
+            .lock()
+            .map(|log| String::from_utf8_lossy(&log).into_owned())
+            .unwrap_or_default()
+    }
+}
+
+fn panicking_router() -> Router {
+    let mut router = test_router();
+    router
+        .route(Method::GET, "/panic", |_| async {
+            panic!("secret-detail 4242");
+        })
+        .expect("panic route must register")
+        .route(Method::POST, "/panic", |_| async {
+            panic!("with a body");
+        })
+        .expect("panic route must register");
+    router
+}
+
+// Current-thread runtime: the server's tasks run on this thread, so the
+// test's log subscriber sees them.
+#[tokio::test(flavor = "current_thread")]
+async fn a_handler_panic_is_a_500_with_the_request_id_and_is_logged() {
+    let log = CapturedLog::default();
+    let writer = log.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_writer(move || writer.clone())
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+    let server = TestServer::start(test_config(Duration::from_secs(10)), panicking_router()).await;
+    let addr = server.addr;
+
+    let text = tokio::task::spawn_blocking(move || {
+        let mut stream = connect(addr);
+        // The connection survives the panic: a second request follows.
+        stream
+            .write_all(
+                b"GET /panic HTTP/1.1\r\nHost: localhost\r\n\r\n\
+                  GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            )
+            .expect("requests must be written");
+        let mut received = Vec::new();
+        stream
+            .read_to_end(&mut received)
+            .expect("server must answer both requests");
+        String::from_utf8_lossy(&received).into_owned()
+    })
+    .await
+    .expect("client task must not panic");
+
+    let (first, rest) = text
+        .split_once("HTTP/1.1 200 ")
+        .unwrap_or_else(|| panic!("no second response in {text:?}"));
+    assert!(first.starts_with("HTTP/1.1 500 "), "{text}");
+    let lower = first.to_ascii_lowercase();
+    assert!(
+        lower.contains("content-type: text/plain; charset=utf-8"),
+        "{text}"
+    );
+    assert!(lower.contains("x-content-type-options: nosniff"), "{text}");
+    assert!(first.ends_with("\r\n\r\ninternal server error"), "{text}");
+    assert!(
+        !text.contains("secret-detail"),
+        "the panic message leaked: {text}"
+    );
+    assert!(rest.ends_with(r#"{"status":"ok"}"#), "{text}");
+    let request_id = lower
+        .lines()
+        .find_map(|line| line.strip_prefix("x-request-id: "))
+        .unwrap_or_else(|| panic!("no x-request-id in {text:?}"))
+        .trim()
+        .to_owned();
+    server.stop().await;
+
+    let logged = log.text();
+    let line = logged
+        .lines()
+        .find(|line| line.contains("request handler panicked"))
+        .unwrap_or_else(|| panic!("panic not logged: {logged}"));
+    // Logged with the request id, where it panicked and the payload type;
+    // the message, which may quote request data, is not logged at info.
+    assert!(line.contains(&request_id), "{line}");
+    assert!(line.contains("ERROR"), "{line}");
+    assert!(
+        line.contains(r#"location="crates/forge-http/src/tests.rs:"#),
+        "{line}"
+    );
+    assert!(line.contains("payload=\"&str\""), "{line}");
+    assert!(!logged.contains("secret-detail"), "{logged}");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn the_panic_message_is_logged_only_at_debug() {
+    let log = CapturedLog::default();
+    let writer = log.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::DEBUG)
+        .with_writer(move || writer.clone())
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+    let server = TestServer::start(test_config(Duration::from_secs(10)), panicking_router()).await;
+
+    let response = exchange(
+        server.addr,
+        "GET /panic HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(response.starts_with("HTTP/1.1 500 "), "{response}");
+    assert!(!response.contains("secret-detail"), "{response}");
+    server.stop().await;
+
+    let logged = log.text();
+    let line = logged
+        .lines()
+        .find(|line| line.contains("request handler panic message"))
+        .unwrap_or_else(|| panic!("message not logged at debug: {logged}"));
+    assert!(line.contains("DEBUG"), "{line}");
+    assert!(line.contains("secret-detail 4242"), "{line}");
+}
+
+// Current-thread runtime, as above, so the test's subscriber sees the
+// server's tasks.
+#[tokio::test(flavor = "current_thread")]
+async fn a_panic_caught_inside_the_request_is_logged_at_warn_without_its_message() {
+    let log = CapturedLog::default();
+    let writer = log.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_writer(move || writer.clone())
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+    let mut router = test_router();
+    router
+        .route(Method::GET, "/caught", |_| async {
+            // A runtime value, so the payload is a formatted String.
+            let detail = std::hint::black_box(77);
+            let caught = std::panic::catch_unwind(|| panic!("hidden-detail {detail}"));
+            Response::new(StatusCode::OK, format!("caught: {}", caught.is_err()))
+        })
+        .expect("caught route must register");
+    let server = TestServer::start(test_config(Duration::from_secs(10)), router).await;
+
+    let response = exchange(
+        server.addr,
+        "GET /caught HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert!(response.starts_with("HTTP/1.1 200 "), "{response}");
+    assert!(response.ends_with("caught: true"), "{response}");
+    let request_id = response
+        .to_ascii_lowercase()
+        .lines()
+        .find_map(|line| line.strip_prefix("x-request-id: ").map(str::to_owned))
+        .unwrap_or_else(|| panic!("no x-request-id in {response:?}"));
+    server.stop().await;
+
+    let logged = log.text();
+    let line = logged
+        .lines()
+        .find(|line| line.contains("request code caught a panic"))
+        .unwrap_or_else(|| panic!("caught panic not logged: {logged}"));
+    assert!(line.contains("WARN"), "{line}");
+    assert!(line.contains(request_id.trim()), "{line}");
+    assert!(
+        line.contains("location=crates/forge-http/src/tests.rs:"),
+        "{line}"
+    );
+    assert!(line.contains(r#"payload="String""#), "{line}");
+    assert!(!logged.contains("hidden-detail"), "{logged}");
+    // Answered normally: no error line.
+    assert!(!logged.contains("request handler panicked"), "{logged}");
+}
+
+#[test]
+fn panic_payload_types_are_named_without_their_text() {
+    let literal: Box<dyn std::any::Any + Send> = Box::new("text");
+    let formatted: Box<dyn std::any::Any + Send> = Box::new(String::from("text"));
+    let other: Box<dyn std::any::Any + Send> = Box::new(7_u8);
+    assert_eq!(panics::payload_type(literal.as_ref()), "&str");
+    assert_eq!(panics::payload_type(formatted.as_ref()), "String");
+    assert_eq!(panics::payload_type(other.as_ref()), "other");
+    assert_eq!(panic_message(other.as_ref()), "non-string panic payload");
+}
+
+/// A server with a 64-byte body limit and a `budget`-byte in-flight body
+/// budget, and a handle on that budget.
+async fn budget_server(budget: usize, request_timeout: Duration) -> (TestServer, Arc<Semaphore>) {
+    let mut config = test_config(request_timeout);
+    config.max_in_flight_body_bytes = budget;
+    let server = Server::new(config, panicking_router());
+    let available = Arc::clone(&server.app.body_budget.0);
+    (TestServer::start_server(server).await, available)
+}
+
+/// Waits until the budget has exactly `bytes` free.
+async fn budget_reaches(budget: &Semaphore, bytes: usize) {
+    let deadline = tokio::time::Instant::now() + CLIENT_TIMEOUT;
+    while budget.available_permits() != bytes {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "budget stuck at {} free, expected {bytes}",
+            budget.available_permits()
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+async fn exchange_owned(addr: SocketAddr, raw: String) -> String {
+    tokio::task::spawn_blocking(move || exchange_blocking(addr, raw.as_bytes()))
+        .await
+        .expect("client task must not panic")
+}
+
+#[tokio::test]
+async fn content_length_bodies_are_charged_as_they_arrive_and_refused_with_503() {
+    let (server, budget) = budget_server(64, Duration::from_secs(10)).await;
+    let addr = server.addr;
+
+    // A trickling upload declares 60 bytes and holds the 40 it sent.
+    let mut holder = tokio::task::spawn_blocking(move || {
+        let mut stream = connect(addr);
+        stream
+            .write_all(
+                format!(
+                    "POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 60\r\n\
+                     Connection: close\r\n\r\n{}",
+                    "a".repeat(40)
+                )
+                .as_bytes(),
+            )
+            .expect("partial body must be written");
+        stream
+    })
+    .await
+    .expect("client task must not panic");
+    budget_reaches(&budget, 24).await;
+
+    // 40 more bytes do not fit in the 24 left (one write, so the server
+    // has read them all when it refuses).
+    let refused = exchange_owned(
+        addr,
+        format!(
+            "POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 40\r\n\
+             Connection: close\r\n\r\n{}",
+            "b".repeat(40)
+        ),
+    )
+    .await;
+    let lower = refused.to_ascii_lowercase();
+    assert!(refused.starts_with("HTTP/1.1 503 "), "{refused}");
+    assert!(lower.contains("retry-after: 5\r\n"), "{refused}");
+    assert!(lower.contains("x-request-id: "), "{refused}");
+    assert!(refused.ends_with("server busy, retry later"), "{refused}");
+    budget_reaches(&budget, 24).await;
+
+    // A body that fits is served meanwhile.
+    let fits = exchange_owned(
+        addr,
+        format!(
+            "POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 20\r\n\
+             Connection: close\r\n\r\n{}",
+            "x".repeat(20)
+        ),
+    )
+    .await;
+    assert!(fits.starts_with("HTTP/1.1 200 "), "{fits}");
+
+    // The first upload completes and returns its share.
+    let completed = tokio::task::spawn_blocking(move || {
+        holder
+            .write_all("c".repeat(20).as_bytes())
+            .expect("rest of the body must be written");
+        let mut response = Vec::new();
+        holder
+            .read_to_end(&mut response)
+            .expect("response must arrive");
+        String::from_utf8_lossy(&response).into_owned()
+    })
+    .await
+    .expect("client task must not panic");
+    assert!(completed.starts_with("HTTP/1.1 200 "), "{completed}");
+    assert!(
+        completed.ends_with(&format!("{}{}", "a".repeat(40), "c".repeat(20))),
+        "{completed}"
+    );
+    budget_reaches(&budget, 64).await;
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn a_declared_but_unsent_body_holds_no_budget() {
+    let (server, budget) = budget_server(64, Duration::from_secs(10)).await;
+    let addr = server.addr;
+
+    // Several clients declare the largest body and send none of it.
+    let holders = tokio::task::spawn_blocking(move || {
+        (0..4)
+            .map(|_| {
+                let mut stream = connect(addr);
+                stream
+                    .write_all(
+                        b"POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 64\r\n\
+                          Connection: close\r\n\r\n",
+                    )
+                    .expect("headers must be written");
+                stream
+            })
+            .collect::<Vec<_>>()
+    })
+    .await
+    .expect("client task must not panic");
+    // Their headers reached the server; no budget was taken for them.
+    budget_reaches(&budget, 64).await;
+
+    // A small form post and a body of the whole budget still succeed.
+    for size in [1, 64] {
+        let response = exchange_owned(
+            addr,
+            format!(
+                "POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: {size}\r\n\
+                 Connection: close\r\n\r\n{}",
+                "y".repeat(size)
+            ),
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 200 "), "{size}: {response}");
+    }
+    drop(holders);
+    budget_reaches(&budget, 64).await;
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn trickling_chunked_uploads_are_charged_as_they_arrive_and_released_on_disconnect() {
+    let (server, budget) = budget_server(64, Duration::from_secs(10)).await;
+    let addr = server.addr;
+
+    // A chunked upload sends 40 bytes and stalls without ending the body.
+    let holder = tokio::task::spawn_blocking(move || {
+        let mut stream = connect(addr);
+        stream
+            .write_all(
+                format!(
+                    "POST /echo HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\
+                     Connection: close\r\n\r\n28\r\n{}\r\n",
+                    "a".repeat(40)
+                )
+                .as_bytes(),
+            )
+            .expect("first chunk must be written");
+        stream
+    })
+    .await
+    .expect("client task must not panic");
+    budget_reaches(&budget, 24).await;
+
+    // A second chunked upload fits with its first 16 bytes, not its next 16
+    // (one write, so the server has read everything when it refuses).
+    let refused = exchange_owned(
+        addr,
+        format!(
+            "POST /echo HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\
+             Connection: close\r\n\r\n10\r\n{0}\r\n10\r\n{0}\r\n",
+            "b".repeat(16)
+        ),
+    )
+    .await;
+    assert!(refused.starts_with("HTTP/1.1 503 "), "{refused}");
+    assert!(
+        refused.to_ascii_lowercase().contains("retry-after: 5\r\n"),
+        "{refused}"
+    );
+    budget_reaches(&budget, 24).await;
+
+    // The stalled client leaves: its share comes back.
+    drop(holder);
+    budget_reaches(&budget, 64).await;
+    let served = exchange_owned(
+        addr,
+        format!(
+            "POST /echo HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\
+             Connection: close\r\n\r\n28\r\n{}\r\n0\r\n\r\n",
+            "d".repeat(40)
+        ),
+    )
+    .await;
+    assert!(served.starts_with("HTTP/1.1 200 "), "{served}");
+    assert!(served.ends_with(&"d".repeat(40)), "{served}");
+    budget_reaches(&budget, 64).await;
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn the_body_budget_is_returned_after_a_panic_a_timeout_and_a_rejection() {
+    let (server, budget) = budget_server(64, Duration::from_millis(300)).await;
+    let addr = server.addr;
+
+    let panicked = exchange(
+        addr,
+        "POST /panic HTTP/1.1\r\nHost: localhost\r\nContent-Length: 10\r\n\
+         Connection: close\r\n\r\n0123456789",
+    )
+    .await;
+    assert!(panicked.starts_with("HTTP/1.1 500 "), "{panicked}");
+    budget_reaches(&budget, 64).await;
+
+    // Declares 40 bytes, sends 2, stalls past the request timeout.
+    let timed_out = exchange(
+        addr,
+        "POST /echo HTTP/1.1\r\nHost: localhost\r\nContent-Length: 40\r\n\
+         Connection: close\r\n\r\nab",
+    )
+    .await;
+    assert!(timed_out.starts_with("HTTP/1.1 504 "), "{timed_out}");
+    budget_reaches(&budget, 64).await;
+
+    // Over the body limit after 40 bytes were charged.
+    let too_large = exchange_owned(
+        addr,
+        format!(
+            "POST /echo HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\
+             Connection: close\r\n\r\n28\r\n{0}\r\n28\r\n{0}\r\n",
+            "e".repeat(40)
+        ),
+    )
+    .await;
+    assert!(too_large.starts_with("HTTP/1.1 413 "), "{too_large}");
+    budget_reaches(&budget, 64).await;
+    server.stop().await;
+}
+
+#[test]
+fn a_charge_larger_than_u32_is_taken_in_steps() {
+    let budget = BodyBudget::new(usize::MAX);
+    let mut held = BodyCharge::default();
+    let big = (u32::MAX as usize) * 2 + 7;
+    assert!(budget.charge(&mut held, big));
+    assert!(budget.charge(&mut held, 3));
+    assert_eq!(held.0.len(), 3);
+    assert_eq!(
+        budget.0.available_permits(),
+        Semaphore::MAX_PERMITS - big - 3
+    );
+    drop(held);
+    assert_eq!(budget.0.available_permits(), Semaphore::MAX_PERMITS);
+
+    let small = BodyBudget::new(10);
+    let mut held = BodyCharge::default();
+    assert!(small.charge(&mut held, 0));
+    assert!(held.0.is_empty());
+    assert!(small.charge(&mut held, 6));
+    assert!(small.charge(&mut held, 1));
+    assert_eq!(held.0.len(), 1, "small charges merge into one permit");
+    assert!(!small.charge(&mut held, 4));
+    assert_eq!(small.0.available_permits(), 3);
+    drop(held);
+    assert_eq!(small.0.available_permits(), 10);
+}
+
+/// Moves `/v2/...` to `/...` in its rewrite step and records it.
+struct RewriteV2;
+
+impl Middleware for RewriteV2 {
+    fn handle<'a>(&'a self, request: Request, next: Next<'a>) -> BoxResponseFuture<'a> {
+        next.run(request)
+    }
+
+    fn rewrite(&self, request: &mut Request) {
+        if let Some(rest) = request.uri().path().strip_prefix("/v2/") {
+            let uri = format!("/{rest}").parse().expect("valid rewritten URI");
+            request.set_uri(uri);
+            request.extensions_mut().insert("rewritten");
+        }
+    }
+}
+
+/// A path guard: refuses `/admin` and everything under it.
+struct DenyAdmin;
+
+impl Middleware for DenyAdmin {
+    fn handle<'a>(&'a self, request: Request, next: Next<'a>) -> BoxResponseFuture<'a> {
+        let path = request.uri().path();
+        if path == "/admin" || path.starts_with("/admin/") {
+            return Box::pin(async { Response::empty(StatusCode::FORBIDDEN) });
+        }
+        next.run(request)
+    }
+}
+
+#[tokio::test]
+async fn rewrites_run_before_every_layer_wherever_they_are_registered() {
+    let mut router = Router::new();
+    router
+        .route(Method::GET, "/admin", |_| async {
+            Response::new(StatusCode::OK, "admin")
+        })
+        .expect("admin route must register")
+        .route(Method::GET, "/posts", |request: Request| async move {
+            let rewritten = request.extensions().get::<&str>().copied();
+            Response::new(StatusCode::OK, rewritten.unwrap_or("as sent"))
+        })
+        .expect("posts route must register");
+    // The guard comes first; the rewriting layer after it.
+    router.layer(DenyAdmin).layer(RewriteV2);
+
+    for (target, status, body) in [
+        ("/admin", StatusCode::FORBIDDEN, ""),
+        ("/v2/admin", StatusCode::FORBIDDEN, ""),
+        ("/v2/posts", StatusCode::OK, "rewritten"),
+        ("/posts", StatusCode::OK, "as sent"),
+    ] {
+        let response = router.dispatch(request(Method::GET, target)).await;
+        assert_eq!(response.status, status, "{target}");
+        assert_eq!(response.body(), body, "{target}");
+    }
 }

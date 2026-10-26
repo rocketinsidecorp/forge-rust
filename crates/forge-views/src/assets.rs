@@ -9,8 +9,8 @@
 //! wildcard, and `..`, percent-encoded separators, undigested names and
 //! absolute paths simply match no route.
 //!
-//! `HEAD` requests are not routed (they answer `405`); conditional `GET` with
-//! `If-None-Match` answers `304`.
+//! `HEAD` is served by the `GET` route without the body, as for every
+//! route; conditional `GET` with `If-None-Match` answers `304`.
 
 use std::{collections::HashMap, sync::Arc};
 
@@ -535,7 +535,7 @@ mod tests {
             .await;
 
         assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
-        assert_eq!(header_of(&response, "allow"), Some("GET"));
+        assert_eq!(header_of(&response, "allow"), Some("GET, HEAD"));
     }
 
     #[test]

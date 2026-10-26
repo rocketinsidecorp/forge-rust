@@ -19,7 +19,7 @@ use std::{
 use bytes::Bytes;
 use forge_config::ServerConfig;
 pub use http::{Extensions, HeaderMap, HeaderValue, Method, StatusCode, Uri, header};
-use http_body_util::{BodyExt, LengthLimitError, Limited};
+use http_body_util::BodyExt;
 use hyper::{
     body::{Body as _, Incoming},
     service::service_fn,
@@ -33,7 +33,7 @@ use tokio::{
     task::{JoinError, JoinSet},
 };
 use tokio_util::sync::CancellationToken;
-use tracing::{Instrument, Span, info_span, warn};
+use tracing::{Instrument, Span, debug, error, info_span, warn};
 use uuid::Uuid;
 
 use crate::body::{OutgoingBody, ResponseBody};
@@ -51,6 +51,7 @@ mod json;
 #[cfg(test)]
 mod media_type_tests;
 mod openapi;
+mod panics;
 mod query;
 #[cfg(test)]
 mod query_tests;
@@ -78,6 +79,9 @@ const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(50);
 /// for a fast API does not cut off clients that read a large download or an
 /// event stream slowly; those are only disconnected when they stop reading.
 const MIN_WRITE_STALL_TIMEOUT: Duration = Duration::from_secs(30);
+/// `Retry-After` of the `503` that refuses a body when the in-flight body
+/// budget is exhausted: uploads in progress end within the request timeout.
+const BODY_BUDGET_RETRY_AFTER_SECS: u32 = 5;
 
 type BoxHandlerFuture = Pin<Box<dyn Future<Output = Response> + Send + 'static>>;
 
@@ -203,8 +207,10 @@ impl Request {
     ///
     /// This exists for [`Middleware`] that rewrites the path the route table
     /// sees, such as the locale prefix `forge_views::LocaleNegotiation`
-    /// removes (`/pt-BR/posts` is routed as `/posts`). Layers registered
-    /// before it, and the server's own request telemetry, keep seeing the
+    /// removes (`/pt-BR/posts` is routed as `/posts`). Done in
+    /// [`Middleware::rewrite`], every layer sees the new URI; done in
+    /// [`Middleware::handle`], layers registered before it keep seeing the
+    /// original one. The server's own request telemetry always logs the
     /// original URI.
     pub fn set_uri(&mut self, uri: Uri) {
         self.uri = uri;
@@ -524,10 +530,24 @@ where
 /// first registered layer is the outermost), and may change it (for example
 /// its method), attach [`Request::extensions`], answer without calling the
 /// rest of the chain, or adjust the response that [`Next::run`] returns.
+///
+/// Before the first layer's `handle`, [`Router::dispatch`] calls every
+/// layer's [`Middleware::rewrite`], in registration order, so a layer that
+/// canonicalizes the request (such as removing a locale path prefix) does it
+/// for every layer, wherever it was registered: a path guard can never see a
+/// different path than the route table.
 pub trait Middleware: Send + Sync + 'static {
     /// Handles `request`; call `next.run(request)` to continue to the
     /// remaining layers and then the route table.
     fn handle<'a>(&'a self, request: Request, next: Next<'a>) -> BoxResponseFuture<'a>;
+
+    /// Canonicalizes `request` before any layer handles it (the default
+    /// does nothing). Every layer, the first registered included, and the
+    /// route table then see the rewritten request. It cannot answer, and it
+    /// runs before every guard, so it must only normalize (for example
+    /// remove a prefix and record it in [`Request::extensions`]); decisions
+    /// belong in [`Middleware::handle`].
+    fn rewrite(&self, _request: &mut Request) {}
 }
 
 /// The rest of the layer chain, ending with route matching.
@@ -664,7 +684,8 @@ impl Router {
 
     /// Adds a [`Middleware`] layer that runs before routing for every request,
     /// including requests that match no route. Layers run in registration
-    /// order: the first one added is the outermost.
+    /// order: the first one added is the outermost. Their
+    /// [`Middleware::rewrite`] steps all run before the first layer.
     pub fn layer(&mut self, middleware: impl Middleware) -> &mut Self {
         self.layers.push(Arc::new(middleware));
         self
@@ -706,16 +727,24 @@ impl Router {
     /// Runs one request through the layers and the route table without a
     /// network connection.
     ///
-    /// Layers added with [`Router::layer`] run first, in registration order;
+    /// Every layer's [`Middleware::rewrite`] runs first, then the layers
+    /// added with [`Router::layer`] handle the request in registration order;
     /// then the request is routed. The raw (still percent-encoded) path is matched segment by segment;
     /// static segments win over `{name}` captures. Unmatched paths answer
-    /// `404`. A matched path without a handler for the request method
-    /// answers `405` with an `Allow` header listing the registered methods in
-    /// sorted order. A captured segment containing an encoded slash (`%2F`)
-    /// answers `400`, because it would let a client smuggle a path separator
-    /// past routing; other malformed escapes are reported by
-    /// [`Request::path_param_as`] when the handler reads the parameter.
-    pub async fn dispatch(&self, request: Request) -> Response {
+    /// `404`. `HEAD` is served by the path's `GET` route unless a `HEAD`
+    /// route is registered; the handler sees the `HEAD` method, and the
+    /// [`Server`] sends the headers without the body (here the body is
+    /// left in place). A matched path without a handler for the request
+    /// method answers `405` with an `Allow` header listing the served
+    /// methods in sorted order (`HEAD` included wherever `GET` is). A
+    /// captured segment containing an encoded slash (`%2F`) answers `400`,
+    /// because it would let a client smuggle a path separator past routing;
+    /// other malformed escapes are reported by [`Request::path_param_as`]
+    /// when the handler reads the parameter.
+    pub async fn dispatch(&self, mut request: Request) -> Response {
+        for layer in &self.layers {
+            layer.rewrite(&mut request);
+        }
         Next {
             layers: &self.layers,
             router: self,
@@ -731,7 +760,7 @@ impl Router {
         let Some(node) = self.root.find(&path, &mut captures) else {
             return Response::new(StatusCode::NOT_FOUND, "not found");
         };
-        let Some(endpoint) = node.endpoint(&request.method) else {
+        let Some(endpoint) = node.serving(&request.method) else {
             let allow = node.allow();
             let mut response = Response::new(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
             if let Ok(value) = HeaderValue::from_str(&allow) {
@@ -816,14 +845,21 @@ impl Server {
     ///
     /// Every request's [`Request::client_ip`] is resolved with
     /// [`ServerConfig::trusted_proxies`] before the first [`Middleware`]
-    /// runs.
+    /// runs. The first server installs, once per process, a panic hook that
+    /// keeps the message of a panic raised while handling a request off
+    /// stderr (the server logs its location at `error`, its message only at
+    /// `debug`) and passes every other panic to the hook it replaced.
     #[must_use]
     pub fn new(config: ServerConfig, router: Router) -> Self {
+        // Request panics are logged without their message (see `panics`).
+        panics::install();
         Self {
             app: Arc::new(ServedApp {
                 trusted_proxies: TrustedProxies::new(config.trusted_proxies.iter().copied()),
                 router,
                 telemetry: None,
+                hsts: config.transport.is_https(),
+                body_budget: BodyBudget::new(config.max_in_flight_body_bytes),
             }),
             config,
             min_write_stall: MIN_WRITE_STALL_TIMEOUT,
@@ -995,7 +1031,52 @@ struct ServedApp {
     router: Router,
     trusted_proxies: TrustedProxies,
     telemetry: Option<ServerInstrumentation>,
+    /// Whether responses carry [`STRICT_TRANSPORT_SECURITY`]: clients use
+    /// HTTPS (`FORGE_HTTP_TRANSPORT` is not `plain`).
+    hsts: bool,
+    /// Request body bytes held at once (`FORGE_MAX_IN_FLIGHT_BODY_BYTES`).
+    body_budget: BodyBudget,
 }
+
+/// The bytes of request bodies all connections may hold in memory at once,
+/// a semaphore with one permit per byte. Bodies are buffered before
+/// dispatch, so without it `FORGE_MAX_BODY_BYTES` times
+/// `FORGE_MAX_CONNECTIONS` (about 10 GiB by default) could be resident.
+struct BodyBudget(Arc<Semaphore>);
+
+impl BodyBudget {
+    fn new(bytes: usize) -> Self {
+        Self(Arc::new(Semaphore::new(
+            bytes.clamp(1, Semaphore::MAX_PERMITS),
+        )))
+    }
+
+    /// Adds `bytes` to `held` without waiting; `false` when the budget has
+    /// no room left. What was added stays in `held` and is returned to the
+    /// budget when `held` is dropped, on every path.
+    fn charge(&self, held: &mut BodyCharge, mut bytes: usize) -> bool {
+        while bytes > 0 {
+            // Permits are acquired, and one permit holds, at most u32::MAX.
+            let step = u32::try_from(bytes).unwrap_or(u32::MAX);
+            let Ok(permit) = Arc::clone(&self.0).try_acquire_many_owned(step) else {
+                return false;
+            };
+            match held.0.last_mut() {
+                Some(last) if last.num_permits() <= (u32::MAX - step) as usize => {
+                    last.merge(permit);
+                }
+                _ => held.0.push(permit),
+            }
+            bytes -= step as usize;
+        }
+        true
+    }
+}
+
+/// The share of the [`BodyBudget`] one request body holds; dropping it
+/// returns the share. Usually one permit; one more per 4 GiB.
+#[derive(Default)]
+struct BodyCharge(Vec<OwnedSemaphorePermit>);
 
 async fn serve_connection(
     stream: tokio::net::TcpStream,
@@ -1057,14 +1138,20 @@ async fn handle_request(
         .as_ref()
         .map(forge_telemetry::http::RequestTelemetry::context);
     let span = request_span(request_id, &method, &path, remote_addr, trace.as_ref());
+    let head = method == Method::HEAD;
+    let hsts = app.hsts;
     let response = async move {
         let matched = MatchedRoute::default();
         let (parts, body) = request.into_parts();
         // The deadline covers reading the body as well as the handler, so a
         // client trickling body bytes cannot hold a connection indefinitely.
         let exchange = async {
-            let body = match collect_body(body, max_body_bytes).await {
-                Ok(body) => body,
+            // `charged` holds the body's share of the in-flight budget until
+            // the handler returned; dropping it on any other way out (a
+            // rejection, the timeout, a panic, the client leaving) releases
+            // it too.
+            let (body, charged) = match collect_body(body, max_body_bytes, &app.body_budget).await {
+                Ok(collected) => collected,
                 Err(rejection) => return rejection.into_response(),
             };
             let mut request = Request {
@@ -1085,30 +1172,71 @@ async fn handle_request(
             }
             // The client address is resolved once, outside every layer.
             app.trusted_proxies.apply(&mut request);
-            app.router.dispatch(request).await
+            let response = app.router.dispatch(request).await;
+            drop(charged);
+            response
         };
         let exchange = tokio::time::timeout(request_timeout, exchange);
-        let response = match io::CatchUnwind::new(exchange).await {
+        let (outcome, site) = panics::scoped(io::CatchUnwind::new(exchange)).await;
+        if outcome.is_ok()
+            && let Some(site) = &site
+        {
+            // Caught inside the request (a `catch_unwind` in a handler or a
+            // metric observer): the hook kept it off stderr, so it is
+            // reported here, without its message.
+            warn!(
+                %request_id,
+                location = %site.location,
+                payload = site.payload,
+                "request code caught a panic"
+            );
+        }
+        let response = match outcome {
             Ok(Ok(response)) => response,
             Ok(Err(_elapsed)) => Response::new(StatusCode::GATEWAY_TIMEOUT, "request timed out"),
             Err(panic) => {
-                // Recorded as a server error, then the panic continues as
-                // before: the connection task fails and the client is cut off.
-                if let Some(telemetry) = telemetry {
-                    telemetry.finish(matched.0.get().map(AsRef::as_ref), 500);
-                }
-                std::panic::resume_unwind(panic);
+                // Like Forge-Go's recoverer: logged here, in the request's
+                // span, and answered with a generic 500 that carries the
+                // request id. The message can quote request data, so it is
+                // logged only at debug and never reaches the client.
+                error!(
+                    %request_id,
+                    location = site.as_ref().map_or("unknown", |site| site.location.as_str()),
+                    payload = panics::payload_type(panic.as_ref()),
+                    "request handler panicked"
+                );
+                debug!(
+                    %request_id,
+                    panic = panic_message(panic.as_ref()),
+                    "request handler panic message"
+                );
+                Response::text(StatusCode::INTERNAL_SERVER_ERROR, "internal server error")
             }
         };
         if let Some(telemetry) = telemetry {
             telemetry.finish(matched.0.get().map(AsRef::as_ref), response.status.as_u16());
         }
-        to_hyper_response(response, request_id)
+        let response = if head {
+            without_body(response)
+        } else {
+            response
+        };
+        to_hyper_response(response, request_id, hsts)
     }
     .instrument(span)
     .await;
 
     Ok(response)
+}
+
+/// The text of a panic payload for the log (`panic!` with a literal or a
+/// formatted message); other payloads are not printable.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    payload
+        .downcast_ref::<&'static str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("non-string panic payload")
 }
 
 /// The log span of a request; with telemetry it carries the trace and span
@@ -1141,6 +1269,8 @@ enum BodyRejection {
     TooLarge,
     /// The body stream failed, e.g. malformed chunked encoding.
     Unreadable,
+    /// The in-flight body budget has no room for the body.
+    Busy,
 }
 
 impl BodyRejection {
@@ -1152,25 +1282,107 @@ impl BodyRejection {
             Self::Unreadable => {
                 Response::text(StatusCode::BAD_REQUEST, "request body could not be read")
             }
+            Self::Busy => {
+                let mut response =
+                    Response::text(StatusCode::SERVICE_UNAVAILABLE, "server busy, retry later");
+                response.headers.insert(
+                    header::RETRY_AFTER,
+                    HeaderValue::from(BODY_BUDGET_RETRY_AFTER_SECS),
+                );
+                response
+            }
         }
     }
 }
 
-/// Buffers a request body, enforcing the configured size limit.
-async fn collect_body(body: Incoming, max_body_bytes: usize) -> Result<Bytes, BodyRejection> {
+/// Buffers a request body, enforcing the configured size limit and charging
+/// it to the in-flight `budget` as its bytes arrive. A declared
+/// `Content-Length` is only checked against the limit, never charged ahead:
+/// a client that declares a large body and sends nothing holds no budget
+/// (only its connection slot, until the request timeout). Returns the body
+/// and its charge, which the caller holds while the body is in use.
+async fn collect_body(
+    mut body: Incoming,
+    max_body_bytes: usize,
+    budget: &BodyBudget,
+) -> Result<(Bytes, BodyCharge), BodyRejection> {
     // Reject a declared Content-Length above the limit without reading it.
-    let limit = u64::try_from(max_body_bytes).unwrap_or(u64::MAX);
-    if body.size_hint().lower() > limit {
+    let declared = body.size_hint().lower();
+    if !usize::try_from(declared).is_ok_and(|declared| declared <= max_body_bytes) {
         return Err(BodyRejection::TooLarge);
     }
-    match Limited::new(body, max_body_bytes).collect().await {
-        Ok(collected) => Ok(collected.to_bytes()),
-        Err(error) if error.is::<LengthLimitError>() => Err(BodyRejection::TooLarge),
-        Err(_) => Err(BodyRejection::Unreadable),
+    let mut held = BodyCharge::default();
+    let mut charged = 0_usize;
+    let mut received = 0_usize;
+    let mut chunks: Vec<Bytes> = Vec::new();
+    while let Some(frame) = body.frame().await {
+        let Ok(frame) = frame else {
+            return Err(BodyRejection::Unreadable);
+        };
+        // Trailers carry no body bytes.
+        let Ok(data) = frame.into_data() else {
+            continue;
+        };
+        received = received.saturating_add(data.len());
+        if received > max_body_bytes {
+            return Err(BodyRejection::TooLarge);
+        }
+        if received > charged {
+            if !budget.charge(&mut held, received - charged) {
+                return Err(BodyRejection::Busy);
+            }
+            charged = received;
+        }
+        if !data.is_empty() {
+            chunks.push(data);
+        }
     }
+    let body = if chunks.len() <= 1 {
+        chunks.pop().unwrap_or_default()
+    } else {
+        let mut joined = bytes::BytesMut::with_capacity(received);
+        for chunk in chunks {
+            joined.extend_from_slice(&chunk);
+        }
+        joined.freeze()
+    };
+    Ok((body, held))
 }
 
-fn to_hyper_response(response: Response, request_id: Uuid) -> hyper::Response<OutgoingBody> {
+/// The answer to a `HEAD` request: the headers of the response the route
+/// produced, without its body (RFC 9110 §9.3.2). A non-empty buffered body
+/// becomes its `Content-Length` (unless the handler set one, or the status
+/// has no content); an empty one adds none, since an explicit `HEAD` route
+/// answers with an empty body; a streamed body is dropped without being
+/// polled and its length, unknown, is left out.
+fn without_body(mut response: Response) -> Response {
+    let body = std::mem::replace(&mut response.body, ResponseBody::Full(Bytes::new()));
+    let may_have_length = !(response.status.is_informational()
+        || response.status == StatusCode::NO_CONTENT
+        || response.status == StatusCode::NOT_MODIFIED);
+    if let ResponseBody::Full(bytes) = body
+        && !bytes.is_empty()
+        && may_have_length
+        && !response.headers.contains_key(header::CONTENT_LENGTH)
+    {
+        response
+            .headers
+            .insert(header::CONTENT_LENGTH, HeaderValue::from(bytes.len()));
+    }
+    response
+}
+
+/// The `Strict-Transport-Security` value the server adds when clients use
+/// HTTPS (`FORGE_HTTP_TRANSPORT` is not `plain`): one year, subdomains
+/// included, as Forge-Go sends it. A response that already carries the
+/// header (for example with `preload`) keeps its own.
+pub const STRICT_TRANSPORT_SECURITY: &str = "max-age=31536000; includeSubDomains";
+
+fn to_hyper_response(
+    response: Response,
+    request_id: Uuid,
+    hsts: bool,
+) -> hyper::Response<OutgoingBody> {
     let mut outgoing = hyper::Response::new(OutgoingBody::from(response.body));
     *outgoing.status_mut() = response.status;
     *outgoing.headers_mut() = response.headers;
@@ -1184,6 +1396,12 @@ fn to_hyper_response(response: Response, request_id: Uuid) -> hyper::Response<Ou
     outgoing
         .headers_mut()
         .insert("x-frame-options", HeaderValue::from_static("DENY"));
+    if hsts {
+        outgoing
+            .headers_mut()
+            .entry(header::STRICT_TRANSPORT_SECURITY)
+            .or_insert(HeaderValue::from_static(STRICT_TRANSPORT_SECURITY));
+    }
     outgoing
 }
 

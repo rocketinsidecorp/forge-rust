@@ -135,14 +135,32 @@ impl Node {
             .find(|endpoint| endpoint.method == *method)
     }
 
-    /// Methods registered at this node, sorted and comma-separated, for the
-    /// `Allow` header.
+    /// The endpoint that serves `method` at this node: the one registered
+    /// for it, else, for `HEAD`, the `GET` endpoint (RFC 9110 §9.3.2: a
+    /// server that supports `GET` supports `HEAD`; the server sends the
+    /// headers without the body). An explicit `HEAD` route wins.
+    pub(crate) fn serving(&self, method: &Method) -> Option<&Endpoint> {
+        self.endpoint(method).or_else(|| {
+            if *method == Method::HEAD {
+                self.endpoint(&Method::GET)
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Methods served at this node, sorted and comma-separated, for the
+    /// `Allow` header: the registered ones, plus `HEAD` wherever `GET` is
+    /// registered.
     pub(crate) fn allow(&self) -> String {
         let mut methods: Vec<&str> = self
             .endpoints
             .iter()
             .map(|endpoint| endpoint.method.as_str())
             .collect();
+        if methods.contains(&Method::GET.as_str()) && !methods.contains(&Method::HEAD.as_str()) {
+            methods.push(Method::HEAD.as_str());
+        }
         methods.sort_unstable();
         methods.join(", ")
     }

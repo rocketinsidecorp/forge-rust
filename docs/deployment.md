@@ -127,7 +127,9 @@ from env files, Kubernetes manifests and unit files.
 | `FORGE_SHUTDOWN_GRACE_SECS` | `15` | Drain deadline for in-flight requests after SIGTERM/SIGINT. |
 | `FORGE_MAX_BODY_BYTES` | `1048576` | Maximum request body size in bytes. |
 | `FORGE_MAX_CONNECTIONS` | `10000` | Maximum concurrent connections. Extra connections wait for a slot (backpressure) instead of being served without bound. |
+| `FORGE_MAX_IN_FLIGHT_BODY_BYTES` | `268435456` (256 MiB), or `FORGE_MAX_BODY_BYTES` when larger | Request body bytes buffered at once across all connections. Bytes are charged as they arrive (a declared `Content-Length` is only checked against `FORGE_MAX_BODY_BYTES`, never reserved, so declaring a body without sending it holds nothing); a body that does not fit gets `503` with `Retry-After: 5`, and requests without a body are unaffected. Must be at least `FORGE_MAX_BODY_BYTES`. Forge-Go streams bodies and has no such key. |
 | `FORGE_HTTP_TRUSTED_PROXIES` | empty | Comma-separated CIDRs or addresses of reverse proxies whose `X-Forwarded-For` is believed; empty trusts nobody. Empty or malformed entries, `/0`, IPv4 prefixes shorter than `/8`, IPv6 prefixes shorter than `/16`, IPv4-mapped prefixes and zoned addresses stop startup; the error names the entry's position, never its text. See [client addresses behind a proxy](#client-addresses-behind-a-proxy). |
+| `FORGE_HTTP_TRANSPORT` | `trusted-proxy` in production, `plain` otherwise | How clients reach the server, Forge-Go's key: `plain` HTTP, or `trusted-proxy` when forge-proxy or a load balancer terminates TLS in front of it. With `trusted-proxy` every response carries `Strict-Transport-Security: max-age=31536000; includeSubDomains` (a handler that sets its own value, for example with `preload`, keeps it). Production refuses `plain`. Forge-Go's `tls` is refused: Forge-Rust does not terminate TLS itself. |
 | `FORGE_LOG` | `info` | `tracing` filter directive, for example `info,shop=debug`. |
 | `FORGE_LOG_FORMAT` | `json` in production, `text` otherwise | `json` or `text`. |
 | `FORGE_DATABASE_URL` | none | Least-privilege PostgreSQL runtime connection URL. Treated as a secret and redacted from ordinary diagnostics. |
@@ -148,9 +150,16 @@ from env files, Kubernetes manifests and unit files.
 
 Logs go to standard output, and the platform (Docker, Kubernetes, journald)
 collects them. The HTTP layer also enforces a header-read timeout and adds
-`X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY` and a UUIDv7
-`x-request-id` to responses. Transient `accept` errors, such as running out of
-file descriptors, do not stop the server.
+`X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, a UUIDv7
+`x-request-id` and, unless `FORGE_HTTP_TRANSPORT=plain`,
+`Strict-Transport-Security` to responses. A handler that panics gets a `500` with the body
+`internal server error` and its `x-request-id`; the log line
+(`request handler panicked`, at `error`) carries the request id, the source
+location and the payload type, and the message, which can quote request
+data, is logged only at `debug` (`FORGE_LOG=forge_http=debug`), never sent
+to the client and withheld from stderr. The connection stays usable. `HEAD` is answered by the `GET`
+route of the path without the body. Transient `accept` errors, such as
+running out of file descriptors, do not stop the server.
 
 Do not put secrets in the image or in build arguments. Both database URLs contain
 credentials and must come from the deployment platform's secret mechanism.
@@ -877,8 +886,9 @@ volume, so it resumes routing after a restart. It:
   application `response_timeout` to send response headers;
 - disconnects clients that hold connections without using them, after
   `-idle-timeout` (120 s by default): a keep-alive connection waiting for its
-  next request (or after the 10 s `-read-header-timeout`, whichever is
-  shorter), a response the client stops reading, and an upgraded
+  next request (whose headers then have the 10 s `-read-header-timeout` from
+  their first byte; the first request on a connection has it from the
+  start, as in Go's `http.Server`), a response the client stops reading, and an upgraded
   (WebSocket) connection with no data in either direction. The application
   connection and the in-flight count are released with it, so a stalled
   client cannot hold a drain open. WebSocket applications should ping more

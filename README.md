@@ -313,6 +313,17 @@ forge deploy rollback <previous version>
 forge deploy lock release            # removes only your own lock; --force for anyone's
 ```
 
+forge-proxy's connection limits are Go's `http.Server` ones: a keep-alive
+connection waits `-idle-timeout` (120 s) for its next request, whose headers
+then have `-read-header-timeout` (10 s); a silent first request gets only the
+header timeout. To try them locally (no control socket under `/run`, no state
+file, no HTTPS):
+
+```sh
+cargo run -p forge-proxy -- run -http-addr 127.0.0.1:8080 -https-addr '' \
+  -control /tmp/forge-proxy.sock -state '' -idle-timeout 120s -read-header-timeout 10s
+```
+
 Release note: `retain: 1` in `config/deploy.yml` is now refused (`retain`
 counts the running version, so 1 would prune the previous one and leave
 nothing to roll back to); use 2 to 100, default 5. The deploy lock also needs
@@ -336,6 +347,18 @@ cargo run
 docker network create --subnet 172.30.0.0/24 edge   # the proxy joins it too
 docker run --rm --network edge -e FORGE_HTTP_TRUSTED_PROXIES=172.30.0.0/24 shop   # no -p: only the proxy reaches it
 FORGE_HTTP_TRUSTED_PROXIES=0.0.0.0/0 cargo run -- healthcheck   # refused: entry 1 is too broad
+```
+
+Behind TLS termination the application sends
+`Strict-Transport-Security: max-age=31536000; includeSubDomains` on every
+response. `FORGE_HTTP_TRANSPORT` (Forge-Go's key) says how clients connect:
+`trusted-proxy` (the production default) or `plain` (the default elsewhere,
+refused in production):
+
+```sh
+FORGE_HTTP_TRANSPORT=trusted-proxy cargo run
+curl -sI http://127.0.0.1:3000/health | grep -i strict-transport-security
+FORGE_ENV=production FORGE_HTTP_TRANSPORT=plain cargo run -- healthcheck   # refused
 ```
 
 List only proxy networks and keep the application port reachable only
@@ -584,9 +607,13 @@ Kubernetes and systemd deployment is covered in
 - Typed `FORGE_*` environment configuration. Database URLs are redacted from
   normal debug/serialization output, and unknown `FORGE_*` keys are
   rejected at startup.
-- HTTP defaults: request and header-read timeouts, a body size limit, bounded
+- HTTP defaults: request and header-read timeouts, a body size limit, a
+  256 MiB budget for all request bodies buffered at once
+  (`FORGE_MAX_IN_FLIGHT_BODY_BYTES`; `503` with `Retry-After` beyond it), bounded
   connections, `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`,
-  and UUIDv7 `x-request-id`.
+  UUIDv7 `x-request-id`, `Strict-Transport-Security` behind TLS termination
+  (`FORGE_HTTP_TRANSPORT`), `HEAD` on every `GET` route, and a `500` with the
+  request id when a handler panics.
 - A multi-stage `Dockerfile`, `.dockerignore`, `compose.yaml`, the opt-in
   observability overlay (`compose.observability.yaml` and `observability/`:
   Collector, Prometheus, Tempo, Loki, Grafana) and a
@@ -825,6 +852,7 @@ export FORGE_CACHE_DEFAULT_TTL_SECS=3600         # ttl of writes that pass none
 export FORGE_STORAGE_ROOT=/var/lib/shop/storage  # absolute in production
 export FORGE_STORAGE_SIGNING_KEY=$(openssl rand -base64 32 | tr '+/' '-_' | tr -d '=')
 export FORGE_STORAGE_MAX_UPLOAD_BYTES=524288     # must not exceed FORGE_MAX_BODY_BYTES
+export FORGE_MAX_IN_FLIGHT_BODY_BYTES=268435456  # all request bodies buffered at once; 503 + Retry-After beyond
 export FORGE_STORAGE_LINK_TTL_SECS=900           # default signed link lifetime
 ```
 
