@@ -304,6 +304,8 @@ dependencies = [
 name = "forge-fuzz"
 version = "0.0.0"
 dependencies = [
+ "async-trait",
+ "bytes",
  "forge-config",
  "forge-credentials",
  "forge-encryption",
@@ -312,10 +314,12 @@ dependencies = [
  "forge-mail",
  "forge-openapi",
  "forge-proxy",
+ "forge-storage",
  "forge-telemetry",
  "libfuzzer-sys",
  "serde",
  "serde_json",
+ "uuid",
 ]
 
 [[package]]
@@ -418,6 +422,27 @@ version = "0.1.0"
 dependencies = [
  "forge-core",
  "thiserror",
+]
+
+[[package]]
+name = "forge-storage"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64",
+ "bytes",
+ "forge-config",
+ "forge-http",
+ "hmac",
+ "rustix",
+ "serde",
+ "serde_json",
+ "sha2",
+ "subtle",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

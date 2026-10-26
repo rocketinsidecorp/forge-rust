@@ -668,6 +668,12 @@ third-party crate:
 | `arbitrary` | `1.5.0` | transitive of `libfuzzer-sys` (not used directly: targets split `&[u8]` themselves) | rust-fuzz; no build script, no proc macro (the `derive` feature is off). |
 | `jobserver` | `0.1.35` | transitive of `cc` (already in the framework lockfile) for parallel C++ builds | Cargo's own crate. |
 
+The http and storage targets also name `async-trait`, `bytes` and `uuid` as direct
+dependencies (a `Request` carries a `Bytes` body and a `Uuid`, and the multipart
+target implements `Storage`). They are the framework's own dependencies at the
+framework's versions, already in `fuzz/Cargo.lock` through `forge-http` and
+`forge-storage`, so no package is added to the fuzz graph by them.
+
 The rest of `fuzz/Cargo.lock` is the framework's `Cargo.lock` pruned to the crates
 the targets use, at the same versions. `cargo deny check` runs on
 `fuzz/Cargo.toml` with the same `deny.toml` in CI (job `cargo deny` of
