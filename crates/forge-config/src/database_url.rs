@@ -290,6 +290,14 @@ pub fn client_target(
     })
 }
 
+/// Whether the query of `url` names `parameter`, percent-decoded as the
+/// driver reads it (`application_name`, `options`). It says nothing about
+/// the value and is `false` for a URL that does not parse.
+#[must_use]
+pub fn names_parameter(url: &str, parameter: &str) -> bool {
+    Url::parse(url.trim()).is_ok_and(|parsed| parsed.query_pairs().any(|(key, _)| key == parameter))
+}
+
 /// The TCP endpoint a server URL names by itself, with the engine's default
 /// port when the URL has none; `None` for SQLite, a Unix socket, a host-less
 /// URL or a URL that is not well formed. It ignores the environment; use
@@ -544,6 +552,24 @@ mod tests {
 
     fn located(url: &str) -> Option<Location> {
         location(url)
+    }
+
+    #[test]
+    fn a_named_parameter_is_found_as_the_driver_decodes_it() {
+        let url = "postgres://u:p@db/app?sslmode=verify-full&application%5Fname=shop";
+        assert!(names_parameter(url, "application_name"));
+        assert!(names_parameter(url, "sslmode"));
+        assert!(!names_parameter(url, "options"));
+        assert!(names_parameter(
+            "postgres://db/app?options=-c%20x%3D1",
+            "options"
+        ));
+        // `options[key]` is a setting inside options, not the parameter.
+        assert!(!names_parameter(
+            "postgres://db/app?options[x]=1",
+            "options"
+        ));
+        assert!(!names_parameter("not a url", "options"));
     }
 
     #[test]

@@ -89,6 +89,8 @@ const DEFAULT_DATABASE_MAX_CONNS: u32 = 10;
 /// Forge-Go's bound of `FORGE_DATABASE_MAX_CONNS`.
 const MAX_DATABASE_MAX_CONNS: u32 = 1000;
 const DEFAULT_DATABASE_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_DATABASE_MAX_CONN_LIFETIME: Duration = Duration::from_secs(30 * 60);
+const DEFAULT_DATABASE_MAX_CONN_IDLE_TIME: Duration = Duration::from_secs(5 * 60);
 const DEFAULT_DATABASE_STATEMENT_TIMEOUT: Duration = Duration::from_secs(30);
 /// The largest `statement_timeout` PostgreSQL accepts (an `int` of
 /// milliseconds, about 24.8 days).
@@ -120,7 +122,10 @@ pub const KNOWN_KEYS: &[&str] = &[
     "FORGE_DATABASE_URL",
     "FORGE_MIGRATION_DATABASE_URL",
     "FORGE_DATABASE_MAX_CONNS",
+    "FORGE_DATABASE_MIN_CONNS",
     "FORGE_DATABASE_CONNECT_TIMEOUT",
+    "FORGE_DATABASE_MAX_CONN_LIFETIME",
+    "FORGE_DATABASE_MAX_CONN_IDLE_TIME",
     "FORGE_DATABASE_STATEMENT_TIMEOUT",
     "FORGE_DATABASE_ALLOW_PLAINTEXT",
     JOBS_NOTIFY_KEY,
@@ -752,9 +757,11 @@ impl Serialize for SecretString {
 
 /// Database settings after validation.
 ///
-/// The pool keys (`FORGE_DATABASE_MAX_CONNS`, `FORGE_DATABASE_CONNECT_TIMEOUT`,
-/// `FORGE_DATABASE_STATEMENT_TIMEOUT`) are Forge-Go's, with its defaults and
-/// bounds; they size the serving process's pool. In `production` both URLs
+/// The pool keys (`FORGE_DATABASE_MAX_CONNS`, `FORGE_DATABASE_MIN_CONNS`,
+/// `FORGE_DATABASE_CONNECT_TIMEOUT`, `FORGE_DATABASE_MAX_CONN_LIFETIME`,
+/// `FORGE_DATABASE_MAX_CONN_IDLE_TIME`, `FORGE_DATABASE_STATEMENT_TIMEOUT`)
+/// are Forge-Go's, with its defaults and bounds; they size the serving
+/// process's pool. In `production` both URLs
 /// must verify the server's TLS certificate
 /// ([`database_url::require_verified_tls`]) unless
 /// `FORGE_DATABASE_ALLOW_PLAINTEXT=true`.
@@ -769,9 +776,21 @@ pub struct DatabaseConfig {
     /// Most connections of the serving pool (`FORGE_DATABASE_MAX_CONNS`,
     /// 1 to 1000, default 10).
     pub max_connections: u32,
+    /// Fewest connections the serving pool keeps open
+    /// (`FORGE_DATABASE_MIN_CONNS`, 0 to `FORGE_DATABASE_MAX_CONNS`, default
+    /// 0).
+    pub min_connections: u32,
     /// How long a query waits for a pooled connection, opening one included
     /// (`FORGE_DATABASE_CONNECT_TIMEOUT`, positive, default 5 s).
     pub connect_timeout: Duration,
+    /// How long a pooled connection lives before it is replaced
+    /// (`FORGE_DATABASE_MAX_CONN_LIFETIME`, positive, default 30 min; SQLx's
+    /// `max_lifetime`).
+    pub max_conn_lifetime: Duration,
+    /// How long an idle connection above the minimum stays open
+    /// (`FORGE_DATABASE_MAX_CONN_IDLE_TIME`, positive, default 5 min; SQLx's
+    /// `idle_timeout`).
+    pub max_conn_idle_time: Duration,
     /// Server-side bound of every statement of the serving pool
     /// (`FORGE_DATABASE_STATEMENT_TIMEOUT`, 1 ms to about 24 days, default
     /// 30 s): `statement_timeout` on PostgreSQL, `max_statement_time` on
@@ -790,7 +809,10 @@ impl Default for DatabaseConfig {
             url: None,
             migration_url: None,
             max_connections: DEFAULT_DATABASE_MAX_CONNS,
+            min_connections: 0,
             connect_timeout: DEFAULT_DATABASE_CONNECT_TIMEOUT,
+            max_conn_lifetime: DEFAULT_DATABASE_MAX_CONN_LIFETIME,
+            max_conn_idle_time: DEFAULT_DATABASE_MAX_CONN_IDLE_TIME,
             statement_timeout: DEFAULT_DATABASE_STATEMENT_TIMEOUT,
             allow_plaintext: false,
         }
@@ -1335,6 +1357,33 @@ fn apply_database(
             1..=MAX_DATABASE_MAX_CONNS,
             "an integer from 1 to 1000",
         )?;
+    }
+    if let Some(value) = lookup("FORGE_DATABASE_MIN_CONNS") {
+        database.min_connections = parse_bounded(
+            "FORGE_DATABASE_MIN_CONNS",
+            value.trim(),
+            0..=database.max_connections,
+            "an integer from 0 to FORGE_DATABASE_MAX_CONNS",
+        )?;
+    }
+    for (key, target) in [
+        (
+            "FORGE_DATABASE_MAX_CONN_LIFETIME",
+            &mut database.max_conn_lifetime,
+        ),
+        (
+            "FORGE_DATABASE_MAX_CONN_IDLE_TIME",
+            &mut database.max_conn_idle_time,
+        ),
+    ] {
+        if let Some(value) = lookup(key) {
+            *target = parse_duration_within(
+                key,
+                value,
+                Duration::from_millis(1)..=GO_MAX_DURATION,
+                "a positive duration such as 30m",
+            )?;
+        }
     }
     if let Some(value) = lookup("FORGE_DATABASE_CONNECT_TIMEOUT") {
         database.connect_timeout = telemetry::parse_go_duration(value.trim())
@@ -2224,7 +2273,10 @@ mod tests {
             "postgres://runtime:secret@localhost/app?sslmode=verify-full",
             "postgres://migrator:secret@localhost/app?sslmode=verify-full",
             "50",
+            "5",
             "2s",
+            "45m",
+            "4m",
             "15s",
             "false",
             "true",
@@ -2340,6 +2392,19 @@ mod tests {
         assert_eq!(config.database.connect_timeout, Duration::from_secs(5));
         assert_eq!(config.database.statement_timeout, Duration::from_secs(30));
         assert!(!config.database.allow_plaintext);
+        assert_eq!(config.database.min_connections, 0);
+        assert_eq!(config.database.max_conn_lifetime, Duration::from_secs(1800));
+        assert_eq!(config.database.max_conn_idle_time, Duration::from_secs(300));
+        let config = load(&[
+            ("FORGE_DATABASE_MAX_CONNS", "20"),
+            ("FORGE_DATABASE_MIN_CONNS", "20"),
+            ("FORGE_DATABASE_MAX_CONN_LIFETIME", "1h"),
+            ("FORGE_DATABASE_MAX_CONN_IDLE_TIME", "90s"),
+        ])
+        .expect("valid");
+        assert_eq!(config.database.min_connections, 20);
+        assert_eq!(config.database.max_conn_lifetime, Duration::from_secs(3600));
+        assert_eq!(config.database.max_conn_idle_time, Duration::from_secs(90));
 
         let config = load(&[
             ("FORGE_DATABASE_MAX_CONNS", "1000"),
@@ -2371,6 +2436,13 @@ mod tests {
             ("FORGE_DATABASE_STATEMENT_TIMEOUT", "597h"),
             ("FORGE_DATABASE_STATEMENT_TIMEOUT", "soon"),
             ("FORGE_DATABASE_ALLOW_PLAINTEXT", "yes"),
+            // At most FORGE_DATABASE_MAX_CONNS (default 10).
+            ("FORGE_DATABASE_MIN_CONNS", "11"),
+            ("FORGE_DATABASE_MIN_CONNS", "-1"),
+            ("FORGE_DATABASE_MAX_CONN_LIFETIME", "0s"),
+            ("FORGE_DATABASE_MAX_CONN_LIFETIME", "30"),
+            ("FORGE_DATABASE_MAX_CONN_IDLE_TIME", "0"),
+            ("FORGE_DATABASE_MAX_CONN_IDLE_TIME", "-5m"),
         ] {
             match load(&[(key, value)]) {
                 Err(ConfigError::InvalidValue { key: refused, .. }) => {
