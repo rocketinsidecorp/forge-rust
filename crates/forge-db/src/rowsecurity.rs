@@ -8,10 +8,17 @@ use sqlx::{Postgres, Row as _};
 use crate::{Database, DbError};
 
 /// Describes the login role (`session_user`) and the role in effect
-/// (`current_user`): their own `SUPERUSER`, `BYPASSRLS` and `CREATEROLE`
-/// attributes, and membership in another role with `SUPERUSER` or `BYPASSRLS`
-/// (attributes are not inherited, but a member can `SET ROLE`). Every row also
-/// carries both names, so a role in effect that has no row still counts.
+/// (`current_user`): their own `SUPERUSER`, `BYPASSRLS`, `CREATEROLE` and
+/// `REPLICATION` attributes; membership in another role with `SUPERUSER`,
+/// `BYPASSRLS` or `REPLICATION` (attributes are not inherited, but a member
+/// can `SET ROLE`); membership in a predefined role that reaches the server's
+/// files or programs (`pg_execute_server_program`, `pg_write_server_files`,
+/// `pg_read_server_files`, a path to superuser or to every tenant's data);
+/// and whether it owns, or is a member of the owner of, a table of this
+/// database with row-level security enabled (an owner can switch `FORCE` off
+/// with `ALTER TABLE`; `pg_has_role(u, u)` is true, so direct ownership
+/// counts too). Every row also carries both names, so a role in effect that
+/// has no row still counts.
 ///
 /// It runs with `search_path` pinned to `pg_catalog` (see
 /// [`refuse_row_security_bypass`]), so the operators (`=`, `IN`, `<>`)
@@ -20,16 +27,25 @@ use crate::{Database, DbError};
 /// names and functions are also qualified, as defense in depth.
 const ROLE_ESCAPE_QUERY: &str = "\
 SELECT u.rolname, session_user, current_user, u.rolsuper, u.rolbypassrls, u.rolcreaterole,
+       u.rolreplication,
        EXISTS (SELECT 1 FROM pg_catalog.pg_roles r
-               WHERE (r.rolsuper OR r.rolbypassrls) AND r.oid <> u.oid
-                 AND pg_catalog.pg_has_role(u.oid, r.oid, 'MEMBER'))
+               WHERE (r.rolsuper OR r.rolbypassrls OR r.rolreplication) AND r.oid <> u.oid
+                 AND pg_catalog.pg_has_role(u.oid, r.oid, 'MEMBER')),
+       EXISTS (SELECT 1 FROM pg_catalog.pg_roles r
+               WHERE r.rolname IN ('pg_execute_server_program', 'pg_write_server_files',
+                                   'pg_read_server_files')
+                 AND pg_catalog.pg_has_role(u.oid, r.oid, 'MEMBER')),
+       EXISTS (SELECT 1 FROM pg_catalog.pg_class c
+               WHERE c.relrowsecurity
+                 AND pg_catalog.pg_has_role(u.oid, c.relowner, 'MEMBER'))
 FROM pg_catalog.pg_roles u
 WHERE u.rolname IN (session_user, current_user)";
 
 /// The fix every refusal names.
 const FIX: &str = "set FORGE_DATABASE_URL to log in directly as a NOSUPERUSER NOBYPASSRLS \
-     NOCREATEROLE runtime role with only data privileges and migrate with \
-     FORGE_MIGRATION_DATABASE_URL (docs/database.md, \"Database roles\")";
+     NOCREATEROLE NOREPLICATION runtime role that owns no table and has only data \
+     privileges, and migrate with FORGE_MIGRATION_DATABASE_URL (docs/database.md, \
+     \"Database roles\")";
 
 impl Database<Postgres> {
     /// Refuses, in every environment except development and test (so in
@@ -38,10 +54,17 @@ impl Database<Postgres> {
     /// (`session_user`) and the role it acts as (`current_user`) are checked,
     /// and the call fails with [`DbError::RowSecurityBypass`] when either
     ///
-    /// - is a superuser or has `BYPASSRLS`,
-    /// - is a member of such a role (it can `SET ROLE` to it), or
+    /// - is a superuser or has `BYPASSRLS` or `REPLICATION` (logical decoding
+    ///   reads every tenant's changes),
+    /// - is a member of such a role (it can `SET ROLE` to it),
     /// - has `CREATEROLE` (before PostgreSQL 16 it can grant itself such a
     ///   membership),
+    /// - is a member of `pg_execute_server_program`, `pg_write_server_files`
+    ///   or `pg_read_server_files` (paths to superuser or to the data files),
+    ///   or
+    /// - owns, or is a member of the owner of, a table of this database with
+    ///   row-level security enabled (an owner can `ALTER TABLE ... NO FORCE
+    ///   ROW LEVEL SECURITY`),
     ///
     /// or when the two differ: a role setting (`options=-c role=...`,
     /// `ALTER ROLE ... SET role`) makes the session act as another role, and
@@ -88,7 +111,10 @@ async fn refuse_row_security_bypass(database: &Database<Postgres>) -> Result<(),
                 superuser: row.try_get(3)?,
                 bypass_rls: row.try_get(4)?,
                 create_role: row.try_get(5)?,
-                member_of_bypassing_role: row.try_get(6)?,
+                replication: row.try_get(6)?,
+                member_of_bypassing_role: row.try_get(7)?,
+                member_of_server_file_role: row.try_get(8)?,
+                owns_row_security_table: row.try_get(9)?,
             })
         })
         .collect::<Result<Vec<_>, sqlx::Error>>()?;
@@ -108,7 +134,10 @@ struct RoleRow {
     superuser: bool,
     bypass_rls: bool,
     create_role: bool,
+    replication: bool,
     member_of_bypassing_role: bool,
+    member_of_server_file_role: bool,
+    owns_row_security_table: bool,
 }
 
 impl RoleRow {
@@ -120,8 +149,17 @@ impl RoleRow {
             Some("has BYPASSRLS")
         } else if self.create_role {
             Some("has CREATEROLE")
+        } else if self.replication {
+            Some("has REPLICATION")
         } else if self.member_of_bypassing_role {
-            Some("can SET ROLE to a superuser or BYPASSRLS role")
+            Some("can SET ROLE to a superuser, BYPASSRLS or REPLICATION role")
+        } else if self.member_of_server_file_role {
+            Some(
+                "is a member of pg_execute_server_program, pg_write_server_files or \
+                 pg_read_server_files",
+            )
+        } else if self.owns_row_security_table {
+            Some("owns, or can SET ROLE to the owner of, a table with row-level security")
         } else {
             None
         }
@@ -221,7 +259,16 @@ mod tests {
             ),
             (|row| row.bypass_rls = true, "has BYPASSRLS"),
             (|row| row.create_role = true, "has CREATEROLE"),
+            (|row| row.replication = true, "has REPLICATION"),
             (|row| row.member_of_bypassing_role = true, "can SET ROLE"),
+            (
+                |row| row.member_of_server_file_role = true,
+                "pg_execute_server_program",
+            ),
+            (
+                |row| row.owns_row_security_table = true,
+                "owner of, a table with row-level security",
+            ),
         ] {
             let mut escaping = row("app_runtime");
             change(&mut escaping);
@@ -503,12 +550,25 @@ mod database_tests {
         );
         exec(admin, format!("ALTER ROLE {role} NOCREATEROLE")).await?;
 
+        // Logical decoding reads every tenant's changes (wal_level=logical).
+        exec(admin, format!("ALTER ROLE {role} REPLICATION")).await?;
+        assert_refused(
+            "REPLICATION",
+            check(&runtime_url, Environment::Production).await,
+            "has REPLICATION",
+            &secret,
+        );
+        exec(admin, format!("ALTER ROLE {role} NOREPLICATION")).await?;
+
         // Membership, direct or through another role, in a role that is a
-        // superuser or has BYPASSRLS: the member can SET ROLE to it.
+        // superuser or has BYPASSRLS or REPLICATION: the member can SET ROLE
+        // to it.
         let suffix = Uuid::now_v7().simple().to_string();
-        let names = ["bypass", "super", "middle"].map(|kind| format!("forge_test_{kind}_{suffix}"));
+        let names = ["bypass", "super", "middle", "replication", "plain"]
+            .map(|kind| format!("forge_test_{kind}_{suffix}"));
         let _dropped = Roles(names.to_vec());
-        let [bypass, superuser_role, middle] = names.map(|name| format!("\"{name}\""));
+        let [bypass, superuser_role, middle, replication, plain] =
+            names.clone().map(|name| format!("\"{name}\""));
         {
             exec(admin, format!("CREATE ROLE {bypass} NOLOGIN BYPASSRLS")).await?;
             exec(
@@ -517,10 +577,16 @@ mod database_tests {
             )
             .await?;
             exec(admin, format!("CREATE ROLE {middle} NOLOGIN")).await?;
+            exec(
+                admin,
+                format!("CREATE ROLE {replication} NOLOGIN REPLICATION"),
+            )
+            .await?;
             for (granted, member, what) in [
                 (&bypass, &role, "direct BYPASSRLS"),
                 (&superuser_role, &role, "direct superuser"),
                 (&middle, &role, "inherited BYPASSRLS"),
+                (&replication, &role, "direct REPLICATION"),
             ] {
                 exec(admin, format!("GRANT {granted} TO {member}")).await?;
                 if granted == &middle {
@@ -529,7 +595,7 @@ mod database_tests {
                 assert_refused(
                     what,
                     check(&runtime_url, Environment::Production).await,
-                    "can SET ROLE to a superuser or BYPASSRLS role",
+                    "can SET ROLE to a superuser, BYPASSRLS or REPLICATION role",
                     &secret,
                 );
                 exec(admin, format!("REVOKE {granted} FROM {member}")).await?;
@@ -547,7 +613,7 @@ mod database_tests {
                     assert_refused(
                         option,
                         check(&runtime_url, Environment::Production).await,
-                        "can SET ROLE to a superuser or BYPASSRLS role",
+                        "can SET ROLE to a superuser, BYPASSRLS or REPLICATION role",
                         &secret,
                     );
                     exec(admin, format!("REVOKE {bypass} FROM {role}")).await?;
@@ -555,17 +621,59 @@ mod database_tests {
             }
         }
 
-        // Two unprivileged roles, but the session acts as another role than
-        // the one it logged in as: only a login as the serving role passes.
+        // Predefined roles that reach the server's programs and files: a
+        // path to superuser, or to every tenant's data files.
+        for predefined in [
+            "pg_execute_server_program",
+            "pg_write_server_files",
+            "pg_read_server_files",
+        ] {
+            exec(admin, format!("GRANT {predefined} TO {role}")).await?;
+            assert_refused(
+                predefined,
+                check(&runtime_url, Environment::Production).await,
+                "is a member of pg_execute_server_program, pg_write_server_files or \
+                 pg_read_server_files",
+                &secret,
+            );
+            exec(admin, format!("REVOKE {predefined} FROM {role}")).await?;
+        }
+
+        // The owner of a table with row-level security can switch FORCE off:
+        // being it, or able to SET ROLE to it, is refused.
         let migrator = format!("\"{}\"", test.migrator_role());
+        let owner = "owns, or can SET ROLE to the owner of, a table with row-level security";
         exec(admin, format!("GRANT {migrator} TO {role}")).await?;
         assert_refused(
-            "runtime role acting as the migrator",
+            "member of the table owner",
+            check(&runtime_url, Environment::Production).await,
+            owner,
+            &secret,
+        );
+        exec(admin, format!("REVOKE {migrator} FROM {role}")).await?;
+        exec(admin, format!("ALTER TABLE notes OWNER TO {role}")).await?;
+        assert_refused(
+            "direct owner",
+            check(&runtime_url, Environment::Production).await,
+            owner,
+            &secret,
+        );
+        exec(admin, format!("ALTER TABLE notes OWNER TO {migrator}")).await?;
+        // Owning a table without row-level security is not an escape.
+        exec(admin, "CREATE TABLE plain_owned (id int)".to_owned()).await?;
+        exec(admin, format!("ALTER TABLE plain_owned OWNER TO {role}")).await?;
+        check(&runtime_url, Environment::Production).await?;
+        exec(admin, "DROP TABLE plain_owned".to_owned()).await?;
+
+        // Two unprivileged roles, but the session acts as another role than
+        // the one it logged in as: only a login as the serving role passes.
+        let [.., plain_name] = &names;
+        exec(admin, format!("CREATE ROLE {plain} NOLOGIN")).await?;
+        exec(admin, format!("GRANT {plain} TO {role}")).await?;
+        assert_refused(
+            "runtime role acting as another plain role",
             check(
-                &with_setting(
-                    runtime_url.expose(),
-                    &format!("role={}", test.migrator_role()),
-                ),
+                &with_setting(runtime_url.expose(), &format!("role={plain_name}")),
                 Environment::Production,
             )
             .await,
@@ -575,7 +683,7 @@ mod database_tests {
         // The same through a role setting rather than the URL.
         exec(
             admin,
-            format!("ALTER ROLE {role} SET role = '{}'", test.migrator_role()),
+            format!("ALTER ROLE {role} SET role = '{plain_name}'"),
         )
         .await?;
         assert_refused(
@@ -585,7 +693,7 @@ mod database_tests {
             &secret,
         );
         exec(admin, format!("ALTER ROLE {role} RESET role")).await?;
-        exec(admin, format!("REVOKE {migrator} FROM {role}")).await?;
+        exec(admin, format!("REVOKE {plain} FROM {role}")).await?;
 
         check(&runtime_url, Environment::Production).await?;
         test.cleanup().await?;
