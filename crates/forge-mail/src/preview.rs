@@ -4,10 +4,13 @@
 use std::{error::Error, fmt, sync::Arc};
 
 use askama::Template;
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use forge_config::{AppConfig, Environment};
 use forge_http::{
     BoxResponseFuture, HeaderValue, Method, Middleware, Next, Request, Response, StatusCode, header,
 };
+
+use sha2::{Digest as _, Sha256};
 
 use crate::{Encoded, MailError, Message, encode, message::attachment_content_type};
 
@@ -66,9 +69,52 @@ fn valid_preview_name(name: &str) -> bool {
         })
 }
 
-const PAGE_CSP: &str = "default-src 'none'; style-src 'unsafe-inline'; frame-src 'self'; base-uri 'none'; form-action 'none'";
-const CONTENT_CSP: &str =
+/// What a preview page's policy allows besides its own stylesheet. The page
+/// has one inline `<style>` element and no attribute styles, so
+/// [`page_policy`] admits it by SHA-256 hash instead of `'unsafe-inline'`.
+const PAGE_CSP_REST: &str = "frame-src 'self'; base-uri 'none'; form-action 'none'";
+/// The policy of a preview page whose stylesheet could not be hashed: it is
+/// shown unstyled rather than with `'unsafe-inline'`.
+const PAGE_CSP_UNSTYLED: &str =
+    "default-src 'none'; frame-src 'self'; base-uri 'none'; form-action 'none'";
+/// The policy of the HTML part of the message, shown in the sandboxed frame.
+/// It keeps `style-src 'unsafe-inline'`: a mailer's HTML carries its own
+/// `style` attributes and `<style>` blocks (email clients need them), which
+/// cannot be known, so cannot be hashed. The frame can still run no script,
+/// load nothing but its own inline images and submit no form.
+const HTML_PART_CSP: &str =
     "default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'; sandbox";
+/// Every other response (text part, raw source, inline attachments, errors):
+/// nothing is rendered with style, so it allows none.
+const PLAIN_CSP: &str = "default-src 'none'; sandbox";
+
+/// The CSP source (`'sha256-...'`) of the one `<style>` element of `page`:
+/// the hash of the exact bytes between the tags, which is what browsers
+/// compare. `None` unless the page holds exactly one such element: every
+/// user-supplied value in the page is HTML-escaped, so a second one would be
+/// a template change that needs a new policy.
+fn inline_style_source(page: &str) -> Option<String> {
+    let (_, rest) = page.split_once("<style>")?;
+    let (style, after) = rest.split_once("</style>")?;
+    if after.contains("<style") {
+        return None;
+    }
+    let digest = Sha256::digest(style.as_bytes());
+    Some(format!("'sha256-{}'", STANDARD.encode(digest)))
+}
+
+/// The policy of the preview `page`: its stylesheet by hash, nothing inline
+/// otherwise.
+fn page_policy(page: &str) -> HeaderValue {
+    inline_style_source(page)
+        .and_then(|source| {
+            HeaderValue::from_str(&format!(
+                "default-src 'none'; style-src {source}; {PAGE_CSP_REST}"
+            ))
+            .ok()
+        })
+        .unwrap_or_else(|| HeaderValue::from_static(PAGE_CSP_UNSTYLED))
+}
 
 /// Serves registered [`Preview`]s below a prefix such as `/_mail`: an index
 /// and, per preview, the headers, the HTML part in a sandboxed frame, the
@@ -160,7 +206,7 @@ impl PreviewHandler {
             response
                 .headers_mut()
                 .insert(header::ALLOW, HeaderValue::from_static("GET, HEAD"));
-            secure(&mut response, CONTENT_CSP);
+            secure(&mut response, HeaderValue::from_static(PLAIN_CSP));
             response
         } else {
             self.respond(rest)
@@ -305,12 +351,13 @@ impl PreviewHandler {
     fn render(&self, status: StatusCode, view: &PreviewPage) -> Response {
         match view.render() {
             Ok(html) => {
+                let policy = page_policy(&html);
                 let mut response = Response::new(status, html);
                 response.headers_mut().insert(
                     header::CONTENT_TYPE,
                     HeaderValue::from_static("text/html; charset=utf-8"),
                 );
-                secure(&mut response, PAGE_CSP);
+                secure(&mut response, policy);
                 response
             }
             Err(_) => text_response(
@@ -373,12 +420,9 @@ fn percent_decode(value: &str) -> String {
 }
 
 /// The headers every preview response carries. Previews never need script.
-fn secure(response: &mut Response, csp: &'static str) {
+fn secure(response: &mut Response, csp: HeaderValue) {
     let headers = response.headers_mut();
-    headers.insert(
-        header::CONTENT_SECURITY_POLICY,
-        HeaderValue::from_static(csp),
-    );
+    headers.insert(header::CONTENT_SECURITY_POLICY, csp);
     headers.insert(
         header::X_CONTENT_TYPE_OPTIONS,
         HeaderValue::from_static("nosniff"),
@@ -399,7 +443,12 @@ fn text_response(status: StatusCode, content_type: &str, body: Vec<u8>) -> Respo
     if let Ok(value) = HeaderValue::from_str(content_type) {
         response.headers_mut().insert(header::CONTENT_TYPE, value);
     }
-    secure(&mut response, CONTENT_CSP);
+    let csp = if content_type.starts_with("text/html") {
+        HTML_PART_CSP
+    } else {
+        PLAIN_CSP
+    };
+    secure(&mut response, HeaderValue::from_static(csp));
     response
 }
 
@@ -683,5 +732,85 @@ mod tests {
             .expect("served");
         assert_eq!(head.status(), StatusCode::OK);
         assert!(head.body().is_empty());
+    }
+
+    /// The SHA-256 of the stylesheet of a served `page`, recomputed the way a
+    /// browser does: the bytes between `<style>` and `</style>`.
+    fn served_style_source(page: &str) -> String {
+        assert_eq!(page.matches("<style").count(), 1, "{page}");
+        assert!(!page.contains(" style="), "{page}");
+        let start = page.find("<style>").expect("a style element") + "<style>".len();
+        let end = start + page[start..].find("</style>").expect("closed");
+        let style = page.get(start..end).expect("on char boundaries");
+        format!("'sha256-{}'", STANDARD.encode(Sha256::digest(style)))
+    }
+
+    #[test]
+    fn preview_pages_allow_their_stylesheet_by_hash_not_unsafe_inline() {
+        for path in ["/_mail", "/_mail/welcome", "/_mail/broken"] {
+            let response = get(path).expect("served");
+            let csp = header_of(&response, header::CONTENT_SECURITY_POLICY);
+            assert_eq!(
+                csp,
+                format!(
+                    "default-src 'none'; style-src {}; frame-src 'self'; base-uri 'none'; \
+                     form-action 'none'",
+                    served_style_source(&body(&response))
+                ),
+                "{path}"
+            );
+            assert!(!csp.contains("unsafe-inline"), "{path}: {csp}");
+        }
+    }
+
+    #[test]
+    fn the_style_source_is_the_sha256_of_the_exact_bytes_between_the_tags() {
+        // `printf 'a{}' | openssl dgst -sha256 -binary | base64`
+        assert_eq!(
+            inline_style_source("<head><style>a{}</style></head>").as_deref(),
+            Some("'sha256-X1RutGBrXCt9KkSaXMK7tHftWiRscFHOhxsS8tv8hBk='")
+        );
+        // Whitespace is part of the hashed text.
+        assert_ne!(
+            inline_style_source("<style> a{} </style>"),
+            inline_style_source("<style>a{}</style>")
+        );
+        // No stylesheet or more than one: nothing is allowed, never inline.
+        for page in [
+            "<p>no style</p>",
+            "<style>a{}",
+            "<style>a{}</style><style>b{}</style>",
+        ] {
+            assert_eq!(inline_style_source(page), None, "{page}");
+            let policy = page_policy(page);
+            let policy = policy.to_str().expect("ascii");
+            assert!(!policy.contains("style-src"), "{policy}");
+            assert!(!policy.contains("unsafe-inline"), "{policy}");
+        }
+    }
+
+    /// The one use that cannot be hashed: a message's own HTML, whose
+    /// `style` attributes and `<style>` blocks are the mailer's. Everything
+    /// else allows no style at all.
+    #[test]
+    fn only_the_html_part_of_a_message_keeps_unsafe_inline() {
+        let csp =
+            |path: &str| header_of(&get(path).expect("served"), header::CONTENT_SECURITY_POLICY);
+        assert!(csp("/_mail/welcome/html").contains("style-src 'unsafe-inline'"));
+        for path in [
+            "/_mail/welcome/text",
+            "/_mail/welcome/raw",
+            "/_mail/welcome/cid/logo",
+            "/_mail/welcome/nope",
+        ] {
+            assert_eq!(csp(path), "default-src 'none'; sandbox", "{path}");
+        }
+        let post = handler()
+            .serve(&request(Method::POST, "/_mail/welcome"))
+            .expect("served");
+        assert_eq!(
+            header_of(&post, header::CONTENT_SECURITY_POLICY),
+            "default-src 'none'; sandbox"
+        );
     }
 }

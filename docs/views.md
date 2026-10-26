@@ -679,7 +679,7 @@ body, like every route. Responses carry:
 | `Cache-Control` | `public, max-age=31536000, immutable` |
 | `X-Content-Type-Options` | `nosniff` |
 | `ETag` | `"<sha256 hex>"`; a matching `If-None-Match` (including `W/` and `*`) answers `304` with no body |
-| `Content-Security-Policy` | SVG only: `default-src 'none'; style-src 'unsafe-inline'; sandbox` |
+| `Content-Security-Policy` | SVG only: `default-src 'none'; style-src 'unsafe-inline'; sandbox` (an SVG's own `style` attributes cannot be hashed; with `default-src 'none'` its styles can load nothing) |
 
 `AssetSet::new` and `AssetSet::from_tables` re-validate the tables (legal
 names, allowlisted extension, well-formed digest, digested name consistent

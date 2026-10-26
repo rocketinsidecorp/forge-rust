@@ -372,6 +372,7 @@ dependencies = [
  "getrandom 0.4.3",
  "rustls",
  "serde",
+ "sha2",
  "thiserror",
  "tokio",
  "tokio-rustls",
