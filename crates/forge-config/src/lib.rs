@@ -1972,7 +1972,7 @@ mod tests {
             "debug",
             "json",
             "postgres://runtime:secret@localhost/app?sslmode=verify-full",
-            "postgres://migrator:secret@localhost/app?sslmode=verify-ca",
+            "postgres://migrator:secret@localhost/app?sslmode=verify-full",
             "50",
             "2s",
             "15s",

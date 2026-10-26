@@ -111,8 +111,9 @@ and verification of the process goes through one
 `forge::auth::PasswordWorkLimiter` (one slot per CPU, at most 16, about
 300 MiB; an attempt that waits more than two seconds for a slot is
 unavailable, `503`), so Tokio's 512 blocking threads can never hold 19 MiB
-each. The limiter is the semaphore `forge-auth` takes from its existing
-`tokio` dependency; no crate is added.
+each. The limiter is a Tokio semaphore: `forge-auth` now depends on `tokio`
+(previously only a dev-dependency there, already in the locked graph), so
+no crate is added.
 
 The RustSec review recorded during admission found historical advisories in old
 `cookie` and `sha2` releases (RUSTSEC-2017-0005 and RUSTSEC-2021-0100);

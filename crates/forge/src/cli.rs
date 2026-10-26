@@ -412,7 +412,7 @@ Environment:
   FORGE_MIGRATION_DATABASE_URL migration URL, same schemes (required for migrate/rollback
                                and application commands that use the database); in
                                production both must verify the server certificate:
-                               sslmode=verify-full|verify-ca or ssl-mode=VERIFY_IDENTITY|VERIFY_CA
+                               sslmode=verify-full or ssl-mode=VERIFY_IDENTITY
   FORGE_DATABASE_ALLOW_PLAINTEXT true accepts production URLs without verified TLS, only
                                on a trusted private network (default: false)
   FORGE_DATABASE_MAX_CONNS     connections of the serving pool, 1-1000 (default: 10)

@@ -463,16 +463,16 @@ fn sqlite_path(url: &str) -> &str {
 
 /// What a PostgreSQL URL needs in production, as the configuration error
 /// says it. It never contains the URL.
-pub const POSTGRES_TLS_REQUIRED: &str = "a URL with sslmode=verify-full (or verify-ca) in \
-     production, so the server certificate is verified: append ?sslmode=verify-full (and \
+pub const POSTGRES_TLS_REQUIRED: &str = "a URL with sslmode=verify-full in production, so \
+     the server certificate and host name are verified: append ?sslmode=verify-full (and \
      sslrootcert=/path/to/ca.pem for a private CA). A Unix socket (host=/run/postgresql) needs no \
      TLS; FORGE_DATABASE_ALLOW_PLAINTEXT=true accepts an unverified or plaintext connection, only \
      on a trusted private network";
 
 /// What a MySQL/MariaDB URL needs in production, as the configuration error
 /// says it. It never contains the URL.
-pub const MYSQL_TLS_REQUIRED: &str = "a URL with ssl-mode=VERIFY_IDENTITY (or VERIFY_CA) in \
-     production, so the server certificate is verified: append ?ssl-mode=VERIFY_IDENTITY (and \
+pub const MYSQL_TLS_REQUIRED: &str = "a URL with ssl-mode=VERIFY_IDENTITY in production, \
+     so the server certificate and host name are verified: append ?ssl-mode=VERIFY_IDENTITY (and \
      ssl-ca=/path/to/ca.pem for a private CA). A Unix socket (socket=/run/mysqld/mysqld.sock) \
      needs no TLS; FORGE_DATABASE_ALLOW_PLAINTEXT=true accepts an unverified or plaintext \
      connection, only on a trusted private network";
@@ -481,11 +481,17 @@ pub const MYSQL_TLS_REQUIRED: &str = "a URL with ssl-mode=VERIFY_IDENTITY (or VE
 /// rule production applies to both database URLs (Forge-Go's
 /// `config/database.go`).
 ///
-/// PostgreSQL needs `sslmode=verify-full` or `verify-ca`: SQLx's default,
-/// `prefer`, falls back to plaintext, and `require` encrypts without checking
-/// the certificate, so both can be intercepted. MySQL/MariaDB needs
-/// `ssl-mode=VERIFY_IDENTITY` or `VERIFY_CA` (`PREFERRED` and `REQUIRED` do
-/// not verify). The mode is read as the driver reads it: either spelling of
+/// PostgreSQL needs `sslmode=verify-full`: SQLx's default, `prefer`, falls
+/// back to plaintext, and `require` encrypts without checking the
+/// certificate, so both can be intercepted. MySQL/MariaDB needs
+/// `ssl-mode=VERIFY_IDENTITY` (`PREFERRED` and `REQUIRED` do not verify).
+/// `verify-ca` and `VERIFY_CA` are refused too: SQLx's rustls backend adds
+/// `sslrootcert`/`ssl-ca` to the public web roots and then skips the host
+/// name check, so any publicly trusted certificate (one for a domain the
+/// attacker owns) would pass. Forge-Go's driver trusts only the given CA, so
+/// it accepts `verify-ca`; the stricter rule here is deliberate.
+///
+/// The mode is read as the driver reads it: either spelling of
 /// the key (`sslmode`, `ssl-mode`), the last occurrence winning, the value in
 /// any case. A Unix socket the URL names has no network path to intercept
 /// (and the servers offer no TLS on it), and SQLite is a local file: both
@@ -508,8 +514,8 @@ pub fn require_verified_tls(url: &SecretString) -> Result<(), &'static str> {
     let raw = url.expose();
     let (verified, required): (&[&str], _) = match DatabaseScheme::of_url(raw) {
         Some(DatabaseScheme::Sqlite) => return Ok(()),
-        Some(DatabaseScheme::Postgres) => (&["verify-full", "verify-ca"], POSTGRES_TLS_REQUIRED),
-        Some(DatabaseScheme::MySql) => (&["verify_identity", "verify_ca"], MYSQL_TLS_REQUIRED),
+        Some(DatabaseScheme::Postgres) => (&["verify-full"], POSTGRES_TLS_REQUIRED),
+        Some(DatabaseScheme::MySql) => (&["verify_identity"], MYSQL_TLS_REQUIRED),
         None => return Err(MALFORMED),
     };
     let found = location(raw).ok_or(MALFORMED)?;
@@ -951,12 +957,12 @@ mod tests {
     fn production_needs_tls_that_verifies_the_server() {
         for verified in [
             "postgres://app:pw@db.internal/shop?sslmode=verify-full",
-            "postgresql://app:pw@db.internal/shop?sslmode=verify-ca&sslrootcert=/ca.pem",
+            "postgresql://app:pw@db.internal/shop?sslmode=verify-full&sslrootcert=/ca.pem",
             "postgres://app:pw@db.internal/shop?ssl-mode=VERIFY-FULL",
             // The driver applies the last occurrence.
             "postgres://app:pw@db.internal/shop?sslmode=disable&sslmode=verify-full",
             "mysql://app:pw@db.internal/shop?ssl-mode=VERIFY_IDENTITY",
-            "mariadb://app:pw@db.internal/shop?sslmode=verify_ca&ssl-ca=/ca.pem",
+            "mariadb://app:pw@db.internal/shop?sslmode=verify_identity&ssl-ca=/ca.pem",
             // A Unix socket has no network path; SQLite is a local file.
             "postgres:///shop?host=/var/run/postgresql",
             "postgres://%2Fvar%2Frun%2Fpostgresql/shop",
@@ -994,6 +1000,20 @@ mod tests {
             (
                 "postgres://app:hunter2@db.internal/shop?sslmode=allow",
                 POSTGRES_TLS_REQUIRED,
+            ),
+            // SQLx's rustls verify-ca trusts the public web roots besides
+            // sslrootcert and skips the host name: any public certificate passes.
+            (
+                "postgres://app:hunter2@db.internal/shop?sslmode=verify-ca&sslrootcert=/ca.pem",
+                POSTGRES_TLS_REQUIRED,
+            ),
+            (
+                "mysql://app:hunter2@db.internal/shop?ssl-mode=VERIFY_CA&ssl-ca=/ca.pem",
+                MYSQL_TLS_REQUIRED,
+            ),
+            (
+                "mariadb://app:hunter2@db.internal/shop?sslmode=verify_ca",
+                MYSQL_TLS_REQUIRED,
             ),
             // The last occurrence wins, as in the driver.
             (

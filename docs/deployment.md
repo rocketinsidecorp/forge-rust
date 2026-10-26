@@ -179,8 +179,8 @@ variable and the fix, never the URL.
 
 | Backend | Production needs | Refused |
 | --- | --- | --- |
-| PostgreSQL | `sslmode=verify-full` or `verify-ca` (`sslrootcert=/path/ca.pem` for a private CA) | no `sslmode` (SQLx's `prefer` falls back to plaintext), `disable`, `allow`, `prefer`, `require` (encrypts without checking the certificate) |
-| MySQL / MariaDB | `ssl-mode=VERIFY_IDENTITY` or `VERIFY_CA` (`ssl-ca=/path/ca.pem` for a private CA) | no `ssl-mode`, `DISABLED`, `PREFERRED`, `REQUIRED`; Forge-Go's `tls=true` is not SQLx's key |
+| PostgreSQL | `sslmode=verify-full` (`sslrootcert=/path/ca.pem` for a private CA) | no `sslmode` (SQLx's `prefer` falls back to plaintext), `disable`, `allow`, `prefer`, `require` (encrypts without checking the certificate), `verify-ca` (SQLx's rustls backend adds the CA to the public web roots and skips the host name, so any publicly trusted certificate passes) |
+| MySQL / MariaDB | `ssl-mode=VERIFY_IDENTITY` (`ssl-ca=/path/ca.pem` for a private CA) | no `ssl-mode`, `DISABLED`, `PREFERRED`, `REQUIRED`, `VERIFY_CA` (same as `verify-ca`); Forge-Go's `tls=true` is not SQLx's key |
 | Any | a Unix socket the URL names (`host=/run/postgresql`, `socket=/run/mysqld/mysqld.sock`) | |
 | SQLite | nothing (a local file) | |
 

@@ -113,15 +113,19 @@ impl PgLoginThrottle {
                 .await?;
         let resets_at = now.saturating_add(self.window_micros());
 
-        // Every counter row exists before the next statement locks them, so
-        // two first attempts for one key serialize here instead of both
-        // seeing no counter and both being allowed.
+        // Every counter row exists, and is locked, before the next statement
+        // reads them, so two first attempts for one key serialize here
+        // instead of both seeing no counter and both being allowed. The
+        // no-op update locks an existing row: DO NOTHING would not, and a
+        // concurrent prune could delete an expired counter in between and
+        // let this attempt through uncounted.
         sqlx::query(
             "INSERT INTO forge_login_throttle (scope, key_hash, attempt_count, reset_at) \
              SELECT scope, key_hash, 0, timestamptz 'epoch' + $3::bigint * interval '1 microsecond' \
              FROM unnest($1::smallint[], $2::bytea[]) AS attempt(scope, key_hash) \
              ORDER BY scope \
-             ON CONFLICT (scope, key_hash) DO NOTHING",
+             ON CONFLICT (scope, key_hash) DO UPDATE \
+               SET attempt_count = forge_login_throttle.attempt_count",
         )
         .bind(&scopes)
         .bind(&digests)

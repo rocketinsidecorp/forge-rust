@@ -340,9 +340,9 @@ how to fix it and never prints the URL. Unix sockets and SQLite files need no
 TLS.
 
 ```sh
-# PostgreSQL: verify-full (or verify-ca); sslrootcert for a private CA
+# PostgreSQL: verify-full; sslrootcert for a private CA
 export FORGE_DATABASE_URL='postgres://app_runtime:PASSWORD@db.internal:5432/shop?sslmode=verify-full&sslrootcert=/etc/ssl/db-ca.pem'
-# MySQL/MariaDB: VERIFY_IDENTITY (or VERIFY_CA); ssl-ca for a private CA
+# MySQL/MariaDB: VERIFY_IDENTITY; ssl-ca for a private CA
 export FORGE_DATABASE_URL='mysql://app:PASSWORD@db.internal:3306/shop?ssl-mode=VERIFY_IDENTITY'
 # only for a database reached over a trusted private network (the generated
 # compose.yaml sets it for its own db service)

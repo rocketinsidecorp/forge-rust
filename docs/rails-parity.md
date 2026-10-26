@@ -26,7 +26,7 @@ the work is finished and waiting for its review; **Planned** means not started.
 | `HEAD` on every `GET` route | `HEAD` routed to `GET` | Done (`http.ServeMux`) | In review (the router serves `HEAD` with the `GET` route unless a `HEAD` route exists, the server drops the body, `Allow` lists `HEAD`) |
 | Handler panic answered with `500` | `ShowExceptions` | Done (`recoverer`: JSON error body with the request id) | In review (text body `internal server error`, `x-request-id`, logged with the request id) |
 | HSTS behind TLS | `config.force_ssl` | Done (`Strict-Transport-Security` unless `FORGE_HTTP_TRANSPORT=plain`) | In review (same header and rule, `FORGE_HTTP_TRANSPORT=plain\|trusted-proxy`, see follow-ups) |
-| Verified database TLS in production, pool limits | `sslmode` in `database.yml`, `pool` | Done (`sslmode=verify-full\|verify-ca`, MySQL `tls=true`, `FORGE_DATABASE_ALLOW_PLAINTEXT`, `FORGE_DATABASE_MAX_CONNS\|MIN_CONNS\|MAX_CONN_LIFETIME\|MAX_CONN_IDLE_TIME\|CONNECT_TIMEOUT\|STATEMENT_TIMEOUT`) | In review (same TLS rule with SQLx's MySQL spelling `ssl-mode=VERIFY_IDENTITY\|VERIFY_CA`, `FORGE_DATABASE_ALLOW_PLAINTEXT`, `FORGE_DATABASE_MAX_CONNS\|CONNECT_TIMEOUT\|STATEMENT_TIMEOUT`; see follow-ups) |
+| Verified database TLS in production, pool limits | `sslmode` in `database.yml`, `pool` | Done (`sslmode=verify-full\|verify-ca`, MySQL `tls=true`, `FORGE_DATABASE_ALLOW_PLAINTEXT`, `FORGE_DATABASE_MAX_CONNS\|MIN_CONNS\|MAX_CONN_LIFETIME\|MAX_CONN_IDLE_TIME\|CONNECT_TIMEOUT\|STATEMENT_TIMEOUT`) | In review (stricter TLS rule: `sslmode=verify-full`, SQLx's MySQL spelling `ssl-mode=VERIFY_IDENTITY`; `verify-ca` refused, see follow-ups; `FORGE_DATABASE_ALLOW_PLAINTEXT`, `FORGE_DATABASE_MAX_CONNS\|CONNECT_TIMEOUT\|STATEMENT_TIMEOUT`; see follow-ups) |
 | Bound on buffered request bodies | — | Not needed (bodies are streamed through `MaxBytesReader`) | In review (`FORGE_MAX_IN_FLIGHT_BODY_BYTES`, 256 MiB for all bodies at once, `503` with `Retry-After`) |
 | Cache | Solid Cache | Done | Done |
 | File storage with signed URLs | Active Storage | Done (disk) | Done (disk) |
@@ -74,9 +74,12 @@ the work is finished and waiting for its review; **Planned** means not started.
   `FORGE_DATABASE_CONNECT_TIMEOUT` (5s) and `FORGE_DATABASE_STATEMENT_TIMEOUT`
   (30s, at least 1ms; migrations run without it) with the same duration
   syntax. Differences: (1) MySQL/MariaDB TLS is spelled as SQLx spells it,
-  `ssl-mode=VERIFY_IDENTITY` or `VERIFY_CA` (Forge-Go's driver takes
-  `tls=true`, which Rust refuses as ignored), so Rust also accepts a
-  CA-only verification on MySQL as both accept it on PostgreSQL. (2) Rust
+  `ssl-mode=VERIFY_IDENTITY` (Forge-Go's driver takes `tls=true`, which
+  Rust refuses as ignored), and Rust refuses CA-only verification
+  (`verify-ca`, `VERIFY_CA`) that Forge-Go accepts: SQLx's rustls backend
+  adds the given CA to the public web roots and skips the host name check,
+  so any publicly trusted certificate would pass, where pgx trusts only
+  `sslrootcert`. (2) Rust
   accepts a Unix socket named in the URL (`host=/dir`, `socket=`) without
   TLS; Forge-Go's URLs need a TCP host. (3) The connect timeout is SQLx's
   acquire timeout (waiting for a free connection and opening one), where

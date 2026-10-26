@@ -109,7 +109,7 @@ is the serving pool of the configuration (below).
 Migrations, `setup`, `seed` and the `db` commands connect with the default
 `PoolSettings`, without the statement timeout, so long schema changes are not
 cancelled. In production both URLs must verify the server certificate
-(`sslmode=verify-full|verify-ca`, `ssl-mode=VERIFY_IDENTITY|VERIFY_CA`, a Unix
+(`sslmode=verify-full`, `ssl-mode=VERIFY_IDENTITY`, a Unix
 socket, or SQLite) unless `FORGE_DATABASE_ALLOW_PLAINTEXT=true`
 ([database TLS](deployment.md#database-tls)).
 

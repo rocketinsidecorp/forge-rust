@@ -3,9 +3,11 @@
 -- every replica counts against the same rows, and a restart or deploy
 -- forgets nothing. A counter is keyed by its scope (1 account, 2 network
 -- source, 3 account and source together) and a SHA-256 digest of the
--- throttle's name with the login, the client address or both, so no login,
--- address or tenant is stored; the table holds no tenant data and needs no
--- row-level security (sign-in runs before a tenant context exists). A row
+-- throttle's name with the login, the client address or both: no login,
+-- address or tenant is stored in clear, but the digests are unkeyed and a
+-- reader of the table or a backup can recover guessable logins and every
+-- IPv4 address by brute force, so treat it as pseudonymous, not anonymous.
+-- It holds no tenant data and needs no row-level security (sign-in runs before a tenant context exists). A row
 -- lives for one window: each attempt deletes up to 8 expired rows, so the
 -- table stays at the size of the live windows.
 
