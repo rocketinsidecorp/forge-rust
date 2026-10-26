@@ -244,7 +244,10 @@ fn execute(
         Command::Check => CargoCommand::Check.run(current_dir),
         Command::Test { args } => {
             // Like Forge-Go's `forge test`: the development environment
-            // files, so database tests find FORGE_TEST_DATABASE_URL.
+            // files reach the tests (the database URLs, FORGE_ENV). Not
+            // FORGE_TEST_DATABASE_URL: the files also feed `forge dev`, and
+            // the application refuses unknown FORGE_* keys, so that one is
+            // passed to the ignored database tests by hand.
             let environment =
                 DevelopmentEnvironment::load(current_dir, &|key| env::var_os(key).is_some(), true)?;
             CargoCommand::Test(args).run_with(current_dir, environment.added())

@@ -132,11 +132,18 @@ forge dev                     # rebuilds and restarts when files change
 
 `forge` reads both URLs from `.env.development` (committed: development
 values only, never real secrets), then `.env.local` (git-ignored: your
-overrides); a variable already set in your environment wins. The application
-binary never reads these files, so with `cargo run` export the URLs yourself:
+overrides); a variable already set in your environment wins. To point the
+`forge` commands at a server of your own, override the URLs in `.env.local`:
 
 ```bash
-echo "FORGE_DATABASE_URL='%%DATABASE_RUNTIME_URL_LOCAL%%'" >> .env.local   # your own server: edit the URL
+echo "FORGE_DATABASE_URL='%%DATABASE_RUNTIME_URL_LOCAL%%'" >> .env.local   # edit the URL
+echo "FORGE_MIGRATION_DATABASE_URL='%%DATABASE_MIGRATION_URL_LOCAL%%'" >> .env.local
+```
+
+The application binary never reads either file, so with `cargo run` set the
+URLs in the command (or export them):
+
+```bash
 FORGE_MIGRATION_DATABASE_URL='%%DATABASE_MIGRATION_URL_LOCAL%%' cargo run -- migrate
 FORGE_DATABASE_URL='%%DATABASE_RUNTIME_URL_LOCAL%%' cargo run
 ```
