@@ -115,6 +115,8 @@ struct Application {
     /// The access module's `SessionTenantAccess` also authorizes the JSON
     /// API (it is written now, or was written with that impl).
     session_access: bool,
+    /// This generation writes the shared access module.
+    writes_access: bool,
 }
 
 impl Application {
@@ -246,6 +248,7 @@ fn plan_wiring(plan: &Plan, options: &ScaffoldOptions, generating: bool) -> Wiri
             &plan.resource,
             application,
             generating && !application.api_access_exists,
+            generating && application.writes_access,
             options.public,
         ),
         Layers::Model => model_wiring(&plan.resource, application.backend),
@@ -358,8 +361,7 @@ fn plan(
     if application.default_locale != DEFAULT_TEXT_LOCALE {
         locales.push(application.default_locale.clone());
     }
-    let write_access =
-        layers == Layers::Scaffold && !application.access_exists && purpose == Purpose::Generate;
+    let write_access = application.writes_access;
     let api = Api {
         enabled: layers.api(),
         access_module: layers.api()
@@ -400,7 +402,11 @@ fn plan(
         ];
         let kept = match layers {
             Layers::Model => model_paths.contains(&file.path),
-            Layers::Resource => model_paths.contains(&file.path) || api_paths.contains(&file.path),
+            Layers::Resource => {
+                model_paths.contains(&file.path)
+                    || api_paths.contains(&file.path)
+                    || (write_access && file.path == ACCESS_PATH)
+            }
             Layers::Scaffold => true,
         };
         if !kept {
@@ -701,10 +707,24 @@ fn inspect_application(
     let identity = root.join("src/adapters/http/authentication.rs").is_file();
     let public = options_public(public, layers, purpose, resource, identity)?;
     let access_source = read(root, ACCESS_PATH);
-    let session_access = access_source.as_deref().map_or(scaffold, |access| {
-        access.contains("impl ApiTenantAccess for SessionTenantAccess")
-    });
-    if scaffold && generating && access_source.is_none() {
+    let bearer_sessions = root.join(BEARER_SESSIONS_MODULE).is_file();
+    let api_only = !root.join("src/adapters/http/views/mod.rs").is_file();
+    // A tenant-scoped JSON resource of an application with the sign-in pages
+    // and no bearer tokens takes the pages' session (D29), so it needs the
+    // access module's SessionTenantAccess as the scaffold does.
+    let resource_session = layers == Layers::Resource
+        && resource.scope == Scope::Tenant
+        && backend == Backend::Postgresql
+        && identity
+        && !bearer_sessions
+        && !api_only;
+    let writes_access = generating && access_source.is_none() && (scaffold || resource_session);
+    let session_access = access_source
+        .as_deref()
+        .map_or(scaffold || resource_session, |access| {
+            access.contains("impl ApiTenantAccess for SessionTenantAccess")
+        });
+    if writes_access {
         let security = read(root, "src/infrastructure/security/mod.rs").unwrap_or_default();
         if !security.contains("pub fn tenant_from_request") {
             return unsupported(TENANT_COOKIE_MISSING);
@@ -820,8 +840,9 @@ fn inspect_application(
         access_exists,
         streams_exists,
         api_access_exists,
-        bearer_sessions: root.join(BEARER_SESSIONS_MODULE).is_file(),
-        api_only: !root.join("src/adapters/http/views/mod.rs").is_file(),
+        bearer_sessions,
+        api_only,
+        writes_access,
         default_locale: application_default_locale(root),
         identity,
         session_access,
@@ -1433,13 +1454,34 @@ fn resource_wiring(
     resource: &Resource,
     application: &Application,
     new_api_access: bool,
+    new_access: bool,
     public: bool,
 ) -> Wiring {
     let plural = &resource.plural;
     let mut declarations = model_declarations(resource);
+    if new_access {
+        declarations.push(("src/adapters/http/mod.rs", "access".to_owned()));
+    }
     if new_api_access {
         declarations.push(("src/adapters/http/mod.rs", "api_access".to_owned()));
     }
+    // With the pages' session (D29): the `protect` guard, as the scaffold's.
+    let session = resource.scope == Scope::Tenant && application.session_api();
+    let access = if session {
+        format!(
+            "    // {plural}: tenant-scoped JSON API of the tenant the session signed in to,\n    \
+             // for roles granted these permissions (the guard grants the owner role).\n    \
+             let access = protect(\n        \
+             composition,\n        \
+             &[\n            \
+             crate::application::use_cases::{plural}::READ_PERMISSION,\n            \
+             crate::application::use_cases::{plural}::WRITE_PERMISSION,\n        \
+             ],\n    \
+             )?;\n"
+        )
+    } else {
+        String::new()
+    };
     declarations.push(("src/adapters/http/mod.rs", format!("{plural}_api")));
     let mut service = service_statement(resource, application.backend);
     service.push_str(&api_statements(resource, application, false, public));
@@ -1459,9 +1501,9 @@ fn resource_wiring(
         layers: Layers::Resource,
         plural: plural.clone(),
         declarations,
-        access: String::new(),
+        access,
         streams: None,
-        guard: None,
+        guard: session.then_some("protect"),
         printed_service: service.clone(),
         service,
         notes,
@@ -1527,7 +1569,7 @@ fn api_statements(
         );
     }
     if !application.bearer_sessions {
-        if pages && application.session_api() {
+        if application.session_api() {
             return format!(
                 "    // {plural} JSON API (/v1/{plural}): the same session cookie and policy as the\n    \
                  // pages; changes send the session's CSRF token in X-CSRF-Token.\n{}",

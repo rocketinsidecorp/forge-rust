@@ -274,21 +274,25 @@ fn a_resource_is_the_model_plus_the_json_api_and_collides_with_the_others() {
         VERSION,
     )
     .unwrap_or_else(|error| panic!("{error}"));
-    assert_eq!(
-        outcome.created,
-        [
-            format!("migrations/{VERSION}_create_posts.up.sql"),
-            format!("migrations/{VERSION}_create_posts.down.sql"),
-            "src/domain/entities/post.rs".to_owned(),
-            "src/application/ports/post_repository.rs".to_owned(),
-            "src/application/use_cases/posts.rs".to_owned(),
-            "src/infrastructure/database/posts.rs".to_owned(),
-            scaffold::API_ACCESS_PATH.to_owned(),
-            "src/adapters/http/posts_api.rs".to_owned(),
-            "tests/posts_api.rs".to_owned(),
-            "tests/posts_repository.rs".to_owned(),
-        ]
-    );
+    let mut created = outcome.created.clone();
+    created.sort();
+    let mut expected = vec![
+        format!("migrations/{VERSION}_create_posts.up.sql"),
+        format!("migrations/{VERSION}_create_posts.down.sql"),
+        "src/domain/entities/post.rs".to_owned(),
+        "src/application/ports/post_repository.rs".to_owned(),
+        "src/application/use_cases/posts.rs".to_owned(),
+        "src/infrastructure/database/posts.rs".to_owned(),
+        // The pages' session authorizes the JSON API (D29): the access
+        // module comes with the first such resource.
+        scaffold::ACCESS_PATH.to_owned(),
+        scaffold::API_ACCESS_PATH.to_owned(),
+        "src/adapters/http/posts_api.rs".to_owned(),
+        "tests/posts_api.rs".to_owned(),
+        "tests/posts_repository.rs".to_owned(),
+    ];
+    expected.sort();
+    assert_eq!(created, expected);
     let scaffolded = tree(&scaffold_root);
     for path in &outcome.created {
         assert_eq!(
@@ -297,18 +301,21 @@ fn a_resource_is_the_model_plus_the_json_api_and_collides_with_the_others() {
             "{path}"
         );
     }
-    assert!(!root.join(scaffold::ACCESS_PATH).exists());
-    // Without `--api-auth` nothing issues bearer tokens: the wiring stays
-    // closed and says how to open it.
+    // Without `--api-auth` the JSON API takes the session cookie of the
+    // sign-in pages behind the `protect` guard, never DenyAll or bearer
+    // tokens.
+    let wiring = wired(&outcome.wiring, &outcome.edits);
+    assert!(wiring.contains("let access = protect("), "{wiring}");
     assert!(
-        wired(&outcome.wiring, &outcome.edits).contains("api_access::DenyAll"),
-        "{}",
-        wired(&outcome.wiring, &outcome.edits)
+        wiring.contains(
+            "crate::adapters::http::posts_api::routes(composition.router(), posts, access)"
+        ),
+        "{wiring}"
     );
-    assert!(
-        wired(&outcome.wiring, &outcome.edits).contains("forge generate authentication --api-auth")
-    );
-    assert!(!wired(&outcome.wiring, &outcome.edits).contains("BearerTenantAccess::new"));
+    assert!(wiring.contains("pub(super) fn protect("), "{wiring}");
+    assert!(wiring.contains("pub mod access;"), "{wiring}");
+    assert!(!wiring.contains("DenyAll"), "{wiring}");
+    assert!(!wiring.contains("BearerTenantAccess::new"), "{wiring}");
 
     for (layers, version) in [
         (Layers::Model, "1760832000000000001"),
@@ -368,7 +375,8 @@ fn a_resource_is_the_model_plus_the_json_api_and_collides_with_the_others() {
     );
     let mut after = tree(&root);
     assert!(after.remove(scaffold::API_ACCESS_PATH).is_some());
-    assert_back_but_shared(after, before, &["api_access"]);
+    assert!(after.remove(scaffold::ACCESS_PATH).is_some());
+    assert_back_but_shared(after, before, &["access", "api_access"]);
 }
 
 /// In a `forge new --api-auth` application a tenant-scoped resource is wired

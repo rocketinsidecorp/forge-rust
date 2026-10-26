@@ -504,6 +504,9 @@ fn readme_quickstart_postgresql() {
     // A global resource next to the Quickstart's: in an application with
     // Forge identity it stays closed (403) to everyone, the owner too.
     let notes: &[&str] = &["g", "scaffold", "note", "body:text", "--global"];
+    // A tenant-scoped JSON resource (an SQL keyword as its name, too): the
+    // session cookie, the CSRF header and the owner's permission (D29).
+    let orders: &[&str] = &["g", "resource", "order", "total:integer", "--tenant-scoped"];
     let migrate: &[&str] = &["migrate"];
     let (_root, _dev, port) = run_quickstart(
         parent.path(),
@@ -525,7 +528,7 @@ fn readme_quickstart_postgresql() {
             .unwrap_or_else(|error| panic!("{error}"));
             databases.push(database);
         },
-        &[notes, migrate],
+        &[notes, orders, migrate],
     );
     assert_eq!(databases.len(), 1, "the Quickstart starts the database");
 
@@ -574,6 +577,20 @@ fn readme_quickstart_postgresql() {
     assert_eq!(write.status, 403, "{}", write.body);
     let api = client.json("POST", "/v1/notes", r#"{"body":"mine"}"#, true);
     assert_eq!(api.status, 403, "{}", api.body);
+
+    // The resource's JSON API: the owner's session with the CSRF header
+    // creates, without it is refused, and signed out is unauthenticated.
+    let order = r#"{"total":1999}"#;
+    let refused = client.json("POST", "/v1/orders", order, false);
+    assert_eq!(refused.status, 403, "{}", refused.body);
+    let created = client.json("POST", "/v1/orders", order, true);
+    assert_eq!(created.status, 201, "{}", created.body);
+    let listed = client.send("GET", "/v1/orders", &[("Accept", "application/json")], "");
+    assert_eq!(listed.status, 200, "{}", listed.body);
+    assert!(listed.body.contains("\"total\":1999"), "{}", listed.body);
+    let mut stranger = Client::new(port);
+    let signed_out = stranger.send("GET", "/v1/orders", &[("Accept", "application/json")], "");
+    assert_eq!(signed_out.status, 401, "{}", signed_out.body);
 }
 
 #[test]
