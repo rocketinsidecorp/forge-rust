@@ -35,7 +35,11 @@ fn json_values_of_any_size_round_trip_and_wrong_shapes_report_the_kind_only() {
         tags: (0..400).map(|i| format!("tag-{i}")).collect(),
     };
     let sealed = attribute.seal("1", &Json(profile.clone())).unwrap();
-    assert!(!sealed.contains("Ada"));
+    // Long plaintext fragments, never a short substring: a needle of n base64
+    // characters occurs by chance in ~7300 random ones with probability about
+    // 7300 / 64^n (3 characters: 2%, 7: 2e-9). These two are 12 and 17
+    // characters, so a false failure is below 1e-17.
+    assert!(!sealed.contains("Ada Lovelace") && !sealed.contains("tag-398\",\"tag-399"));
     let opened: Json<Profile> = attribute.open("1", &sealed).unwrap();
     assert_eq!(opened.0, profile);
 
