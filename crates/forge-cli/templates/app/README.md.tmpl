@@ -125,12 +125,20 @@ Apply the migrations, then run the application:
 %%end%%
 
 ```bash
-export FORGE_MIGRATION_DATABASE_URL='%%DATABASE_MIGRATION_URL_LOCAL%%'
 forge db prepare              # create the database if missing, then migrate (and seed a new one)
-forge migrate                 # or just migrate; same as: cargo run -- migrate
+forge migrate                 # or just migrate
+forge dev                     # rebuilds and restarts when files change
+```
 
-export FORGE_DATABASE_URL='%%DATABASE_RUNTIME_URL_LOCAL%%'
-forge dev                     # rebuilds and restarts when files change; or: cargo run
+`forge` reads both URLs from `.env.development` (committed: development
+values only, never real secrets), then `.env.local` (git-ignored: your
+overrides); a variable already set in your environment wins. The application
+binary never reads these files, so with `cargo run` export the URLs yourself:
+
+```bash
+echo "FORGE_DATABASE_URL='%%DATABASE_RUNTIME_URL_LOCAL%%'" >> .env.local   # your own server: edit the URL
+FORGE_MIGRATION_DATABASE_URL='%%DATABASE_MIGRATION_URL_LOCAL%%' cargo run -- migrate
+FORGE_DATABASE_URL='%%DATABASE_RUNTIME_URL_LOCAL%%' cargo run
 ```
 
 `serve` requires `FORGE_DATABASE_URL`; a URL for another database engine exits
@@ -273,12 +281,8 @@ The application has sign-in, sign-out, password-reset and two-factor pages
 first tenant and its owner with the migration role, then sign in:
 
 ```bash
-export FORGE_MIGRATION_DATABASE_URL='%%DATABASE_MIGRATION_URL_LOCAL%%'
-forge setup --tenant acme --email owner@example.com --organization "Acme Inc"
-# or: cargo run -- setup --tenant acme --email owner@example.com --organization "Acme Inc"
-unset FORGE_MIGRATION_DATABASE_URL
-export FORGE_DATABASE_URL='%%DATABASE_RUNTIME_URL_LOCAL%%'
-forge dev                     # or: cargo run
+forge setup --tenant acme --email owner@example.com --organization "Acme Inc"   # URLs from .env.development
+forge dev
 # open http://127.0.0.1:3000/session/new?tenant=acme
 ```
 

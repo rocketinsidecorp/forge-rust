@@ -31,6 +31,7 @@ the work is finished and waiting for its review; **Planned** means not started.
 | Bounded memory-hard password hashing | — | Not needed (PBKDF2, no per-hash memory) | In review (`forge::auth::PasswordWorkLimiter`: one Argon2id hash per CPU, at most 16, then `503`) |
 | Client address behind trusted proxies | `request.remote_ip`, `trusted_proxies` | Done (`FORGE_HTTP_TRUSTED_PROXIES`, ADR 0037) | Done (`FORGE_HTTP_TRUSTED_PROXIES`, ADR 0032; `forge deploy` sets it for the proxied role, [ADR 0042](adr/0042-forge-deploy.md)) |
 | `HEAD` on every `GET` route | `HEAD` routed to `GET` | Done (`http.ServeMux`) | In review (the router serves `HEAD` with the `GET` route unless a `HEAD` route exists, the server drops the body, `Allow` lists `HEAD`) |
+| Development environment files | `dotenv` gems, `.env.development` | Done (`.env.development` then `.env.local`, process environment wins, `forge dev\|test\|db\|migrate\|rollback\|doctor`) | Done (same files, format, precedence and line-only errors; `forge dev`, `test`, `doctor` and every lifecycle command; `forge new` writes `.env.development`; differences: no `FORGE_TEST_DATABASE_URL` or generated `.env.local`, [cli](cli.md#development-environment-files)) |
 | Catch-all route segment | `get "files/*path"` | Done (`GET /files/{key...}`, `http.ServeMux`) | Done (`{name...}` as the last segment: the rest of the path, possibly empty; static and `{name}` routes win; encoded slashes and dot segments answer `400` as Forge-Go's router does; the OpenAPI document names it `{name}` like Forge-Go's; a path that stops before the catch-all, `/files`, is `404` where `ServeMux` redirects to `/files/`) |
 | Handler panic answered with `500` | `ShowExceptions` | Done (`recoverer`: JSON error body with the request id) | In review (text body `internal server error`, `x-request-id`, logged with the request id) |
 | HSTS behind TLS | `config.force_ssl` | Done (`Strict-Transport-Security` unless `FORGE_HTTP_TRANSPORT=plain`) | In review (same header and rule, `FORGE_HTTP_TRANSPORT=plain\|trusted-proxy`, see follow-ups) |
@@ -246,10 +247,11 @@ the work is finished and waiting for its review; **Planned** means not started.
   an application subcommand so the CLI keeps holding no credentials:
   `db schema:dump|schema:load` (`db console` exists since P5: it runs the
   client with the URL's credentials in the environment, like Forge-Go), browser reload in `forge dev` (the Go
-  proxy needs a reviewed Rust port with the same CSP rules), and
-  `.env.development`/`.env.local` files in `forge dev` and the lifecycle
-  commands together with generating them. Planned right after the generators
-  ([forge-rust#15](https://github.com/rocketinsidecorp/forge-rust/issues/15)).
+  proxy needs a reviewed Rust port with the same CSP rules). The
+  `.env.development`/`.env.local` files are read by `forge dev`, `test`,
+  `doctor` and the lifecycle commands with Forge-Go's names, format,
+  precedence and redaction, and `forge new` generates `.env.development`
+  ([cli](cli.md#development-environment-files)).
   `forge inspect` stays "Planned" in the table above. Forge-Go reads the target
   database of `db create|drop` from `FORGE_DATABASE_URL` and the credentials
   from `FORGE_MIGRATION_DATABASE_URL`; Forge-Rust uses

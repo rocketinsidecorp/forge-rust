@@ -25,6 +25,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crate::CliError;
 use crate::application::{BuildOutcome, cargo_build, scrub};
+use crate::envfile::{DevelopmentEnvironment, ENV_FILES};
 use crate::process::{OwnedChild, STOP_GRACE, Shutdown};
 
 /// Shortest and longest accepted `--poll-interval` and `--debounce`.
@@ -90,6 +91,9 @@ const NAMES: &[&str] = &["Cargo.toml", "Cargo.lock", "rust-toolchain.toml"];
 
 /// Whether a file (`/`-separated, relative to the root) triggers a rebuild.
 fn watched(relative: &str) -> bool {
+    if ENV_FILES.contains(&relative) {
+        return true;
+    }
     let name = relative.rsplit('/').next().unwrap_or(relative);
     if name.ends_with('~') || name.starts_with(".#") || name.starts_with('.') {
         return false;
@@ -347,12 +351,17 @@ impl Host for CargoHost {
     }
 
     fn start(&mut self, binary: &Path) -> Result<Box<dyn Instance>, CliError> {
+        // Read again on every start, so an edited .env.local takes effect on
+        // the restart it triggers (Forge-Go's rule); the process wins.
+        let environment =
+            DevelopmentEnvironment::load(&self.root, &|key| std::env::var_os(key).is_some(), true)?;
         let mut command = Command::new(binary);
         command
             .current_dir(&self.root)
             .stdin(Stdio::null())
             .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit());
+            .stderr(Stdio::inherit())
+            .envs(environment.added().iter().map(|(key, value)| (key, value)));
         scrub(&mut command);
         Ok(Box::new(Running {
             child: OwnedChild::spawn(command, true)?,
@@ -418,6 +427,8 @@ mod tests {
             "assets/application.css",
             "migrations/20261020000000_create_posts.up.sql",
             "assets/logo.png",
+            ".env.development",
+            ".env.local",
         ] {
             assert!(watched(path), "{path}");
         }
@@ -427,6 +438,8 @@ mod tests {
             "src/main.rs~",
             "src/.#main.rs",
             ".env",
+            "config/.env.local",
+            ".env.production",
             "compose.yaml",
             "src/notes.md",
             "Dockerfile",

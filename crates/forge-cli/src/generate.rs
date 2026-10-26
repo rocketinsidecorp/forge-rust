@@ -280,6 +280,7 @@ const TEMPLATES: &[Template] = &[
     template!(Group::Always, "Cargo.toml" => "Cargo.toml.tmpl"),
     template!(Group::Always, "rust-toolchain.toml" => "rust-toolchain.toml.tmpl"),
     template!(Group::Always, ".gitignore" => "gitignore.tmpl"),
+    template!(Group::Always, ".env.development" => "env.development.tmpl"),
     template!(Group::Always, "README.md" => "README.md.tmpl"),
     template!(Group::Always, "src/main.rs" => "src/main.rs.tmpl"),
     template!(Group::Always, "src/lib.rs" => "src/lib.rs.tmpl"),
@@ -1854,6 +1855,60 @@ mod tests {
         assert!(read(&root, ".dockerignore").contains("/storage"));
         assert!(read(&root, "README.md").contains("sqlite://storage/development.sqlite3?mode=rwc"));
         assert_no_postgres_artifacts(&root);
+    }
+
+    #[test]
+    fn the_development_environment_file_holds_the_local_urls_and_is_committed() {
+        for (database, urls) in [
+            (
+                Database::Postgresql,
+                Some((
+                    "postgres://app_runtime:app_runtime@127.0.0.1:5432/sample_app",
+                    "postgres://app_migrator:app_migrator@127.0.0.1:5432/sample_app",
+                )),
+            ),
+            (
+                Database::Mariadb,
+                Some((
+                    "mariadb://app:app@127.0.0.1:3306/sample_app",
+                    "mariadb://app:app@127.0.0.1:3306/sample_app",
+                )),
+            ),
+            (
+                Database::Sqlite3,
+                Some((
+                    "sqlite://storage/development.sqlite3?mode=rwc",
+                    "sqlite://storage/development.sqlite3?mode=rwc",
+                )),
+            ),
+            (Database::Disabled, None),
+        ] {
+            let (_parent, root) = generate(database, true);
+            let text = read(&root, ".env.development");
+            let pairs = crate::envfile::parse(&text).expect("the CLI reads it");
+            let mut expected = vec![("FORGE_ENV".to_owned(), "development".to_owned())];
+            if let Some((runtime, migration)) = urls {
+                expected.push(("FORGE_DATABASE_URL".to_owned(), runtime.to_owned()));
+                expected.push((
+                    "FORGE_MIGRATION_DATABASE_URL".to_owned(),
+                    migration.to_owned(),
+                ));
+            }
+            assert_eq!(pairs, expected, "{database:?}");
+            // Every key is one the application accepts: it gets them all.
+            let vars = pairs
+                .iter()
+                .map(|(key, value)| (key.into(), value.into()))
+                .collect::<Vec<(std::ffi::OsString, std::ffi::OsString)>>();
+            forge_config::AppConfig::from_vars(vars).expect("a valid development configuration");
+            let gitignore = read(&root, ".gitignore");
+            let ignored: Vec<&str> = gitignore.lines().collect();
+            for line in [".env", ".env.local", ".env.*.local"] {
+                assert!(ignored.contains(&line), "{database:?}: {line}");
+            }
+            assert!(!ignored.contains(&".env.*"), "{database:?}");
+            assert!(read(&root, ".dockerignore").contains("**/.env.*"));
+        }
     }
 
     #[test]

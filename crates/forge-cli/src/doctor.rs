@@ -22,6 +22,7 @@ use forge_config::{AppConfig, DatabaseScheme};
 use serde_json::{Value, json};
 
 use crate::CliError;
+use crate::envfile::DevelopmentEnvironment;
 use crate::lifecycle::ALLOW_DESTRUCTIVE;
 
 /// How long the database server gets to accept a TCP connection.
@@ -127,10 +128,40 @@ pub(crate) fn run(
     let mut environment = None;
     let mut database = "none".to_owned();
 
+    // The development environment files, as `forge dev` reads them (the
+    // process wins); doctor sets no FORGE_ENV of its own, like Forge-Go's.
+    let files = match DevelopmentEnvironment::load(
+        directory,
+        &|name| variables.iter().any(|(key, _)| key == name),
+        false,
+    ) {
+        Ok(files) => files,
+        Err(_) if json_output => {
+            let report = json!({
+                "schema_version": 1,
+                "ok": false,
+                "diagnostics": [Diagnostic::error(
+                    "environment_file.invalid",
+                    "Development environment files could not be loaded.",
+                    "Check .env.development and .env.local for valid KEY=VALUE lines.",
+                )
+                .json()],
+            });
+            writeln!(output, "{report}").map_err(CliError::Output)?;
+            return Err(CliError::Reported);
+        }
+        Err(error) => return Err(error),
+    };
     // The CLI's own switch is not an application setting, and the
     // application would refuse it as an unknown key.
     let variables = variables
         .into_iter()
+        .chain(
+            files
+                .added()
+                .iter()
+                .map(|(key, value)| (OsString::from(key), OsString::from(value))),
+        )
         .filter(|(key, _)| key != ALLOW_DESTRUCTIVE)
         .collect::<Vec<_>>();
     // Only the host and port settings of the driver are read from it.
@@ -667,6 +698,51 @@ mod tests {
         let (_, text) = report(false, &[url], &probes);
         assert!(text.contains("not checked (a Unix socket)"), "{text}");
         assert!(probes.connected.borrow().is_empty());
+    }
+
+    #[test]
+    fn the_development_environment_files_are_read_and_the_process_wins() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            directory.path().join(".env.development"),
+            "FORGE_HTTP_ADDR=127.0.0.1:4100\nFORGE_DATABASE_URL=sqlite:dev.db\n",
+        )
+        .expect("write");
+        std::fs::write(
+            directory.path().join(".env.local"),
+            "FORGE_HTTP_ADDR=127.0.0.1:4200\n",
+        )
+        .expect("write");
+        let run_in = |json: bool, pairs: &[(&str, &str)]| {
+            let mut output = Vec::new();
+            let result = run(
+                json,
+                variables(pairs),
+                directory.path(),
+                &Fake::healthy(),
+                &mut output,
+            );
+            (result, String::from_utf8(output).expect("utf-8"))
+        };
+        let (result, text) = run_in(false, &[]);
+        result.expect("healthy");
+        assert!(text.contains("http address: 127.0.0.1:4200\n"), "{text}");
+        assert!(text.contains("environment: development\n"), "{text}");
+        assert!(text.contains("database: sqlite"), "{text}");
+        let (result, text) = run_in(false, &[("FORGE_HTTP_ADDR", "127.0.0.1:4300")]);
+        result.expect("healthy");
+        assert!(text.contains("http address: 127.0.0.1:4300\n"), "{text}");
+
+        std::fs::write(directory.path().join(".env.local"), "PASSWORD hunter2\n").expect("write");
+        let (result, text) = run_in(true, &[]);
+        assert!(matches!(result, Err(CliError::Reported)));
+        let parsed: Value = serde_json::from_str(text.trim()).expect("json");
+        assert_eq!(parsed["ok"], false);
+        assert_eq!(parsed["diagnostics"][0]["code"], "environment_file.invalid");
+        assert!(!text.contains("hunter2"), "{text}");
+        let (result, _) = run_in(false, &[]);
+        let error = result.expect_err("malformed file").to_string();
+        assert_eq!(error, ".env.local: line 1: expected KEY=VALUE");
     }
 
     #[test]

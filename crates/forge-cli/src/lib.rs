@@ -16,6 +16,7 @@ mod dev;
 #[cfg(test)]
 mod dev_tests;
 mod doctor;
+mod envfile;
 mod error;
 #[cfg(test)]
 mod error_tests;
@@ -52,6 +53,7 @@ use crate::cli::{
 };
 use crate::controller::ControllerOptions;
 use crate::destroy::{DestroyFlags, DestroyPlan};
+use crate::envfile::DevelopmentEnvironment;
 use crate::generate::{ForgeSource, NewApplication};
 use crate::job::JobOptions;
 use crate::lifecycle::{Db, Destructive, Lifecycle};
@@ -233,7 +235,13 @@ fn execute(
         },
         Command::Destroy { generator } => run_destroy(current_dir, generator, output),
         Command::Check => CargoCommand::Check.run(current_dir),
-        Command::Test { args } => CargoCommand::Test(args).run(current_dir),
+        Command::Test { args } => {
+            // Like Forge-Go's `forge test`: the development environment
+            // files, so database tests find FORGE_TEST_DATABASE_URL.
+            let environment =
+                DevelopmentEnvironment::load(current_dir, &|key| env::var_os(key).is_some(), true)?;
+            CargoCommand::Test(args).run_with(current_dir, environment.added())
+        }
         Command::Format => CargoCommand::Format.run(current_dir),
         Command::Lint => CargoCommand::Lint.run(current_dir),
         Command::Build { name } => CargoCommand::Build(name).run(current_dir),
@@ -653,16 +661,22 @@ fn lifecycle(
     command: impl FnOnce(&mut Lifecycle<'_, CargoApplication>) -> Result<(), CliError>,
 ) -> Result<(), CliError> {
     let project = Project::discover(current_dir)?;
+    let files =
+        DevelopmentEnvironment::load(&project.root, &|key| env::var_os(key).is_some(), true)?;
     let stdin = io::stdin();
     let mut input = stdin.lock();
     let mut messages = io::stderr();
-    // A value that is not UTF-8 is read lossily, so it can never pass for an
+    // The process environment, then the development environment files. A
+    // value that is not UTF-8 is read lossily, so it can never pass for an
     // unprotected FORGE_ENV.
-    let environment =
-        |key: &str| env::var_os(key).map(|value| value.to_string_lossy().into_owned());
+    let environment = |key: &str| {
+        env::var_os(key)
+            .map(|value| value.to_string_lossy().into_owned())
+            .or_else(|| files.get(key).map(str::to_owned))
+    };
     let mut client = dbclient::System;
     let mut lifecycle = Lifecycle {
-        app: CargoApplication::new(project.clone()),
+        app: CargoApplication::new(project.clone()).with_environment(files.added()),
         client: &mut client,
         root: &project.root,
         name: &project.name,
@@ -689,9 +703,11 @@ fn run_dev(
         }
         project.name = name;
     }
+    let files =
+        DevelopmentEnvironment::load(&project.root, &|key| env::var_os(key).is_some(), true)?;
     if no_reload {
         let name = project.name.clone();
-        let mut app = CargoApplication::new(project);
+        let mut app = CargoApplication::new(project).with_environment(files.added());
         return match app.run(&[])? {
             Some(0) => Ok(()),
             code => Err(CliError::AppCommandFailed {

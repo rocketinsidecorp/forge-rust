@@ -2,6 +2,8 @@
 .env
 .env.*
 !.env.example
+# Generated applications commit their development settings (no secrets).
+!/examples/hello-forge/.env.development
 *.profraw
 coverage/
 
