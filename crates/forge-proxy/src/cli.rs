@@ -13,7 +13,10 @@ use tokio_util::sync::CancellationToken;
 use crate::control::{ControlRequest, call, listen_control};
 use crate::duration::GoDuration;
 use crate::flags::{self, Spec};
-use crate::listen::{self, HttpLimits, Plain};
+use crate::listen::{
+    self, DEFAULT_MAX_CONNECTIONS, DEFAULT_MAX_HEADER_BYTES, HttpLimits, MAX_MAX_HEADER_BYTES,
+    MIN_MAX_HEADER_BYTES, Plain,
+};
 use crate::log::{Logger, text};
 use crate::server::Server;
 use crate::settings::{
@@ -79,6 +82,16 @@ const RUN_FLAGS: &[Spec] = &[
         "idle-timeout",
         false,
         "keep-alive idle timeout; also how long a write to a client may make no progress and an upgraded connection may carry no data",
+    ),
+    (
+        "max-header-bytes",
+        false,
+        "largest request line and headers a client may send, 4096 to 1048576",
+    ),
+    (
+        "max-connections",
+        false,
+        "most client connections open at once on each listener; further clients wait in the listen backlog",
     ),
     ("shutdown-timeout", false, "graceful shutdown budget"),
 ];
@@ -169,6 +182,11 @@ pub async fn main(
     }
 }
 
+/// A flag default as the `i64` the flag parser works in.
+fn to_i64(value: usize) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
 /// `:8080` listens on every IPv4 address, as Go's `:8080` does.
 fn listen_address(address: &str) -> String {
     if address.starts_with(':') {
@@ -208,6 +226,20 @@ async fn run(
     if idle.as_nanos() <= 0 {
         return Err("-idle-timeout must be positive".to_owned());
     }
+    let max_header_bytes = parsed
+        .int("max-header-bytes", to_i64(DEFAULT_MAX_HEADER_BYTES))
+        .map_err(flag_error)?;
+    if !(to_i64(MIN_MAX_HEADER_BYTES)..=to_i64(MAX_MAX_HEADER_BYTES)).contains(&max_header_bytes) {
+        return Err(format!(
+            "-max-header-bytes must be between {MIN_MAX_HEADER_BYTES} and {MAX_MAX_HEADER_BYTES}"
+        ));
+    }
+    let max_connections = parsed
+        .int("max-connections", to_i64(DEFAULT_MAX_CONNECTIONS))
+        .map_err(flag_error)?;
+    if max_connections < 1 {
+        return Err("-max-connections must be at least 1".to_owned());
+    }
     let shutdown_timeout = parsed
         .duration("shutdown-timeout", GoDuration::from_secs(30))
         .map_err(flag_error)?;
@@ -215,6 +247,9 @@ async fn run(
         read_header_timeout: read_header.to_std().max(Duration::from_millis(1)),
         idle_timeout: idle.to_std(),
         shutdown_timeout: shutdown_timeout.to_std(),
+        // Both are in range here; usize::MAX only on a 32-bit target.
+        max_header_bytes: usize::try_from(max_header_bytes).unwrap_or(MAX_MAX_HEADER_BYTES),
+        max_connections: usize::try_from(max_connections).unwrap_or(usize::MAX),
     };
 
     let logger = Logger::new(stdout);

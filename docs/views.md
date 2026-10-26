@@ -599,6 +599,40 @@ update as failed, so a busy database pool never fails the stored change. `Fanout
 use `Fanout::InProcess`, which reaches the browsers connected to this process
 only. Behind a proxy, see [deployment](deployment.md#live-updates-behind-a-proxy).
 
+### Rotating the stream signing key
+
+Changing `FORGE_STREAMS_KEY` alone invalidates the stream name of every page
+that is already open: its next reconnect gets `403 stream_invalid` and stops
+updating until the page is reloaded. To rotate without that, move the old key
+to `FORGE_STREAMS_PREVIOUS_KEYS` (comma-separated, at most 3, same format as
+`FORGE_STREAMS_KEY`). Previous keys only verify, never sign; the current key
+always signs:
+
+`NEW_STREAMS_KEY=$(openssl rand -base64 32)` creates the new key.
+
+```sh
+# step 1: every replica learns the new key, but still signs with the old one
+export FORGE_STREAMS_KEY=$OLD_STREAMS_KEY
+export FORGE_STREAMS_PREVIOUS_KEYS=$NEW_STREAMS_KEY
+# redeploy every replica, then
+# step 2: sign with the new key; the old one keeps verifying pages already open
+export FORGE_STREAMS_KEY=$NEW_STREAMS_KEY
+export FORGE_STREAMS_PREVIOUS_KEYS=$OLD_STREAMS_KEY
+# redeploy every replica; after the token lifetime (24 hours by default,
+# up to 7 days with Signer::with_ttl) unset FORGE_STREAMS_PREVIOUS_KEYS and redeploy
+```
+
+Two steps keep a rolling redeploy safe: after step 1 every replica already
+accepts the new key, so a page signed by a replica that finished step 2 keeps
+updating when it reconnects to one that has not.
+
+`Signer::from_config` (the generated `Streams::register` calls it) reads both
+variables, so an application generated earlier needs no code change, only a
+`forge` dependency that has the setting. Both values are
+redacted in diagnostics, and an error names the entry's position, never the
+key. Previous keys without `FORGE_STREAMS_KEY` are refused: nothing would sign.
+By hand, `Signer::new(&new_key, &[&old_key])` does the same.
+
 ## Assets
 
 Assets live in `assets/` (CSS, JavaScript, images, fonts). The generated
@@ -657,7 +691,7 @@ body, like every route. Responses carry:
 | `Cache-Control` | `public, max-age=31536000, immutable` |
 | `X-Content-Type-Options` | `nosniff` |
 | `ETag` | `"<sha256 hex>"`; a matching `If-None-Match` (including `W/` and `*`) answers `304` with no body |
-| `Content-Security-Policy` | SVG only: `default-src 'none'; style-src 'unsafe-inline'; sandbox` |
+| `Content-Security-Policy` | SVG only: `default-src 'none'; style-src 'unsafe-inline'; sandbox` (an SVG's own `style` attributes cannot be hashed; with `default-src 'none'` its styles can load nothing) |
 
 `AssetSet::new` and `AssetSet::from_tables` re-validate the tables (legal
 names, allowlisted extension, well-formed digest, digested name consistent

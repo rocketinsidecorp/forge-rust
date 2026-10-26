@@ -189,6 +189,9 @@ async fn run_serves_and_shuts_down() {
         dir.path().join("acme").to_str().expect("utf-8"),
         "-acme-directory",
         "http://127.0.0.1:1/directory",
+        "-max-header-bytes",
+        "4096",
+        "-max-connections=0x10",
     ]
     .iter()
     .map(|arg| (*arg).to_owned())
@@ -261,4 +264,59 @@ async fn run_refuses_a_non_positive_idle_timeout() {
         assert_eq!(code, EXIT_FAILED, "{value}: {err}");
         assert!(err.contains("-idle-timeout must be positive"), "{err}");
     }
+}
+
+#[tokio::test]
+async fn run_validates_the_header_and_connection_limits() {
+    for (flag, value, message) in [
+        (
+            "-max-header-bytes",
+            "4095",
+            "-max-header-bytes must be between 4096 and 1048576",
+        ),
+        (
+            "-max-header-bytes",
+            "1048577",
+            "-max-header-bytes must be between 4096 and 1048576",
+        ),
+        (
+            "-max-header-bytes",
+            "0",
+            "-max-header-bytes must be between 4096 and 1048576",
+        ),
+        (
+            "-max-header-bytes",
+            "-1",
+            "-max-header-bytes must be between 4096 and 1048576",
+        ),
+        (
+            "-max-header-bytes",
+            "64k",
+            "invalid value \"64k\" for flag -max-header-bytes",
+        ),
+        (
+            "-max-connections",
+            "0",
+            "-max-connections must be at least 1",
+        ),
+        (
+            "-max-connections",
+            "-5",
+            "-max-connections must be at least 1",
+        ),
+        (
+            "-max-connections",
+            "many",
+            "invalid value \"many\" for flag -max-connections",
+        ),
+    ] {
+        let (code, _, err) = run(&["run", flag, value, "-state", ""]).await;
+        assert_eq!(code, EXIT_FAILED, "{flag} {value}: {err}");
+        assert!(err.contains(message), "{flag} {value}: {err}");
+    }
+    // The usage lists both flags with their ranges.
+    let (_, _, usage) = run(&["run", "-h"]).await;
+    assert!(usage.contains("-max-header-bytes value"), "{usage}");
+    assert!(usage.contains("4096 to 1048576"), "{usage}");
+    assert!(usage.contains("-max-connections value"), "{usage}");
 }

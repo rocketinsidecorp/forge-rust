@@ -32,11 +32,17 @@ use crate::forward::{BoxError, ProxyBody};
 use crate::log::text;
 use crate::server::Server;
 
-/// The most client connections open at once per listener; further clients
-/// wait in the kernel backlog.
-const MAX_CONNECTIONS: usize = 10_000;
+/// Default of `-max-header-bytes`: 64 KiB of request line and headers.
+pub const DEFAULT_MAX_HEADER_BYTES: usize = 64 << 10;
+/// Least `-max-header-bytes`: below 4 KiB ordinary cookies would be refused.
+pub const MIN_MAX_HEADER_BYTES: usize = 4 << 10;
+/// Most `-max-header-bytes`: above 1 MiB (hyper's former buffer size here)
+/// the limit protects nothing.
+pub const MAX_MAX_HEADER_BYTES: usize = 1 << 20;
+/// Default of `-max-connections`, per listener.
+pub const DEFAULT_MAX_CONNECTIONS: usize = 10_000;
 
-/// Time limits of client connections.
+/// Limits of client connections: time, header size and how many at once.
 #[derive(Clone, Copy, Debug)]
 pub struct HttpLimits {
     /// Time allowed to read request headers.
@@ -49,6 +55,38 @@ pub struct HttpLimits {
     pub idle_timeout: Duration,
     /// Graceful shutdown budget.
     pub shutdown_timeout: Duration,
+    /// The largest request line and headers a client may send
+    /// (`-max-header-bytes`, [`MIN_MAX_HEADER_BYTES`] to
+    /// [`MAX_MAX_HEADER_BYTES`]); more is answered with `431` and the
+    /// connection is closed.
+    pub max_header_bytes: usize,
+    /// The most client connections open at once on a listener
+    /// (`-max-connections`, at least 1); further clients wait in the kernel's
+    /// listen backlog until one closes.
+    pub max_connections: usize,
+}
+
+impl HttpLimits {
+    /// The permits of a listener: `max_connections`, never more than a
+    /// semaphore can hold (which no machine reaches, but a flag could ask
+    /// for).
+    fn connection_permits(&self) -> usize {
+        self.max_connections.clamp(1, Semaphore::MAX_PERMITS)
+    }
+}
+
+/// Where client connections come from: a listener, or a double in tests.
+pub(crate) trait Incoming: Send + Sync + 'static {
+    /// The next connection, or why accepting failed.
+    fn accept(
+        &self,
+    ) -> impl std::future::Future<Output = std::io::Result<(tokio::net::TcpStream, SocketAddr)>> + Send;
+}
+
+impl Incoming for TcpListener {
+    async fn accept(&self) -> std::io::Result<(tokio::net::TcpStream, SocketAddr)> {
+        TcpListener::accept(self).await
+    }
 }
 
 /// Turns an accepted TCP stream into the stream requests are read from.
@@ -87,9 +125,25 @@ pub(crate) async fn serve<A: Accept>(
     limits: HttpLimits,
     shutdown: CancellationToken,
 ) {
+    let permits = Arc::new(Semaphore::new(limits.connection_permits()));
+    serve_with(server, listener, acceptor, limits, shutdown, permits).await;
+}
+
+/// [`serve`] with the connection permits and the source of connections given.
+///
+/// One permit is taken before each accept and belongs to the connection that
+/// accept returns; a failed accept keeps it for the retry, so errors never
+/// cost a permit. Every permit is back once this returns.
+async fn serve_with<A: Accept, I: Incoming>(
+    server: Server,
+    listener: I,
+    acceptor: Arc<A>,
+    limits: HttpLimits,
+    shutdown: CancellationToken,
+    permits: Arc<Semaphore>,
+) {
     let mut tasks = JoinSet::new();
     let connections = CancellationToken::new();
-    let permits = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     'accept: loop {
         // Admission happens before accept: while every permit is held,
         // clients wait in the listen backlog.
@@ -199,6 +253,9 @@ async fn serve_connection<S>(
         .timer(TokioTimer::new())
         .header_read_timeout(None)
         .max_buf_size(1 << 20)
+        // Larger heads are answered with 431: a limit hyper's buffer size
+        // alone cannot express below its 8 KiB minimum.
+        .max_header_size(limits.max_header_bytes)
         .serve_connection(TokioIo::new(Progress::new(stream, idle)), service)
         .with_upgrades();
     tokio::pin!(connection);
@@ -213,6 +270,8 @@ async fn serve_connection<S>(
 
 #[cfg(test)]
 mod keep_alive_tests;
+#[cfg(test)]
+mod limit_tests;
 
 /// Reading a request head ([`KeepAlive`]).
 const HEAD: u8 = 0;

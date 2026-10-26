@@ -497,7 +497,7 @@ application's database backend, with tests. The walkthrough is in
 | `--global` | Rows are shared by every tenant. Routes `/<plural>/...`, closed by `DenyAll` until the application decides who may use them. |
 | `--tenant-scoped` | Rows belong to a tenant. Routes `/tenants/{tenant_id}/<plural>/...`, `tenant_id` bound from the authorized `TenantContext` in every statement, plus forced row-level security on PostgreSQL. Exactly one of `--global` and `--tenant-scoped` is required. |
 | `--plural <PLURAL>` | The plural when the English rules (`-y` to `-ies`; `-s`, `-x`, `-z`, `-ch`, `-sh` take `-es`; otherwise `-s`) get it wrong. A name that already looks plural is refused unless `--plural` is given. |
-| `--broadcast` | Live updates ([ADR 0031](adr/0031-live-updates-over-server-sent-events.md)): create, update and delete publish Turbo Streams and the index page subscribes over Server-Sent Events. Writes `src/adapters/http/streams.rs` once and `templates/<plural>/_row.html`; production needs `FORGE_STREAMS_KEY` ([views](views.md#live-updates)). |
+| `--broadcast` | Live updates ([ADR 0031](adr/0031-live-updates-over-server-sent-events.md)): create, update and delete publish Turbo Streams and the index page subscribes over Server-Sent Events. Writes `src/adapters/http/streams.rs` once and `templates/<plural>/_row.html`; production needs `FORGE_STREAMS_KEY` ([views](views.md#live-updates); [rotation](views.md#rotating-the-stream-signing-key) with `FORGE_STREAMS_PREVIOUS_KEYS`). |
 | `--dry-run` | Print the files that would be created and the wiring; write nothing. |
 
 Names are validated before anything is read: snake_case ASCII, at most 40
@@ -657,6 +657,23 @@ only while it is byte-identical to what the generator writes (`--force`
 otherwise); migrations stay unless `--migrations`, translated locale files
 are kept, and the shared access, streams and jobs modules are never removed.
 Details, files and refusals: [generators](generators.md).
+
+Vendored dependencies: Forge-Go runs `go mod vendor` after a successful
+`forge generate` in an application that has a `vendor/` directory (never on
+`--dry-run`), because what it generates can import packages the directory does
+not hold yet. Forge-Rust has no such step and needs none: `forge new` does not
+vendor anything (no `cargo vendor`, no `.cargo/config.toml` source
+replacement), and no generator edits `Cargo.toml`, `Cargo.lock` or
+`.cargo/config.toml` or writes code for a crate the manifest does not already
+declare, so an application you vendored yourself is still complete afterwards
+(a test runs every generator against one). The one change that alters the
+dependency set is yours: enabling the `broadcast` feature of `forge` that
+`scaffold --broadcast` asks for in an application without it. Run `cargo
+vendor` again after that edit.
+
+```sh
+mkdir -p .cargo && cargo vendor > .cargo/config.toml   # after editing Cargo.toml by hand in a vendored application
+```
 
 ## `forge i18n check`
 
@@ -962,6 +979,9 @@ Same command names, flags, messages and exit codes, except:
   `logs`, `app`. They are tracked in [Rails parity](rails-parity.md).
 - `forge doctor` also checks the toolchain and that the database server answers.
 - Progress lines of `forge dev` carry no time stamp.
+- `forge generate` does not re-vendor: Go's `go mod vendor` step has no Rust
+  counterpart because no generator changes the dependency set (see
+  [above](#forge-generate-modelcontrollermailerjob-and-forge-destroy)).
 
 ## `forge deploy`, `forge logs`, `forge app`
 

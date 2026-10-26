@@ -224,6 +224,7 @@ dependency and moves two admitted crates into `forge-auth`.
 | `rustix` | `1.1.5` | `forge` (Unix targets only) | turn terminal echo off (`tcgetattr`/`tcsetattr`) while `setup` reads the owner password | defaults disabled; `std`, `termios` |
 | `getrandom` | `0.4.3` | `forge-auth` | 256-bit password reset tokens from the OS CSPRNG | as admitted above |
 | `sha2` | `0.11.0` | `forge-auth` | SHA-256 digests of reset tokens and throttle keys | defaults disabled |
+| `sha2` | `0.11.0` | `forge-mail` | SHA-256 of the mail preview page's one inline stylesheet, for its `style-src` hash (forge-rust#77) | defaults disabled |
 
 `rustix` review: it was already in the workspace `Cargo.lock` (through
 `tempfile`); it is maintained by the Bytecode Alliance, MIT/Apache-2.0,

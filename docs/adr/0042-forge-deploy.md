@@ -94,7 +94,15 @@ configuration, and no new crate unless strictly necessary.
    before 2026-10-25 hyper's header timer cut that wait at 10 s), a response write
    that makes no progress and an upgraded connection silent in both
    directions, so a client that stops reading cannot hold a connection, a
-   tunnel or a drain open. The cache and control directories are kept 0700
+   tunnel or a drain open. `-max-header-bytes` (default 65536, 4096 to
+   1048576, `431` above it; hyper's `max_header_size`, which unlike
+   `max_buf_size` accepts values below 8 KiB; before 2026-10-26 the bound was
+   hyper's 1 MiB buffer) and `-max-connections` (default 10000 per listener,
+   at least 1) are Forge-Go's flags with Forge-Go's names, defaults and
+   range. Admission happens before accept: one permit is taken per accept and
+   belongs to the connection it returns, a failed accept keeps it for the
+   retry, and shutdown ends the loop whether it waits for a permit or for a
+   client. The cache and control directories are kept 0700
    (existing ones restricted at start, links refused), and state and cache
    files are written atomically, synced, with the directory synced after
    the rename.

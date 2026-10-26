@@ -431,6 +431,8 @@ Environment:
   FORGE_STORAGE_MAX_UPLOAD_BYTES largest uploaded file (default: 524288)
   FORGE_STORAGE_LINK_TTL_SECS default signed link lifetime (default: 900)
   FORGE_STREAMS_KEY           base64 of 32+ bytes signing live-update stream names; required in production when streams are served
+  FORGE_STREAMS_PREVIOUS_KEYS up to 3 comma-separated old FORGE_STREAMS_KEY values that still verify
+                              stream names but never sign (key rotation); needs FORGE_STREAMS_KEY
   FORGE_I18N_DEFAULT_LOCALE   default locale, spelled canonically (en, pt-BR); needs config/locales/LOCALE.json
                               (default: the application's, set by forge new --locale)
   FORGE_OPENAPI_ENABLED       true serves GET /openapi.json in production too; false never

@@ -150,6 +150,7 @@ from env files, Kubernetes manifests and unit files.
 | `FORGE_STORAGE_LINK_TTL_SECS` | `900` | Default lifetime of signed links, `1` to `604800`. |
 | `FORGE_I18N_DEFAULT_LOCALE` | the application's `DEFAULT_LOCALE` (`forge new --locale`, else `en`) | The locale requests that ask for no available locale get, and the one production shows for a missing translation. A locale such as `en` or `pt-BR`, spelled canonically; `config/locales/LOCALE.json` must exist or start-up fails ([i18n](i18n.md)). |
 | `FORGE_STREAMS_KEY` | none | HMAC key of signed live-update stream names: base64 (standard or URL-safe, padded or not) of at least 32 random bytes, as `openssl rand -base64 32` prints; the same on every replica. Redacted. **Required in `production` by applications that serve live updates** (`scaffold --broadcast`); development and test use a random per-process key ([views](views.md#live-updates)). |
+| `FORGE_STREAMS_PREVIOUS_KEYS` | none | While `FORGE_STREAMS_KEY` is rotated: up to 3 older keys, comma-separated, in the same format. They only verify, so pages open during the rotation keep updating; the current key always signs. Remove them after the token lifetime (24 hours by default). Redacted; an error names the entry's position, never the key. Needs `FORGE_STREAMS_KEY` ([rotating the key](deployment.md#rotating-the-stream-signing-key)). |
 | `FORGE_TELEMETRY_*` | on, exporting nothing | Traces, metrics and log export ([observability](observability.md#configuration)). The ones operators set most: `FORGE_TELEMETRY_METRICS_ADDR` (separate Prometheus listener; in a container `0.0.0.0:9464` with `FORGE_TELEMETRY_METRICS_PUBLIC=true` and the port kept off the internet), `FORGE_TELEMETRY_EXPORTER=otlp` and `FORGE_TELEMETRY_LOGS_EXPORTER=otlp` with `FORGE_TELEMETRY_OTLP_ENDPOINT` (`https` in production unless `FORGE_TELEMETRY_OTLP_ALLOW_PLAINTEXT=true`), `FORGE_TELEMETRY_OTLP_HEADERS` (secret, redacted), `FORGE_TELEMETRY_SERVICE_NAME`, `FORGE_TELEMETRY_TRUST_TRACEPARENT` (only behind a gateway that sets or sanitizes `traceparent`). `FORGE_TELEMETRY_ENABLED=false` turns it off. |
 
 Logs go to standard output, and the platform (Docker, Kubernetes, journald)
@@ -570,24 +571,34 @@ its slot until a write fails, at most until the 30 minute maximum age
 
 ### Rotating the stream signing key
 
-Generated applications sign stream names with `FORGE_STREAMS_KEY` only.
-Rotating it invalidates the stream URL of every page already open: on its
-next reconnect (at the latest after 30 minutes) such a page gets `403` and
-stops updating live until it is reloaded. Nothing else breaks, and pages
-loaded afterwards work. Rotate during a quiet period:
+Changing `FORGE_STREAMS_KEY` alone invalidates the stream URL of every page
+already open: on its next reconnect (at the latest after 30 minutes) such a
+page gets `403` and stops updating live until it is reloaded. To rotate
+without that, move the old key to `FORGE_STREAMS_PREVIOUS_KEYS`
+(comma-separated, at most 3, same format). Previous keys only verify, the new
+key signs:
+
+`NEW_STREAMS_KEY=$(openssl rand -base64 32)` creates the new key.
 
 ```sh
-export FORGE_STREAMS_KEY=$(openssl rand -base64 32)   # the new key, on every replica
-# redeploy every replica with it; replicas with different keys refuse each other's pages
+# step 1: every replica learns the new key, but still signs with the old one
+export FORGE_STREAMS_KEY=$OLD_STREAMS_KEY
+export FORGE_STREAMS_PREVIOUS_KEYS=$NEW_STREAMS_KEY
+# redeploy every replica, then
+# step 2: sign with the new key; the old one keeps verifying pages already open
+export FORGE_STREAMS_KEY=$NEW_STREAMS_KEY
+export FORGE_STREAMS_PREVIOUS_KEYS=$OLD_STREAMS_KEY
+# redeploy every replica; after the token lifetime (24 hours by default,
+# up to 7 days with Signer::with_ttl) unset FORGE_STREAMS_PREVIOUS_KEYS and redeploy
 ```
 
-To keep open pages working across a rotation, build the signer yourself in
-`src/adapters/http/streams.rs` with
-`forge::broadcast::Signer::new(&new_key, &[&old_key])`, which signs with the
-new key and still verifies the old one, keep the old key for at least the
-token lifetime (24 hours), then remove it. A `FORGE_STREAMS_PREVIOUS_KEYS`
-setting will come to Forge-Rust and Forge-Go together
-([parity follow-ups](rails-parity.md#parity-follow-ups)).
+Two steps keep a rolling redeploy safe: after step 1 every replica already
+accepts the new key, so a page signed by a replica that finished step 2 keeps
+updating when it reconnects to one that has not.
+
+Both variables are redacted, errors
+name an entry's position and never a key, and previous keys without a current
+key are refused. See [views](views.md#rotating-the-stream-signing-key).
 
 ## forge deploy
 
@@ -1013,8 +1024,16 @@ volume, so it resumes routing after a restart. It:
   client cannot hold a drain open. WebSocket applications should ping more
   often than that. There is no total time limit per connection: like
   nginx's `send_timeout`, a client that reads or sends a little in every
-  interval keeps its connection, bounded only by the 10,000 connections per
-  listener (no per-address limit);
+  interval keeps its connection, bounded only by `-max-connections` (no
+  per-address limit);
+- bounds what one client can make it hold: request lines and headers up to
+  `-max-header-bytes` (64 KiB by default, `4096` to `1048576`; larger ones get
+  `431` and the connection is closed), and at most `-max-connections` open
+  connections on each listener (10,000 by default, at least 1; further clients
+  wait in the kernel's listen backlog until one closes). Both are flags of
+  `forge-proxy run`, with the same names, defaults and range as Forge-Go's,
+  and every `forge deploy setup` uses the defaults; `config/deploy.yml` does
+  not expose them. Try them with `cargo run -p forge-proxy -- run -h`;
 - tunnels protocol upgrades (WebSocket) and counts them as in flight, so a
   switch drains them; refuses `CONNECT`;
 - writes JSON access logs (service, host, method, path without query,

@@ -364,7 +364,11 @@ name) measures statement coverage with `go test -coverpkg`; see its
 
 - **Tokens:** round trips, byte-for-byte equality with tokens Forge-Go
   printed, forged/tampered/foreign-key/oversized/padded tokens invalid, expiry
-  at the exact second (an expired forgery stays invalid), key rotation,
+  at the exact second (an expired forgery stays invalid), key rotation
+  (`FORGE_STREAMS_PREVIOUS_KEYS`: a token signed with the old key verifies
+  after rotation, a new token is signed with the new key, previous keys
+  without a current key, more than 3, an empty, non-base64 or short entry
+  are refused without echoing a key),
   `FORGE_STREAMS_KEY` required in production only and never echoed.
 - **Handler:** one identical `403` for every invalid token, `401`/`403`/`503`
   from the access policy, another tenant (member, principal or anonymous)

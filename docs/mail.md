@@ -198,6 +198,15 @@ images only from the preview itself and `data:` URIs (`img-src 'self' data:`):
 remote images and fonts are not loaded, so opening a preview does not contact
 any server. Inline `cid:` images work.
 
+The preview pages (the index and one per preview) have a single inline
+stylesheet and allow it by its SHA-256 hash (`style-src 'sha256-...'`, computed
+from the exact bytes served), not by `'unsafe-inline'`. The one response that
+keeps `style-src 'unsafe-inline'` is the HTML part of your message in the
+sandboxed frame: its `style` attributes and `<style>` blocks are the mailer's
+own (email clients need them), so they cannot be hashed. That frame still runs
+no script, loads nothing but its own inline images and submits no form. The
+text part, raw source, attachments and errors allow no style at all.
+
 ## Testing
 
 ```rust

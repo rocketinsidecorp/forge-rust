@@ -24,6 +24,10 @@ the work is finished and waiting for its review; **Planned** means not started.
 | Session idle timeout | (gems, e.g. Devise `timeoutable`) | Done ([forge-go#62](https://github.com/rocketinsidecorp/forge-go/pull/62): `FORGE_AUTH_SESSION_IDLE_TIMEOUT`, default 2h; `last_seen_at` written at most once a minute) | Done (`FORGE_AUTH_SESSION_IDLE_TIMEOUT`, default 2h, `5m` to `720h`; `forge_sessions.last_seen_at` written at most once a minute, migration `00000000000000000006_forge_session_idle_timeout`, [forge-rust#75](https://github.com/rocketinsidecorp/forge-rust/issues/75); see follow-ups) |
 | CSRF token masked per render (BREACH) | `masked_authenticity_token` | Done ([forge-go#62](https://github.com/rocketinsidecorp/forge-go/pull/62): `csrf.Token`, `csrf.MaskToken`) | Done (`csrf_meta`, `csrf_field`, `forge::views::mask_csrf_token`/`unmask_csrf_token`; same encoding) |
 | Production warning for a per-process attempt throttle | — | Done ([forge-go#62](https://github.com/rocketinsidecorp/forge-go/pull/62): `auth.MemoryLoginThrottler` in `NewLoginService`, `NewMFAService`, `NewRecoveryService`) | Done (`MemoryLoginThrottle` passed to the generated sign-in, reset or two-factor wiring, `Composition::warn_if_process_local_throttle`) |
+| Stream signing key rotation without breaking open pages | `MessageVerifier#rotate` | Done ([forge-go#64](https://github.com/rocketinsidecorp/forge-go/pull/64): `FORGE_STREAMS_PREVIOUS_KEYS`, at most 3, redacted, `broadcast.DecodePreviousKeys`) | Done (`FORGE_STREAMS_PREVIOUS_KEYS`, same name, separator, limit and redaction; `Signer::from_config` reads it for every generated application, [forge-rust#77](https://github.com/rocketinsidecorp/forge-rust/issues/77), [views](views.md#rotating-the-stream-signing-key)) |
+| forge-proxy bounds on request headers and connections | nginx `large_client_header_buffers`, `worker_connections` | Done ([forge-go#64](https://github.com/rocketinsidecorp/forge-go/pull/64): `-max-header-bytes` 65536, `431` above; `-max-connections` 10000 per listener) | Done (`-max-header-bytes` and `-max-connections`, same names, defaults and range, [forge-rust#77](https://github.com/rocketinsidecorp/forge-rust/issues/77), [deployment](deployment.md#forge-deploy)) |
+| Inline stylesheets allowed by hash, not `'unsafe-inline'` | `content_security_policy` | Done ([forge-go#64](https://github.com/rocketinsidecorp/forge-go/pull/64): the welcome page, with a test that recomputes the hash) | Done (mail preview pages, with a test that recomputes the hash; the generated welcome page has no inline style; two cases stay, see follow-ups) |
+| Re-vendor after `forge generate` | — | Done ([forge-go#64](https://github.com/rocketinsidecorp/forge-go/pull/64): `go mod vendor` in an application with `vendor/`, never on `--dry-run`) | Not applicable (`forge new` sets up no vendoring and no generator changes `Cargo.toml` or `Cargo.lock`; a test runs every generator against a vendored application, [cli](cli.md#forge-generate-modelcontrollermailerjob-and-forge-destroy)) |
 | Bounded memory-hard password hashing | — | Not needed (PBKDF2, no per-hash memory) | In review (`forge::auth::PasswordWorkLimiter`: one Argon2id hash per CPU, at most 16, then `503`) |
 | Client address behind trusted proxies | `request.remote_ip`, `trusted_proxies` | Done (`FORGE_HTTP_TRUSTED_PROXIES`, ADR 0037) | Done (`FORGE_HTTP_TRUSTED_PROXIES`, ADR 0032; `forge deploy` sets it for the proxied role, [ADR 0042](adr/0042-forge-deploy.md)) |
 | `HEAD` on every `GET` route | `HEAD` routed to `GET` | Done (`http.ServeMux`) | In review (the router serves `HEAD` with the `GET` route unless a `HEAD` route exists, the server drops the body, `Allow` lists `HEAD`) |
@@ -262,15 +266,45 @@ the work is finished and waiting for its review; **Planned** means not started.
   key files, which Forge-Go accepts inside the directory
   ([credentials](credentials.md#compatibility-with-forge-go)).
 
-- Stream signing key rotation (ADR 0031, rocketinsidecorp/forge-rust#14):
-  both libraries verify previous keys (`Signer::new(key, previous)`,
-  `SignerOptions.PreviousKeys`), but generated applications of both read only
-  `FORGE_STREAMS_KEY`, so rotating it stops live updates on open pages until
-  they are reloaded. Add `FORGE_STREAMS_PREVIOUS_KEYS` (comma-separated,
-  validated and redacted like `FORGE_STREAMS_KEY`, at most 3) to both
-  frameworks in one change, Forge-Go first since its live updates are still in
-  review; until then the rotation procedure is in
+- Stream signing key rotation (ADR 0031, rocketinsidecorp/forge-rust#14 and
+  #77): both frameworks read `FORGE_STREAMS_PREVIOUS_KEYS` (comma-separated
+  base64 keys in the format of `FORGE_STREAMS_KEY`, at most 3, redacted,
+  errors name an entry's position and never a key; previous keys without a
+  current key are refused). Previous keys only verify, the current key signs.
+  Differences: (1) Forge-Go reads the variable in the generated
+  `htmlstreams.NewSigner`, which an application generated earlier must update
+  by hand (`streams.go` is written once); Forge-Rust reads it in
+  `Signer::from_config` and `forge_config::StreamsConfig`, so applications
+  generated earlier need no code change. (2) Forge-Rust validates the list
+  when the configuration is loaded (a bad entry stops every command, as a bad
+  `FORGE_STREAMS_KEY` does) and refuses previous keys without a current key
+  in `Signer::from_config`; Forge-Go does both in `NewSigner`, so only the
+  application's `serve` sees them. Procedure:
   [deployment](deployment.md#rotating-the-stream-signing-key).
+
+- forge-proxy limits (forge-go QG4b, audit S-8, forge-rust#77): both proxies
+  have `-max-header-bytes` (default 65536, 4096 to 1048576, `431` above it)
+  and `-max-connections` (default 10000 per listener, at least 1); neither is
+  in `config/deploy.yml`. Differences: Forge-Rust answers `431` through hyper
+  (its response has no body; Go's has a one-line text body) and closes the
+  connection in both; the head limit is the exact byte count of the request
+  line and headers, where `net/http` adds 4 KiB of read-buffer slack.
+
+- Inline styles (forge-go QG4b S-10, forge-rust#77): Forge-Go's welcome page
+  allows its one stylesheet by SHA-256 hash. Forge-Rust's generated welcome
+  page has no inline style (its policy is `style-src 'self'`, asserted by a
+  generated test), so the hash applies to the mail preview pages, which
+  compute it from the page served. Two uses cannot be hashed and keep
+  `style-src 'unsafe-inline'`: the HTML part of a previewed message (the
+  mailer's own `style` attributes and `<style>` blocks, shown in a sandboxed
+  frame that runs no script and loads nothing remote) and SVG assets
+  (`default-src 'none'; style-src 'unsafe-inline'; sandbox`, whose styles can
+  load nothing). Forge-Go has no mail preview page.
+
+- Re-vendoring after `forge generate` (forge-go QG4b D-9): Forge-Go runs `go
+  mod vendor` in an application with `vendor/`. Not applicable to Forge-Rust:
+  `forge new` sets up no vendoring and generators never change the
+  dependency set ([cli](cli.md#forge-generate-modelcontrollermailerjob-and-forge-destroy)).
 
 - Deployment ([ADR 0042](adr/0042-forge-deploy.md)): commands, flags,
   `config/deploy.yml`, `.forge/secrets`, hooks, remote layout, lock and
@@ -352,8 +386,8 @@ the work is finished and waiting for its review; **Planned** means not started.
 - Welcome page and README logo: the generated welcome page has Forge-Go's
   layout, sections, colors and text (masthead, logo, call-to-action buttons,
   health endpoints, footer) with the Forge Rust logo. Forge-Go serves it as a
-  standalone document with an inline stylesheet (`style-src
-  'unsafe-inline'`); Forge-Rust renders it in the application layout, so it
+  standalone document with an inline stylesheet (allowed by SHA-256 hash since
+  forge-go#64, [follow-ups](#parity-follow-ups)); Forge-Rust renders it in the application layout, so it
   keeps the strict Content-Security-Policy, the flash messages and Turbo, and
   its styles are the `welcome-page` section of `assets/application.css`. The
   generated README starts with the logo from `assets/` like Forge-Go's; a
