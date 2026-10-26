@@ -743,8 +743,9 @@ impl Router {
     /// method answers `405` with an `Allow` header listing the served
     /// methods in sorted order (`HEAD` included wherever `GET` is).
     ///
-    /// Before matching, every path is refused with `400` that Forge-Go's
-    /// router refuses: one holding `%2F` or `%5C` (any case) or a raw `\`,
+    /// After the [`Middleware`] layers and before matching, every routed
+    /// request whose path Forge-Go's router refuses answers `400` (layers
+    /// see the raw path first and must validate what they use): one holding `%2F` or `%5C` (any case) or a raw `\`,
     /// or a `.` or `..` segment, spelled or percent-encoded (`%2e%2e`). A
     /// `{name...}` catch-all also answers `400` when its capture starts with
     /// `/` or holds `//` (`/files//etc/passwd`); a trailing `/` is kept.
@@ -802,7 +803,7 @@ impl Router {
 }
 
 /// Forge-Go's `invalid_path` rule (`router/router.go`), applied to every
-/// request before routing: an encoded slash or backslash (`%2F`, `%5C`, any
+/// routed request (after the middleware layers) before matching: an encoded slash or backslash (`%2F`, `%5C`, any
 /// case), a raw backslash, or a `.` or `..` segment, spelled or
 /// percent-encoded. A capture holding one could smuggle a separator past
 /// routing or climb out of a directory a handler joins it to.
