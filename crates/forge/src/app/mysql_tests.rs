@@ -9,7 +9,8 @@ use std::sync::{
 };
 
 use super::lifecycle_tests::{
-    RunBoxed as _, config, free_port, raise, request, serialized, start, wait_until_serving,
+    Bound, EPHEMERAL, METRICS_ADDR, RunBoxed as _, config, raise, request, serialized, start,
+    wait_until_serving,
 };
 use super::*;
 use forge_http::{Response, StatusCode};
@@ -121,8 +122,6 @@ fn serve_over_mysql_answers_readiness_and_stops_on_sigterm() {
     let test = runtime
         .block_on(TestDatabase::create_empty())
         .expect("needs FORGE_TEST_MYSQL_URL");
-    let port = free_port();
-    let metrics = free_port();
     let app = App::new("demo")
         .mysql(migrations())
         .routes(|router| {
@@ -140,15 +139,13 @@ fn serve_over_mysql_answers_readiness_and_stops_on_sigterm() {
         app,
         &["serve"],
         vec![
-            ("FORGE_HTTP_ADDR", format!("127.0.0.1:{port}")),
-            (
-                "FORGE_TELEMETRY_METRICS_ADDR",
-                format!("127.0.0.1:{metrics}"),
-            ),
+            ("FORGE_HTTP_ADDR", "127.0.0.1:0".to_owned()),
+            (METRICS_ADDR, EPHEMERAL.to_owned()),
             ("FORGE_DATABASE_URL", test.url().expose().to_owned()),
             ("FORGE_HTTP_SHUTDOWN_TIMEOUT", "2s".to_owned()),
         ],
     );
+    let (port, metrics) = (running.port(Bound::Http), running.port(Bound::Metrics));
 
     assert_eq!(wait_until_serving(&running, port, "/marker").status, 200);
     let ready = request(port, "GET", "/health/ready").expect("readiness");

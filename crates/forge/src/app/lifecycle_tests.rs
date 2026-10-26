@@ -8,12 +8,14 @@
 //! process.
 
 use std::{
+    cell::RefCell,
     io::Read as _,
-    net::{TcpListener as StdListener, TcpStream},
+    net::{SocketAddr, TcpListener as StdListener, TcpStream},
     process::Command as Process,
     sync::{
         Arc, Mutex, MutexGuard, PoisonError,
         atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver, RecvTimeoutError, Sender},
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant as StdInstant},
@@ -63,12 +65,95 @@ pub(super) fn config(vars: &[(&str, &str)]) -> Result<AppConfig, ConfigError> {
     )
 }
 
-pub(super) fn free_port() -> u16 {
-    StdListener::bind("127.0.0.1:0")
-        .expect("a free port")
-        .local_addr()
-        .expect("its address")
-        .port()
+/// The variable and value with which a test asks for an ephemeral metrics
+/// listener (see [`start`]); the HTTP one takes `127.0.0.1:0` as it is.
+pub(super) const METRICS_ADDR: &str = "FORGE_TELEMETRY_METRICS_ADDR";
+pub(super) const EPHEMERAL: &str = "127.0.0.1:0";
+
+/// The listeners an application binds.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum Bound {
+    Http,
+    Metrics,
+}
+
+thread_local! {
+    /// Where the application running on this thread reports what it bound
+    /// (installed by [`start`], which runs it on a thread of its own).
+    static REPORT: RefCell<Option<Sender<(Bound, SocketAddr)>>> = const { RefCell::new(None) };
+}
+
+/// Called by `serve` and by the metrics binding right after they bound. Tests
+/// start applications on port 0 and read the address from here: probing a
+/// free port, closing it and binding it later races with every other
+/// process that binds a port (the "address already in use" flake).
+pub(super) fn listening(listener: Bound, address: SocketAddr) {
+    REPORT.with(|report| {
+        if let Some(report) = report.borrow().as_ref() {
+            let _ = report.send((listener, address));
+        }
+    });
+}
+
+/// An application running on a thread of its own, with the addresses it
+/// bound.
+pub(super) struct Running {
+    thread: JoinHandle<ExitCode>,
+    reports: Receiver<(Bound, SocketAddr)>,
+    seen: RefCell<Vec<(Bound, SocketAddr)>>,
+}
+
+impl Running {
+    pub(super) fn is_finished(&self) -> bool {
+        self.thread.is_finished()
+    }
+
+    pub(super) fn join(self) -> thread::Result<ExitCode> {
+        self.thread.join()
+    }
+
+    /// The address `listener` bound: waits for it, and fails when the process
+    /// exits first (a bind that failed) or nothing is bound within a minute.
+    pub(super) fn port(&self, listener: Bound) -> u16 {
+        let deadline = StdInstant::now() + Duration::from_secs(60);
+        loop {
+            self.drain(Duration::from_millis(10));
+            if let Some((_, address)) = self
+                .seen
+                .borrow()
+                .iter()
+                .find(|(kind, _)| *kind == listener)
+            {
+                return address.port();
+            }
+            assert!(
+                !self.thread.is_finished(),
+                "the process exited before binding {listener:?}"
+            );
+            assert!(
+                StdInstant::now() < deadline,
+                "{listener:?} was not bound in time"
+            );
+        }
+    }
+
+    /// Whether `listener` has been bound (not waiting for it).
+    pub(super) fn bound(&self, listener: Bound) -> bool {
+        self.drain(Duration::ZERO);
+        self.seen.borrow().iter().any(|(kind, _)| *kind == listener)
+    }
+
+    fn drain(&self, wait: Duration) {
+        match self.reports.recv_timeout(wait) {
+            Ok(report) => {
+                self.seen.borrow_mut().push(report);
+                while let Ok(report) = self.reports.try_recv() {
+                    self.seen.borrow_mut().push(report);
+                }
+            }
+            Err(RecvTimeoutError::Timeout | RecvTimeoutError::Disconnected) => {}
+        }
+    }
 }
 
 /// What a raw HTTP/1.1 exchange returned.
@@ -102,7 +187,7 @@ pub(super) fn request(port: u16, method: &str, path: &str) -> std::io::Result<Re
 
 /// Requests `path` until the server answers, or fails when the process
 /// exits first.
-pub(super) fn wait_until_serving(running: &JoinHandle<ExitCode>, port: u16, path: &str) -> Reply {
+pub(super) fn wait_until_serving(running: &Running, port: u16, path: &str) -> Reply {
     let deadline = StdInstant::now() + Duration::from_secs(60);
     loop {
         assert!(!running.is_finished(), "the process exited before serving");
@@ -127,16 +212,34 @@ pub(super) fn start(
     app: App,
     command: &'static [&'static str],
     vars: Vec<(&'static str, String)>,
-) -> JoinHandle<ExitCode> {
-    thread::spawn(move || {
+) -> Running {
+    let (report, reports) = mpsc::channel();
+    let thread = thread::spawn(move || {
+        REPORT.with(|slot| *slot.borrow_mut() = Some(report));
         app.run_boxed(command, move || {
+            // FORGE_TELEMETRY_METRICS_ADDR refuses port 0 on purpose (a
+            // metrics endpoint must be addressable by a scraper), so a test
+            // asking for an ephemeral one sets the field after loading.
+            let ephemeral = vars
+                .iter()
+                .any(|(key, value)| *key == METRICS_ADDR && value == EPHEMERAL);
             let vars: Vec<(&str, &str)> = vars
                 .iter()
+                .filter(|(key, value)| !(*key == METRICS_ADDR && value == EPHEMERAL))
                 .map(|(key, value)| (*key, value.as_str()))
                 .collect();
-            config(&vars)
+            let mut config = config(&vars)?;
+            if ephemeral {
+                config.telemetry.metrics_addr = Some(SocketAddr::from(([127, 0, 0, 1], 0)));
+            }
+            Ok(config)
         })
-    })
+    });
+    Running {
+        thread,
+        reports,
+        seen: RefCell::new(Vec::new()),
+    }
 }
 
 pub(super) fn marker_app() -> App {
@@ -161,7 +264,6 @@ fn sqlite_url(directory: &tempfile::TempDir) -> String {
 fn serve_runs_until_sigterm_and_stops_what_it_started() {
     let _serial = serialized();
     let directory = tempfile::tempdir().expect("tempdir");
-    let (port, metrics) = (free_port(), free_port());
     let stopped = Arc::new(AtomicBool::new(false));
     let seen = Arc::clone(&stopped);
     let app = marker_app()
@@ -177,15 +279,13 @@ fn serve_runs_until_sigterm_and_stops_what_it_started() {
         app,
         &["serve"],
         vec![
-            ("FORGE_HTTP_ADDR", format!("127.0.0.1:{port}")),
-            (
-                "FORGE_TELEMETRY_METRICS_ADDR",
-                format!("127.0.0.1:{metrics}"),
-            ),
+            ("FORGE_HTTP_ADDR", "127.0.0.1:0".to_owned()),
+            (METRICS_ADDR, EPHEMERAL.to_owned()),
             ("FORGE_DATABASE_URL", sqlite_url(&directory)),
             ("FORGE_HTTP_SHUTDOWN_TIMEOUT", "2s".to_owned()),
         ],
     );
+    let (port, metrics) = (running.port(Bound::Http), running.port(Bound::Metrics));
 
     let marker = wait_until_serving(&running, port, "/marker");
     assert_eq!((marker.status, marker.body.as_str()), (200, "marker"));
@@ -240,12 +340,12 @@ fn serve_runs_until_sigterm_and_stops_what_it_started() {
 #[test]
 fn serve_also_stops_on_sigint() {
     let _serial = serialized();
-    let port = free_port();
     let running = start(
         marker_app(),
         &["serve"],
-        vec![("FORGE_HTTP_ADDR", format!("127.0.0.1:{port}"))],
+        vec![("FORGE_HTTP_ADDR", "127.0.0.1:0".to_owned())],
     );
+    let port = running.port(Bound::Http);
     assert_eq!(wait_until_serving(&running, port, "/marker").status, 200);
 
     raise("INT");
@@ -269,7 +369,7 @@ fn serve_fails_when_an_address_is_taken() {
         marker_app(),
         &["serve"],
         vec![
-            ("FORGE_HTTP_ADDR", format!("127.0.0.1:{}", free_port())),
+            ("FORGE_HTTP_ADDR", "127.0.0.1:0".to_owned()),
             (
                 "FORGE_TELEMETRY_METRICS_ADDR",
                 format!("127.0.0.1:{taken_port}"),

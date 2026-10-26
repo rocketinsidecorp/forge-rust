@@ -12,7 +12,8 @@ use std::sync::{
 };
 
 use super::lifecycle_tests::{
-    RunBoxed as _, config, free_port, raise, request, serialized, start, wait_until_serving,
+    Bound, EPHEMERAL, METRICS_ADDR, RunBoxed as _, Running, config, raise, request, serialized,
+    start, wait_until_serving,
 };
 use super::*;
 use forge_http::{Response, StatusCode};
@@ -138,7 +139,7 @@ fn production(url: &str) -> Vec<(&'static str, String)> {
 /// would serve is stopped with `SIGTERM` and fails the test.
 fn refused_in_production(app: App, command: &'static [&'static str], url: &str) {
     let mut vars = production(url);
-    vars.push(("FORGE_HTTP_ADDR", format!("127.0.0.1:{}", free_port())));
+    vars.push(("FORGE_HTTP_ADDR", "127.0.0.1:0".to_owned()));
     let running = start(app, command, vars);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     while !running.is_finished() && std::time::Instant::now() < deadline {
@@ -196,10 +197,10 @@ fn serve_in_production_refuses_a_superuser_and_serves_the_runtime_role() {
         );
     }
 
-    let port = free_port();
     let mut vars = production(roles.runtime_url().expose());
-    vars.push(("FORGE_HTTP_ADDR", format!("127.0.0.1:{port}")));
+    vars.push(("FORGE_HTTP_ADDR", "127.0.0.1:0".to_owned()));
     let running = start(app(), &["serve"], vars);
+    let port = running.port(Bound::Http);
     assert_eq!(
         wait_until_serving(&running, port, "/health/ready").status,
         200
@@ -208,15 +209,15 @@ fn serve_in_production_refuses_a_superuser_and_serves_the_runtime_role() {
     assert_eq!(running.join().expect("serve thread"), ExitCode::SUCCESS);
 
     // Development lets an administrator serve, as local tools do.
-    let port = free_port();
     let running = start(
         app(),
         &["serve"],
         vec![
-            ("FORGE_HTTP_ADDR", format!("127.0.0.1:{port}")),
+            ("FORGE_HTTP_ADDR", "127.0.0.1:0".to_owned()),
             ("FORGE_DATABASE_URL", superuser.url().expose().to_owned()),
         ],
     );
+    let port = running.port(Bound::Http);
     assert_eq!(
         wait_until_serving(&running, port, "/health/ready").status,
         200
@@ -368,11 +369,7 @@ mod jobs {
     }
 
     /// Waits until the handler and the subscriber ran.
-    fn wait_for_work(
-        running: &std::thread::JoinHandle<ExitCode>,
-        greeted: &AtomicUsize,
-        heard: &AtomicUsize,
-    ) {
+    fn wait_for_work(running: &Running, greeted: &AtomicUsize, heard: &AtomicUsize) {
         let expected_events = usize::from(cfg!(feature = "events"));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         while greeted.load(Ordering::SeqCst) == 0 || heard.load(Ordering::SeqCst) < expected_events
@@ -397,7 +394,6 @@ mod jobs {
         let url = test.url().expose().to_owned();
         migrate(&url);
         let (greeted, heard) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
-        let port = free_port();
         let app = background_app(WorkerMode::InServe)
             .routes(|router| {
                 router.route(Method::GET, "/marker", |_| async {
@@ -410,11 +406,12 @@ mod jobs {
             app,
             &["serve"],
             vec![
-                ("FORGE_HTTP_ADDR", format!("127.0.0.1:{port}")),
+                ("FORGE_HTTP_ADDR", "127.0.0.1:0".to_owned()),
                 ("FORGE_DATABASE_URL", url),
                 ("FORGE_HTTP_SHUTDOWN_TIMEOUT", "2s".to_owned()),
             ],
         );
+        let port = running.port(Bound::Http);
         assert_eq!(wait_until_serving(&running, port, "/marker").status, 200);
         let ready = request(port, "GET", "/health/ready").expect("readiness");
         assert_eq!(ready.status, 200, "the database answers");
@@ -438,7 +435,6 @@ mod jobs {
         let url = test.url().expose().to_owned();
         migrate(&url);
         let (greeted, heard) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
-        let metrics = free_port();
         let app = background_app(WorkerMode::Dedicated)
             .compose(counting_hook(Arc::clone(&greeted), Arc::clone(&heard)));
         produce(&runtime, &test);
@@ -447,19 +443,20 @@ mod jobs {
             &["jobs", "work"],
             vec![
                 ("FORGE_DATABASE_URL", url),
-                (
-                    "FORGE_TELEMETRY_METRICS_ADDR",
-                    format!("127.0.0.1:{metrics}"),
-                ),
+                (METRICS_ADDR, EPHEMERAL.to_owned()),
                 ("FORGE_HTTP_SHUTDOWN_TIMEOUT", "2s".to_owned()),
             ],
         );
+        let metrics = running.port(Bound::Metrics);
 
         // `jobs work` serves no HTTP, only the metrics listener.
         let scrape = wait_until_serving(&running, metrics, "/metrics");
         assert_eq!(scrape.status, 200);
         wait_for_work(&running, &greeted, &heard);
-        assert!(request(free_port(), "GET", "/marker").is_err());
+        assert!(
+            !running.bound(Bound::Http),
+            "jobs work binds no HTTP listener"
+        );
 
         raise("TERM");
         assert_eq!(running.join().expect("work thread"), ExitCode::SUCCESS);
@@ -481,7 +478,6 @@ mod jobs {
         let url = test.url().expose().to_owned();
         migrate(&url);
         let (greeted, heard) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
-        let port = free_port();
         let app = background_app(WorkerMode::Dedicated)
             .routes(|router| {
                 router.route(Method::GET, "/marker", |_| async {
@@ -495,10 +491,11 @@ mod jobs {
             app,
             &["serve"],
             vec![
-                ("FORGE_HTTP_ADDR", format!("127.0.0.1:{port}")),
+                ("FORGE_HTTP_ADDR", "127.0.0.1:0".to_owned()),
                 ("FORGE_DATABASE_URL", url),
             ],
         );
+        let port = running.port(Bound::Http);
         assert_eq!(wait_until_serving(&running, port, "/marker").status, 200);
         // The job stays queued: `serve` only enqueues in this mode.
         let queued: i64 = runtime
