@@ -672,6 +672,8 @@ dependencies = [
  "forge-db",
  "forge-security",
  "forge-tenancy",
+ "getrandom 0.4.3",
+ "hmac",
  "serde",
  "serde_json",
  "sha2 0.11.1",

@@ -57,7 +57,7 @@ mod store;
 #[cfg(feature = "testing")]
 pub mod testing;
 
-pub use fetch::{FetchError, fetch, fetch_json, get_json, set_json};
+pub use fetch::{FetchError, decode_failures, fetch, fetch_json, get_json, set_json};
 pub use flight::Flight;
 #[cfg(any(feature = "mysql", feature = "postgres", feature = "sqlite"))]
 pub use forge_db::{MAX_PRUNE_ROUNDS, PruneGate};

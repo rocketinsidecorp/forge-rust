@@ -13,6 +13,9 @@ async-trait.workspace = true
 forge-config = { path = "../forge-config" }
 forge-db = { path = "../forge-db", optional = true }
 forge-tenancy = { path = "../forge-tenancy" }
+# The per-process key of the decode-failure log's key HMAC.
+getrandom.workspace = true
+hmac.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
