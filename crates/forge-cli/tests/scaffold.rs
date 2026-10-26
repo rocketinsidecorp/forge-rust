@@ -28,11 +28,12 @@
 //! ```
 
 use std::fs;
-use std::io::{Read as _, Write as _};
-use std::net::{TcpListener, TcpStream};
+use std::io::{BufRead as _, Read, Write as _};
+use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
-use std::time::Duration;
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use forge_db::sqlx;
 use forge_db::testing::TestDatabase;
@@ -755,14 +756,6 @@ fn run_the_job_workers(root: &Path, binary: &str, url: &str) {
     );
 }
 
-/// A free loopback port.
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .and_then(|listener| listener.local_addr())
-        .map(|address| address.port())
-        .unwrap_or_else(|error| panic!("free port: {error}"))
-}
-
 /// The application server; killed when dropped.
 struct Server(Child);
 
@@ -771,6 +764,95 @@ impl Drop for Server {
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
+}
+
+impl Server {
+    /// Starts `serve` on an ephemeral loopback port and returns it with the
+    /// port the server reports in its `listening` log line. Probing a free
+    /// port, closing it and handing it to the server would race with every
+    /// other process that binds a port (address already in use).
+    fn start(root: &Path, binary: &str, environment: &[(&str, &str)]) -> (Self, u16) {
+        let mut serve = command(root, binary, &["serve"], environment);
+        serve
+            .env("FORGE_HTTP_ADDR", "127.0.0.1:0")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = serve
+            .spawn()
+            .unwrap_or_else(|error| panic!("serve: {error}"));
+        let (lines, reported) = mpsc::channel::<String>();
+        // Both streams are read until the process ends, so a full pipe never
+        // blocks the server.
+        if let Some(stdout) = child.stdout.take() {
+            forward(stdout, lines.clone());
+        }
+        if let Some(stderr) = child.stderr.take() {
+            forward(stderr, lines);
+        }
+        let server = Self(child);
+        let deadline = Instant::now() + Duration::from_secs(120);
+        let mut log = String::new();
+        while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+            match reported.recv_timeout(left) {
+                Ok(line) => {
+                    if let Some(address) = listening_address(&line) {
+                        return (server, address.port());
+                    }
+                    log.push_str(&line);
+                    log.push('\n');
+                }
+                Err(_) => break,
+            }
+        }
+        panic!("the server did not report where it listens:\n{log}");
+    }
+}
+
+/// Sends every line of `stream` to `lines` until it ends.
+fn forward(stream: impl Read + Send + 'static, lines: mpsc::Sender<String>) {
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stream)
+            .lines()
+            .map_while(Result::ok)
+        {
+            // The receiver is gone once the address was read: keep draining.
+            let _ = lines.send(line);
+        }
+    });
+}
+
+/// The address of the `listening` line of the server log, in either the text
+/// (`address=127.0.0.1:3000`) or the JSON (`"address":"127.0.0.1:3000"`)
+/// format.
+fn listening_address(line: &str) -> Option<SocketAddr> {
+    if !line.contains("listening") || line.contains("metrics listening") {
+        return None;
+    }
+    let (_, rest) = line
+        .split_once("address=")
+        .or_else(|| line.split_once("\"address\":"))?;
+    rest.trim_start_matches('"')
+        .split(|character: char| character == '"' || character.is_whitespace() || character == ',')
+        .next()?
+        .parse()
+        .ok()
+}
+
+#[test]
+fn the_listening_line_names_the_address_in_both_log_formats() {
+    let text = r#"2026-10-26T09:31:53Z  INFO forge::app: listening app="demo" version="0.1.0" address=127.0.0.1:36293 trusted_proxies=0"#;
+    let json = r#"{"level":"INFO","target":"forge::app","message":"listening","address":"127.0.0.1:41000","app":"demo"}"#;
+    let metrics = r#"INFO forge::app: metrics listening on GET /metrics address=127.0.0.1:9464"#;
+    assert_eq!(
+        listening_address(text),
+        Some(([127, 0, 0, 1], 36293).into())
+    );
+    assert_eq!(
+        listening_address(json),
+        Some(([127, 0, 0, 1], 41000).into())
+    );
+    assert_eq!(listening_address(metrics), None);
+    assert_eq!(listening_address("shutdown complete"), None);
 }
 
 /// One HTTP/1.1 response.
@@ -972,35 +1054,15 @@ fn sign_in_use_a_tenant_scaffold_and_sign_out(root: &Path, binary: &str, url: &s
     assert_eq!(again.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&again.stderr).contains("already set up"));
 
-    let port = free_port();
-    let bind = format!("127.0.0.1:{port}");
-    let mut serve = command(
+    let (_server, port) = Server::start(
         root,
         binary,
-        &["serve"],
         &[
             ("FORGE_DATABASE_URL", url),
-            ("FORGE_HTTP_ADDR", &bind),
             ("FORGE_AUTH_MFA_KEY", MFA_KEY),
             ("FORGE_AUTH_SESSION_IDLE_TIMEOUT", "5m"),
         ],
     );
-    let _server = Server(
-        serve
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap_or_else(|error| panic!("serve: {error}")),
-    );
-    let mut ready = false;
-    for _ in 0..200 {
-        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            ready = true;
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    assert!(ready, "the server did not start on {bind}");
 
     let mut browser = Browser::default();
     let events = format!("/tenants/{tenant}/events");
@@ -2301,30 +2363,7 @@ fn sign_in_with_a_bearer_token_and_use_the_resource(root: &Path, binary: &str) {
         );
         assert!(created.status.success(), "{created:?}");
 
-        let port = free_port();
-        let bind = format!("127.0.0.1:{port}");
-        let mut serve = command(
-            root,
-            binary,
-            &["serve"],
-            &[("FORGE_DATABASE_URL", &url), ("FORGE_HTTP_ADDR", &bind)],
-        );
-        let server = Server(
-            serve
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .unwrap_or_else(|error| panic!("serve: {error}")),
-        );
-        let mut ready = false;
-        for _ in 0..200 {
-            if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-                ready = true;
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        assert!(ready, "the server did not start on {bind}");
+        let (server, port) = Server::start(root, binary, &[("FORGE_DATABASE_URL", &url)]);
 
         let refused = api_request(port, "GET", "/v1/products", None, None);
         assert_eq!(refused.status, 401, "{}", refused.body);
