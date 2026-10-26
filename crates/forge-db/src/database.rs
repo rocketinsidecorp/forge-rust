@@ -47,6 +47,7 @@ pub struct PoolSettings {
     max_connections: u32,
     acquire_timeout: Duration,
     statement_timeout: Option<Duration>,
+    job_announcements: bool,
 }
 
 impl PoolSettings {
@@ -98,6 +99,23 @@ impl PoolSettings {
         self
     }
 
+    /// Whether each new PostgreSQL connection sets `forge.jobs_notify = on`.
+    #[must_use]
+    pub const fn job_announcements(&self) -> bool {
+        self.job_announcements
+    }
+
+    /// Sets `forge.jobs_notify = on` on each new PostgreSQL connection, so
+    /// every job enqueued through the pool announces itself to listening
+    /// workers when it is due (forge-jobs ADR 0046; `forge::App::jobs_notify`
+    /// and `FORGE_JOBS_NOTIFY` turn it on for the application's pool).
+    /// Other backends ignore it. Default off.
+    #[must_use]
+    pub const fn with_job_announcements(mut self, on: bool) -> Self {
+        self.job_announcements = on;
+        self
+    }
+
     /// The serving pool of `config`: `FORGE_DATABASE_MAX_CONNS`,
     /// `FORGE_DATABASE_CONNECT_TIMEOUT` (the acquire timeout, which bounds
     /// opening a connection too) and `FORGE_DATABASE_STATEMENT_TIMEOUT`.
@@ -111,6 +129,7 @@ impl PoolSettings {
             },
             acquire_timeout: config.connect_timeout,
             statement_timeout: Some(config.statement_timeout),
+            job_announcements: false,
         }
     }
 }
@@ -121,6 +140,7 @@ impl Default for PoolSettings {
             max_connections: 10,
             acquire_timeout: Duration::from_secs(5),
             statement_timeout: None,
+            job_announcements: false,
         }
     }
 }
@@ -221,13 +241,8 @@ impl<B: Backend> Database<B> {
             .max_connections(settings.max_connections())
             .acquire_timeout(settings.acquire_timeout());
         let pool_options = <B as crate::backend::sealed::Hooks>::pool_options(raw, pool_options);
-        let pool_options = match settings.statement_timeout() {
-            Some(timeout) => <B as crate::backend::sealed::Hooks>::bound_statements(
-                pool_options,
-                statement_timeout_millis(timeout),
-            ),
-            None => pool_options,
-        };
+        let pool_options =
+            <B as crate::backend::sealed::Hooks>::connection_setup(pool_options, &settings);
         Ok((options, pool_options))
     }
 

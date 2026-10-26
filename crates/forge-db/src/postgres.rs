@@ -12,19 +12,33 @@ impl Hooks for Postgres {
     const SCHEME: DatabaseScheme = DatabaseScheme::Postgres;
     const TEST_URL_ENV: &'static str = "FORGE_TEST_DATABASE_URL";
 
-    fn bound_statements(
+    fn connection_setup(
         options: sqlx::pool::PoolOptions<Self>,
-        millis: u64,
+        settings: &crate::PoolSettings,
     ) -> sqlx::pool::PoolOptions<Self> {
+        let millis = settings
+            .statement_timeout()
+            .map(crate::database::statement_timeout_millis);
+        let announce = settings.job_announcements();
+        if millis.is_none() && !announce {
+            return options;
+        }
+        // One hook: SQLx keeps only the last `after_connect`.
         options.after_connect(move |connection, _| {
             Box::pin(async move {
-                // Audited: `millis` is an integer Forge computed, not input.
-                sqlx::Executor::execute(
-                    connection,
-                    sqlx::AssertSqlSafe(format!("SET statement_timeout = {millis}")),
-                )
-                .await
-                .map(|_| ())
+                if let Some(millis) = millis {
+                    // Audited: `millis` is an integer Forge computed, not input.
+                    sqlx::Executor::execute(
+                        &mut *connection,
+                        sqlx::AssertSqlSafe(format!("SET statement_timeout = {millis}")),
+                    )
+                    .await?;
+                }
+                if announce {
+                    // Read by the forge_jobs_announce trigger (forge-jobs ADR 0046).
+                    sqlx::Executor::execute(&mut *connection, "SET forge.jobs_notify = on").await?;
+                }
+                Ok(())
             })
         })
     }
