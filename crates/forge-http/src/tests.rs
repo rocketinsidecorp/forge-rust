@@ -982,7 +982,19 @@ async fn heads_are_due_within_the_read_header_timeout_and_idle_connections_withi
         kept.write_all(b"GET /health/live HTTP/1.1\r\nHost: localhost\r\n\r\n")
             .expect("first request");
         read_until(&mut kept, r#"{"status":"live"}"#);
-        std::thread::sleep(header * 2);
+        // The server must not close the idle connection within twice the
+        // read-header timeout: a read with that deadline times out instead
+        // of seeing the end of the stream.
+        kept.set_read_timeout(Some(header * 2))
+            .expect("read timeout must be settable");
+        let mut probe = [0_u8; 1];
+        let idle_read = kept.read(&mut probe);
+        assert!(
+            matches!(&idle_read, Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)),
+            "the idle connection was closed early: {idle_read:?}"
+        );
+        kept.set_read_timeout(Some(CLIENT_TIMEOUT))
+            .expect("read timeout must be settable");
         kept.write_all(b"GET /health/live HTTP/1.1\r\nHost: localhost\r\n\r\n")
             .expect("second request after an idle wait");
         let second = read_until(&mut kept, r#"{"status":"live"}"#);
