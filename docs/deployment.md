@@ -200,8 +200,17 @@ process. Run migrations as a separate deployment job/task with the migration
 credential, then start the application with only `FORGE_DATABASE_URL`
 (`forge deploy` does this with [`migrate.env`](#the-migration-credential)). The
 runtime database role should be `NOSUPERUSER`, `NOCREATEDB`, `NOCREATEROLE`,
-`NOBYPASSRLS`, and should not own application schemas. See
-[ADR 0011](adr/0011-postgresql-runtime-migration-roles-and-rls-context.md).
+`NOBYPASSRLS`, and should not own application schemas. In production `serve`,
+`jobs work` and the `jobs` operator commands refuse to start (exit 1, the
+message names the role) when it is a superuser, has `BYPASSRLS`,
+`CREATEROLE` or `REPLICATION`, is a member of such a role or of
+`pg_execute_server_program`, `pg_write_server_files` or
+`pg_read_server_files`, owns (or can `SET ROLE` to the owner of) a table with
+row-level security, or when the URL switches it to another role
+(`options=-c role=...`); see
+[Database roles](database.md#database-roles), [ADR
+0011](adr/0011-postgresql-runtime-migration-roles-and-rls-context.md) and
+[ADR 0044](adr/0044-refused-row-level-security-bypass-and-runtime-role-tests.md).
 
 ## Authentication cookies and TLS
 

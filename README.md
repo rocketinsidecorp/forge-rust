@@ -382,6 +382,42 @@ The statement timeout is PostgreSQL's `statement_timeout`, MariaDB's
 only); SQLite has none. Migrations, `setup`, `seed` and the `db` commands run
 without it ([database](docs/database.md#connection-pool-and-tls)).
 
+### Database roles (PostgreSQL)
+
+A PostgreSQL application serves as a runtime role that row-level security
+binds and that cannot change the schema, and migrates as a separate role that
+owns it ([ADR 0011](docs/adr/0011-postgresql-runtime-migration-roles-and-rls-context.md),
+[ADR 0044](docs/adr/0044-refused-row-level-security-bypass-and-runtime-role-tests.md)).
+`docker/postgres/init.sql` creates both in the Compose database
+(`app_migrator`, `app_runtime`, development-only passwords). In production
+`serve`, `jobs work` and the `jobs` commands refuse to start (exit 1, naming
+the role, never the URL) when the role `FORGE_DATABASE_URL` logs in as, or
+acts as, is a superuser, has `BYPASSRLS`, `CREATEROLE` or `REPLICATION`, is
+a member of such a role or of `pg_execute_server_program`,
+`pg_write_server_files` or `pg_read_server_files`, owns (or can `SET ROLE` to
+the owner of) a table with row-level security, or when the URL switches it to
+another role (`options=-c role=...`):
+
+```sh
+docker compose up -d db           # first start: init.sql creates app_migrator, app_runtime and the database
+FORGE_MIGRATION_DATABASE_URL='postgres://app_migrator:app_migrator@127.0.0.1:5432/shop' forge migrate
+export FORGE_DATABASE_URL='postgres://app_runtime:app_runtime@127.0.0.1:5432/shop'
+forge dev                         # serves as app_runtime
+FORGE_ENV=production FORGE_DATABASE_ALLOW_PLAINTEXT=true \
+  FORGE_DATABASE_URL='postgres://postgres:postgres@127.0.0.1:5432/shop' \
+  cargo run -- jobs status        # refused: PostgreSQL role "postgres", which is a superuser
+FORGE_ENV=production FORGE_DATABASE_ALLOW_PLAINTEXT=true \
+  FORGE_DATABASE_URL='postgres://app_runtime:app_runtime@127.0.0.1:5432/shop' \
+  cargo run -- jobs status        # accepted: the runtime role
+FORGE_TEST_DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5432/postgres \
+  forge test -- --include-ignored # repository tests as a fresh runtime role (RlsTestDatabase)
+```
+
+In production, provision the same two roles once (SQL in
+[Database roles](docs/database.md#database-roles)). There is no override
+variable; development and test are not checked, so local tools may connect
+as an administrator.
+
 ### Client addresses behind a proxy
 
 Sign-in and reset throttles, `forge::ratelimit::by_client_ip` and the

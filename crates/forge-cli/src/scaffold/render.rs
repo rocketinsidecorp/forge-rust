@@ -403,6 +403,15 @@ impl<'a> Renderer<'a> {
                 .to_owned(),
             ),
             (
+                "%%RLS_DDL_SUMMARY%%",
+                if tenant && self.backend == Backend::Postgresql {
+                    " or switch its row-level security off"
+                } else {
+                    ""
+                }
+                .to_owned(),
+            ),
+            (
                 "%%ISOLATION_SUMMARY%%",
                 if tenant {
                     ", plus tenant isolation".to_owned()

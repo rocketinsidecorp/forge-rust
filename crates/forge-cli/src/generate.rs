@@ -940,7 +940,9 @@ fn write_application(
                 },
             );
             write_file(&root.join(template.path), &content)?;
-            if template.path.starts_with(OBSERVABILITY_DIRECTORY) {
+            if template.path.starts_with(OBSERVABILITY_DIRECTORY)
+                || template.path == crate::dbclient::INIT_SCRIPT
+            {
                 make_world_readable(root, template.path)?;
             }
         }
@@ -1000,10 +1002,13 @@ fn write_application(
 /// into containers that run as other users.
 const OBSERVABILITY_DIRECTORY: &str = "observability/";
 
-/// Makes `relative` (a file below [`OBSERVABILITY_DIRECTORY`]) readable, and
-/// its directories traversable, by every user whatever the umask: the
-/// stack's containers (Grafana, Prometheus, ...) read these bind mounts as
-/// their own users. The files hold no secrets.
+/// Makes `relative` (a file below [`OBSERVABILITY_DIRECTORY`], or
+/// `docker/postgres/init.sql`) readable, and its directories traversable, by
+/// every user whatever the umask: the stack's containers (Grafana,
+/// Prometheus, ...) and the postgres image, which runs `init.sql` as its own
+/// user, read these bind mounts as their own users. The files hold no
+/// secrets (`init.sql` holds only the development-only role passwords that
+/// the generated README and `.env` files print too).
 #[cfg(unix)]
 fn make_world_readable(root: &Path, relative: &str) -> Result<(), CliError> {
     use std::os::unix::fs::PermissionsExt as _;

@@ -651,6 +651,32 @@ Scope: `forge-http`'s server (request bodies, panics, response headers,
 | Protocol downgrade (SSL stripping) after the first visit | T, I | With `FORGE_HTTP_TRANSPORT=trusted-proxy` (the production default; production refuses `plain`) every response carries `Strict-Transport-Security: max-age=31536000; includeSubDomains`, including `404`s and recovered panics; a handler's own value (for `preload`) is kept. **Residual:** `preload` is opt-in, so the very first visit can still be downgraded | `the_server_sends_hsts_only_behind_tls_termination`, `hsts_is_added_when_clients_use_https_and_a_handler_value_is_kept`, `the_transport_follows_the_environment_and_production_refuses_plain` |
 | `HEAD` answered differently from `GET`, or with a body | T | `HEAD` runs the `GET` route (layers included, so guards apply equally) unless a `HEAD` route exists; the server drops the body without polling a stream and keeps the `GET` length | `head_is_served_by_the_get_route_with_the_head_method`, `head_answers_with_the_get_headers_and_no_body`, `a_keep_alive_connection_continues_cleanly_after_head` |
 
+## Serving role and row-level security review
+
+Scope: `PgDatabase::require_row_security` (forge-db) and its wiring in the
+`forge::App` lifecycle, `forge::db::testing::RlsTestDatabase`, the PostgreSQL
+tests `forge generate scaffold` writes
+([ADR 0044](adr/0044-refused-row-level-security-bypass-and-runtime-role-tests.md),
+port of Forge-Go ADR 0046).
+
+| Threat | STRIDE | Control | Verification |
+| --- | --- | --- | --- |
+| Serving role bypasses row-level security, or can switch it off | E, I, T | Generated PostgreSQL applications serve as a runtime role (`NOSUPERUSER NOBYPASSRLS NOCREATEROLE`, owns nothing, data privileges only, no temporary tables) and migrate as a separate owner role (`FORGE_MIGRATION_DATABASE_URL`; the development roles come from `docker/postgres/init.sql`). Outside development and test, `serve`, `jobs work` and the `jobs` operator commands refuse to start (exit 1), before telemetry starts and before any composition hook receives the pool, when the login role (`session_user`) or the role in effect (`current_user`) is a superuser, has `BYPASSRLS`, `CREATEROLE` or `REPLICATION` (logical decoding reads every tenant's changes), is a member, directly or through other roles and whatever the grant's `INHERIT`/`SET` options, of a superuser, `BYPASSRLS` or `REPLICATION` role, is a member of `pg_execute_server_program`, `pg_write_server_files` or `pg_read_server_files`, or owns, or is a member of the owner of, a table with row-level security (an owner can `ALTER TABLE ... NO FORCE ROW LEVEL SECURITY`), or when the two differ (a role setting such as `options=-c role=` or `ALTER ROLE ... SET role`, which `SET ROLE NONE` undoes) (`DbError::RowSecurityBypass`). There is no override variable | `require_row_security_refuses_bypassing_roles_outside_development_and_test`, `serve_in_production_refuses_a_superuser_and_serves_the_runtime_role` (no composition hook runs before the refusal), `job_commands_in_production_refuse_a_superuser`, the scaffold end-to-end test (`jobs status` of a generated binary in production) |
+| The check itself is fooled | T, E | The role query runs in a `READ ONLY` transaction after `SET LOCAL search_path = pg_catalog`, so operators resolve to PostgreSQL's own whatever `search_path` the URL or role sets, and names `pg_catalog.pg_roles` and `pg_catalog.pg_has_role`. It fails closed: no row for the login role, rows that disagree on the session's roles, or any error (an unreachable server, a failed `SET`) refuse. The message names the role (quoted, so a role name cannot forge log lines) and the fix, never the URL | `require_row_security_ignores_a_shadowing_pg_roles_view`, `require_row_security_ignores_a_shadowing_operator` (both fail when the pin or the qualification is removed), `no_row_fails_closed`, `inconsistent_rows_fail_closed`, `an_unreachable_server_fails_closed`, `serve_in_production_fails_closed_when_the_role_cannot_be_checked`, `role_names_are_quoted_so_they_cannot_forge_log_lines` |
+| Tests prove isolation as a role production never uses | T | `RlsTestDatabase` applies the migrations as a fresh owner role and runs the generated repository tests as a fresh runtime role with `init.sql`'s default privileges; every PostgreSQL scaffold gets a test that this role cannot run `CREATE TABLE`, `CREATE TEMPORARY TABLE`, `ALTER TABLE`, `TRUNCATE`, `DROP TABLE` and, for tenant resources, `DISABLE`/`NO FORCE ROW LEVEL SECURITY` or `DROP POLICY`, and a tenant scaffold's RLS test runs as it. Roles and database are dropped afterwards, also on panic; each login is verified, so a `user=` query parameter cannot leave a test running as the administrator | `the_runtime_role_is_confined_by_row_level_security`, the generated `postgres_runtime_role_cannot_change_the_schema` and `postgres_row_level_security_isolates_tenants` (run by `postgresql_application_with_scaffolds_passes_its_gates_and_migrations_revert`) |
+| The database container cannot read `init.sql`, so the roles are never created | D | `forge new` makes `docker/postgres/init.sql` `0644` under `0755` directories whatever the umask, as the observability configuration | `bind_mounted_files_are_world_readable_whatever_the_umask` (umask 077 in a child shell) |
+
+**Residual:** row-level security stops a query that forgets its tenant
+predicate, not SQL injected into the serving process, which can call
+`set_config('forge.tenant_id', ...)` itself; ownership is judged only on
+tables with row-level security enabled when the process starts; it runs at
+startup only, and not in development or test;
+`routes` and `openapi` do not connect and are not checked; migrations that
+grant to `app_runtime` by name (the generated identity tables) do not reach
+the per-test runtime role, which keeps the broader default privileges on
+those tables, and the generated sign-in tests still run as the test server's
+user.
+
 ## Review cadence
 
 Update this model when adding a trust boundary, privileged capability, protocol,

@@ -300,6 +300,25 @@ impl DatabaseHandle {
         }
     }
 
+    /// Outside development and test, refuses a PostgreSQL pool whose role
+    /// could bypass row-level security (`PgDatabase::require_row_security`,
+    /// ADR 0044). MySQL, MariaDB and SQLite have no row-level security, so
+    /// there is nothing to refuse.
+    pub(crate) async fn require_row_security(
+        &self,
+        environment: Environment,
+    ) -> Result<(), DbError> {
+        let _ = environment;
+        match *self {
+            #[cfg(feature = "postgres")]
+            Self::Postgres(ref database) => database.require_row_security(environment).await,
+            #[cfg(feature = "mysql")]
+            Self::MySql(_) => Ok(()),
+            #[cfg(feature = "sqlite")]
+            Self::Sqlite(_) => Ok(()),
+        }
+    }
+
     /// Closes the pool, giving checked-out connections a bounded time to
     /// return.
     pub(crate) async fn close(&self) {

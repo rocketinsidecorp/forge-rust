@@ -123,6 +123,135 @@ fn an_application_command_uses_the_postgres_pool() {
     runtime.block_on(test.cleanup()).expect("cleanup");
 }
 
+/// The production settings a test server without TLS needs.
+fn production(url: &str) -> Vec<(&'static str, String)> {
+    vec![
+        ("FORGE_ENV", "production".to_owned()),
+        ("FORGE_DATABASE_URL", url.to_owned()),
+        // The test server has no TLS; these tests are about the role.
+        ("FORGE_DATABASE_ALLOW_PLAINTEXT", "true".to_owned()),
+    ]
+}
+
+/// Runs `command` in production as the role `url` names and expects it to
+/// exit by itself with a failure, before serving anything. A process that
+/// would serve is stopped with `SIGTERM` and fails the test.
+fn refused_in_production(app: App, command: &'static [&'static str], url: &str) {
+    let mut vars = production(url);
+    vars.push(("FORGE_BIND", format!("127.0.0.1:{}", free_port())));
+    let running = start(app, command, vars);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !running.is_finished() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    if !running.is_finished() {
+        raise("TERM");
+        drop(running.join());
+        panic!("{command:?} started in production as a role that bypasses row-level security");
+    }
+    assert_eq!(
+        running.join().expect("command thread"),
+        ExitCode::FAILURE,
+        "{command:?}"
+    );
+}
+
+/// Outside development and test `serve` refuses a role that could bypass
+/// row-level security (here the test server's superuser) before it listens,
+/// and serves as the runtime role (ADR 0044).
+#[test]
+#[ignore = "needs FORGE_TEST_DATABASE_URL"]
+fn serve_in_production_refuses_a_superuser_and_serves_the_runtime_role() {
+    let _serial = serialized();
+    let runtime = runtime();
+    let superuser = runtime
+        .block_on(TestDatabase::create_empty())
+        .expect("needs FORGE_TEST_DATABASE_URL");
+    let roles = runtime
+        .block_on(forge_db::testing::RlsTestDatabase::create([]))
+        .expect("needs FORGE_TEST_DATABASE_URL");
+    let app = || App::new("demo").postgres(forge_db::Migrator::DEFAULT);
+
+    let is_superuser: bool = runtime
+        .block_on(
+            sqlx::query_scalar(
+                "SELECT rolsuper FROM pg_catalog.pg_roles WHERE rolname = current_user",
+            )
+            .fetch_one(superuser.database().pool()),
+        )
+        .expect("role query");
+    if is_superuser {
+        // Refused before any composition hook sees the pool.
+        let composed = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&composed);
+        let app_with_hook = app().compose(move |_| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        });
+        refused_in_production(app_with_hook, &["serve"], superuser.url().expose());
+        assert_eq!(
+            composed.load(Ordering::SeqCst),
+            0,
+            "a hook ran before the refusal"
+        );
+    }
+
+    let port = free_port();
+    let mut vars = production(roles.runtime_url().expose());
+    vars.push(("FORGE_BIND", format!("127.0.0.1:{port}")));
+    let running = start(app(), &["serve"], vars);
+    assert_eq!(
+        wait_until_serving(&running, port, "/health/ready").status,
+        200
+    );
+    raise("TERM");
+    assert_eq!(running.join().expect("serve thread"), ExitCode::SUCCESS);
+
+    // Development lets an administrator serve, as local tools do.
+    let port = free_port();
+    let running = start(
+        app(),
+        &["serve"],
+        vec![
+            ("FORGE_BIND", format!("127.0.0.1:{port}")),
+            ("FORGE_DATABASE_URL", superuser.url().expose().to_owned()),
+        ],
+    );
+    assert_eq!(
+        wait_until_serving(&running, port, "/health/ready").status,
+        200
+    );
+    raise("TERM");
+    assert_eq!(running.join().expect("serve thread"), ExitCode::SUCCESS);
+
+    runtime.block_on(roles.cleanup()).expect("cleanup");
+    runtime.block_on(superuser.cleanup()).expect("cleanup");
+}
+
+/// A server that cannot be reached fails the check closed: production does
+/// not start to serve on an unchecked role.
+#[test]
+fn serve_in_production_fails_closed_when_the_role_cannot_be_checked() {
+    let _serial = serialized();
+    let composed = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&composed);
+    refused_in_production(
+        App::new("demo")
+            .postgres(forge_db::Migrator::DEFAULT)
+            .compose(move |_| {
+                counted.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }),
+        &["serve"],
+        "postgres://app_runtime:app_runtime@127.0.0.1:1/app",
+    );
+    assert_eq!(
+        composed.load(Ordering::SeqCst),
+        0,
+        "a hook ran before the refusal"
+    );
+}
+
 #[cfg(feature = "jobs")]
 mod jobs {
     use async_trait::async_trait;
@@ -673,5 +802,39 @@ mod jobs {
             assert!(log.contains("no composition hook set a publisher"), "{log}");
             assert!(log.contains("outbox telemetry is not recorded"), "{log}");
         }
+    }
+
+    /// `jobs work` and the operator commands use the runtime URL too, so
+    /// production refuses a superuser for them as it does for `serve`.
+    #[test]
+    #[ignore = "needs FORGE_TEST_DATABASE_URL"]
+    fn job_commands_in_production_refuse_a_superuser() {
+        let _serial = serialized();
+        let runtime = runtime();
+        let test = runtime
+            .block_on(TestDatabase::create_empty())
+            .expect("needs FORGE_TEST_DATABASE_URL");
+        let is_superuser: bool = runtime
+            .block_on(
+                sqlx::query_scalar(
+                    "SELECT rolsuper FROM pg_catalog.pg_roles WHERE rolname = current_user",
+                )
+                .fetch_one(test.database().pool()),
+            )
+            .expect("role query");
+        if is_superuser {
+            let url = test.url().expose();
+            refused_in_production(
+                background_app(WorkerMode::Dedicated),
+                &["jobs", "work"],
+                url,
+            );
+            refused_in_production(
+                background_app(WorkerMode::Dedicated),
+                &["jobs", "status"],
+                url,
+            );
+        }
+        runtime.block_on(test.cleanup()).expect("cleanup");
     }
 }

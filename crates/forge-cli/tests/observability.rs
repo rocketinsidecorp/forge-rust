@@ -178,6 +178,63 @@ fn every_application_with_docker_gets_the_stack() {
     }
 }
 
+/// The files containers read from bind mounts as their own users (the
+/// observability stack, and the postgres image running
+/// `docker/postgres/init.sql`) are `0644` under `0755` directories even
+/// when `forge new` runs under a restrictive umask. The umask is set in a
+/// child shell, never in this process, so parallel tests are unaffected.
+#[cfg(unix)]
+#[test]
+fn bind_mounted_files_are_world_readable_whatever_the_umask() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let directory = tempfile::tempdir().expect("temporary directory should be available");
+    let output = Command::new("sh")
+        .args([
+            "-c",
+            "umask 077 && exec \"$0\" \"$@\"",
+            env!("CARGO_BIN_EXE_forge"),
+            "new",
+            "shop",
+            "--database",
+            "postgresql",
+            "--skip-lockfile",
+            "--forge-path",
+            "../forge",
+        ])
+        .current_dir(directory.path())
+        .output()
+        .expect("sh should start");
+    assert!(
+        output.status.success(),
+        "forge new under umask 077: {output:?}"
+    );
+    let root = directory.path().join("shop");
+    let mode = |relative: &str| {
+        std::fs::metadata(root.join(relative))
+            .unwrap_or_else(|error| panic!("{relative}: {error}"))
+            .permissions()
+            .mode()
+            & 0o777
+    };
+    // The umask applied: a file nothing mounts stays private.
+    assert_eq!(mode("Cargo.toml"), 0o600, "umask 077 was not in effect");
+    let mounted = OBSERVABILITY_FILES
+        .iter()
+        .copied()
+        .filter(|relative| relative.starts_with("observability/"))
+        .chain(["docker/postgres/init.sql"]);
+    for relative in mounted {
+        assert_eq!(mode(relative), 0o644, "{relative} is {:o}", mode(relative));
+        let mut parent = Path::new(relative).parent();
+        while let Some(directory) = parent.filter(|path| !path.as_os_str().is_empty()) {
+            let display = directory.to_string_lossy();
+            assert_eq!(mode(&display), 0o755, "{display} is {:o}", mode(&display));
+            parent = directory.parent();
+        }
+    }
+}
+
 #[test]
 fn skip_docker_omits_the_stack() {
     let (_directory, root) = generate("shop", &["--skip-docker"]);

@@ -15,7 +15,7 @@ the work is finished and waiting for its review; **Planned** means not started.
 | HTML + JSON CRUD generator | `rails g scaffold` | Done | Done |
 | Authentication pages, password reset | `rails g authentication` | Done | Done |
 | First tenant and owner, seeds | `db:seed` | Done (`forge setup`, `forge seed`) | In review (`forge setup`, `forge seed`; the application commands `setup` and `seed` are Done) |
-| Multi-tenancy with database enforcement | (gems) | Done (PostgreSQL RLS) | Done (PostgreSQL RLS) |
+| Multi-tenancy with database enforcement | (gems) | Done (PostgreSQL RLS; `app_migrator`/`app_runtime` roles, staging and production refuse a serving role that could bypass RLS, tests run as the runtime role; Forge-Go ADR 0046) | Done (PostgreSQL RLS; `app_migrator`/`app_runtime` roles, [ADR 0011](adr/0011-postgresql-runtime-migration-roles-and-rls-context.md)); In review (production refuses a serving role that could bypass RLS, generated repository tests run as a per-test runtime role and prove it cannot run DDL, [ADR 0044](adr/0044-refused-row-level-security-bypass-and-runtime-role-tests.md); see follow-ups) |
 | TOTP MFA | (gems) | Done | Done (`FORGE_AUTH_MFA_KEY`, `/session/mfa`, `/mfa`, [ADR 0040](adr/0040-totp-multi-factor-authentication.md), [MFA](mfa.md)) |
 | Persistent jobs, cron, outbox | Solid Queue | Done | Done (framework crates); In review (`forge new` wires the job queue into PostgreSQL applications: `jobs` feature, `.jobs(WorkerMode::InServe)`, `jobs_configure`) |
 | Mailer with previews | Action Mailer | Done | Done (`forge::mail`, password-reset emails, `/_mail` previews, [ADR 0035](adr/0035-mail.md); `forge generate mailer`, [ADR 0038](adr/0038-generators-and-destroy.md)) |
@@ -89,6 +89,43 @@ the work is finished and waiting for its review; **Planned** means not started.
   `MAX_CONN_IDLE_TIME` are not ported yet (SQLx's defaults apply: no
   minimum, 30 min lifetime, 10 min idle); add them when a deployment needs
   them.
+
+- RLS defense in depth (forge-rust#70, 2026-10-26, port of Forge-Go QG1
+  and its ADR 0046): `PgDatabase::require_row_security` is Forge-Go's
+  `postgres.RequireRowSecurity`, with the same rules (login and acting role;
+  superuser, `BYPASSRLS`, `CREATEROLE`, membership in a superuser or
+  `BYPASSRLS` role; a role switch through the URL or `ALTER ROLE ... SET
+  role`), the same pinned `search_path`, qualified catalog names and
+  fail-closed result, the same environments ("every environment except
+  development and test") and no override variable, plus three rules
+  Forge-Go does not have yet, found by the independent review of
+  forge-rust#70: Forge-Rust also refuses a serving role that owns, or can
+  `SET ROLE` to the owner of, a table with row-level security (the owner can
+  `ALTER TABLE ... NO FORCE ROW LEVEL SECURITY`); `REPLICATION`, or
+  membership in a `REPLICATION` role (logical decoding reads every tenant's
+  changes); and membership in `pg_execute_server_program`,
+  `pg_write_server_files` or `pg_read_server_files`. **Forge-Go follow-up:**
+  port these three rules to `postgres.RequireRowSecurity` (being ported by
+  the maintainers, 2026-10-26). Forge-Rust also runs the check before any
+  composition hook or telemetry, as Forge-Go does inside `Open`;
+  `forge::db::testing::RlsTestDatabase` is `postgrestest.NewRLS`, and every
+  PostgreSQL scaffold gets Forge-Go's DDL-refusal test. Differences: (1)
+  Forge-Rust's `FORGE_ENV` has no `staging`, so the check runs in
+  `production`; (2) Forge-Go's generated bootstrap passes the option to
+  `postgres.Open`, Forge-Rust's `forge::App` lifecycle runs it for `serve`,
+  `jobs work` and the `jobs` operator commands, so there is no line to
+  remove from a generated bootstrap; (3) the generated sign-in tests
+  (`tests/authentication_postgres.rs`) still run as the test server's user,
+  where Forge-Go's run as `NewRLS`'s runtime role: some of them read
+  `pg_stat_activity` and lock rows across sessions as the administrator, so
+  moving them is a follow-up; (4) migrations that grant to `app_runtime` by
+  name (the generated identity tables) do not reach the per-test runtime
+  role, which keeps the broader default privileges there; (5) the
+  development `init.sql` grants sequences `USAGE, SELECT, UPDATE`, where
+  Forge-Go grants `USAGE, SELECT`; (6) Forge-Go's SQLSTATE 42883 `uuidv7()`
+  explainer is not needed: Forge-Rust generates no SQL UUID default on any
+  backend (identifiers are UUIDv7 from Rust). `docker/postgres/init.sql` is
+  now `0644` under `0755` directories whatever the umask, as Forge-Go's.
 
 - Database URLs without a host (tracked 2026-10-25, forge-rust#24): the Rust
   production guard of `db drop` treats `postgres:///shop` as a local socket

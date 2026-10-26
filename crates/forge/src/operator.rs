@@ -111,11 +111,14 @@ pub(crate) async fn run(
     Ok(out)
 }
 
-/// Connects with the runtime URL, runs `command` and prints the result.
+/// Connects with the runtime URL, refuses a role that could bypass
+/// row-level security outside development and test (ADR 0044), runs
+/// `command` and prints the result.
 pub(crate) async fn execute(
     app: &'static str,
     url: &forge_config::SecretString,
     command: JobsCommand,
+    environment: forge_config::Environment,
 ) -> Result<String, ExitCode> {
     let database = match PgDatabase::connect(url).await {
         Ok(database) => database,
@@ -124,6 +127,8 @@ pub(crate) async fn execute(
             return Err(ExitCode::FAILURE);
         }
     };
+    let handle = crate::database::DatabaseHandle::Postgres(database.clone());
+    crate::app::require_row_security(app, Some(&handle), environment).await?;
     let result = run(command, &database).await;
     database.close().await;
     result.map_err(|failure| {
