@@ -1885,6 +1885,17 @@ fn postgresql_application_lists_every_route_with_forge_routes() {
         listed("GET", "/tenants/{tenant_id}/articles"),
         "the scaffold's pages are listed:\n{table}"
     );
+    for (method, path) in [
+        ("GET", "/v1/articles"),
+        ("POST", "/v1/articles"),
+        ("PATCH", "/v1/articles/{id}"),
+        ("DELETE", "/v1/articles/{id}"),
+    ] {
+        assert!(
+            listed(method, path),
+            "the scaffold's JSON API lists {method} {path}:\n{table}"
+        );
+    }
     // Sorted by path, then method.
     let order: Vec<(&str, &str)> = rows.iter().map(|row| (row[1], row[0])).collect();
     let mut sorted = order.clone();
