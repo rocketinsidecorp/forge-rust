@@ -265,10 +265,12 @@ std::thread::sleep(Duration::from_millis(20));
 
 `crates/forge/tests/test_sleeps.rs` (the twin of Forge-Go's `test_sleeps_test.go`)
 scans test code (`tests/` directories, `tests.rs`, `*_tests.rs`, `testing.rs`,
-`suite.rs` and `#[cfg(test)]` items) for `sleep(` and fails for a sleep that has
-neither a paused clock nor a reason. It also counts the real-clock sleeps and
-pins the count in `BUDGET`: a new sleep fails the test, and removing one fails
-it until `BUDGET` is lowered, so the budget only goes down.
+`suite.rs` and `#[cfg(test)]` / `#[cfg(all(test, ...))]` items) for `sleep(` and
+fails for a sleep that has neither a paused clock nor a reason. It also counts
+the real-clock sleeps against the ceiling `BUDGET`: a new sleep fails the test,
+and when the count is below `BUDGET` the test prints a hint to lower it (and
+passes, so two branches that each remove a sleep can merge), so the budget only
+goes down.
 
 ### Fuzz harness invariants
 

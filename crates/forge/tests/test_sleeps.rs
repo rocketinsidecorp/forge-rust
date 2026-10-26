@@ -13,13 +13,15 @@
 //!   line or in the comment block directly above, saying why no fake clock or
 //!   event can replace it (a child process, a real socket, the database's
 //!   clock, a poll with a deadline). The number of them may never grow: it is
-//!   pinned by [`BUDGET`], which only goes down. A new test waits for an event
+//!   capped by [`BUDGET`], which only goes down. A new test waits for an event
 //!   (a `Notify`, a channel, a counter), polls with a deadline, or uses the
 //!   paused clock.
 //!
 //! Test code is a file under a `tests/` directory, a file named `tests.rs`,
 //! `*_tests.rs`, `testing.rs` or `suite.rs`, or an item marked
-//! `#[cfg(test)]`. The scanner reads text, like `supply_chain.rs`; its rules
+//! `#[cfg(test)]` or `#[cfg(all(test, ...))]` (other `cfg` forms, such as
+//! `any(test, feature = "testing")`, are not only test code and are not
+//! scanned). The scanner reads text, like `supply_chain.rs`; its rules
 //! are functions with their own tests below, so each bypass it closes stays
 //! closed.
 
@@ -28,9 +30,9 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// The number of real-clock sleeps in test code. Lower it when a sleep goes
-/// away; the gate fails when the count differs from it, so that the budget
-/// cannot hide slack that a new sleep could use.
+/// The most real-clock sleeps test code may hold. The gate fails above it and
+/// prints a hint when the count is below it: lower it when a sleep goes away,
+/// so that the slack cannot be used by a new sleep.
 const BUDGET: usize = 101;
 
 /// Directories that hold no workspace test code.
@@ -77,7 +79,8 @@ fn cfg_test_lines(lines: &[&str]) -> Vec<bool> {
     let mut inside = vec![false; lines.len()];
     let mut index = 0;
     while index < lines.len() {
-        if lines[index].trim() != "#[cfg(test)]" {
+        let marker = lines[index].trim();
+        if marker != "#[cfg(test)]" && !marker.starts_with("#[cfg(all(test,") {
             index += 1;
             continue;
         }
@@ -275,11 +278,14 @@ fn every_real_clock_sleep_in_a_test_says_why_and_the_budget_never_grows() {
         "{real} real-clock sleeps in tests, over the budget of {BUDGET}: remove one, or use a fake \
          clock or an event (docs/test-strategy.md)"
     );
-    assert_eq!(
-        real, BUDGET,
-        "{real} real-clock sleeps in tests, under the budget of {BUDGET}: lower BUDGET to {real} \
-         in crates/forge/tests/test_sleeps.rs, so the budget only goes down"
-    );
+    if real < BUDGET {
+        // A ceiling, not an equality: two branches that each remove a sleep
+        // must not turn main red when both merge.
+        eprintln!(
+            "{real} real-clock sleeps in tests, under the budget of {BUDGET}: lower BUDGET to {real} \
+             in crates/forge/tests/test_sleeps.rs, so the budget only goes down"
+        );
+    }
 }
 
 #[test]
@@ -373,6 +379,11 @@ fn only_test_code_is_scanned_and_only_calls_count() {
     // A one-line `#[cfg(test)]` item does not swallow the code after it.
     let single = "#[cfg(test)]\nuse std::time::Duration;\n\nfn run() {\n    sleep(D);\n}\n";
     assert!(sleeps("crates/x/src/lib.rs", single).is_empty());
+    // `cfg(all(test, ...))` is test code too; `any(test, ...)` is not.
+    let all = "#[cfg(all(test, unix))]\nmod tests {\n    fn t() {\n        sleep(D);\n    }\n}\n";
+    assert_eq!(sleeps("crates/x/src/lib.rs", all).len(), 1);
+    let any = "#[cfg(any(test, feature = \"testing\"))]\nfn helper() {\n    sleep(D);\n}\n";
+    assert!(sleeps("crates/x/src/lib.rs", any).is_empty());
     // File names that mean test code.
     for name in [
         "crates/x/src/a_tests.rs",
