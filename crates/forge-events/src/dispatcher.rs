@@ -22,7 +22,10 @@ use crate::{
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct DispatcherSettings {
-    /// Events claimed per round trip (1 to 1000, default 50).
+    /// Events claimed per round trip (1 to 1000, default 10, Forge-Go's
+    /// `DispatcherOptions.BatchSize` default). They are published one after
+    /// another, so a slow publication delays the rest of its batch; 10 keeps
+    /// that wait short and still claims a tenth as often as one at a time.
     pub batch: u16,
     /// Wait between claims while the outbox is empty, jittered (default 1 s).
     pub poll_interval: Duration,
@@ -37,7 +40,7 @@ pub struct DispatcherSettings {
 impl Default for DispatcherSettings {
     fn default() -> Self {
         Self {
-            batch: 50,
+            batch: 10,
             poll_interval: Duration::from_secs(1),
             publish_timeout: Duration::from_secs(10),
             max_attempts: 20,
