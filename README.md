@@ -392,8 +392,11 @@ owns it ([ADR 0011](docs/adr/0011-postgresql-runtime-migration-roles-and-rls-con
 (`app_migrator`, `app_runtime`, development-only passwords). In production
 `serve`, `jobs work` and the `jobs` commands refuse to start (exit 1, naming
 the role, never the URL) when the role `FORGE_DATABASE_URL` logs in as, or
-acts as, is a superuser, has `BYPASSRLS` or `CREATEROLE`, is a member of such
-a role, or when the URL switches it to another role (`options=-c role=...`):
+acts as, is a superuser, has `BYPASSRLS`, `CREATEROLE` or `REPLICATION`, is
+a member of such a role or of `pg_execute_server_program`,
+`pg_write_server_files` or `pg_read_server_files`, owns (or can `SET ROLE` to
+the owner of) a table with row-level security, or when the URL switches it to
+another role (`options=-c role=...`):
 
 ```sh
 docker compose up -d db           # first start: init.sql creates app_migrator, app_runtime and the database

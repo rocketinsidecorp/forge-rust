@@ -26,11 +26,20 @@ earlier on a `search_path` setting can make the check's comparisons lie.
    `PgDatabase::require_row_security(environment)` (forge-db) does nothing in
    `development` and `test` and otherwise fails with
    `DbError::RowSecurityBypass` when the login role (`session_user`) or the
-   role in effect (`current_user`) is a superuser, has `BYPASSRLS` or
+   role in effect (`current_user`) is a superuser, has `BYPASSRLS`,
    `CREATEROLE` (before PostgreSQL 16 it can grant itself a `BYPASSRLS`
-   membership), or is a member, directly or through other roles, of a
-   superuser or `BYPASSRLS` role (`pg_has_role(..., 'MEMBER')`, whatever the
-   grant's `INHERIT` and `SET` options). It also fails when the two differ: a
+   membership) or `REPLICATION` (with `wal_level=logical`, logical decoding
+   reads every tenant's changes); is a member, directly or through other
+   roles, of a superuser, `BYPASSRLS` or `REPLICATION` role
+   (`pg_has_role(..., 'MEMBER')`, whatever the grant's `INHERIT` and `SET`
+   options); is a member of `pg_execute_server_program`,
+   `pg_write_server_files` or `pg_read_server_files` (paths to superuser, or
+   to every tenant's data files); or owns, or is a member of the owner of, a
+   table of the database with row-level security enabled
+   (`pg_catalog.pg_class.relrowsecurity`), because an owner can run `ALTER
+   TABLE ... NO FORCE ROW LEVEL SECURITY` and then read every tenant (found
+   by the independent review of this ADR's first version; Forge-Go shares
+   the gap and ports the rule). It also fails when the two differ: a
    role setting (`options=-c role=...`, `ALTER ROLE ... SET role`) makes the
    session act as another role and `SET ROLE NONE` returns it to the login
    role, so the URL must log in as the serving role itself. The environments
@@ -39,7 +48,8 @@ earlier on a `search_path` setting can make the check's comparisons lie.
 2. **The query cannot be shadowed.** It runs in a `READ ONLY` transaction
    that first runs `SET LOCAL search_path = pg_catalog`, so operators resolve
    to PostgreSQL's own whatever `search_path` the URL or the role sets, and
-   it names `pg_catalog.pg_roles` and `pg_catalog.pg_has_role` explicitly.
+   it names `pg_catalog.pg_roles`, `pg_catalog.pg_class` and
+   `pg_catalog.pg_has_role` explicitly.
 3. **Fail closed.** No row for the login role, rows that disagree on the
    session's roles, or any error (an unreachable server, a failed `SET`)
    refuses. The message names the role and the fix (log in as a
@@ -48,9 +58,11 @@ earlier on a `search_path` setting can make the check's comparisons lie.
    they cannot forge log lines.
 4. **Wired by the bootstrap ring.** The check is an infrastructure method of
    forge-db; the `forge::App` lifecycle, Forge-Rust's bootstrap, calls it
-   on the composed pool before `serve` listens, before `jobs work` starts its
-   workers and before the `jobs` operator commands query, and exits with
-   status 1 (closing the pool) when it refuses. `routes` and `openapi` only inspect the composition and do not
+   on the pool as soon as it is created, for `serve` and `jobs work` before
+   telemetry starts and before any composition hook receives the pool (as
+   Forge-Go checks inside `Open`), and for the `jobs` operator commands
+   before they query, and exits with status 1 (closing the pool) when it
+   refuses. `routes` and `openapi` only inspect the composition and do not
    connect. MySQL, MariaDB and SQLite have no row-level security, so nothing
    is checked for them. As in Forge-Go there is no override variable.
 5. **Tests run as the runtime role.** `forge::db::testing::RlsTestDatabase`
@@ -80,8 +92,9 @@ earlier on a `search_path` setting can make the check's comparisons lie.
 - The generated tests prove what production relies on: the policies hold for
   the serving role and that role cannot change the schema.
 - The check runs once at startup; a role changed afterwards is not noticed
-  until the next start. It does not refuse a serving role that owns tables
-  (`FORCE` still applies to an owner, but an owner can switch it off).
+  until the next start. Ownership is judged on tables with row-level
+  security only: a serving role may own a table without it, which no policy
+  protects anyway.
 - Row-level security stops a query that forgets its tenant predicate, not SQL
   injected into the serving process, which can set `forge.tenant_id` itself.
 - Migrations that grant to `app_runtime` by name (the generated identity

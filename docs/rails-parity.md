@@ -97,7 +97,17 @@ the work is finished and waiting for its review; **Planned** means not started.
   `BYPASSRLS` role; a role switch through the URL or `ALTER ROLE ... SET
   role`), the same pinned `search_path`, qualified catalog names and
   fail-closed result, the same environments ("every environment except
-  development and test") and no override variable;
+  development and test") and no override variable, plus three rules
+  Forge-Go does not have yet, found by the independent review of
+  forge-rust#70: Forge-Rust also refuses a serving role that owns, or can
+  `SET ROLE` to the owner of, a table with row-level security (the owner can
+  `ALTER TABLE ... NO FORCE ROW LEVEL SECURITY`); `REPLICATION`, or
+  membership in a `REPLICATION` role (logical decoding reads every tenant's
+  changes); and membership in `pg_execute_server_program`,
+  `pg_write_server_files` or `pg_read_server_files`. **Forge-Go follow-up:**
+  port these three rules to `postgres.RequireRowSecurity` (being ported by
+  the maintainers, 2026-10-26). Forge-Rust also runs the check before any
+  composition hook or telemetry, as Forge-Go does inside `Open`;
   `forge::db::testing::RlsTestDatabase` is `postgrestest.NewRLS`, and every
   PostgreSQL scaffold gets Forge-Go's DDL-refusal test. Differences: (1)
   Forge-Rust's `FORGE_ENV` has no `staging`, so the check runs in

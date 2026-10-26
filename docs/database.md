@@ -101,14 +101,22 @@ pool (`PgDatabase::require_row_security`), and exit with status 1 when either
 - is a superuser or has `BYPASSRLS`;
 - has `CREATEROLE` (before PostgreSQL 16 it can grant itself membership in a
   `BYPASSRLS` role);
-- is a member, directly or through other roles, of a superuser or
-  `BYPASSRLS` role (it could `SET ROLE` to it);
+- has `REPLICATION` (with `wal_level=logical`, logical decoding reads every
+  tenant's changes);
+- is a member, directly or through other roles, of a superuser, `BYPASSRLS`
+  or `REPLICATION` role (it could `SET ROLE` to it);
+- is a member of `pg_execute_server_program`, `pg_write_server_files` or
+  `pg_read_server_files` (paths to superuser, or to the data files);
+- owns, or is a member of the owner of, a table with row-level security (an
+  owner can `ALTER TABLE ... NO FORCE ROW LEVEL SECURITY` and read every
+  tenant), so never grant the migration role to the runtime role;
 
 or when the two differ: a role setting (`?options=-c%20role%3D...`,
 `ALTER ROLE ... SET role`) makes the session act as another role, and
 `SET ROLE NONE` turns it back into the login role, so the URL must log in as
 the serving role itself. The query runs in a `READ ONLY` transaction with
-`SET LOCAL search_path = pg_catalog` and qualified catalog names, so a view
+`SET LOCAL search_path = pg_catalog` and qualified catalog names
+(`pg_catalog.pg_roles`, `pg_catalog.pg_class`, `pg_catalog.pg_has_role`), so a view
 or operator earlier on a `search_path` setting cannot hide anything, and any
 failure to run it (an unreachable server included) refuses too. The error
 (`DbError::RowSecurityBypass`, code `row_security_bypass`) names the role and
@@ -118,24 +126,25 @@ the fix, never the URL:
 the database role bypasses row-level security: refusing to serve outside
 development and test as PostgreSQL role "postgres", which is a superuser; set
 FORGE_DATABASE_URL to log in directly as a NOSUPERUSER NOBYPASSRLS
-NOCREATEROLE runtime role with only data privileges and migrate with
-FORGE_MIGRATION_DATABASE_URL (docs/database.md, "Database roles")
+NOCREATEROLE NOREPLICATION runtime role that owns no table and has only data
+privileges, and migrate with FORGE_MIGRATION_DATABASE_URL (docs/database.md,
+"Database roles")
 ```
 
-There is no override variable. Development and test are not checked, so
-local tools may connect as an administrator; `routes` and `openapi` do not
-connect. The check does not refuse a role that owns tables: `FORCE` still
-applies to an owner, but an owner can switch it off, so keep the serving role
-separate from the migration role. MySQL, MariaDB and SQLite have no
-row-level security and nothing is checked.
+There is no override variable. The check runs as soon as the pool exists,
+before telemetry starts and before any `App::compose` hook receives the pool.
+Development and test are not checked, so local tools may connect as an
+administrator; `routes` and `openapi` do not connect. Owning a table without
+row-level security is allowed (no policy protects it anyway). MySQL, MariaDB
+and SQLite have no row-level security and nothing is checked.
 
 **Provisioning in production.** Create the equivalent of `init.sql` once, as
 an administrator, then migrate with the migration role and serve with the
 runtime role only:
 
 ```sql
-CREATE ROLE shop_migrator LOGIN PASSWORD '...' NOSUPERUSER NOCREATEROLE NOBYPASSRLS;
-CREATE ROLE shop_runtime  LOGIN PASSWORD '...' NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS;
+CREATE ROLE shop_migrator LOGIN PASSWORD '...' NOSUPERUSER NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+CREATE ROLE shop_runtime  LOGIN PASSWORD '...' NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
 CREATE DATABASE shop OWNER shop_migrator;
 -- connected to shop:
 REVOKE CONNECT, TEMPORARY ON DATABASE shop FROM PUBLIC;
