@@ -874,6 +874,30 @@ async fn health_routes_return_json() {
     }
 }
 
+/// Installs, once, a process-wide `DEBUG` subscriber that discards its output.
+///
+/// `tracing` caches, per call site, whether any subscriber wants its events,
+/// computed when the call site first runs. While a single subscriber is
+/// registered, a thread that hits a call site for the first time decides from
+/// its own thread's subscriber alone, so a parallel test without one (no
+/// default: everything off) can switch a `debug!` call site off for the whole
+/// process, and the test that captures `DEBUG` through `set_default` never
+/// sees the event (`the_panic_message_is_logged_only_at_debug`). With this
+/// subscriber registered before any server runs, every call site is
+/// registered against one that wants `DEBUG`, whichever test runs first; each
+/// test's own `set_default` subscriber still decides what its thread logs.
+fn debug_call_sites_are_enabled() {
+    static INSTALLED: std::sync::Once = std::sync::Once::new();
+    INSTALLED.call_once(|| {
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(std::io::sink)
+            .finish();
+        // Nothing else here sets a global subscriber; if one is set, keep it.
+        let _ = tracing::subscriber::set_global_default(subscriber);
+    });
+}
+
 struct TestServer {
     addr: SocketAddr,
     shutdown: oneshot::Sender<()>,
@@ -886,6 +910,7 @@ impl TestServer {
     }
 
     async fn start_server(server: Server) -> Self {
+        debug_call_sites_are_enabled();
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("test listener must bind");
