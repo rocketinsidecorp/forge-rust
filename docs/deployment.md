@@ -127,7 +127,7 @@ from env files, Kubernetes manifests and unit files.
 | `FORGE_HTTP_READ_TIMEOUT` | `15s` | Time to send a request body; a slower body is answered `408`. |
 | `FORGE_HTTP_WRITE_TIMEOUT` | `30s` | Deadline of a request once its head is read: reading the body and the handler; past it the client gets `504`. A response write that makes no progress for this long (at least 30 seconds) ends the connection. Was `FORGE_REQUEST_TIMEOUT_SECS`, in seconds. |
 | `FORGE_HTTP_IDLE_TIMEOUT` | `60s` | How long a kept-alive connection may wait for its next request. Keep it above your load balancer's idle timeout. |
-| `FORGE_HTTP_MAX_HEADER_BYTES` | `1048576` | Largest request head (request line and headers) in bytes; a larger one is answered `431` and the connection closed. |
+| `FORGE_HTTP_MAX_HEADER_BYTES` | `1048576` | Largest request head (request line and headers) in bytes; a larger one is answered `431` and the connection closed. It also sizes each connection's read buffer (at least 8 KiB), which grows only while a head needs it: in the worst case, every open connection sending a maximal head, the server holds about `FORGE_HTTP_MAX_HEADER_BYTES` × `FORGE_MAX_CONNECTIONS` bytes (1 MiB × 10000 ≈ 10 GiB by default). There is no upper bound: lower it (`16384` suits most APIs) or lower `FORGE_MAX_CONNECTIONS` on small hosts. |
 | `FORGE_HTTP_SHUTDOWN_TIMEOUT` | `15s` | Drain deadline for in-flight requests after SIGTERM/SIGINT, a positive duration (`15s`, `1m`). |
 | `FORGE_HTTP_MAX_BODY_BYTES` | `1048576` | Maximum request body size in bytes. |
 | `FORGE_MAX_CONNECTIONS` | `10000` | Maximum concurrent connections. Extra connections wait for a slot (backpressure) instead of being served without bound. |

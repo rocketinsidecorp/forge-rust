@@ -159,7 +159,8 @@ closed). `PoolSettings::allow_row_security_bypass()` is the only opt-out
 (Forge-Go's `postgres.AllowRowSecurityBypass()`), for a pool that must
 connect as such a role on purpose: Forge uses it only for the pools that
 connect with `FORGE_MIGRATION_DATABASE_URL` (`migrate`, `rollback`, and
-application commands such as `setup` and `seed`), because the migration role
+every application command registered with `App::command`, such as `setup`
+and `seed`: they connect with the migration credential), because the migration role
 owns every table by design and `setup` creates principals the runtime role
 may only read. Development and test are not checked, so local tools may
 connect as an administrator; `routes` and `openapi` connect only if

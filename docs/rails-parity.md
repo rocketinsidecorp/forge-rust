@@ -149,7 +149,8 @@ the work is finished and waiting for its review; **Planned** means not started.
   pool but the migrator's while it is set; `PGAPPNAME` is replaced by the
   URL's `application_name`, else `forge`, as in Forge-Go; SQLx never reads
   `PGTZ`. (2) Forge-Go's `seed` and `setup` open the runtime pool and are
-  checked; Forge-Rust's application commands connect with
+  checked; Forge-Rust's application commands (every `App::command`, `setup`
+  and `seed` included) connect with
   `FORGE_MIGRATION_DATABASE_URL` (ADR 0026: `setup` creates principals the
   runtime role may only read), whose role owns the schema, so they opt out
   like the migrator. (3) A refused lazy connection surfaces as a pool

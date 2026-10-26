@@ -523,7 +523,9 @@ row-level security of such a table, or when the URL switches it to another
 role (`options=-c role=...`). Every other pool on `FORGE_DATABASE_URL`
 (`routes`, `openapi`, your own) checks each connection the same way, and a
 `PoolSettings` with no environment is checked too; the migration credential's
-pools (`migrate`, `rollback`, `setup`, `seed`) opt out, since that role owns
+pools (`migrate`, `rollback` and the application commands, `setup`, `seed`
+and your own `App::command`s, which connect with the migration credential)
+opt out, since that role owns
 the tables. No pool but the migrator's opens while `PGOPTIONS` is set (it
 would give every session a default tenant):
 
