@@ -9,6 +9,7 @@ use forge::core::{Timestamp, Uuid};
 use forge::http::{Method, Request, Response, Router, StatusCode};
 use forge::views::{
     CsrfProtection, FlashLayer, csrf_field, csrf_meta, csrf_token, csrf_verified, flash, html,
+    unmask_csrf_token,
 };
 use forge_bench::exec::block_on;
 use forge_bench::{Case, Runner};
@@ -173,7 +174,19 @@ fn html_render(cases: &mut Vec<Case>) {
                 .named_header("cookie", &format!("__Host-forge_csrf={TOKEN}"));
             let page = block_on(router.dispatch(parts.build()));
             assert_eq!(page.status(), StatusCode::OK);
-            assert!(String::from_utf8_lossy(page.body()).contains(TOKEN));
+            // The page embeds the token masked (BREACH), never the cookie's
+            // raw value; unmasked, the meta content is that value.
+            let body = String::from_utf8_lossy(page.body()).into_owned();
+            assert!(!body.contains(TOKEN));
+            let meta = body
+                .split(r#"<meta name="csrf-token" content=""#)
+                .nth(1)
+                .and_then(|rest| rest.split('"').next())
+                .unwrap_or_default();
+            assert_eq!(
+                unmask_csrf_token(meta).map(|token| token.expose().to_owned()),
+                Ok(TOKEN.to_owned())
+            );
             Box::new(move |iterations| {
                 for _ in 0..iterations {
                     black_box(block_on(router.dispatch(black_box(parts.build()))));
