@@ -20,10 +20,16 @@ use base64::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+mod aliases;
 pub mod database_url;
 mod mail;
 mod telemetry;
 
+pub use aliases::{
+    CACHE_DEFAULT_TTL_KEY, DEPRECATED_KEYS, DeprecatedKey, DeprecationNotices, HTTP_ADDR_KEY,
+    HTTP_MAX_BODY_BYTES_KEY, HTTP_SHUTDOWN_TIMEOUT_KEY, STORAGE_LINK_TTL_KEY, deprecated_keys_in,
+    deprecation_warning,
+};
 pub use mail::{
     AuthConfig, DEFAULT_SESSION_IDLE_TIMEOUT, MAIL_KEYS, MFA_KEY_BYTES, MFA_KEY_KEY, MailConfig,
     MailEndpoint, MailTransport, MailboxError, PASSWORD_RESET_URL_KEY, SESSION_IDLE_TIMEOUT_KEY,
@@ -39,6 +45,9 @@ pub use telemetry::{
 const DEFAULT_BIND: &str = "127.0.0.1:3000";
 const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_SHUTDOWN_GRACE_SECS: u64 = 15;
+/// The longest duration Forge-Go parses (an `int64` of nanoseconds, about
+/// 2562047h).
+const GO_MAX_DURATION: Duration = Duration::from_nanos(i64::MAX as u64);
 const DEFAULT_MAX_BODY_BYTES: usize = 1_048_576;
 const DEFAULT_MAX_CONNECTIONS: usize = 10_000;
 const DEFAULT_MAX_IN_FLIGHT_BODY_BYTES: usize = 256 << 20;
@@ -93,13 +102,15 @@ const DATABASE_URL_CONTRACT: &str =
 /// [`KNOWN_KEYS`]; anything else is rejected by [`AppConfig::from_env`].
 const KEY_PREFIX: &str = "FORGE_";
 
-/// Every environment variable understood by [`AppConfig::from_env`].
+/// Every environment variable understood by [`AppConfig::from_env`], by its
+/// current name. The deprecated spellings of [`DEPRECATED_KEYS`] are read
+/// too, with a warning.
 pub const KNOWN_KEYS: &[&str] = &[
     "FORGE_ENV",
-    "FORGE_BIND",
+    HTTP_ADDR_KEY,
     "FORGE_REQUEST_TIMEOUT_SECS",
-    "FORGE_SHUTDOWN_GRACE_SECS",
-    "FORGE_MAX_BODY_BYTES",
+    HTTP_SHUTDOWN_TIMEOUT_KEY,
+    HTTP_MAX_BODY_BYTES_KEY,
     "FORGE_MAX_CONNECTIONS",
     MAX_IN_FLIGHT_BODY_BYTES_KEY,
     TRUSTED_PROXIES_KEY,
@@ -117,11 +128,11 @@ pub const KNOWN_KEYS: &[&str] = &[
     "FORGE_CACHE_MAX_ENTRIES",
     "FORGE_CACHE_MAX_BYTES",
     "FORGE_CACHE_MAX_VALUE_BYTES",
-    "FORGE_CACHE_DEFAULT_TTL_SECS",
+    CACHE_DEFAULT_TTL_KEY,
     "FORGE_STORAGE_ROOT",
     "FORGE_STORAGE_SIGNING_KEY",
     "FORGE_STORAGE_MAX_UPLOAD_BYTES",
-    "FORGE_STORAGE_LINK_TTL_SECS",
+    STORAGE_LINK_TTL_KEY,
     "FORGE_STREAMS_KEY",
     STREAMS_PREVIOUS_KEYS_KEY,
     I18N_DEFAULT_LOCALE_KEY,
@@ -172,7 +183,7 @@ pub const I18N_DEFAULT_LOCALE_KEY: &str = "FORGE_I18N_DEFAULT_LOCALE";
 pub const TRUSTED_PROXIES_KEY: &str = "FORGE_HTTP_TRUSTED_PROXIES";
 
 /// The request body bytes the server holds in memory at once, across all
-/// connections. Unset it is 256 MiB, or `FORGE_MAX_BODY_BYTES` when that is
+/// connections. Unset it is 256 MiB, or `FORGE_HTTP_MAX_BODY_BYTES` when that is
 /// larger; a request whose body would exceed it gets `503` with
 /// `Retry-After`.
 pub const MAX_IN_FLIGHT_BODY_BYTES_KEY: &str = "FORGE_MAX_IN_FLIGHT_BODY_BYTES";
@@ -825,7 +836,7 @@ pub struct CacheConfig {
     /// [`MAX_CACHE_VALUE_BYTES`]).
     pub max_value_bytes: usize,
     /// Time to live used when a write passes none
-    /// (`FORGE_CACHE_DEFAULT_TTL_SECS`).
+    /// (`FORGE_CACHE_DEFAULT_TTL`, a duration from 1ms to 8760h).
     #[serde(with = "duration_seconds")]
     pub default_ttl: Duration,
 }
@@ -856,7 +867,8 @@ pub struct StorageConfig {
     pub signing_key: Option<SecretString>,
     /// Largest uploaded file (`FORGE_STORAGE_MAX_UPLOAD_BYTES`).
     pub max_upload_bytes: u64,
-    /// Default lifetime of signed links (`FORGE_STORAGE_LINK_TTL_SECS`).
+    /// Default lifetime of signed links (`FORGE_STORAGE_LINK_TTL`, a duration
+    /// from 1s to 168h).
     #[serde(with = "duration_seconds")]
     pub link_ttl: Duration,
 }
@@ -1083,9 +1095,16 @@ impl AppConfig {
     /// Supported keys are listed in [`KNOWN_KEYS`]. Loading fails closed: any
     /// other variable starting with `FORGE_` is rejected with
     /// [`ConfigError::UnknownKey`], so a typo such as `FORGE_BIDN` cannot
-    /// silently fall back to a default.
+    /// silently fall back to a default. A deprecated spelling
+    /// ([`DEPRECATED_KEYS`]) prints a one-line warning to standard error,
+    /// once per process.
     pub fn from_env() -> Result<Self, ConfigError> {
-        Self::from_vars(std::env::vars_os())
+        let vars: Vec<(OsString, OsString)> = std::env::vars_os().collect();
+        aliases::PROCESS_NOTICES.report(
+            vars.iter().filter_map(|(key, _)| key.to_str()),
+            &mut std::io::stderr(),
+        );
+        Self::from_vars(vars)
     }
 
     /// Loads configuration from an explicit set of environment variables.
@@ -1104,6 +1123,7 @@ impl AppConfig {
             let Some(known) = KNOWN_KEYS
                 .iter()
                 .copied()
+                .chain(DEPRECATED_KEYS.iter().map(|key| key.deprecated))
                 .find(|known| **known == *key_text)
             else {
                 return Err(ConfigError::UnknownKey {
@@ -1129,19 +1149,57 @@ impl AppConfig {
         if let Some(value) = lookup("FORGE_ENV") {
             config.environment = value.parse()?;
         }
-        if let Some(value) = lookup("FORGE_BIND") {
-            config.server.bind = parse_value("FORGE_BIND", &value, "a socket address")?;
+        if let Some(bind) = aliases::read_aliased(
+            &lookup,
+            HTTP_ADDR_KEY,
+            |value| {
+                parse_value(
+                    HTTP_ADDR_KEY,
+                    &value,
+                    "a socket address such as 127.0.0.1:3000",
+                )
+            },
+            |value| {
+                parse_value(
+                    "FORGE_BIND",
+                    &value,
+                    "a socket address such as 127.0.0.1:3000",
+                )
+            },
+        )? {
+            config.server.bind = bind;
         }
         if let Some(value) = lookup("FORGE_REQUEST_TIMEOUT_SECS") {
             config.server.request_timeout =
                 Duration::from_secs(parse_positive("FORGE_REQUEST_TIMEOUT_SECS", &value)?);
         }
-        if let Some(value) = lookup("FORGE_SHUTDOWN_GRACE_SECS") {
-            config.server.shutdown_grace =
-                Duration::from_secs(parse_positive("FORGE_SHUTDOWN_GRACE_SECS", &value)?);
+        if let Some(grace) = aliases::read_aliased(
+            &lookup,
+            HTTP_SHUTDOWN_TIMEOUT_KEY,
+            |value| {
+                parse_duration_within(
+                    HTTP_SHUTDOWN_TIMEOUT_KEY,
+                    value,
+                    Duration::from_millis(1)..=GO_MAX_DURATION,
+                    "a positive duration such as 15s",
+                )
+            },
+            |value| {
+                Ok(Duration::from_secs(parse_positive(
+                    "FORGE_SHUTDOWN_GRACE_SECS",
+                    &value,
+                )?))
+            },
+        )? {
+            config.server.shutdown_grace = grace;
         }
-        if let Some(value) = lookup("FORGE_MAX_BODY_BYTES") {
-            config.server.max_body_bytes = parse_positive("FORGE_MAX_BODY_BYTES", &value)?;
+        if let Some(max_body_bytes) = aliases::read_aliased(
+            &lookup,
+            HTTP_MAX_BODY_BYTES_KEY,
+            |value| parse_positive(HTTP_MAX_BODY_BYTES_KEY, &value),
+            |value| parse_positive("FORGE_MAX_BODY_BYTES", &value),
+        )? {
+            config.server.max_body_bytes = max_body_bytes;
         }
         if let Some(value) = lookup("FORGE_MAX_CONNECTIONS") {
             config.server.max_connections = parse_positive("FORGE_MAX_CONNECTIONS", &value)?;
@@ -1153,7 +1211,7 @@ impl AppConfig {
                     return Err(ConfigError::InvalidValue {
                         key: MAX_IN_FLIGHT_BODY_BYTES_KEY,
                         value,
-                        expected: "at least FORGE_MAX_BODY_BYTES",
+                        expected: "at least FORGE_HTTP_MAX_BODY_BYTES",
                     });
                 }
                 budget
@@ -1334,13 +1392,27 @@ fn apply_services(
             "an integer from 1 to 8388608",
         )?;
     }
-    if let Some(value) = lookup("FORGE_CACHE_DEFAULT_TTL_SECS") {
-        config.cache.default_ttl = Duration::from_secs(parse_bounded(
-            "FORGE_CACHE_DEFAULT_TTL_SECS",
-            &value,
-            1..=MAX_CACHE_TTL_SECS,
-            "a number of seconds from 1 to 31536000",
-        )?);
+    if let Some(ttl) = aliases::read_aliased(
+        lookup,
+        CACHE_DEFAULT_TTL_KEY,
+        |value| {
+            parse_duration_within(
+                CACHE_DEFAULT_TTL_KEY,
+                value,
+                Duration::from_millis(1)..=Duration::from_secs(MAX_CACHE_TTL_SECS),
+                "a duration such as 1h, from 1ms to 8760h",
+            )
+        },
+        |value| {
+            Ok(Duration::from_secs(parse_bounded(
+                "FORGE_CACHE_DEFAULT_TTL_SECS",
+                &value,
+                1..=MAX_CACHE_TTL_SECS,
+                "a number of seconds from 1 to 31536000",
+            )?))
+        },
+    )? {
+        config.cache.default_ttl = ttl;
     }
     if let Some(value) = lookup("FORGE_STORAGE_ROOT") {
         let trimmed = value.trim();
@@ -1375,13 +1447,27 @@ fn apply_services(
         // Validates every entry; a rejected entry is a secret and never echoed.
         config.streams.previous_keys = parse_previous_streams_keys(&value)?;
     }
-    if let Some(value) = lookup("FORGE_STORAGE_LINK_TTL_SECS") {
-        config.storage.link_ttl = Duration::from_secs(parse_bounded(
-            "FORGE_STORAGE_LINK_TTL_SECS",
-            &value,
-            1..=MAX_STORAGE_LINK_TTL_SECS,
-            "a number of seconds from 1 to 604800",
-        )?);
+    if let Some(ttl) = aliases::read_aliased(
+        lookup,
+        STORAGE_LINK_TTL_KEY,
+        |value| {
+            parse_duration_within(
+                STORAGE_LINK_TTL_KEY,
+                value,
+                Duration::from_secs(1)..=Duration::from_secs(MAX_STORAGE_LINK_TTL_SECS),
+                "a duration such as 15m, from 1s to 168h",
+            )
+        },
+        |value| {
+            Ok(Duration::from_secs(parse_bounded(
+                "FORGE_STORAGE_LINK_TTL_SECS",
+                &value,
+                1..=MAX_STORAGE_LINK_TTL_SECS,
+                "a number of seconds from 1 to 604800",
+            )?))
+        },
+    )? {
+        config.storage.link_ttl = ttl;
     }
     Ok(())
 }
@@ -1422,7 +1508,7 @@ fn validate_services(config: &AppConfig) -> Result<(), ConfigError> {
         return Err(ConfigError::InvalidValue {
             key: "FORGE_STORAGE_MAX_UPLOAD_BYTES",
             value: storage.max_upload_bytes.to_string(),
-            expected: "at most FORGE_MAX_BODY_BYTES when FORGE_STORAGE_ROOT is set",
+            expected: "at most FORGE_HTTP_MAX_BODY_BYTES when FORGE_STORAGE_ROOT is set",
         });
     }
     Ok(())
@@ -1446,6 +1532,23 @@ where
         });
     }
     Ok(parsed)
+}
+
+/// Parses a Forge-Go duration (`15s`, `1h30m`) that must lie in `range`.
+fn parse_duration_within(
+    key: &'static str,
+    value: String,
+    range: std::ops::RangeInclusive<Duration>,
+    expected: &'static str,
+) -> Result<Duration, ConfigError> {
+    match telemetry::parse_go_duration(value.trim()) {
+        Some(duration) if range.contains(&duration) => Ok(duration),
+        _ => Err(ConfigError::InvalidValue {
+            key,
+            value,
+            expected,
+        }),
+    }
 }
 
 fn parse_value<T>(key: &'static str, value: &str, expected: &'static str) -> Result<T, ConfigError>
@@ -1531,6 +1634,19 @@ pub enum ConfigError {
         /// Why it was refused.
         reason: &'static str,
     },
+    /// A setting is spelled both ways, canonical and deprecated
+    /// ([`DEPRECATED_KEYS`]), with values that differ. Neither value is
+    /// echoed.
+    #[error(
+        "{canonical} and {deprecated} are both set, to different values; {deprecated} is the \
+         deprecated spelling of {canonical}: unset it and keep {canonical}"
+    )]
+    ConflictingAlias {
+        /// The current spelling.
+        canonical: &'static str,
+        /// The deprecated spelling.
+        deprecated: &'static str,
+    },
     /// A known key contains a value that is not valid UTF-8.
     #[error("invalid value for {key}: value is not valid UTF-8")]
     NotUnicode {
@@ -1539,23 +1655,43 @@ pub enum ConfigError {
     },
 }
 
+/// A [`Duration`] as whole seconds when it has no fraction (the form older
+/// configurations hold), otherwise as an exact Forge-Go duration in
+/// nanoseconds (`"250000000ns"`): nothing is lost, and both forms (and any
+/// other Go duration such as `"1m30s"`) deserialize.
 mod duration_seconds {
     use std::time::Duration;
 
-    use serde::{Deserialize, Deserializer, Serializer};
+    use serde::{Deserialize, Deserializer, Serializer, de::Error as _};
 
     pub fn serialize<S>(value: &Duration, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
-        serializer.serialize_u64(value.as_secs())
+        if value.subsec_nanos() == 0 {
+            serializer.serialize_u64(value.as_secs())
+        } else {
+            serializer.serialize_str(&format!("{}ns", value.as_nanos()))
+        }
+    }
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Form {
+        Seconds(u64),
+        Go(String),
     }
 
     pub fn deserialize<'de, D>(deserializer: D) -> Result<Duration, D::Error>
     where
         D: Deserializer<'de>,
     {
-        Ok(Duration::from_secs(u64::deserialize(deserializer)?))
+        match Form::deserialize(deserializer)? {
+            Form::Seconds(seconds) => Ok(Duration::from_secs(seconds)),
+            Form::Go(text) => super::telemetry::parse_go_duration(&text).ok_or_else(|| {
+                D::Error::custom("expected a number of seconds or a duration such as 15s")
+            }),
+        }
     }
 }
 
@@ -1891,7 +2027,7 @@ mod tests {
                 key: "FORGE_BIDN".to_owned()
             }
         );
-        assert!(error.to_string().contains("FORGE_BIND"));
+        assert!(error.to_string().contains(HTTP_ADDR_KEY));
     }
 
     #[test]
@@ -2055,7 +2191,7 @@ mod tests {
             "production",
             "0.0.0.0:8080",
             "5",
-            "5",
+            "5s",
             "10",
             "10",
             "100",
@@ -2074,11 +2210,11 @@ mod tests {
             "100",
             "100000",
             "1024",
-            "60",
+            "60s",
             "/var/lib/app/storage",
             "dGhpcy1pcy1hLTMyLWJ5dGUtc2lnbmluZy1rZXktISE",
             "10",
-            "60",
+            "60s",
             "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=",
             "ZmVkY2JhOTg3NjU0MzIxMGZlZGNiYTk4NzY1NDMyMTA=",
             "pt-BR",
@@ -2282,6 +2418,109 @@ mod tests {
     }
 
     #[test]
+    fn canonical_keys_take_forge_go_names_and_formats() {
+        let config = load(&[
+            (HTTP_ADDR_KEY, "0.0.0.0:8080"),
+            (HTTP_MAX_BODY_BYTES_KEY, "4096"),
+            (HTTP_SHUTDOWN_TIMEOUT_KEY, "1m30s"),
+            (CACHE_DEFAULT_TTL_KEY, "250ms"),
+            (STORAGE_LINK_TTL_KEY, "15m"),
+        ])
+        .expect("canonical keys are valid");
+        assert_eq!(config.server.bind.to_string(), "0.0.0.0:8080");
+        assert_eq!(config.server.max_body_bytes, 4096);
+        assert_eq!(config.server.shutdown_grace, Duration::from_secs(90));
+        assert_eq!(config.cache.default_ttl, Duration::from_millis(250));
+        assert_eq!(config.storage.link_ttl, Duration::from_secs(900));
+        for (key, value) in [
+            (HTTP_ADDR_KEY, "localhost"),
+            (HTTP_MAX_BODY_BYTES_KEY, "0"),
+            (HTTP_SHUTDOWN_TIMEOUT_KEY, "15"),
+            (HTTP_SHUTDOWN_TIMEOUT_KEY, "0s"),
+            (HTTP_SHUTDOWN_TIMEOUT_KEY, "2562048h"),
+            (CACHE_DEFAULT_TTL_KEY, "3600"),
+            (CACHE_DEFAULT_TTL_KEY, "8761h"),
+            (STORAGE_LINK_TTL_KEY, "999ms"),
+            (STORAGE_LINK_TTL_KEY, "169h"),
+        ] {
+            let error = load(&[(key, value)]).expect_err("refused");
+            assert!(
+                matches!(error, ConfigError::InvalidValue { key: found, .. } if found == key),
+                "{key}={value}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn deprecated_spellings_are_still_read() {
+        let config = load(&[
+            ("FORGE_BIND", "0.0.0.0:8080"),
+            ("FORGE_MAX_BODY_BYTES", "4096"),
+            ("FORGE_SHUTDOWN_GRACE_SECS", "90"),
+            ("FORGE_CACHE_DEFAULT_TTL_SECS", "60"),
+            ("FORGE_STORAGE_LINK_TTL_SECS", "900"),
+        ])
+        .expect("deprecated keys are still valid");
+        assert_eq!(config.server.bind.to_string(), "0.0.0.0:8080");
+        assert_eq!(config.server.max_body_bytes, 4096);
+        assert_eq!(config.server.shutdown_grace, Duration::from_secs(90));
+        assert_eq!(config.cache.default_ttl, Duration::from_secs(60));
+        assert_eq!(config.storage.link_ttl, Duration::from_secs(900));
+        // from_vars accepts them as known keys.
+        let vars = [("FORGE_BIND", "0.0.0.0:8080")]
+            .map(|(key, value)| (OsString::from(key), OsString::from(value)));
+        let config = AppConfig::from_vars(vars).expect("a deprecated key is not unknown");
+        assert_eq!(config.server.bind.to_string(), "0.0.0.0:8080");
+    }
+
+    #[test]
+    fn both_spellings_must_agree_or_loading_fails_closed() {
+        let agreeing = load(&[
+            ("FORGE_BIND", "0.0.0.0:8080"),
+            (HTTP_ADDR_KEY, "0.0.0.0:8080"),
+            ("FORGE_SHUTDOWN_GRACE_SECS", "15"),
+            (HTTP_SHUTDOWN_TIMEOUT_KEY, "15s"),
+            ("FORGE_STORAGE_LINK_TTL_SECS", "900"),
+            (STORAGE_LINK_TTL_KEY, "15m"),
+        ])
+        .expect("the same value under both spellings is accepted");
+        assert_eq!(agreeing.server.shutdown_grace, Duration::from_secs(15));
+        for deprecated in DEPRECATED_KEYS {
+            let (old, new) = match deprecated.canonical {
+                HTTP_ADDR_KEY => ("127.0.0.1:4000", "127.0.0.1:4001"),
+                HTTP_MAX_BODY_BYTES_KEY => ("4096", "8192"),
+                _ => ("60", "61s"),
+            };
+            let error = load(&[(deprecated.deprecated, old), (deprecated.canonical, new)])
+                .expect_err("different values under both spellings are refused");
+            assert_eq!(
+                error,
+                ConfigError::ConflictingAlias {
+                    canonical: deprecated.canonical,
+                    deprecated: deprecated.deprecated,
+                }
+            );
+            let message = error.to_string();
+            assert!(message.contains(deprecated.canonical), "{message}");
+            assert!(message.contains(deprecated.deprecated), "{message}");
+            assert!(
+                !message.contains(old) && !message.contains(new),
+                "values are never echoed: {message}"
+            );
+        }
+        // An invalid value under either spelling is still an invalid value.
+        let error = load(&[("FORGE_BIND", "nope"), (HTTP_ADDR_KEY, "127.0.0.1:3000")])
+            .expect_err("invalid alias");
+        assert!(matches!(
+            error,
+            ConfigError::InvalidValue {
+                key: "FORGE_BIND",
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn service_defaults_match_the_documented_values() {
         let config = load(&[]).expect("defaults are valid");
 
@@ -2308,6 +2547,8 @@ mod tests {
             ("FORGE_STORAGE_MAX_UPLOAD_BYTES", "1073741825"),
             ("FORGE_STORAGE_LINK_TTL_SECS", "604801"),
             ("FORGE_STORAGE_LINK_TTL_SECS", "abc"),
+            (CACHE_DEFAULT_TTL_KEY, "0s"),
+            (STORAGE_LINK_TTL_KEY, "abc"),
         ] {
             let error = load(&[(key, value)]).expect_err("out of range must fail");
             assert!(
@@ -2648,6 +2889,32 @@ mod tests {
         assert!(v6.contains(v4("fd00:1::abcd")));
         assert!(!v6.contains(v4("fd00:2::1")));
         assert!(!v6.contains(v4("10.0.0.1")));
+    }
+
+    #[test]
+    fn server_durations_round_trip_without_losing_fractions() {
+        for (grace, timeout) in [
+            (Duration::from_millis(250), Duration::from_secs(30)),
+            (Duration::from_millis(1500), Duration::new(2, 1)),
+            (Duration::from_secs(15), Duration::from_nanos(1)),
+        ] {
+            let server = ServerConfig {
+                shutdown_grace: grace,
+                request_timeout: timeout,
+                ..ServerConfig::default()
+            };
+            let json = serde_json::to_string(&server).expect("serializes");
+            let back: ServerConfig = serde_json::from_str(&json).expect("deserializes");
+            assert_eq!(back, server, "{json}");
+        }
+        // Whole seconds keep the integer form older configurations hold.
+        let json = serde_json::to_string(&ServerConfig::default()).expect("serializes");
+        assert!(json.contains(r#""shutdown_grace":15"#), "{json}");
+        let go = json.replace(r#""shutdown_grace":15"#, r#""shutdown_grace":"1m30s""#);
+        let back: ServerConfig = serde_json::from_str(&go).expect("a Go duration");
+        assert_eq!(back.shutdown_grace, Duration::from_secs(90));
+        let bad = json.replace(r#""shutdown_grace":15"#, r#""shutdown_grace":"soon""#);
+        assert!(serde_json::from_str::<ServerConfig>(&bad).is_err());
     }
 
     #[test]

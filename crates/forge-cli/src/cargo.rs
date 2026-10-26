@@ -17,10 +17,21 @@ pub(crate) enum CargoCommand {
 
 impl CargoCommand {
     pub(crate) fn run(self, current_dir: &Path) -> Result<(), CliError> {
+        self.run_with(current_dir, &[])
+    }
+
+    /// [`CargoCommand::run`] with `environment` added to Cargo's (the
+    /// development environment files, for `forge test`).
+    pub(crate) fn run_with(
+        self,
+        current_dir: &Path,
+        environment: &[(String, String)],
+    ) -> Result<(), CliError> {
         let (display_name, arguments) = self.arguments();
         let status = Command::new("cargo")
             .args(arguments)
             .current_dir(current_dir)
+            .envs(environment.iter().map(|(key, value)| (key, value)))
             .status()
             .map_err(|source| CliError::SpawnCargo {
                 command: display_name,

@@ -16,6 +16,7 @@ mod dev;
 #[cfg(test)]
 mod dev_tests;
 mod doctor;
+mod envfile;
 mod error;
 #[cfg(test)]
 mod error_tests;
@@ -34,6 +35,7 @@ mod mailer;
 mod process;
 mod project;
 mod scaffold;
+mod view;
 
 use std::env;
 use std::io::{self, IsTerminal as _};
@@ -48,9 +50,11 @@ use crate::cli::{
     AppCommand, Cli, Command, ControllerArgs, CredentialsCommand, DbCommand, DeployArgs,
     DeployCommand, DestroyArgs, DestroyCommand, DestructiveArgs, GenerateCommand, I18nCommand,
     JobArgs, LockActionArg, LogsArgs, MailerArgs, MigrateView, RemoteCommon, ResourceArgs, Toggle,
+    UuidCount, ViewArgs,
 };
 use crate::controller::ControllerOptions;
 use crate::destroy::{DestroyFlags, DestroyPlan};
+use crate::envfile::DevelopmentEnvironment;
 use crate::generate::{ForgeSource, NewApplication};
 use crate::job::JobOptions;
 use crate::lifecycle::{Db, Destructive, Lifecycle};
@@ -58,6 +62,19 @@ use crate::mailer::MailerOptions;
 use crate::process::Signals;
 use crate::project::Project;
 use crate::scaffold::{Layers, ScaffoldOptions, Scope};
+
+/// What `forge id`, the deprecated spelling of `forge uuid`, prints to
+/// standard error.
+const ID_DEPRECATION: &str = "warning: `forge id` is deprecated and will be removed in the next \
+     minor version; use `forge uuid`";
+
+/// `forge uuid [--count N]`: one UUIDv7 per line, in creation order.
+fn print_uuids(count: UuidCount, output: &mut dyn io::Write) -> Result<(), CliError> {
+    for _ in 0..count.count {
+        writeln!(output, "{}", Uuid::now_v7()).map_err(CliError::Output)?;
+    }
+    Ok(())
+}
 
 /// Parses process arguments and executes the selected Forge command.
 pub fn run() -> Result<(), CliError> {
@@ -72,7 +89,13 @@ fn execute(
     output: &mut dyn io::Write,
 ) -> Result<(), CliError> {
     match command {
-        Command::Id => writeln!(output, "{}", Uuid::now_v7()).map_err(CliError::Output),
+        Command::Uuid { count } => print_uuids(count, output),
+        Command::Id { count } => {
+            use std::io::Write as _;
+            // A warning must never fail the command.
+            let _ = writeln!(io::stderr(), "{ID_DEPRECATION}");
+            print_uuids(count, output)
+        }
         Command::New {
             name,
             skip_docker,
@@ -198,6 +221,12 @@ fn execute(
                 }
                 write!(output, "{}", outcome.wiring).map_err(CliError::Output)
             }
+            GenerateCommand::View { view } => {
+                let options = view_options(view);
+                let outcome = view::generate(current_dir, &options)?;
+                generators::report(output, options.dry_run, &outcome.files)?;
+                write!(output, "{}", outcome.wiring).map_err(CliError::Output)
+            }
             GenerateCommand::Mailer { mailer } => {
                 let options = mailer_options(mailer);
                 let outcome = mailer::generate(current_dir, &options)?;
@@ -213,7 +242,16 @@ fn execute(
         },
         Command::Destroy { generator } => run_destroy(current_dir, generator, output),
         Command::Check => CargoCommand::Check.run(current_dir),
-        Command::Test { args } => CargoCommand::Test(args).run(current_dir),
+        Command::Test { args } => {
+            // Like Forge-Go's `forge test`: the development environment
+            // files reach the tests (the database URLs, FORGE_ENV). Not
+            // FORGE_TEST_DATABASE_URL: the files also feed `forge dev`, and
+            // the application refuses unknown FORGE_* keys, so that one is
+            // passed to the ignored database tests by hand.
+            let environment =
+                DevelopmentEnvironment::load(current_dir, &|key| env::var_os(key).is_some(), true)?;
+            CargoCommand::Test(args).run_with(current_dir, environment.added())
+        }
         Command::Format => CargoCommand::Format.run(current_dir),
         Command::Lint => CargoCommand::Lint.run(current_dir),
         Command::Build { name } => CargoCommand::Build(name).run(current_dir),
@@ -513,6 +551,13 @@ fn controller_options(arguments: ControllerArgs) -> ControllerOptions {
     }
 }
 
+fn view_options(arguments: ViewArgs) -> view::ViewOptions {
+    view::ViewOptions {
+        name: arguments.name,
+        dry_run: arguments.dry_run,
+    }
+}
+
 fn mailer_options(arguments: MailerArgs) -> MailerOptions {
     MailerOptions {
         name: arguments.name,
@@ -583,6 +628,18 @@ fn run_destroy(
                 destroy_flags(options.dry_run, flags),
             )
         }
+        DestroyCommand::View { view, flags } => {
+            let options = view_options(view);
+            let (files, unwire, owned_elsewhere) = view::plan_destroy(root, &options)?;
+            (
+                DestroyPlan {
+                    files,
+                    unwire,
+                    owned_elsewhere,
+                },
+                destroy_flags(options.dry_run, flags),
+            )
+        }
         DestroyCommand::Mailer { mailer, flags } => {
             let options = mailer_options(mailer);
             let (files, unwire) = mailer::plan_destroy(root, &options)?;
@@ -633,16 +690,22 @@ fn lifecycle(
     command: impl FnOnce(&mut Lifecycle<'_, CargoApplication>) -> Result<(), CliError>,
 ) -> Result<(), CliError> {
     let project = Project::discover(current_dir)?;
+    let files =
+        DevelopmentEnvironment::load(&project.root, &|key| env::var_os(key).is_some(), true)?;
     let stdin = io::stdin();
     let mut input = stdin.lock();
     let mut messages = io::stderr();
-    // A value that is not UTF-8 is read lossily, so it can never pass for an
+    // The process environment, then the development environment files. A
+    // value that is not UTF-8 is read lossily, so it can never pass for an
     // unprotected FORGE_ENV.
-    let environment =
-        |key: &str| env::var_os(key).map(|value| value.to_string_lossy().into_owned());
+    let environment = |key: &str| {
+        env::var_os(key)
+            .map(|value| value.to_string_lossy().into_owned())
+            .or_else(|| files.get(key).map(str::to_owned))
+    };
     let mut client = dbclient::System;
     let mut lifecycle = Lifecycle {
-        app: CargoApplication::new(project.clone()),
+        app: CargoApplication::new(project.clone()).with_environment(files.added()),
         client: &mut client,
         root: &project.root,
         name: &project.name,
@@ -669,9 +732,11 @@ fn run_dev(
         }
         project.name = name;
     }
+    let files =
+        DevelopmentEnvironment::load(&project.root, &|key| env::var_os(key).is_some(), true)?;
     if no_reload {
         let name = project.name.clone();
-        let mut app = CargoApplication::new(project);
+        let mut app = CargoApplication::new(project).with_environment(files.added());
         return match app.run(&[])? {
             Some(0) => Ok(()),
             code => Err(CliError::AppCommandFailed {
@@ -720,14 +785,38 @@ mod tests {
     use super::*;
 
     #[test]
-    fn id_command_emits_a_version_seven_uuid() {
+    fn uuid_command_emits_version_seven_uuids_in_order() {
         let directory = tempfile::tempdir().expect("temporary directory should be available");
-        let mut output = Vec::new();
-
-        execute(Command::Id, directory.path(), &mut output).expect("id generation should succeed");
-
-        let rendered = String::from_utf8(output).expect("UUID output should be UTF-8");
-        let id = Uuid::parse_str(rendered.trim()).expect("output should be a UUID");
-        assert_eq!(id.get_version_num(), 7);
+        for (command, expected) in [
+            (
+                Command::Uuid {
+                    count: UuidCount { count: 1 },
+                },
+                1,
+            ),
+            (
+                Command::Uuid {
+                    count: UuidCount { count: 3 },
+                },
+                3,
+            ),
+            (
+                Command::Id {
+                    count: UuidCount { count: 2 },
+                },
+                2,
+            ),
+        ] {
+            let mut output = Vec::new();
+            execute(command, directory.path(), &mut output).expect("uuid generation");
+            let rendered = String::from_utf8(output).expect("UUID output should be UTF-8");
+            let ids: Vec<Uuid> = rendered
+                .lines()
+                .map(|line| Uuid::parse_str(line).expect("output should be a UUID"))
+                .collect();
+            assert_eq!(ids.len(), expected);
+            assert!(ids.iter().all(|id| id.get_version_num() == 7));
+            assert!(ids.windows(2).all(|pair| pair[0] < pair[1]), "{ids:?}");
+        }
     }
 }

@@ -127,6 +127,9 @@ pub(crate) struct CargoApplication {
     /// Ctrl-C at a confirmation prompt, before that, ends the CLI as usual.
     signals: Option<Signals>,
     binary: Option<PathBuf>,
+    /// Added to the application's environment: what the development
+    /// environment files set and the process does not.
+    environment: Vec<(String, String)>,
 }
 
 impl CargoApplication {
@@ -136,7 +139,14 @@ impl CargoApplication {
             shutdown: Shutdown::new(),
             signals: None,
             binary: None,
+            environment: Vec::new(),
         }
+    }
+
+    /// Runs the application with `environment` added to the caller's.
+    pub(crate) fn with_environment(mut self, environment: &[(String, String)]) -> Self {
+        self.environment = environment.to_vec();
+        self
     }
 
     fn binary(&mut self) -> Result<PathBuf, CliError> {
@@ -174,7 +184,8 @@ impl Application for CargoApplication {
             .current_dir(&self.project.root)
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit());
+            .stderr(Stdio::inherit())
+            .envs(self.environment.iter().map(|(key, value)| (key, value)));
         scrub(&mut command);
         // Not in its own group: a password prompt reads the terminal, and
         // Ctrl-C reaches the application directly.
@@ -265,7 +276,8 @@ not json at all
         let script = directory.path().join("app");
         write_executable(
             &script,
-            "#!/bin/sh\npwd > record\necho \"$@\" >> record\nexit 7\n",
+            "#!/bin/sh\npwd > record\necho \"$@\" >> record\n\
+             echo \"${FORGE_FROM_FILE:-unset}\" >> record\nexit 7\n",
         );
         let mut app = CargoApplication {
             project: Project {
@@ -275,7 +287,9 @@ not json at all
             shutdown: Shutdown::new(),
             signals: None,
             binary: Some(script),
-        };
+            environment: Vec::new(),
+        }
+        .with_environment(&[("FORGE_FROM_FILE".to_owned(), "dotenv".to_owned())]);
 
         let code = app
             .run(&["db".to_owned(), "create".to_owned()])
@@ -291,6 +305,7 @@ not json at all
             "{record}"
         );
         assert_eq!(lines.next(), Some("db create"));
+        assert_eq!(lines.next(), Some("dotenv"), "the added environment");
     }
 
     #[test]

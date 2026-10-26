@@ -345,7 +345,7 @@ first, chooses the locale (cookie, `Accept-Language`, default) and adds
 - the strict query-string grammar: `+` is a space, `%XX` must form UTF-8,
   empty segments, pairs without `=` and empty names are `Malformed`;
 - at most `MAX_FORM_FIELDS` (1000) pairs; the whole body is already bounded by
-  `FORGE_MAX_BODY_BYTES` (1 MiB by default);
+  `FORGE_HTTP_MAX_BODY_BYTES` (1 MiB by default);
 - a name may repeat only for a sequence field (`Vec<T>`: checkbox groups,
   multiple selects); a repeated scalar field is `DuplicateField`;
 - `bool` accepts `true`, `on` (a checked checkbox without `value`) and `1`, or

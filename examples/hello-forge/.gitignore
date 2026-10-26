@@ -1,9 +1,10 @@
 /target
 # Local scratch: the file mail sink (FORGE_MAIL_URL=file:tmp/mail) and similar.
 /tmp/
+# Local secrets and overrides. .env.development is committed on purpose.
 .env
-.env.*
-!.env.example
+.env.local
+.env.*.local
 # Credential keys: never commit. The encrypted config/credentials/*.json.enc
 # files are meant to be committed.
 /config/credentials/*.key

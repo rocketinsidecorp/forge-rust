@@ -175,16 +175,58 @@ fn generate_migration_creates_reversible_pair() {
 }
 
 #[test]
-fn id_prints_a_uuid_version_seven() {
+fn uuid_prints_uuid_version_seven_values() {
     let directory = tempfile::tempdir().expect("temporary directory should be available");
 
-    let output = forge(directory.path(), &["id"]);
+    let output = forge(directory.path(), &["uuid"]);
 
     assert!(output.status.success());
+    assert!(
+        output.stderr.is_empty(),
+        "no warning for the canonical name"
+    );
     let id = String::from_utf8_lossy(&output.stdout);
     let id = id.trim();
     assert_eq!(id.len(), 36);
     assert_eq!(id.as_bytes()[14], b'7', "version nibble of {id}");
+
+    let output = forge(directory.path(), &["uuid", "--count", "3"]);
+    assert!(output.status.success());
+    let ids = String::from_utf8_lossy(&output.stdout);
+    let ids: Vec<&str> = ids.lines().collect();
+    assert_eq!(ids.len(), 3);
+    assert!(ids.windows(2).all(|pair| pair[0] < pair[1]), "{ids:?}");
+
+    for count in ["0", "1001", "x"] {
+        let refused = forge(directory.path(), &["uuid", "--count", count]);
+        assert!(!refused.status.success(), "--count {count}");
+        assert!(refused.stdout.is_empty());
+    }
+}
+
+#[test]
+fn id_is_a_deprecated_spelling_of_uuid_that_warns_once() {
+    let directory = tempfile::tempdir().expect("temporary directory should be available");
+
+    let output = forge(directory.path(), &["id", "--count", "2"]);
+
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8_lossy(&output.stdout).lines().count(), 2);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stderr,
+        "warning: `forge id` is deprecated and will be removed in the next minor version; use \
+         `forge uuid`\n"
+    );
+    let help = forge(directory.path(), &["--help"]);
+    let help = String::from_utf8_lossy(&help.stdout);
+    assert!(help.contains("uuid"), "{help}");
+    assert!(
+        !help
+            .lines()
+            .any(|line| line.trim_start().starts_with("id ")),
+        "the deprecated spelling is hidden: {help}"
+    );
 }
 
 #[test]

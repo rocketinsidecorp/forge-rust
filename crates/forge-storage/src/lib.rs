@@ -13,7 +13,7 @@
 //! traversal needs no check at the call site because an unsafe key cannot be
 //! built.
 //!
-//! `forge-http` buffers each request body (up to `FORGE_MAX_BODY_BYTES`) and
+//! `forge-http` buffers each request body (up to `FORGE_HTTP_MAX_BODY_BYTES`) and
 //! sends whole responses, so the port moves [`Bytes`](bytes::Bytes) rather than
 //! streams; disk writes and reads are bounded by explicit byte limits.
 //!

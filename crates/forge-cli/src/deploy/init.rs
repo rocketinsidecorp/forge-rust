@@ -76,7 +76,7 @@ proxy:
   # DNS records at the web hosts first.
   ssl: true
   # acme_email: ops@example.com
-  # Forge-Rust applications listen on 3000 (FORGE_BIND).
+  # Forge-Rust applications listen on 3000 (FORGE_HTTP_ADDR).
   app_port: 3000
   healthcheck:
     path: /health/ready
@@ -116,7 +116,7 @@ builder:
   # platform: linux/amd64
 
 retain: 5            # versions kept per role for rollback (2 or more; the running one counts)
-stop_timeout: 35s    # SIGTERM grace; above FORGE_SHUTDOWN_GRACE_SECS (15s)
+stop_timeout: 35s    # SIGTERM grace; above FORGE_HTTP_SHUTDOWN_TIMEOUT (15s)
 
 ssh:
   user: deploy

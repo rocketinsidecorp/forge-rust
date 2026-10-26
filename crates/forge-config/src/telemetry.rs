@@ -401,7 +401,7 @@ pub(crate) fn apply(
     Ok(())
 }
 
-/// Rules that involve several keys, the environment or `FORGE_BIND`. A
+/// Rules that involve several keys, the environment or `FORGE_HTTP_ADDR`. A
 /// disabled telemetry is not checked further, as in Forge-Go.
 pub(crate) fn validate(
     config: &TelemetryConfig,
@@ -427,7 +427,7 @@ pub(crate) fn validate(
             return Err(ConfigError::InvalidValue {
                 key: "FORGE_TELEMETRY_METRICS_ADDR",
                 value: address.to_string(),
-                expected: "an address other than FORGE_BIND: metrics are never served on the application listener",
+                expected: "an address other than FORGE_HTTP_ADDR: metrics are never served on the application listener",
             });
         }
         if environment == Environment::Production

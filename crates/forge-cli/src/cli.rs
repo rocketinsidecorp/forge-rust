@@ -25,8 +25,18 @@ impl Cli {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum Command {
-    /// Generate a sortable UUIDv7 identifier.
-    Id,
+    /// Print new sortable UUIDv7 identifiers, one per line.
+    Uuid {
+        #[command(flatten)]
+        count: UuidCount,
+    },
+    /// Deprecated spelling of `forge uuid`, kept until the next minor
+    /// version; prints a warning to standard error.
+    #[command(hide = true)]
+    Id {
+        #[command(flatten)]
+        count: UuidCount,
+    },
     /// Create a new full-stack application (server-rendered views; `--api`
     /// for JSON only) with hexagonal boundaries, Docker and CI.
     New {
@@ -555,6 +565,19 @@ pub(crate) enum DbCommand {
     },
 }
 
+/// How many identifiers `forge uuid` prints.
+#[derive(Clone, Copy, Debug, Args)]
+pub(crate) struct UuidCount {
+    /// Number of UUIDv7 values to print, 1 to 1000.
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = 1,
+        value_parser = clap::value_parser!(u16).range(1..=1000)
+    )]
+    pub(crate) count: u16,
+}
+
 #[derive(Debug, Subcommand)]
 pub(crate) enum GenerateCommand {
     /// Add sign-in, sign-out and password-reset pages and the `setup`
@@ -566,6 +589,13 @@ pub(crate) enum GenerateCommand {
         /// writing anything.
         #[arg(long)]
         dry_run: bool,
+    },
+    /// Create one server-rendered page, templates/DIR/NAME.html (DIR
+    /// defaults to pages), in the application layout, with its view model
+    /// and a test (like Forge-Go's `forge generate view`).
+    View {
+        #[command(flatten)]
+        view: ViewArgs,
     },
     /// Create a reversible SQL migration in migrations/.
     Migration {
@@ -664,6 +694,17 @@ pub(crate) struct ResourceArgs {
     pub(crate) dry_run: bool,
 }
 
+/// The arguments of `forge generate view` (and `forge destroy view`).
+#[derive(Debug, Args)]
+pub(crate) struct ViewArgs {
+    /// NAME or DIR/NAME, snake_case (`welcome`, `admin/audit_log`).
+    #[arg(value_name = "[DIR/]NAME")]
+    pub(crate) name: String,
+    /// List the files without writing (or removing) anything.
+    #[arg(long)]
+    pub(crate) dry_run: bool,
+}
+
 /// The arguments of `forge generate controller` (and `forge destroy
 /// controller`).
 #[derive(Debug, Args)]
@@ -753,6 +794,14 @@ pub(crate) enum DestroyCommand {
     Controller {
         #[command(flatten)]
         controller: ControllerArgs,
+        #[command(flatten)]
+        flags: DestroyArgs,
+    },
+    /// Remove what `forge generate view` created; a page a controller
+    /// renders is refused without --force.
+    View {
+        #[command(flatten)]
+        view: ViewArgs,
         #[command(flatten)]
         flags: DestroyArgs,
     },

@@ -316,6 +316,185 @@ async fn encoded_slash_in_a_capture_is_a_bad_request() {
 }
 
 #[tokio::test]
+async fn a_catch_all_captures_the_rest_of_the_path_like_forge_go() {
+    let mut router = Router::new();
+    router
+        .route(
+            Method::GET,
+            "/files/{key...}",
+            |request: Request| async move {
+                let key: String = request.path_param_as("key").expect("catch-all capture");
+                Response::new(StatusCode::OK, format!("key={key}"))
+            },
+        )
+        .expect("catch-all route must register");
+    router
+        .route(Method::GET, "/files/static", |_| async {
+            Response::new(StatusCode::OK, "static")
+        })
+        .expect("static route must register");
+    router
+        .route(
+            Method::GET,
+            "/files/{dir}/meta",
+            |request: Request| async move {
+                let dir: String = request.path_param_as("dir").expect("capture");
+                Response::new(StatusCode::OK, format!("meta={dir}"))
+            },
+        )
+        .expect("parameter route must register");
+    router
+        .route(Method::POST, "/files/{key...}", |_| async {
+            Response::empty(StatusCode::CREATED)
+        })
+        .expect("another method on the catch-all");
+
+    // The same answers as Forge-Go's router for these paths.
+    for (path, body) in [
+        ("/files/", "key="),
+        ("/files/a", "key=a"),
+        ("/files/a/b/c.png", "key=a/b/c.png"),
+        ("/files/a/", "key=a/"),
+        ("/files/%41", "key=A"),
+        ("/files/static", "static"),
+        ("/files/static/x", "key=static/x"),
+        ("/files/a/meta", "meta=a"),
+        ("/files/a/meta/x", "key=a/meta/x"),
+    ] {
+        let response = router.dispatch(request(Method::GET, path)).await;
+        assert_eq!(response.status, StatusCode::OK, "{path}");
+        assert_eq!(response.body(), body, "{path}");
+    }
+    let created = router.dispatch(request(Method::POST, "/files/x/y")).await;
+    assert_eq!(created.status, StatusCode::CREATED);
+    let wrong_method = router.dispatch(request(Method::DELETE, "/files/x/y")).await;
+    assert_eq!(wrong_method.status, StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(
+        wrong_method
+            .headers
+            .get(header::ALLOW)
+            .map(HeaderValue::as_bytes),
+        Some(&b"GET, HEAD, POST"[..])
+    );
+    // The path must reach the catch-all's position (no redirect, as
+    // everywhere in the router).
+    let short = router.dispatch(request(Method::GET, "/files")).await;
+    assert_eq!(short.status, StatusCode::NOT_FOUND);
+    // Encoded slashes and backslashes, dot segments and empty segments
+    // (an absolute or `//` capture) are refused: Forge-Go's router refuses
+    // the first ones for every request and `ServeMux` cleans the last.
+    for path in [
+        "/files/a%2Fb",
+        "/files/a/..",
+        "/files/../secret",
+        "/files/a/./b",
+        "/files/%2e%2e/secret",
+        "/files/a/%2E",
+        "/files//etc/passwd",
+        "/files/a//b",
+        "/files/a/b//",
+        "/files/..%5C..%5Cwin.ini",
+        "/files/..%5c..%5cwin.ini",
+        "/files/a%5Cb",
+        "/files/..\\..\\win.ini",
+    ] {
+        let response = router.dispatch(request(Method::GET, path)).await;
+        assert_eq!(response.status, StatusCode::BAD_REQUEST, "{path}");
+        assert_eq!(response.body(), "bad request", "{path}");
+    }
+    // Dots inside a segment are ordinary text.
+    let dotted = router
+        .dispatch(request(Method::GET, "/files/a..b/.c"))
+        .await;
+    assert_eq!(dotted.body(), "key=a..b/.c");
+}
+
+#[tokio::test]
+async fn a_catch_all_at_the_root_and_its_registration_rules() {
+    let mut router = Router::new();
+    router
+        .route(Method::GET, "/{path...}", |request: Request| async move {
+            let path: String = request.path_param_as("path").expect("capture");
+            Response::new(StatusCode::OK, format!("path={path}"))
+        })
+        .expect("root catch-all");
+    router
+        .route(Method::GET, "/health", |_| async {
+            Response::new(StatusCode::OK, "ok")
+        })
+        .expect("static route");
+    for (path, body) in [("/", "path="), ("/x/y", "path=x/y"), ("/health", "ok")] {
+        let response = router.dispatch(request(Method::GET, path)).await;
+        assert_eq!(response.body(), body, "{path}");
+    }
+    assert!(matches!(
+        router.route(Method::GET, "/{other...}", |_| async {
+            Response::empty(StatusCode::OK)
+        }),
+        Err(RouteError::Ambiguous { .. })
+    ));
+    assert!(matches!(
+        router.route(Method::GET, "/a/{rest...}/b", |_| async {
+            Response::empty(StatusCode::OK)
+        }),
+        Err(RouteError::InvalidPath(_))
+    ));
+}
+
+#[tokio::test]
+async fn traversal_and_encoded_separators_are_refused_for_every_path_like_forge_go() {
+    let mut router = Router::new();
+    router
+        .route(
+            Method::GET,
+            "/files/{name}",
+            |request: Request| async move {
+                let name: String = request.path_param_as("name").expect("capture");
+                Response::new(StatusCode::OK, name)
+            },
+        )
+        .expect("parameter route");
+    router
+        .route(Method::GET, "/static/page", |_| async {
+            Response::empty(StatusCode::OK)
+        })
+        .expect("static route");
+    for path in [
+        "/files/..",
+        "/files/.",
+        "/files/%2e%2e",
+        "/files/%2E%2e",
+        "/files/%2e",
+        "/files/a%5Cb",
+        "/files/%5c",
+        "/files/a%2fb",
+        "/files/..\\win.ini",
+        "/files/a\\b",
+        "/../static/page",
+        "/static/./page",
+        "/static/page/..",
+        "/nowhere/%2e%2e/x",
+        "/static%2Fpage",
+    ] {
+        let response = router.dispatch(request(Method::GET, path)).await;
+        assert_eq!(response.status, StatusCode::BAD_REQUEST, "{path}");
+    }
+    // Dots inside a segment, a double-encoded escape (decoded once) and an
+    // escaped percent are ordinary text.
+    for (path, body) in [
+        ("/files/a..b", "a..b"),
+        ("/files/...", "..."),
+        ("/files/.env", ".env"),
+        ("/files/%252e%252e", "%2e%2e"),
+        ("/files/a%255Cb", "a%5Cb"),
+    ] {
+        let response = router.dispatch(request(Method::GET, path)).await;
+        assert_eq!(response.status, StatusCode::OK, "{path}");
+        assert_eq!(response.body(), body, "{path}");
+    }
+}
+
+#[tokio::test]
 async fn unmatched_and_empty_segments_are_not_found() {
     let mut router = Router::new();
     router

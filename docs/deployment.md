@@ -30,7 +30,7 @@ used; see [ADR 0008](adr/0008-docker-by-default.md)).
   manager. It contains C runtime libraries, CA certificates and the application
   binary.
 - User: numeric non-root uid/gid `65532`.
-- Environment: `FORGE_ENV=production` and `FORGE_BIND=0.0.0.0:3000`.
+- Environment: `FORGE_ENV=production` and `FORGE_HTTP_ADDR=0.0.0.0:3000`.
 - Port: `EXPOSE 3000`.
 - `HEALTHCHECK` (exec form) runs `<binary> healthcheck`, which probes
   `GET /health/live` over loopback.
@@ -122,12 +122,12 @@ from env files, Kubernetes manifests and unit files.
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `FORGE_ENV` | `development` | `development`, `test` or `production`. Selects safety-sensitive defaults such as the log format. |
-| `FORGE_BIND` | `127.0.0.1:3000` | Listen socket address. The container image sets `0.0.0.0:3000`. |
+| `FORGE_HTTP_ADDR` | `127.0.0.1:3000` | Listen socket address. The container image sets `0.0.0.0:3000`. |
 | `FORGE_REQUEST_TIMEOUT_SECS` | `30` | Maximum time for one request, including reading the request body. A response write that makes no progress for this long (at least 30 seconds) ends the connection. |
-| `FORGE_SHUTDOWN_GRACE_SECS` | `15` | Drain deadline for in-flight requests after SIGTERM/SIGINT. |
-| `FORGE_MAX_BODY_BYTES` | `1048576` | Maximum request body size in bytes. |
+| `FORGE_HTTP_SHUTDOWN_TIMEOUT` | `15s` | Drain deadline for in-flight requests after SIGTERM/SIGINT, a positive duration (`15s`, `1m`). |
+| `FORGE_HTTP_MAX_BODY_BYTES` | `1048576` | Maximum request body size in bytes. |
 | `FORGE_MAX_CONNECTIONS` | `10000` | Maximum concurrent connections. Extra connections wait for a slot (backpressure) instead of being served without bound. |
-| `FORGE_MAX_IN_FLIGHT_BODY_BYTES` | `268435456` (256 MiB), or `FORGE_MAX_BODY_BYTES` when larger | Request body bytes buffered at once across all connections. Bytes are charged as they arrive (a declared `Content-Length` is only checked against `FORGE_MAX_BODY_BYTES`, never reserved, so declaring a body without sending it holds nothing); a body that does not fit gets `503` with `Retry-After: 5`, and requests without a body are unaffected. Must be at least `FORGE_MAX_BODY_BYTES`. Forge-Go streams bodies and has no such key. |
+| `FORGE_MAX_IN_FLIGHT_BODY_BYTES` | `268435456` (256 MiB), or `FORGE_HTTP_MAX_BODY_BYTES` when larger | Request body bytes buffered at once across all connections. Bytes are charged as they arrive (a declared `Content-Length` is only checked against `FORGE_HTTP_MAX_BODY_BYTES`, never reserved, so declaring a body without sending it holds nothing); a body that does not fit gets `503` with `Retry-After: 5`, and requests without a body are unaffected. Must be at least `FORGE_HTTP_MAX_BODY_BYTES`. Forge-Go streams bodies and has no such key. |
 | `FORGE_HTTP_TRUSTED_PROXIES` | empty | Comma-separated CIDRs or addresses of reverse proxies whose `X-Forwarded-For` is believed; empty trusts nobody. Empty or malformed entries, `/0`, IPv4 prefixes shorter than `/8`, IPv6 prefixes shorter than `/16`, IPv4-mapped prefixes and zoned addresses stop startup; the error names the entry's position, never its text. See [client addresses behind a proxy](#client-addresses-behind-a-proxy). |
 | `FORGE_HTTP_TRANSPORT` | `trusted-proxy` in production, `plain` otherwise | How clients reach the server, Forge-Go's key: `plain` HTTP, or `trusted-proxy` when forge-proxy or a load balancer terminates TLS in front of it. With `trusted-proxy` every response carries `Strict-Transport-Security: max-age=31536000; includeSubDomains` (a handler that sets its own value, for example with `preload`, keeps it). Production refuses `plain`. Forge-Go's `tls` is refused: Forge-Rust does not terminate TLS itself. |
 | `FORGE_LOG` | `info` | `tracing` filter directive, for example `info,shop=debug`. |
@@ -143,11 +143,11 @@ from env files, Kubernetes manifests and unit files.
 | `FORGE_CACHE_MAX_ENTRIES` | `10000` | Entry bound of every cache ([caching](caching.md)). |
 | `FORGE_CACHE_MAX_BYTES` | `67108864` | Memory bound of the in-memory cache; at least `FORGE_CACHE_MAX_VALUE_BYTES` plus `4096`. |
 | `FORGE_CACHE_MAX_VALUE_BYTES` | `1048576` | Largest cached value, at most `8388608`. |
-| `FORGE_CACHE_DEFAULT_TTL_SECS` | `3600` | Time to live of cache writes that pass none, `1` to `31536000`. |
+| `FORGE_CACHE_DEFAULT_TTL` | `1h` | Time to live of cache writes that pass none, a duration from `1ms` to `8760h`. |
 | `FORGE_STORAGE_ROOT` | none | Directory of the disk storage adapter; storage is unused when unset. In `production` it must be an absolute path on a persistent volume ([storage](storage.md)). |
 | `FORGE_STORAGE_SIGNING_KEY` | none | HMAC key of signed links: unpadded base64url of 32 to 1024 random bytes. Redacted. **Required in `production` whenever `FORGE_STORAGE_ROOT` is set**; there is no default key. |
-| `FORGE_STORAGE_MAX_UPLOAD_BYTES` | `524288` | Largest uploaded file, at most `1073741824`; when storage is configured it must not exceed `FORGE_MAX_BODY_BYTES`. |
-| `FORGE_STORAGE_LINK_TTL_SECS` | `900` | Default lifetime of signed links, `1` to `604800`. |
+| `FORGE_STORAGE_MAX_UPLOAD_BYTES` | `524288` | Largest uploaded file, at most `1073741824`; when storage is configured it must not exceed `FORGE_HTTP_MAX_BODY_BYTES`. |
+| `FORGE_STORAGE_LINK_TTL` | `15m` | Default lifetime of signed links, a duration from `1s` to `168h`. |
 | `FORGE_I18N_DEFAULT_LOCALE` | the application's `DEFAULT_LOCALE` (`forge new --locale`, else `en`) | The locale requests that ask for no available locale get, and the one production shows for a missing translation. A locale such as `en` or `pt-BR`, spelled canonically; `config/locales/LOCALE.json` must exist or start-up fails ([i18n](i18n.md)). |
 | `FORGE_STREAMS_KEY` | none | HMAC key of signed live-update stream names: base64 (standard or URL-safe, padded or not) of at least 32 random bytes, as `openssl rand -base64 32` prints; the same on every replica. Redacted. **Required in `production` by applications that serve live updates** (`scaffold --broadcast`); development and test use a random per-process key ([views](views.md#live-updates)). |
 | `FORGE_STREAMS_PREVIOUS_KEYS` | none | While `FORGE_STREAMS_KEY` is rotated: up to 3 older keys, comma-separated, in the same format. They only verify, so pages open during the rotation keep updating; the current key always signs. Remove them after the token lifetime (24 hours by default). Redacted; an error names the entry's position, never the key. Needs `FORGE_STREAMS_KEY` ([rotating the key](deployment.md#rotating-the-stream-signing-key)). |
@@ -170,6 +170,44 @@ Do not put secrets in the image or in build arguments. Both database URLs contai
 credentials and must come from the deployment platform's secret mechanism.
 Forge's typed configuration redacts them from normal Debug/serialization output,
 but adapters must still avoid logging exposed URLs.
+
+### Renamed variables
+
+Forge-Rust and Forge-Go read the same variable for the same setting, and
+Forge-Go's structured `FORGE_HTTP_*`, `FORGE_DATABASE_*`, `FORGE_CACHE_*` and
+`FORGE_STORAGE_*` names are canonical. The older Forge-Rust spellings below are
+still read until the next minor version: the application prints a one-line
+warning to standard error the first time it sees each one, and a setting given
+under both spellings with different values stops start-up with an error naming
+both variables (never their values). Rename them in env files, manifests and
+unit files:
+
+| Deprecated | Use instead | Value |
+| --- | --- | --- |
+| `FORGE_BIND` | `FORGE_HTTP_ADDR` | unchanged: a socket address |
+| `FORGE_MAX_BODY_BYTES` | `FORGE_HTTP_MAX_BODY_BYTES` | unchanged: bytes |
+| `FORGE_SHUTDOWN_GRACE_SECS` | `FORGE_HTTP_SHUTDOWN_TIMEOUT` | seconds (`15`) become a duration (`15s`) |
+| `FORGE_CACHE_DEFAULT_TTL_SECS` | `FORGE_CACHE_DEFAULT_TTL` | seconds (`3600`) become a duration (`1h`); `1ms` is now the minimum, as in Forge-Go |
+| `FORGE_STORAGE_LINK_TTL_SECS` | `FORGE_STORAGE_LINK_TTL` | seconds (`900`) become a duration (`15m`) |
+
+```sh
+sed -i -e 's/^FORGE_BIND=/FORGE_HTTP_ADDR=/' -e 's/^FORGE_MAX_BODY_BYTES=/FORGE_HTTP_MAX_BODY_BYTES=/' .env.production   # names only; convert the *_SECS values by hand
+```
+
+Every other variable already has the same name in both frameworks, or exists
+in one of them only:
+
+| Forge-Rust only | Why |
+| --- | --- |
+| `FORGE_REQUEST_TIMEOUT_SECS` | one per-request deadline; Forge-Go splits it into `FORGE_HTTP_READ_TIMEOUT` and `FORGE_HTTP_WRITE_TIMEOUT` |
+| `FORGE_MAX_CONNECTIONS`, `FORGE_MAX_IN_FLIGHT_BODY_BYTES` | connection and buffered-body backpressure; Forge-Go streams bodies |
+| `FORGE_LOG`, `FORGE_LOG_FORMAT` | `tracing` filter and output format; Forge-Go's `slog` output has no such settings |
+
+| Forge-Go only | Forge-Rust |
+| --- | --- |
+| `FORGE_HTTP_TLS_CERT_FILE`, `FORGE_HTTP_TLS_KEY_FILE` | TLS is terminated in front (`forge-proxy` or a load balancer); `FORGE_HTTP_TRANSPORT=tls` is refused |
+| `FORGE_HTTP_READ_HEADER_TIMEOUT`, `FORGE_HTTP_READ_TIMEOUT`, `FORGE_HTTP_WRITE_TIMEOUT`, `FORGE_HTTP_IDLE_TIMEOUT`, `FORGE_HTTP_MAX_HEADER_BYTES` | fixed header limits plus `FORGE_REQUEST_TIMEOUT_SECS` |
+| `FORGE_DATABASE_MIN_CONNS`, `FORGE_DATABASE_MAX_CONN_LIFETIME`, `FORGE_DATABASE_MAX_CONN_IDLE_TIME` | not configurable yet (SQLx pool defaults) |
 
 ### Database TLS
 
@@ -273,11 +311,11 @@ ignores the image `HEALTHCHECK`.
 On `SIGTERM` or `SIGINT`, the application:
 
 1. stops accepting new connections;
-2. lets in-flight requests finish, for up to `FORGE_SHUTDOWN_GRACE_SECS`;
+2. lets in-flight requests finish, for up to `FORGE_HTTP_SHUTDOWN_TIMEOUT`;
 3. exits. A graceful shutdown exits with status `0`.
 
 The supervisor's stop timeout must be **longer** than
-`FORGE_SHUTDOWN_GRACE_SECS`, or the process is killed (`SIGKILL`) mid-drain:
+`FORGE_HTTP_SHUTDOWN_TIMEOUT`, or the process is killed (`SIGKILL`) mid-drain:
 
 | Platform | Setting | Default | Recommendation (grace 15 s) |
 | --- | --- | --- | --- |
@@ -288,7 +326,7 @@ The supervisor's stop timeout must be **longer** than
 
 Docker's default 10-second stop timeout is **shorter** than the default 15-second
 grace, so pass `-t` to plain `docker stop` when long requests matter. If you
-raise `FORGE_SHUTDOWN_GRACE_SECS`, raise every stop timeout above it as well.
+raise `FORGE_HTTP_SHUTDOWN_TIMEOUT`, raise every stop timeout above it as well.
 
 ## Read-only root filesystem
 
@@ -319,7 +357,7 @@ spec:
       labels:
         app: shop
     spec:
-      terminationGracePeriodSeconds: 30   # > FORGE_SHUTDOWN_GRACE_SECS
+      terminationGracePeriodSeconds: 30   # > FORGE_HTTP_SHUTDOWN_TIMEOUT
       automountServiceAccountToken: false
       securityContext:
         runAsNonRoot: true
@@ -336,10 +374,10 @@ spec:
           env:
             - name: FORGE_ENV
               value: production
-            - name: FORGE_BIND
+            - name: FORGE_HTTP_ADDR
               value: 0.0.0.0:3000
-            - name: FORGE_SHUTDOWN_GRACE_SECS
-              value: "15"
+            - name: FORGE_HTTP_SHUTDOWN_TIMEOUT
+              value: 15s
           livenessProbe:
             httpGet:
               path: /health/live
@@ -393,8 +431,8 @@ After=network-online.target
 Type=exec
 ExecStart=/usr/local/bin/shop serve
 Environment=FORGE_ENV=production
-Environment=FORGE_BIND=127.0.0.1:3000
-Environment=FORGE_SHUTDOWN_GRACE_SECS=15
+Environment=FORGE_HTTP_ADDR=127.0.0.1:3000
+Environment=FORGE_HTTP_SHUTDOWN_TIMEOUT=15s
 KillSignal=SIGTERM
 TimeoutStopSec=30
 Restart=on-failure
@@ -503,7 +541,7 @@ services:
   app:
     image: shop:latest
     environment:
-      FORGE_BIND: 0.0.0.0:3000
+      FORGE_HTTP_ADDR: 0.0.0.0:3000
       FORGE_HTTP_TRUSTED_PROXIES: 172.30.0.0/24
     networks: [edge]            # no `ports:`: only the proxy reaches it
   proxy:
@@ -706,7 +744,7 @@ proxy:
   hosts: [shop.example.com]
   ssl: true                                  # Let's Encrypt (accepts its terms)
   acme_email: ops@example.com
-  app_port: 3000                             # FORGE_BIND of Forge-Rust applications
+  app_port: 3000                             # FORGE_HTTP_ADDR of Forge-Rust applications
   healthcheck: {path: /health/ready, interval: 1s, timeout: 2s, healthy_count: 3, deploy_timeout: 60s}
   drain_timeout: 30s
   response_timeout: 30s
@@ -726,7 +764,7 @@ accessories:
     env: {secret: [POSTGRES_PASSWORD]}
 builder: {context: ., dockerfile: Dockerfile, platform: linux/amd64, args: {RUST_VERSION: "1.98.1"}}
 retain: 5                                    # versions kept per role (2 to 100; the running one counts)
-stop_timeout: 35s                            # > FORGE_SHUTDOWN_GRACE_SECS
+stop_timeout: 35s                            # > FORGE_HTTP_SHUTDOWN_TIMEOUT
 boot_timeout: 60s                            # readiness wait for non-proxied roles
 hooks: .forge/hooks
 parallelism: 4                               # hosts handled at once

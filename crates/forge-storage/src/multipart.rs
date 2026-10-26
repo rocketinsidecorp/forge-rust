@@ -1,6 +1,6 @@
 //! A strict `multipart/form-data` parser over a complete in-memory body.
 //!
-//! `forge-http` buffers each request body up to `FORGE_MAX_BODY_BYTES` before a
+//! `forge-http` buffers each request body up to `FORGE_HTTP_MAX_BODY_BYTES` before a
 //! handler runs, so the parser works on a slice and returns *ranges* into it:
 //! file contents are never copied. It is deliberately stricter than the RFCs
 //! allow, because every deviation from what browsers send is an attack surface:

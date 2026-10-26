@@ -100,21 +100,35 @@ impl Document {
         self.routes
             .iter()
             .filter(|route| {
+                let catch_all = matches!(route.segments.last(), Some(Segment::Rest(_)));
+                let lengths = if catch_all {
+                    // `/files/` is the empty rest of `/files/{key...}`.
+                    segments.len() >= route.segments.len()
+                        || (segments.is_empty() && route.segments.len() == 1)
+                } else {
+                    route.segments.len() == segments.len()
+                };
                 route.method.eq_ignore_ascii_case(method)
-                    && route.segments.len() == segments.len()
+                    && lengths
                     && route.segments.iter().zip(&segments).all(
                         |(pattern, segment)| match pattern {
                             Segment::Static(text) => text == segment,
                             Segment::Param(_) => !segment.is_empty(),
+                            Segment::Rest(_) => true,
                         },
                     )
             })
             .max_by(|a, b| {
-                let shape = |route: &DocumentedRoute| -> Vec<bool> {
+                // Static text beats a capture, which beats a catch-all.
+                let shape = |route: &DocumentedRoute| -> Vec<u8> {
                     route
                         .segments
                         .iter()
-                        .map(|segment| matches!(segment, Segment::Static(_)))
+                        .map(|segment| match segment {
+                            Segment::Static(_) => 2,
+                            Segment::Param(_) => 1,
+                            Segment::Rest(_) => 0,
+                        })
                         .collect()
                 };
                 shape(a).cmp(&shape(b))
@@ -134,7 +148,7 @@ impl Document {
         let operation = self
             .tree
             .get("paths")
-            .and_then(|paths| paths.get(&route.path))
+            .and_then(|paths| paths.get(&route.documented))
             .and_then(|item| item.get(route.method.to_ascii_lowercase()))
             .ok_or_else(|| mismatch("the document has no such operation".to_owned()))?;
         let responses = operation.get("responses");

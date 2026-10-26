@@ -31,6 +31,9 @@ the work is finished and waiting for its review; **Planned** means not started.
 | Bounded memory-hard password hashing | — | Not needed (PBKDF2, no per-hash memory) | In review (`forge::auth::PasswordWorkLimiter`: one Argon2id hash per CPU, at most 16, then `503`) |
 | Client address behind trusted proxies | `request.remote_ip`, `trusted_proxies` | Done (`FORGE_HTTP_TRUSTED_PROXIES`, ADR 0037) | Done (`FORGE_HTTP_TRUSTED_PROXIES`, ADR 0032; `forge deploy` sets it for the proxied role, [ADR 0042](adr/0042-forge-deploy.md)) |
 | `HEAD` on every `GET` route | `HEAD` routed to `GET` | Done (`http.ServeMux`) | In review (the router serves `HEAD` with the `GET` route unless a `HEAD` route exists, the server drops the body, `Allow` lists `HEAD`) |
+| One name per setting and command (naming decision D2) | — | Done (`FORGE_HTTP_*`, `FORGE_DATABASE_*`, `FORGE_CACHE_DEFAULT_TTL`, `FORGE_STORAGE_LINK_TTL`; `forge uuid [--count N]`) | In review (the same names and duration formats; `FORGE_BIND`, `FORGE_MAX_BODY_BYTES`, `FORGE_SHUTDOWN_GRACE_SECS`, `FORGE_CACHE_DEFAULT_TTL_SECS`, `FORGE_STORAGE_LINK_TTL_SECS` and `forge id` are deprecated aliases until the next minor version: a one-line warning, and different values under both spellings stop start-up; [deployment](deployment.md#renamed-variables), [cli](cli.md#forge-uuid)) |
+| Development environment files | `dotenv` gems, `.env.development` | Done (`.env.development` then `.env.local`, process environment wins, `forge dev\|test\|db\|migrate\|rollback\|doctor`) | In review (same files, format, precedence and line-only errors; `forge dev`, `test`, `doctor` and every lifecycle command; `forge new` writes `.env.development`; differences: no `FORGE_TEST_DATABASE_URL` or generated `.env.local`, [cli](cli.md#development-environment-files)) |
+| Catch-all route segment | `get "files/*path"` | Done (`GET /files/{key...}`, `http.ServeMux`) | In review (`{name...}` as the last segment: the rest of the path, possibly empty; static and `{name}` routes win; like Forge-Go's router, every path holding `%2F`, `%5C`, a raw backslash or a `.`/`..` segment (spelled or `%2e`-encoded) answers `400` before routing, and so does a catch-all value starting with `/` or holding `//` (which `ServeMux` cleans); the OpenAPI document names it `{name}` like Forge-Go's; a path that stops before the catch-all, `/files`, is `404` where `ServeMux` redirects to `/files/`) |
 | Handler panic answered with `500` | `ShowExceptions` | Done (`recoverer`: JSON error body with the request id) | In review (text body `internal server error`, `x-request-id`, logged with the request id) |
 | HSTS behind TLS | `config.force_ssl` | Done (`Strict-Transport-Security` unless `FORGE_HTTP_TRANSPORT=plain`) | In review (same header and rule, `FORGE_HTTP_TRANSPORT=plain\|trusted-proxy`, see follow-ups) |
 | Verified database TLS in production, pool limits | `sslmode` in `database.yml`, `pool` | Done (`sslmode=verify-full\|verify-ca`, MySQL `tls=true`, `FORGE_DATABASE_ALLOW_PLAINTEXT`, `FORGE_DATABASE_MAX_CONNS\|MIN_CONNS\|MAX_CONN_LIFETIME\|MAX_CONN_IDLE_TIME\|CONNECT_TIMEOUT\|STATEMENT_TIMEOUT`) | In review (stricter TLS rule: `sslmode=verify-full`, SQLx's MySQL spelling `ssl-mode=VERIFY_IDENTITY`; `verify-ca` refused, see follow-ups; `FORGE_DATABASE_ALLOW_PLAINTEXT`, `FORGE_DATABASE_MAX_CONNS\|CONNECT_TIMEOUT\|STATEMENT_TIMEOUT`; see follow-ups) |
@@ -49,6 +52,8 @@ the work is finished and waiting for its review; **Planned** means not started.
 | OpenAPI from typed routes | — | Done (Forge-Go ADR 0043) | Done (`#[derive(OpenApiSchema)]`, `forge::openapi::typed`/`describe`, `GET /openapi.json`, `FORGE_OPENAPI_ENABLED`, `forge openapi`, [ADR 0039](adr/0039-openapi-from-typed-routes.md), [OpenAPI](openapi.md)) |
 | List the application's routes | `rails routes` | Done (`forge routes`, a source scan: literal `Handle`/`Resources` paths only, so the `/v1/<plural>` JSON routes of resources are missing) | Done (`forge routes`, runs the composed application: every HTML and JSON route with its source line, [CLI](cli.md#application-lifecycle-commands)) |
 | Controller, model, mailer and job generators | `rails g` | Done (Forge-Go ADR 0041) | Done (`forge generate model\|controller\|mailer\|job --queue`, [ADR 0038](adr/0038-generators-and-destroy.md), [generators](generators.md)) |
+| One page generator | — | Done (`forge generate view [DIR/]NAME`, `forge destroy view`) | In review (same command and arguments: `templates/DIR/NAME.html`, plus the Askama view model and a rendering test; refuses `--api` applications instead of adding a views base, [generators](generators.md#view)) |
+| Model plus JSON API generator | `rails g resource` | Done (`forge generate resource`, `forge destroy resource`: model + `/v1/<plural>` JSON routes behind bearer tokens) | Planned (it is the JSON layer of the scaffold, which needs the JSON CRUD and bearer-token login that `show_json` waits for; it lands with that work, under the same name) |
 | Undo a generator | `rails d` | Done (`forge destroy`, Forge-Go ADR 0041) | Done (`forge destroy`, [ADR 0038](adr/0038-generators-and-destroy.md)) |
 | Continuous fuzzing, SBOM, signed images | — | Done (`scripts/fuzz.sh`, `scripts/sbom.sh`, `release.yml`, Forge-Go ADR 0044) | Done (`scripts/fuzz.sh`, `scripts/sbom.sh`, signed forge-proxy image, SHA/digest pins enforced by `crates/forge/tests/supply_chain.rs`, [ADR 0043](adr/0043-continuous-fuzzing-sbom-signed-images.md), [supply chain](supply-chain.md)) |
 | Published benchmarks | — | Done (`go test -bench`, `scripts/bench.sh`, [BENCHMARKS.md](https://github.com/rocketinsidecorp/forge-go/blob/main/docs/BENCHMARKS.md)) | Done (`cargo bench -p forge-bench`, `scripts/bench.sh`, [benchmarks](benchmarks.md)) |
@@ -197,14 +202,14 @@ the work is finished and waiting for its review; **Planned** means not started.
 
 - Benchmarks ([benchmarks](benchmarks.md), rocketinsidecorp/forge-rust#41): the
   scenario names, variants and output formats are Forge-Go's, and results are
-  read side by side. Forge-Rust has no equivalent of two scenarios, so they are
-  not run and not reported: `router_match/wildcard/*` (its router has no
-  catch-all `{name...}` segment) and the end-to-end `show_json` (a generated
+  read side by side. Forge-Rust has no equivalent of one scenario, so it is
+  not run and not reported: the end-to-end `show_json` (a generated
   application has no JSON scaffold and no bearer-token login: `forge generate
   scaffold` is HTML-only, [CLI](cli.md#refusals)). Adding a JSON
-  scaffold with bearer-token login to Forge-Rust, or a catch-all to its router,
-  makes the scenario available; the load generator already names `show_json`
-  and refuses it with that reason. Differences that are not gaps: `health` is
+  scaffold with bearer-token login to Forge-Rust makes the scenario
+  available; the load generator already names `show_json` and refuses it
+  with that reason. `router_match/wildcard/*` runs since the router has
+  Forge-Go's catch-all `{name...}` segment. Differences that are not gaps: `health` is
   `GET /health/ready` in Forge-Rust (the probe that pings the database; its
   `/health` never does), `password_verify` times Argon2id where Forge-Go's is
   PBKDF2, `middleware_chain` and `http_telemetry` drive `Router::dispatch`
@@ -245,10 +250,11 @@ the work is finished and waiting for its review; **Planned** means not started.
   an application subcommand so the CLI keeps holding no credentials:
   `db schema:dump|schema:load` (`db console` exists since P5: it runs the
   client with the URL's credentials in the environment, like Forge-Go), browser reload in `forge dev` (the Go
-  proxy needs a reviewed Rust port with the same CSP rules), and
-  `.env.development`/`.env.local` files in `forge dev` and the lifecycle
-  commands together with generating them. Planned right after the generators
-  ([forge-rust#15](https://github.com/rocketinsidecorp/forge-rust/issues/15)).
+  proxy needs a reviewed Rust port with the same CSP rules). The
+  `.env.development`/`.env.local` files are read by `forge dev`, `test`,
+  `doctor` and the lifecycle commands with Forge-Go's names, format,
+  precedence and redaction, and `forge new` generates `.env.development`
+  ([cli](cli.md#development-environment-files)).
   `forge inspect` stays "Planned" in the table above. Forge-Go reads the target
   database of `db create|drop` from `FORGE_DATABASE_URL` and the credentials
   from `FORGE_MIGRATION_DATABASE_URL`; Forge-Rust uses

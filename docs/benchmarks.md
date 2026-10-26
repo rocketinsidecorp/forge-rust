@@ -73,7 +73,7 @@ numbers: shared runners are too noisy for that.
 
 | Scenario | Variants | What is timed in Forge-Rust | Benchmark |
 | --- | --- | --- | --- |
-| `router_match` | `static`, `param` x 1, 10, 100, 1000 routes (`wildcard`: not run, see below) | `Router::dispatch` for a request matching the middle route of the table, to a handler that answers `204`; `static` is `/static/rN/item`, `param` `/param/rN/{id}` | `router_match/<kind>/<routes>` |
+| `router_match` | `static`, `param`, `wildcard` x 1, 10, 100, 1000 routes | `Router::dispatch` for a request matching the middle route of the table, to a handler that answers `204`; `static` is `/static/rN/item`, `param` `/param/rN/{id}`, `wildcard` the catch-all `/files/rN/{path...}` requested as `/files/rN/docs/2026/report.txt` | `router_match/<kind>/<routes>` |
 | `middleware_chain` | `passthrough`, `context` x 0, 1, 5, 10 layers | the server's request path for one `GET /users/{id}` (telemetry started and finished around `Router::dispatch`, see below) with N layers added by `Router::layer`; `context` layers also insert a value into the request extensions | `middleware_chain/<kind>/<n>` |
 | `json_render` | `object`, `list_50` | `Response::json` of one record and of a page of 50 | `json_render/<variant>` |
 | `html_render` | `layout_partial`, `layout_partial_csrf` | a page of 50 rows in a layout with two partials, auto-escaping text that contains markup (Askama, the generated applications' template engine); the second variant goes through `CsrfProtection` and `FlashLayer` and a router, with the CSRF meta tag, a form token and flash messages | `html_render/<variant>` |
@@ -86,13 +86,9 @@ numbers: shared runners are too noisy for that.
 | `rate_limit_decision` | `allowed`, `denied`, `distinct_keys` | one `MemoryLimiter::allow`; `distinct_keys` inserts a key and evicts another on every call (the worst case) | `rate_limit_decision/<variant>` |
 | `http_telemetry` | `baseline`, `disabled`, `enabled_no_export`, `enabled_exporting` | the cost of telemetry on the same request path as `middleware_chain/passthrough/0`, see below | `http_telemetry/<variant>` |
 
-Two scenarios of Forge-Go's catalog are **not run** because Forge-Rust has
-nothing to time (they are not reported, not estimated):
-
-- `router_match/wildcard/{1,10,100,1000}`: Forge-Go's `/files/rN/{path...}`
-  catch-all segment. A Forge-Rust `{name}` segment captures exactly one
-  non-empty segment and the router has no catch-all.
-- `show_json` (end to end): see [End-to-end scenarios](#end-to-end-scenarios).
+One scenario of Forge-Go's catalog is **not run** because Forge-Rust has
+nothing to time (it is not reported, not estimated): `show_json` (end to
+end), see [End-to-end scenarios](#end-to-end-scenarios).
 
 Notes on the choices:
 
@@ -383,7 +379,9 @@ Argon2's 19 MiB block memory).
 | `rate_limit_decision` | `denied` | 169 | 56 | 1 |
 | `rate_limit_decision` | `distinct_keys` | 403 | 341 | 4 |
 
-Not run, because Forge-Rust has no equivalent: `router_match/wildcard/*`.
+`router_match/wildcard/*` (the router's catch-all segment) was added after
+this run and has no figures here yet: `cargo bench -p forge-bench --
+router_match/wildcard` measures it.
 
 Reference rows that are not part of Forge-Go's catalog: the cost of building
 the request that the dispatching scenarios above include in their figures.

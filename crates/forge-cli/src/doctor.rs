@@ -22,6 +22,7 @@ use forge_config::{AppConfig, DatabaseScheme};
 use serde_json::{Value, json};
 
 use crate::CliError;
+use crate::envfile::DevelopmentEnvironment;
 use crate::lifecycle::ALLOW_DESTRUCTIVE;
 
 /// How long the database server gets to accept a TCP connection.
@@ -94,6 +95,15 @@ impl Diagnostic {
         }
     }
 
+    fn warning(code: &'static str, summary: String, remediation: String) -> Self {
+        Self {
+            code,
+            severity: "warning",
+            summary,
+            remediation,
+        }
+    }
+
     fn json(&self) -> Value {
         json!({
             "code": self.code,
@@ -118,10 +128,40 @@ pub(crate) fn run(
     let mut environment = None;
     let mut database = "none".to_owned();
 
+    // The development environment files, as `forge dev` reads them (the
+    // process wins); doctor sets no FORGE_ENV of its own, like Forge-Go's.
+    let files = match DevelopmentEnvironment::load(
+        directory,
+        &|name| variables.iter().any(|(key, _)| key == name),
+        false,
+    ) {
+        Ok(files) => files,
+        Err(_) if json_output => {
+            let report = json!({
+                "schema_version": 1,
+                "ok": false,
+                "diagnostics": [Diagnostic::error(
+                    "environment_file.invalid",
+                    "Development environment files could not be loaded.",
+                    "Check .env.development and .env.local for valid KEY=VALUE lines.",
+                )
+                .json()],
+            });
+            writeln!(output, "{report}").map_err(CliError::Output)?;
+            return Err(CliError::Reported);
+        }
+        Err(error) => return Err(error),
+    };
     // The CLI's own switch is not an application setting, and the
     // application would refuse it as an unknown key.
     let variables = variables
         .into_iter()
+        .chain(
+            files
+                .added()
+                .iter()
+                .map(|(key, value)| (OsString::from(key), OsString::from(value))),
+        )
         .filter(|(key, _)| key != ALLOW_DESTRUCTIVE)
         .collect::<Vec<_>>();
     // Only the host and port settings of the driver are read from it.
@@ -132,6 +172,27 @@ pub(crate) fn run(
             .map(|(_, value)| value.to_string_lossy().into_owned())
     };
     let process_environment: &dyn Fn(&str) -> Option<String> = &process_environment;
+    for key in
+        forge_config::deprecated_keys_in(variables.iter().filter_map(|(key, _)| key.to_str()))
+    {
+        diagnostics.push(Diagnostic::warning(
+            "configuration.deprecated_key",
+            format!(
+                "{} is a deprecated spelling of {}.",
+                key.deprecated, key.canonical
+            ),
+            format!(
+                "Rename {} to {}{}; the old name is read only until the next minor version.",
+                key.deprecated,
+                key.canonical,
+                if key.value_change.is_empty() {
+                    String::new()
+                } else {
+                    format!(" and give it {}", key.value_change)
+                }
+            ),
+        ));
+    }
     match AppConfig::from_vars(variables.clone()) {
         Err(error) => {
             diagnostics.push(Diagnostic::error(
@@ -441,6 +502,47 @@ mod tests {
     }
 
     #[test]
+    fn a_deprecated_spelling_is_a_warning_and_a_conflict_an_error() {
+        let (result, text) = report(false, &[("FORGE_BIND", "127.0.0.1:4000")], &Fake::healthy());
+        result.expect("a deprecated key is only a warning");
+        assert!(text.contains("http address: 127.0.0.1:4000\n"), "{text}");
+        assert!(
+            text.contains(
+                "warning: FORGE_BIND is a deprecated spelling of FORGE_HTTP_ADDR. Rename \
+                 FORGE_BIND to FORGE_HTTP_ADDR;"
+            ),
+            "{text}"
+        );
+        let (result, text) = report(
+            true,
+            &[("FORGE_SHUTDOWN_GRACE_SECS", "15")],
+            &Fake::healthy(),
+        );
+        result.expect("a deprecated key is only a warning");
+        let parsed: Value = serde_json::from_str(text.trim()).expect("json");
+        assert_eq!(parsed["ok"], true);
+        assert_eq!(
+            parsed["diagnostics"][0]["code"],
+            "configuration.deprecated_key"
+        );
+        assert_eq!(parsed["diagnostics"][0]["severity"], "warning");
+        let (result, text) = report(
+            false,
+            &[
+                ("FORGE_BIND", "127.0.0.1:4000"),
+                ("FORGE_HTTP_ADDR", "127.0.0.1:4001"),
+            ],
+            &Fake::healthy(),
+        );
+        assert!(matches!(result, Err(CliError::Reported)));
+        assert!(
+            text.contains("FORGE_HTTP_ADDR and FORGE_BIND are both set, to different values"),
+            "{text}"
+        );
+        assert!(!text.contains("4000") && !text.contains("4001"), "{text}");
+    }
+
+    #[test]
     fn the_destructive_switch_is_the_clis_not_a_setting() {
         let (result, text) = report(
             false,
@@ -596,6 +698,51 @@ mod tests {
         let (_, text) = report(false, &[url], &probes);
         assert!(text.contains("not checked (a Unix socket)"), "{text}");
         assert!(probes.connected.borrow().is_empty());
+    }
+
+    #[test]
+    fn the_development_environment_files_are_read_and_the_process_wins() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            directory.path().join(".env.development"),
+            "FORGE_HTTP_ADDR=127.0.0.1:4100\nFORGE_DATABASE_URL=sqlite:dev.db\n",
+        )
+        .expect("write");
+        std::fs::write(
+            directory.path().join(".env.local"),
+            "FORGE_HTTP_ADDR=127.0.0.1:4200\n",
+        )
+        .expect("write");
+        let run_in = |json: bool, pairs: &[(&str, &str)]| {
+            let mut output = Vec::new();
+            let result = run(
+                json,
+                variables(pairs),
+                directory.path(),
+                &Fake::healthy(),
+                &mut output,
+            );
+            (result, String::from_utf8(output).expect("utf-8"))
+        };
+        let (result, text) = run_in(false, &[]);
+        result.expect("healthy");
+        assert!(text.contains("http address: 127.0.0.1:4200\n"), "{text}");
+        assert!(text.contains("environment: development\n"), "{text}");
+        assert!(text.contains("database: sqlite"), "{text}");
+        let (result, text) = run_in(false, &[("FORGE_HTTP_ADDR", "127.0.0.1:4300")]);
+        result.expect("healthy");
+        assert!(text.contains("http address: 127.0.0.1:4300\n"), "{text}");
+
+        std::fs::write(directory.path().join(".env.local"), "PASSWORD hunter2\n").expect("write");
+        let (result, text) = run_in(true, &[]);
+        assert!(matches!(result, Err(CliError::Reported)));
+        let parsed: Value = serde_json::from_str(text.trim()).expect("json");
+        assert_eq!(parsed["ok"], false);
+        assert_eq!(parsed["diagnostics"][0]["code"], "environment_file.invalid");
+        assert!(!text.contains("hunter2"), "{text}");
+        let (result, _) = run_in(false, &[]);
+        let error = result.expect_err("malformed file").to_string();
+        assert_eq!(error, ".env.local: line 1: expected KEY=VALUE");
     }
 
     #[test]

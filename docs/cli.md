@@ -16,7 +16,7 @@ from a checkout.
 ## Command summary
 
 ```text
-forge id
+forge uuid [--count N]
 forge new <name> [-d <DATABASE>] [--api] [--locale en|es|pt-BR] [--skip-docker] [--skip-ci] [--skip-lockfile] [--forge-path <PATH>]
 forge generate migration <name>
 forge generate authentication [--dry-run]
@@ -25,7 +25,8 @@ forge generate model <name> <field:type>... (--global | --tenant-scoped) [--plur
 forge generate controller <name> <action>... [--api] [--public] [--dry-run]
 forge generate mailer <name> <method[:field,...]>... [--dry-run]
 forge generate job <name> [<field:type>...] --queue [--dry-run]
-forge destroy model|scaffold|controller|mailer|job <arguments of the generator> [--dry-run] [--force] [--migrations]
+forge generate view [<dir>/]<name> [--dry-run]
+forge destroy model|scaffold|controller|mailer|job|view <arguments of the generator> [--dry-run] [--force] [--migrations]
 forge check
 forge test [ARGS]
 forge format
@@ -62,11 +63,18 @@ non-zero status. The lifecycle commands (`dev`, `migrate`, `rollback`, `setup`,
 `seed`, `db`, `routes`, `openapi`) are described under
 [Application lifecycle commands](#application-lifecycle-commands).
 
-## `forge id`
+## `forge uuid`
 
-Prints a new UUIDv7 identifier to standard output. UUIDv7 values sort by
-creation time and are Forge's default identifier format
-([ADR 0003](adr/0003-uuidv7-default-identifiers.md)).
+```sh
+forge uuid              # one UUIDv7
+forge uuid --count 5    # five, one per line, in creation order (1 to 1000)
+```
+
+Prints new UUIDv7 identifiers to standard output, as Forge-Go's `forge uuid`
+does. UUIDv7 values sort by creation time and are Forge's default identifier
+format ([ADR 0003](adr/0003-uuidv7-default-identifiers.md)). `forge id`, the
+earlier spelling, still works until the next minor version and prints a
+deprecation warning to standard error.
 
 ## `forge new <name>`
 
@@ -218,8 +226,9 @@ shop/
 │   ├── dependabot.yml       #   cargo, docker, github-actions updates
 │   └── workflows/
 │       └── ci.yml           #   fmt check, clippy -D warnings, tests, image build
+├── .env.development         # FORGE_ENV and the local database URLs, read by forge (committed, no secrets)
 ├── .gitattributes           # omitted with -d none; SQL migrations use LF
-├── .gitignore
+├── .gitignore               # ignores .env, .env.local and .env.*.local
 ├── assets/                  # omitted with --api; digested and embedded in the binary
 │   ├── application.css
 │   ├── application.js       #   imports Turbo, starts Stimulus
@@ -642,6 +651,7 @@ forge generate controller reports monthly                             # guarded:
 forge generate controller status_checks index --api                   # JSON under /v1
 forge generate mailer user welcome:name,url password_reset            # typed emails, templates, previews
 forge generate job send_welcome user_id:uuid 'note:string?' --queue   # persistent PostgreSQL queue job
+forge generate view admin/audit_log                                   # one page: templates/admin/audit_log.html
 forge destroy controller pages index about_us --public --dry-run      # what would be removed
 forge destroy model post title:string 'body:text?' --global --migrations
 ```
@@ -941,8 +951,44 @@ Builds and runs the application, then follows changes:
 - `--no-reload` builds and runs once, forwarding signals. `NAME` selects one
   binary when the package has several.
 
-The environment is yours (`FORGE_ENV` defaults to `development` in the
-application); `forge dev` does not read `.env` files.
+The environment is yours plus the [development environment
+files](#development-environment-files), read again on every restart: an
+edited `.env.local` or `.env.development` restarts the application with the
+new values.
+
+### Development environment files
+
+```sh
+cat .env.development                                   # committed by forge new: FORGE_ENV and the local database URLs
+echo 'FORGE_AUTH_SESSION_IDLE_TIMEOUT=30m' >> .env.local   # your overrides, git-ignored
+FORGE_HTTP_ADDR=127.0.0.1:4000 forge dev               # a variable you set wins over both files
+```
+
+`forge dev`, `forge test`, `forge doctor`, `forge migrate`, `forge rollback`,
+`forge seed`, `forge setup`, `forge routes`, `forge openapi` and `forge db`
+read `.env.development` and then `.env.local` from the application directory,
+as Forge-Go's `forge` does: a later file overrides an earlier one, and a
+variable already set in the process environment always wins. All but `doctor`
+set `FORGE_ENV=development` when no source sets it. Only the CLI reads the
+files: the application binary (`cargo run`, the container image, a production
+process) never does, and `.dockerignore` keeps them out of the image.
+`FORGE_ALLOW_DESTRUCTIVE` is never taken from a file: it confirms a
+destructive command only from the process environment.
+
+The format is deliberately small: `KEY=VALUE` lines, blank lines and lines
+starting with `#` ignored, an optional `export ` prefix, and one pair of
+matching single or double quotes removed from the value. There is no variable
+interpolation and no inline comment syntax. A parse error names the file and
+the line number, never its content (`.env.local: line 3: expected
+KEY=VALUE`); `forge doctor --json` reports it as `environment_file.invalid`. A
+file that is a symbolic link out of the application is refused.
+
+`forge new` writes `.env.development` (committed; development values only,
+never real secrets) and a `.gitignore` that ignores `.env`, `.env.local` and
+`.env.*.local`. Unlike Forge-Go's, it holds no `FORGE_TEST_DATABASE_URL`:
+the Rust application refuses unknown `FORGE_*` variables, and `forge dev`
+passes the file to it, so pass that one to the ignored database tests
+yourself.
 
 ### Differences from Forge-Go
 
@@ -954,8 +1000,12 @@ Same command names, flags, messages and exit codes, except:
   `FORGE_MIGRATION_DATABASE_URL` for both the credentials and the database
   name; Forge-Go takes the name from `FORGE_DATABASE_URL` and the credentials
   from the privileged URL.
-- `forge dev` has no browser-reload proxy, and does not read `.env.development`
-  or `.env.local` (generated Rust applications have no env files).
+- `forge dev` has no browser-reload proxy.
+- `.env.development` holds no `FORGE_TEST_DATABASE_URL` (see [development
+  environment files](#development-environment-files)), and `forge new` writes
+  no `.env.local` (Forge-Go puts a generated MFA key there; Forge-Rust's
+  generated applications read theirs from `FORGE_AUTH_MFA_KEY` as you set
+  it).
 - `forge routes` runs the application instead of scanning the source (Rust
   routes are registered by code and composition hooks at run time, so a scan
   would be wrong), so it needs the configuration `serve` needs and builds the

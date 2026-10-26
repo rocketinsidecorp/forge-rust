@@ -977,7 +977,7 @@ fn sign_in_use_a_tenant_scaffold_and_sign_out(root: &Path, binary: &str, url: &s
         &["serve"],
         &[
             ("FORGE_DATABASE_URL", url),
-            ("FORGE_BIND", &bind),
+            ("FORGE_HTTP_ADDR", &bind),
             ("FORGE_AUTH_MFA_KEY", MFA_KEY),
             ("FORGE_AUTH_SESSION_IDLE_TIMEOUT", "5m"),
         ],
@@ -1822,14 +1822,21 @@ fn postgresql_application_lists_every_route_with_forge_routes() {
     }
     run(&root, "cargo", &["generate-lockfile", "--quiet"], &[]);
 
-    // The application composes with the configuration `serve` needs.
+    // The application composes with the configuration `serve` needs: without
+    // the generated `.env.development` there is no database URL to use.
+    let env_file = root.join(".env.development");
+    let parked = root.join(".env.development.parked");
+    std::fs::rename(&env_file, &parked).unwrap_or_else(|error| panic!("{error}"));
     let refused = run_unchecked(&root, forge, &["routes"], &[], None);
+    std::fs::rename(&parked, &env_file).unwrap_or_else(|error| panic!("{error}"));
     assert!(!refused.status.success());
     assert!(
         String::from_utf8_lossy(&refused.stderr).contains("FORGE_DATABASE_URL"),
         "{}",
         String::from_utf8_lossy(&refused.stderr)
     );
+    // With the file back, `forge routes` takes the URL from it.
+    stdout(&run(&root, forge, &["routes"], &[]));
     let environment = [(
         "FORGE_DATABASE_URL",
         "postgres://app:secret@127.0.0.1:1/routes",
@@ -1916,10 +1923,10 @@ fn postgresql_application_lists_every_route_with_forge_routes() {
     assert_eq!(extra.status.code(), Some(2));
 }
 
-/// `forge generate model|controller|mailer|job` and `forge destroy` end to
-/// end (ADR 0038): a PostgreSQL application gets a model, a tenant-scoped
+/// `forge generate model|controller|mailer|job|view` and `forge destroy` end
+/// to end (ADR 0038): a PostgreSQL application gets a model, a tenant-scoped
 /// scaffold, a controller that reuses the model's permission, a public and
-/// a JSON controller, a mailer and a queue job; the printed wiring is
+/// a JSON controller, a mailer, a queue job and two views; the printed wiring is
 /// applied and the application passes `cargo fmt --check`, Clippy with
 /// warnings denied and `cargo test` (with FORGE_TEST_DATABASE_URL, the
 /// repository tests too). Then everything is destroyed, the wiring taken
@@ -1957,7 +1964,9 @@ fn postgresql_application_generates_and_destroys_every_generator() {
     const REPORTS: &[&str] = &["reports", "monthly", "--api"];
     const MAILER: &[&str] = &["user", "welcome:name,url", "password_reset"];
     const JOB: &[&str] = &["send_welcome", "user_id:uuid", "note:string?", "--queue"];
-    let generations: [(&str, &[&str]); 7] = [
+    const VIEW: &[&str] = &["help"];
+    const ADMIN_VIEW: &[&str] = &["admin/audit_log"];
+    let generations: [(&str, &[&str]); 9] = [
         ("model", MODEL),
         ("scaffold", SCAFFOLD),
         ("controller", BOOKS),
@@ -1965,6 +1974,8 @@ fn postgresql_application_generates_and_destroys_every_generator() {
         ("controller", REPORTS),
         ("mailer", MAILER),
         ("job", JOB),
+        ("view", VIEW),
+        ("view", ADMIN_VIEW),
     ];
     for (generator, arguments) in generations {
         let mut command = vec!["generate", generator];
@@ -1983,7 +1994,7 @@ fn postgresql_application_generates_and_destroys_every_generator() {
         // Generating again refuses and writes nothing.
         let again = run_unchecked(&root, forge, &command, &[], None);
         assert!(!again.status.success(), "{generator} {arguments:?} twice");
-        if generator == "model" {
+        if generator == "model" || generator == "view" {
             declare_modules(&root, &printed);
         } else {
             apply_wiring(&root, &printed);
@@ -2042,9 +2053,17 @@ fn postgresql_application_generates_and_destroys_every_generator() {
         "the_handler_registers_once ... ok",
         "the_placeholder_fails_permanently ... ok",
         "create_show_edit_update_and_delete ... ok",
+        "the_page_renders_in_the_layout_and_escapes_its_text ... ok",
     ] {
         assert!(tests.contains(test), "{test}\n{tests}");
     }
+    assert_eq!(
+        tests
+            .matches("the_page_renders_in_the_layout_and_escapes_its_text ... ok")
+            .count(),
+        2,
+        "both views' tests ran"
+    );
     if server {
         assert!(
             tests.contains("postgres_round_trip_locking_and_pages ... ok"),
@@ -2074,6 +2093,21 @@ fn postgresql_application_generates_and_destroys_every_generator() {
     assert!(String::from_utf8_lossy(&refused.stderr).contains("templates/pages/about_us.html"));
     assert!(root.join("src/adapters/http/pages_controller.rs").exists());
     fs::write(&page, edited).unwrap_or_else(|error| panic!("{error}"));
+    // A controller's page is not a view's to remove.
+    let owned = run_unchecked(
+        &root,
+        forge,
+        &["destroy", "view", "pages/about_us"],
+        &[],
+        None,
+    );
+    assert!(!owned.status.success());
+    assert!(
+        String::from_utf8_lossy(&owned.stderr).contains("is a page of the pages controller"),
+        "{}",
+        String::from_utf8_lossy(&owned.stderr)
+    );
+    assert!(page.exists());
 
     let destroy = |generator: &'static str, arguments: &[&'static str], extra: &[&'static str]| {
         let mut command = vec!["destroy", generator];
@@ -2098,6 +2132,8 @@ fn postgresql_application_generates_and_destroys_every_generator() {
     destroy("controller", REPORTS, &[]);
     destroy("mailer", MAILER, &[]);
     destroy("job", JOB, &[]);
+    destroy("view", VIEW, &[]);
+    destroy("view", ADMIN_VIEW, &[]);
 
     // Take the wiring out again: the files Forge never edits.
     for (path, content) in &original {

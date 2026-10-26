@@ -177,13 +177,13 @@ fn serve_runs_until_sigterm_and_stops_what_it_started() {
         app,
         &["serve"],
         vec![
-            ("FORGE_BIND", format!("127.0.0.1:{port}")),
+            ("FORGE_HTTP_ADDR", format!("127.0.0.1:{port}")),
             (
                 "FORGE_TELEMETRY_METRICS_ADDR",
                 format!("127.0.0.1:{metrics}"),
             ),
             ("FORGE_DATABASE_URL", sqlite_url(&directory)),
-            ("FORGE_SHUTDOWN_GRACE_SECS", "2".to_owned()),
+            ("FORGE_HTTP_SHUTDOWN_TIMEOUT", "2s".to_owned()),
         ],
     );
 
@@ -244,7 +244,7 @@ fn serve_also_stops_on_sigint() {
     let running = start(
         marker_app(),
         &["serve"],
-        vec![("FORGE_BIND", format!("127.0.0.1:{port}"))],
+        vec![("FORGE_HTTP_ADDR", format!("127.0.0.1:{port}"))],
     );
     assert_eq!(wait_until_serving(&running, port, "/marker").status, 200);
 
@@ -261,7 +261,7 @@ fn serve_fails_when_an_address_is_taken() {
     let main = start(
         marker_app(),
         &["serve"],
-        vec![("FORGE_BIND", format!("127.0.0.1:{taken_port}"))],
+        vec![("FORGE_HTTP_ADDR", format!("127.0.0.1:{taken_port}"))],
     );
     assert_eq!(main.join().expect("serve thread"), ExitCode::FAILURE);
 
@@ -269,7 +269,7 @@ fn serve_fails_when_an_address_is_taken() {
         marker_app(),
         &["serve"],
         vec![
-            ("FORGE_BIND", format!("127.0.0.1:{}", free_port())),
+            ("FORGE_HTTP_ADDR", format!("127.0.0.1:{}", free_port())),
             (
                 "FORGE_TELEMETRY_METRICS_ADDR",
                 format!("127.0.0.1:{taken_port}"),
@@ -587,7 +587,11 @@ fn inspection_commands_compose_over_the_declared_database_and_close_it() {
 
 #[test]
 fn a_configuration_that_cannot_be_loaded_is_a_configuration_error_for_every_command() {
-    let unloadable = || Err(ConfigError::NotUnicode { key: "FORGE_BIND" });
+    let unloadable = || {
+        Err(ConfigError::NotUnicode {
+            key: "FORGE_HTTP_ADDR",
+        })
+    };
     let app = || {
         let app = App::new("demo").command("seed", "x", |_| async { Ok(()) });
         #[cfg(feature = "sqlite")]

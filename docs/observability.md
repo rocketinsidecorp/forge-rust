@@ -72,7 +72,7 @@ echo the endpoint or a header value. Durations use Go's syntax (`10s`,
 | `FORGE_TELEMETRY_OTLP_ALLOW_PLAINTEXT` | `false` | Permit `http://` endpoints in `production` (sidecar or private network) |
 | `FORGE_TELEMETRY_SAMPLE_RATIO` | `1` | Fraction of new traces sampled, `0` to `1` |
 | `FORGE_TELEMETRY_TRUST_TRACEPARENT` | `false` | Continue traces from incoming `traceparent`/`tracestate`. Enable only behind a proxy or gateway that sets or sanitizes them |
-| `FORGE_TELEMETRY_METRICS_ADDR` | (empty: off) | `ip:port` or `localhost:port` of the Prometheus listener; must differ from `FORGE_BIND` |
+| `FORGE_TELEMETRY_METRICS_ADDR` | (empty: off) | `ip:port` or `localhost:port` of the Prometheus listener; must differ from `FORGE_HTTP_ADDR` |
 | `FORGE_TELEMETRY_METRICS_PUBLIC` | `false` | Confirms a non-loopback `FORGE_TELEMETRY_METRICS_ADDR` (such as `0.0.0.0:9464` in a container). Without it `production` refuses to start and other environments log a warning |
 | `FORGE_TELEMETRY_METRICS_INTERVAL` | `1m` | OTLP metric push interval, at least `1s` |
 
@@ -440,7 +440,7 @@ metric and in `forge_telemetry_export_errors_total{signal}`, and is
 reported **on standard output only**: the telemetry's own diagnostics
 (target `forge_telemetry`) are never exported, so a broken collector cannot
 feed itself. On shutdown spans, log records and a final metric snapshot are
-flushed concurrently within what remains of `FORGE_SHUTDOWN_GRACE_SECS`
+flushed concurrently within what remains of `FORGE_HTTP_SHUTDOWN_TIMEOUT`
 since shutdown began; whatever is still queued at the deadline is dropped
 and counted. Lines logged after that reach standard output only.
 
@@ -470,7 +470,7 @@ has no such counter:
   default to the name and version given to `App` rather than
   `unknown_service:<binary>` and empty.
 - `FORGE_TELEMETRY_METRICS_ADDR` takes an IP address or `localhost` (not
-  other host names), like `FORGE_BIND`; it must differ from `FORGE_BIND`.
+  other host names), like `FORGE_HTTP_ADDR`; it must differ from `FORGE_HTTP_ADDR`.
 - `FORGE_TELEMETRY_OTLP_COMPRESSION` and `FORGE_TELEMETRY_OTLP_TIMEOUT` are
   validated even when no OTLP exporter is selected.
 - OTLP log records carry no trace flags (the sampled bit), which the span

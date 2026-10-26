@@ -140,13 +140,13 @@ fn serve_over_mysql_answers_readiness_and_stops_on_sigterm() {
         app,
         &["serve"],
         vec![
-            ("FORGE_BIND", format!("127.0.0.1:{port}")),
+            ("FORGE_HTTP_ADDR", format!("127.0.0.1:{port}")),
             (
                 "FORGE_TELEMETRY_METRICS_ADDR",
                 format!("127.0.0.1:{metrics}"),
             ),
             ("FORGE_DATABASE_URL", test.url().expose().to_owned()),
-            ("FORGE_SHUTDOWN_GRACE_SECS", "2".to_owned()),
+            ("FORGE_HTTP_SHUTDOWN_TIMEOUT", "2s".to_owned()),
         ],
     );
 

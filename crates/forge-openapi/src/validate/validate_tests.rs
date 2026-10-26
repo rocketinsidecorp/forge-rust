@@ -474,3 +474,57 @@ fn a_tree_that_lacks_the_operation_or_the_status_is_reported() {
         "{error}"
     );
 }
+
+#[test]
+fn a_catch_all_is_documented_as_one_parameter_and_matched_like_the_router() {
+    let text = || Some(Arc::new(Operation::new().response(Response::text(200))));
+    let route = |path: &str| Route {
+        method: "GET".to_owned(),
+        path: path.to_owned(),
+        operation: text(),
+    };
+    let document = Document::build(
+        &Info::new("t", "1"),
+        &[
+            route("/files/{key...}"),
+            route("/files/static"),
+            route("/files/{dir}/meta"),
+        ],
+    )
+    .expect("document");
+    // OpenAPI has no multi-segment parameter: `{key...}` is `{key}`, as in
+    // Forge-Go's document.
+    assert_eq!(
+        document.paths(),
+        ["/files/static", "/files/{dir}/meta", "/files/{key}"]
+    );
+    let operation = &document.as_value()["paths"]["/files/{key}"]["get"];
+    assert_eq!(operation["operationId"], "getFilesByKey");
+    assert_eq!(operation["parameters"][0]["name"], "key");
+    assert_eq!(operation["parameters"][0]["in"], "path");
+    let ok = |path: &str| document.validate_response("GET", path, 200, Some("text/plain"), b"x");
+    for path in ["/files/", "/files/a", "/files/a/b/c", "/files/a/meta/x"] {
+        assert_eq!(ok(path), Ok(()), "{path}");
+    }
+    assert!(matches!(
+        ok("/files"),
+        Err(ContractError::Undocumented { .. })
+    ));
+    assert_eq!(
+        document.validate_route_response("GET", "/files/{key...}", 200, Some("text/plain"), b""),
+        Ok(())
+    );
+
+    // A route the document would spell like another one is refused, and a
+    // catch-all must be the last segment.
+    for paths in [
+        &["/files/{key...}", "/files/{key}"][..],
+        &["/files/{key...}/meta"][..],
+    ] {
+        let routes: Vec<Route> = paths.iter().map(|path| route(path)).collect();
+        assert!(
+            Document::build(&Info::new("t", "1"), &routes).is_err(),
+            "{paths:?}"
+        );
+    }
+}

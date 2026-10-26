@@ -290,8 +290,10 @@ impl Request {
     }
 
     /// Parses a named parameter captured by a dynamic route such as
-    /// `/customers/{id}`. Percent escapes are decoded before parsing; `+`
-    /// remains a literal plus, as it does in a URL path. Returns an error if the
+    /// `/customers/{id}`. Percent escapes are decoded once before parsing
+    /// (`%252e` becomes the text `%2e`: never decode the value again, or a
+    /// dot segment the router refused comes back); `+` remains a literal
+    /// plus, as it does in a URL path. Returns an error if the
     /// parameter is missing, malformed or cannot be parsed as `T`.
     pub fn path_param_as<T>(&self, name: &str) -> Result<T, PathParamError>
     where
@@ -634,8 +636,12 @@ impl Router {
     }
 
     /// Registers a route and rejects duplicate or ambiguous method/pattern
-    /// pairs. Whole path segments may be named captures such as `{id}`.
-    /// Static segments take precedence over capture segments during dispatch.
+    /// pairs. Whole path segments may be named captures such as `{id}`, and
+    /// the last one may be a catch-all such as `{key...}`, which captures
+    /// the rest of the path, slashes included (Forge-Go's wildcard): `GET
+    /// /files/{key...}` serves `/files/a/b.png` with `key` = `a/b.png`, and
+    /// `/files/` with an empty `key`. Static segments take precedence over
+    /// `{name}` captures, and those over a catch-all, during dispatch.
     /// The call site is kept for [`Router::routes`].
     #[track_caller]
     pub fn route(
@@ -649,17 +655,16 @@ impl Router {
         let segments = routing::parse_pattern(&path)?;
         let params = segments
             .iter()
-            .filter_map(|segment| match segment {
-                routing::Segment::Param(name) => Some(Arc::clone(name)),
-                routing::Segment::Static(_) => None,
-            })
+            .filter_map(|segment| segment.capture().map(Arc::clone))
             .collect::<Vec<_>>();
+        let catch_all = matches!(segments.last(), Some(routing::Segment::Rest(_)));
         self.root.insert(
             segments,
             routing::Endpoint {
                 method: method.clone(),
                 path: Arc::from(path.as_str()),
                 params: params.into_boxed_slice(),
+                catch_all,
                 handler: Arc::new(handler),
             },
         )?;
@@ -736,11 +741,18 @@ impl Router {
     /// [`Server`] sends the headers without the body (here the body is
     /// left in place). A matched path without a handler for the request
     /// method answers `405` with an `Allow` header listing the served
-    /// methods in sorted order (`HEAD` included wherever `GET` is). A
-    /// captured segment containing an encoded slash (`%2F`) answers `400`,
-    /// because it would let a client smuggle a path separator past routing;
-    /// other malformed escapes are reported by [`Request::path_param_as`]
-    /// when the handler reads the parameter.
+    /// methods in sorted order (`HEAD` included wherever `GET` is).
+    ///
+    /// After the [`Middleware`] layers and before matching, every routed
+    /// request whose path Forge-Go's router refuses answers `400` (layers
+    /// see the raw path first and must validate what they use): one holding `%2F` or `%5C` (any case) or a raw `\`,
+    /// or a `.` or `..` segment, spelled or percent-encoded (`%2e%2e`). A
+    /// `{name...}` catch-all also answers `400` when its capture starts with
+    /// `/` or holds `//` (`/files//etc/passwd`); a trailing `/` is kept.
+    /// Other malformed escapes are reported by [`Request::path_param_as`]
+    /// when the handler reads the parameter. Escapes are decoded once:
+    /// `%252e%252e` reaches the handler as the text `%2e%2e`, which a
+    /// handler must not decode again.
     pub async fn dispatch(&self, mut request: Request) -> Response {
         for layer in &self.layers {
             layer.rewrite(&mut request);
@@ -756,6 +768,9 @@ impl Router {
     /// Matches the request against the route table and calls its handler.
     async fn route_request(&self, request: Request) -> Response {
         let path = request.uri.path().to_owned();
+        if is_invalid_path(&path) {
+            return Response::new(StatusCode::BAD_REQUEST, "bad request");
+        }
         let mut captures = Vec::new();
         let Some(node) = self.root.find(&path, &mut captures) else {
             return Response::new(StatusCode::NOT_FOUND, "not found");
@@ -768,7 +783,7 @@ impl Router {
             }
             return response;
         };
-        if captures.iter().any(|value| has_encoded_slash(value)) {
+        if endpoint.catch_all && captures.last().is_some_and(|rest| has_empty_segment(rest)) {
             return Response::new(StatusCode::BAD_REQUEST, "bad request");
         }
         let params = endpoint
@@ -787,11 +802,28 @@ impl Router {
     }
 }
 
-/// Whether `segment` contains `%2F` or `%2f`.
-fn has_encoded_slash(segment: &str) -> bool {
-    segment.as_bytes().windows(3).any(|window| {
-        window[0] == b'%' && window[1] == b'2' && window[2].eq_ignore_ascii_case(&b'f')
-    })
+/// Forge-Go's `invalid_path` rule (`router/router.go`), applied to every
+/// routed request (after the middleware layers) before matching: an encoded slash or backslash (`%2F`, `%5C`, any
+/// case), a raw backslash, or a `.` or `..` segment, spelled or
+/// percent-encoded. A capture holding one could smuggle a separator past
+/// routing or climb out of a directory a handler joins it to.
+fn is_invalid_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower.contains("%2f")
+        || lower.contains("%5c")
+        || path.contains('\\')
+        || path.split('/').any(|segment| {
+            crate::encoding::percent_decode(segment, false)
+                .is_ok_and(|decoded| decoded == "." || decoded == "..")
+        })
+}
+
+/// Whether a catch-all capture starts with `/` or has an empty segment
+/// inside (`//`), which `ServeMux` would have cleaned away: `/files//etc`
+/// must not hand a handler the absolute `/etc`. A trailing `/` is allowed,
+/// as in Forge-Go (`/files/a/` captures `a/`).
+fn has_empty_segment(rest: &str) -> bool {
+    rest.starts_with('/') || rest.contains("//")
 }
 
 fn static_json(status: StatusCode, body: &'static str) -> Response {
@@ -1040,7 +1072,7 @@ struct ServedApp {
 
 /// The bytes of request bodies all connections may hold in memory at once,
 /// a semaphore with one permit per byte. Bodies are buffered before
-/// dispatch, so without it `FORGE_MAX_BODY_BYTES` times
+/// dispatch, so without it `FORGE_HTTP_MAX_BODY_BYTES` times
 /// `FORGE_MAX_CONNECTIONS` (about 10 GiB by default) could be resident.
 struct BodyBudget(Arc<Semaphore>);
 

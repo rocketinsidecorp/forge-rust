@@ -25,14 +25,18 @@ pub fn cases(cases: &mut Vec<Case>) {
 /// `Router::dispatch` for a request that matches the middle route of a table
 /// of 1, 10, 100 or 1000 routes, answered by a handler that does nothing.
 ///
-/// `static` is `/static/rN/item` and `param` is `/param/rN/{id}`, as in
-/// Forge-Go. The `wildcard` variants (`/files/rN/{path...}`) have no
-/// Forge-Rust equivalent: a `{name}` segment captures exactly one non-empty
-/// segment and the router has no catch-all, so they are not run.
+/// `static` is `/static/rN/item`, `param` is `/param/rN/{id}` and
+/// `wildcard` is the catch-all `/files/rN/{path...}` matched by
+/// `/files/rN/docs/2026/report.txt`, as in Forge-Go.
 fn router_match(cases: &mut Vec<Case>) {
     for (variant, pattern, target) in [
         ("static", "/static/r{}/item", "/static/r{}/item"),
         ("param", "/param/r{}/{id}", "/param/r{}/42"),
+        (
+            "wildcard",
+            "/files/r{}/{path...}",
+            "/files/r{}/docs/2026/report.txt",
+        ),
     ] {
         for routes in [1_usize, 10, 100, 1000] {
             let name: &'static str = Box::leak(format!("{variant}/{routes}").into_boxed_str());

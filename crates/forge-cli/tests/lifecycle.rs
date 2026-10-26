@@ -418,6 +418,70 @@ fn db_reset_without_psql_refuses_before_dropping_the_database() {
 }
 
 #[test]
+fn the_development_environment_files_reach_the_application_and_the_process_wins() {
+    let fixture = Fixture::new(FAKE_APP);
+    fs::write(
+        fixture.project().join(".env.development"),
+        "# committed\nFORGE_DATABASE_URL=postgres://dev@127.0.0.1/shop_development\n",
+    )
+    .expect("env file");
+    fs::write(
+        fixture.project().join(".env.local"),
+        "export FORGE_DATABASE_URL='postgres://local@127.0.0.1/shop_development'\n",
+    )
+    .expect("env file");
+    let output = fixture.run(&["migrate"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let output = fixture
+        .command(&["migrate"])
+        .env("FORGE_DATABASE_URL", "postgres://process@127.0.0.1/shop")
+        .output()
+        .expect("forge runs");
+    assert!(output.status.success(), "{}", stderr(&output));
+    let urls: Vec<String> = fixture
+        .lines()
+        .into_iter()
+        .filter(|line| line.starts_with("allow="))
+        .collect();
+    assert_eq!(
+        urls,
+        [
+            "allow=unset url=postgres://local@127.0.0.1/shop_development",
+            "allow=unset url=postgres://process@127.0.0.1/shop",
+        ]
+    );
+
+    // A file can make the environment production, never confirm a
+    // destructive command.
+    fs::write(
+        fixture.project().join(".env.local"),
+        "FORGE_ENV=production\nFORGE_ALLOW_DESTRUCTIVE=true\n",
+    )
+    .expect("env file");
+    let output = fixture.run(&["db", "drop", "--force-production", "--yes"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        stderr(&output).contains("--yes here also needs FORGE_ALLOW_DESTRUCTIVE=true"),
+        "{}",
+        stderr(&output)
+    );
+
+    // A malformed file stops the command before anything runs, without
+    // showing the line.
+    fs::write(fixture.project().join(".env.local"), "TOKEN hunter2\n").expect("env file");
+    let calls = fixture.app_calls().len();
+    let output = fixture.run(&["migrate"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        stderr(&output).contains(".env.local: line 1: expected KEY=VALUE"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(!stderr(&output).contains("hunter2"));
+    assert_eq!(fixture.app_calls().len(), calls);
+}
+
+#[test]
 fn production_refuses_destructive_commands_before_building_anything() {
     for arguments in [
         &["db", "drop"][..],
