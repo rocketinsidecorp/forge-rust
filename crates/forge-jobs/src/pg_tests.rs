@@ -255,7 +255,9 @@ async fn schema_reverts_cleanly_and_grants_least_privilege() {
         "SELECT proname::text FROM pg_proc
          WHERE proname LIKE 'forge\\_jobs\\_%'
            AND (proconfig IS NULL
-                OR (NOT prosecdef AND proname <> 'forge_jobs_require_worker_scope'))",
+                OR (NOT prosecdef
+                    AND proname <> 'forge_jobs_require_worker_scope'
+                    AND prorettype <> 'trigger'::regtype))",
     )
     .fetch_all(db.admin().pool())
     .await
@@ -265,10 +267,22 @@ async fn schema_reverts_cleanly_and_grants_least_privilege() {
         "every function pins its search path: {definer:?}"
     );
 
-    assert_eq!(
-        db.migrator().rollback(&migrator()).await.expect("rollback"),
-        Some(1)
-    );
+    // Neither the runtime role nor anyone else can call the announcement
+    // trigger function directly.
+    let callable: bool =
+        sqlx::query_scalar("SELECT has_function_privilege($1, 'forge_jobs_announce()', 'EXECUTE')")
+            .bind(db.runtime_role())
+            .fetch_one(db.admin().pool())
+            .await
+            .expect("privilege");
+    assert!(!callable);
+
+    for version in [2, 1] {
+        assert_eq!(
+            db.migrator().rollback(&migrator()).await.expect("rollback"),
+            Some(version)
+        );
+    }
     let left: i64 =
         sqlx::query_scalar("SELECT count(*) FROM pg_class WHERE relname LIKE 'forge\\_job%'")
             .fetch_one(db.admin().pool())
@@ -277,7 +291,7 @@ async fn schema_reverts_cleanly_and_grants_least_privilege() {
     assert_eq!(left, 0);
     assert_eq!(
         db.migrator().migrate(&migrator()).await.expect("re-apply"),
-        vec![1]
+        vec![1, 2]
     );
     db.cleanup().await.expect("cleanup");
 }

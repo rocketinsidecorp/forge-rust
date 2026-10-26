@@ -35,9 +35,10 @@
 //! # Lifecycle
 //!
 //! [`Jobs::run`] owns every task it starts: one bounded worker loop per
-//! queue, the scheduler and the pruner. Each claim leases at most
-//! [`WorkerSettings::batch`] jobs and never more than the queue's free
-//! slots. On shutdown it stops claiming, waits
+//! queue, the scheduler, the pruner and, when the store's connections carry
+//! [`postgres::NOTIFY_SETTING`] on, the listener that wakes idle workers as
+//! soon as a due job is enqueued (ADR 0046). Each claim leases at most
+//! [`WorkerSettings::batch`] jobs and never more than the queue's free slots. On shutdown it stops claiming, waits
 //! for in-flight attempts up to a deadline, cancels the remaining ones
 //! cooperatively, then aborts them and releases their leases. A panicking
 //! handler is recorded as a failed attempt; the worker keeps running. Logs
@@ -56,8 +57,11 @@ mod backoff;
 mod cron;
 mod error;
 mod job;
+mod listener;
 mod name;
 pub mod panics;
+#[cfg(test)]
+mod pg_notify_tests;
 #[cfg(test)]
 mod pg_tests;
 pub mod postgres;

@@ -14,7 +14,9 @@ use tokio::task::JoinSet;
 use tracing::{error, info, warn};
 
 use crate::{
-    JobHandler, JobsError, Schedule, name,
+    JobHandler, JobsError, Schedule,
+    listener::{self, Wakes},
+    name,
     postgres::{PgJobStore, Pruning},
     scheduler,
     worker::{Chain, ErasedHandler, QueueWorker, Typed},
@@ -328,6 +330,15 @@ impl Jobs {
     /// schedules exist) and the pruning loop until `shutdown` is cancelled,
     /// then drains them (see [`WorkerSettings`]) and returns.
     ///
+    /// When the store's connections carry
+    /// [`forge.jobs_notify`](crate::postgres::NOTIFY_SETTING) `on`, it also
+    /// holds one `LISTEN` connection (outside the store's pool) and an idle
+    /// queue worker claims as soon as a job of its queue is announced, at
+    /// most once per 10 ms; on every (re)subscription each queue claims
+    /// once. The connection reconnects after a jittered 0.5 to 1 s, doubling
+    /// to 15 to 30 s, while polling continues: announcements are hints,
+    /// never needed for correctness.
+    ///
     /// Every loop is a task owned by this future; none outlives it. If a loop
     /// panics, the others are stopped gracefully and the panic is reported as
     /// [`JobsError::TaskFailed`].
@@ -362,6 +373,9 @@ impl Jobs {
         if !queues.is_empty() || !schedules.is_empty() || pruning.is_some() {
             store.check_worker_grants().await?;
         }
+        // With `forge.jobs_notify` on, idle workers also wake when a job of
+        // their queue is announced (ADR 0046).
+        let mut wakes = (!queues.is_empty() && store.notifies().await?).then(Wakes::new);
 
         let stop = shutdown.child();
         let mut tasks: JoinSet<()> = JoinSet::new();
@@ -378,9 +392,14 @@ impl Jobs {
                 store: store.clone(),
                 settings,
                 telemetry: telemetry.clone(),
+                wake: wakes.as_mut().map(|wakes| wakes.register(queue)),
             };
             let handle = tasks.spawn(worker.run(stop.clone()));
             names.insert(handle.id(), "queue worker");
+        }
+        if let Some(wakes) = wakes {
+            let handle = tasks.spawn(listener::run(store.clone(), wakes, stop.clone()));
+            names.insert(handle.id(), "job announcement listener");
         }
         if !schedules.is_empty() {
             let handle = tasks.spawn(scheduler::run(store.clone(), schedules, stop.clone()));

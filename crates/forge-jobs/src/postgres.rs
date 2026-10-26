@@ -25,7 +25,8 @@ use crate::{
 pub const MIGRATIONS_TABLE: &str = "_forge_jobs_migrations";
 
 /// The embedded, reversible job schema (`forge_jobs`, `forge_job_schedules`,
-/// row-level security, the `SECURITY DEFINER` functions and runtime grants).
+/// row-level security, the `SECURITY DEFINER` functions and runtime grants;
+/// version 2 adds the [`NOTIFY_CHANNEL`] announcement trigger).
 ///
 /// Apply it with the migration role, e.g. `database.migrate(&migrator())`;
 /// `forge::App::jobs` does so in the application's `migrate` command. The
@@ -40,28 +41,64 @@ pub fn migrator() -> Migrator {
         migrate::{Migration, MigrationType},
     };
 
-    let migration = |kind, sql: &'static str| {
+    let migration = |version, description, kind, sql: &'static str| {
         Migration::new(
-            1,
-            Cow::Borrowed("forge jobs"),
+            version,
+            Cow::Borrowed(description),
             kind,
             sql.into_sql_str(),
             false,
         )
     };
+    // Released history is immutable: changes go into a new version.
     let mut migrator = Migrator::with_migrations(vec![
         migration(
+            1,
+            "forge jobs",
             MigrationType::ReversibleUp,
             include_str!("../migrations/postgres/1_forge_jobs.up.sql"),
         ),
         migration(
+            1,
+            "forge jobs",
             MigrationType::ReversibleDown,
             include_str!("../migrations/postgres/1_forge_jobs.down.sql"),
+        ),
+        migration(
+            2,
+            "forge jobs notify",
+            MigrationType::ReversibleUp,
+            include_str!("../migrations/postgres/2_forge_jobs_notify.up.sql"),
+        ),
+        migration(
+            2,
+            "forge jobs notify",
+            MigrationType::ReversibleDown,
+            include_str!("../migrations/postgres/2_forge_jobs_notify.down.sql"),
         ),
     ]);
     migrator.table_name = Cow::Borrowed(MIGRATIONS_TABLE);
     migrator
 }
+
+/// The PostgreSQL notification channel on which due jobs are announced when
+/// they are enqueued by a session with [`NOTIFY_SETTING`] on. The payload is
+/// the job's queue name; anything else is ignored.
+pub const NOTIFY_CHANNEL: &str = "forge_jobs";
+
+/// The session setting that turns on enqueue announcements and the workers'
+/// `LISTEN` (ADR 0046), with the meaning of Forge-Go's
+/// `queuepostgres.WithNotify()`: `on` (or `true`, `yes`, `1`) in the
+/// connection settings of every process, for example
+/// `PGOPTIONS='-c forge.jobs_notify=on'` or `?options=-c%20forge.jobs_notify%3Don`
+/// in the database URL. Unset or anything else means off.
+pub const NOTIFY_SETTING: &str = "forge.jobs_notify";
+
+/// How long opening the `LISTEN` connection may take.
+const SUBSCRIBE_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long closing the `LISTEN` connection may take, so a dead network cannot
+/// hold up shutdown.
+const UNSUBSCRIBE_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Idempotency-key prefix reserved for schedule ticks.
 pub(crate) const SCHEDULE_KEY_PREFIX: &str = "forge.schedule:";
@@ -620,6 +657,7 @@ impl PgJobStore {
                      ARRAY(
                          SELECT p.oid::regprocedure::text FROM pg_proc AS p
                          WHERE p.proname LIKE 'forge\_jobs\_%'
+                           AND p.prorettype <> 'pg_catalog.trigger'::pg_catalog.regtype
                            AND pg_function_is_visible(p.oid)
                            AND NOT has_function_privilege(p.oid, 'EXECUTE')
                          ORDER BY 1
@@ -650,6 +688,35 @@ impl PgJobStore {
             return Ok(());
         };
         Err(JobsError::WorkerNotGranted { role, detail })
+    }
+
+    /// Whether this store's sessions have [`NOTIFY_SETTING`] on, so its
+    /// workers listen for announcements.
+    pub(crate) async fn notifies(&self) -> Result<bool, JobsError> {
+        Ok(sqlx::query_scalar(
+            "SELECT lower(coalesce(current_setting($1, true), '')) IN ('on', 'true', 'yes', '1')",
+        )
+        .bind(NOTIFY_SETTING)
+        .fetch_one(self.database.pool())
+        .await?)
+    }
+
+    /// A subscription to [`NOTIFY_CHANNEL`] on one connection outside the
+    /// store's pool (so it never takes a connection from requests or
+    /// workers), with the pool's connection settings. It connects in
+    /// [`Subscription::listen`].
+    pub(crate) fn subscription(&self) -> Subscription {
+        let options = (*self.database.pool().connect_options()).clone();
+        Subscription {
+            pool: sqlx::postgres::PgPoolOptions::new()
+                .max_connections(1)
+                .min_connections(0)
+                .acquire_timeout(SUBSCRIBE_TIMEOUT)
+                .idle_timeout(None)
+                .max_lifetime(None)
+                .connect_lazy_with(options),
+            listener: None,
+        }
     }
 
     pub(crate) async fn claim(
@@ -794,6 +861,54 @@ impl PgJobStore {
             .fetch_one(self.database.pool())
             .await?;
         timestamp(micros)
+    }
+}
+
+/// One `LISTEN` connection on [`NOTIFY_CHANNEL`], on a pool of its own.
+///
+/// Always close it with [`Subscription::close`], also after a failed or
+/// cancelled [`Subscription::listen`]: dropping SQLx's `PgListener` returns
+/// its connection from a task SQLx spawns, and closing the pool waits
+/// (bounded by one second) until that is done and the connection is closed,
+/// so no `LISTEN` session outlives the job runtime.
+pub(crate) struct Subscription {
+    pool: sqlx::PgPool,
+    listener: Option<sqlx::postgres::PgListener>,
+}
+
+impl Subscription {
+    /// Connects and runs `LISTEN`.
+    pub(crate) async fn listen(&mut self) -> Result<(), JobsError> {
+        let mut listener = sqlx::postgres::PgListener::connect_with(&self.pool).await?;
+        // A lost connection ends the subscription; the worker reconnects
+        // with backoff instead of SQLx reconnecting at once.
+        listener.eager_reconnect(false);
+        let listening = listener.listen(NOTIFY_CHANNEL).await;
+        self.listener = Some(listener);
+        listening.map_err(JobsError::from)
+    }
+
+    /// The payload of the next announcement, or `None` when the connection
+    /// was lost. Notifications on other channels are skipped.
+    pub(crate) async fn next(&mut self) -> Result<Option<String>, JobsError> {
+        let Some(listener) = self.listener.as_mut() else {
+            return Ok(None);
+        };
+        loop {
+            match listener.try_recv().await? {
+                Some(notification) if notification.channel() == NOTIFY_CHANNEL => {
+                    return Ok(Some(notification.payload().to_owned()));
+                }
+                Some(_) => {}
+                None => return Ok(None),
+            }
+        }
+    }
+
+    /// Closes the connection, waiting at most [`UNSUBSCRIBE_TIMEOUT`].
+    pub(crate) async fn close(mut self) {
+        drop(self.listener.take());
+        let _ = tokio::time::timeout(UNSUBSCRIBE_TIMEOUT, self.pool.close()).await;
     }
 }
 
