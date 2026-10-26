@@ -15,7 +15,10 @@
 //! sign-in pages regains them with `forge generate authentication`, and
 //! another PostgreSQL application runs its whole lifecycle through the `forge`
 //! CLI: `doctor`, `db prepare|status|reset|drop`, `migrate`, `rollback` and
-//! `setup`, against a database the CLI itself creates.
+//! `setup`, against a database the CLI itself creates. An application created
+//! with `--api-auth` generates and destroys every generator, the JSON
+//! resource included, and an API client signs in for a bearer token and uses
+//! the resource against the running server.
 //!
 //! These tests build whole applications and resolve dependencies with
 //! `cargo generate-lockfile`, so they are ignored by default:
@@ -1889,6 +1892,17 @@ fn postgresql_application_lists_every_route_with_forge_routes() {
         listed("GET", "/tenants/{tenant_id}/articles"),
         "the scaffold's pages are listed:\n{table}"
     );
+    for (method, path) in [
+        ("GET", "/v1/articles"),
+        ("POST", "/v1/articles"),
+        ("PATCH", "/v1/articles/{id}"),
+        ("DELETE", "/v1/articles/{id}"),
+    ] {
+        assert!(
+            listed(method, path),
+            "the scaffold's JSON API lists {method} {path}:\n{table}"
+        );
+    }
     // Sorted by path, then method.
     let order: Vec<(&str, &str)> = rows.iter().map(|row| (row[1], row[0])).collect();
     let mut sorted = order.clone();
@@ -1946,6 +1960,7 @@ fn postgresql_application_generates_and_destroys_every_generator() {
         &[
             "new",
             "generators-postgresql",
+            "--api-auth",
             "--skip-docker",
             "--skip-ci",
             "--skip-lockfile",
@@ -1959,6 +1974,12 @@ fn postgresql_application_generates_and_destroys_every_generator() {
 
     const MODEL: &[&str] = &["book", "title:string", "pages:integer?", "--global"];
     const SCAFFOLD: &[&str] = &["article", "title:string", "--tenant-scoped"];
+    const RESOURCE: &[&str] = &[
+        "product",
+        "name:string",
+        "price_cents:integer?",
+        "--tenant-scoped",
+    ];
     const BOOKS: &[&str] = &["books", "shelf"];
     const PAGES: &[&str] = &["pages", "index", "about_us", "--public"];
     const REPORTS: &[&str] = &["reports", "monthly", "--api"];
@@ -1966,9 +1987,10 @@ fn postgresql_application_generates_and_destroys_every_generator() {
     const JOB: &[&str] = &["send_welcome", "user_id:uuid", "note:string?", "--queue"];
     const VIEW: &[&str] = &["help"];
     const ADMIN_VIEW: &[&str] = &["admin/audit_log"];
-    let generations: [(&str, &[&str]); 9] = [
+    let generations: [(&str, &[&str]); 10] = [
         ("model", MODEL),
         ("scaffold", SCAFFOLD),
+        ("resource", RESOURCE),
         ("controller", BOOKS),
         ("controller", PAGES),
         ("controller", REPORTS),
@@ -2054,9 +2076,24 @@ fn postgresql_application_generates_and_destroys_every_generator() {
         "the_placeholder_fails_permanently ... ok",
         "create_show_edit_update_and_delete ... ok",
         "the_page_renders_in_the_layout_and_escapes_its_text ... ok",
+        "create_show_list_update_and_delete ... ok",
+        "a_request_without_a_valid_token_is_unauthorized ... ok",
+        "a_role_without_the_permission_is_forbidden ... ok",
+        "another_tenants_rows_are_invisible ... ok",
+        "invalid_values_and_bodies_are_unprocessable ... ok",
+        "every_wrong_sign_in_is_the_same_401_and_issues_nothing ... ok",
+        "missing_malformed_and_unknown_tokens_are_refused ... ok",
     ] {
         assert!(tests.contains(test), "{test}\n{tests}");
     }
+    // The scaffold's JSON API and the resource's both ran their tests.
+    assert_eq!(
+        tests
+            .matches("another_tenants_rows_are_invisible ... ok")
+            .count(),
+        2,
+        "{tests}"
+    );
     assert_eq!(
         tests
             .matches("the_page_renders_in_the_layout_and_escapes_its_text ... ok")
@@ -2065,10 +2102,20 @@ fn postgresql_application_generates_and_destroys_every_generator() {
         "both views' tests ran"
     );
     if server {
-        assert!(
-            tests.contains("postgres_round_trip_locking_and_pages ... ok"),
-            "{tests}"
-        );
+        for test in [
+            "postgres_round_trip_locking_and_pages ... ok",
+            "bearer_sessions_are_tenant_bound_found_by_digest_and_revoked_for_good ... ok",
+            "a_password_change_two_factor_or_a_disabled_account_ends_bearer_sessions ... ok",
+            "bearer_sessions_end_after_the_idle_timeout ... ok",
+        ] {
+            assert!(tests.contains(test), "{test}\n{tests}");
+        }
+        run(&root, "cargo", &["build", "--locked", "--quiet"], &[]);
+        let binary = Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .join("scaffold-apps/debug/generators-postgresql")
+            .to_string_lossy()
+            .into_owned();
+        sign_in_with_a_bearer_token_and_use_the_resource(&root, &binary);
     }
 
     // The model's files belong to its permission's controller until it goes.
@@ -2128,6 +2175,7 @@ fn postgresql_application_generates_and_destroys_every_generator() {
     assert!(String::from_utf8_lossy(&leftover.stderr).contains("--migrations"));
     run(&root, forge, &model(&["--migrations"]), &[]);
     destroy("scaffold", SCAFFOLD, &["--migrations"]);
+    destroy("resource", RESOURCE, &["--migrations"]);
     destroy("controller", PAGES, &[]);
     destroy("controller", REPORTS, &[]);
     destroy("mailer", MAILER, &[]);
@@ -2143,7 +2191,11 @@ fn postgresql_application_generates_and_destroys_every_generator() {
         }
     }
     let mut restored = source_tree(&root);
-    for shared in ["src/adapters/http/access.rs", "src/adapters/jobs/mod.rs"] {
+    for shared in [
+        "src/adapters/http/access.rs",
+        "src/adapters/http/api_access.rs",
+        "src/adapters/jobs/mod.rs",
+    ] {
         assert!(
             restored.remove(shared).is_some(),
             "{shared} is shared and kept"
@@ -2164,4 +2216,200 @@ fn postgresql_application_generates_and_destroys_every_generator() {
 
     run(&root, "cargo", &clippy, &[]);
     run(&root, "cargo", &["build", "--locked", "--quiet"], &[]);
+}
+
+/// One JSON request to the server, with the bearer token when there is one.
+fn api_request(
+    port: u16,
+    method: &str,
+    path: &str,
+    token: Option<&str>,
+    body: Option<&str>,
+) -> Reply {
+    let mut stream =
+        TcpStream::connect(("127.0.0.1", port)).unwrap_or_else(|error| panic!("connect: {error}"));
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap_or_else(|error| panic!("{error}"));
+    let payload = body.unwrap_or_default();
+    let mut request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\
+         Accept: application/json\r\nContent-Length: {}\r\n",
+        payload.len()
+    );
+    if let Some(token) = token {
+        request.push_str(&format!("Authorization: Bearer {token}\r\n"));
+    }
+    if body.is_some() {
+        request.push_str("Content-Type: application/json\r\n");
+    }
+    request.push_str("\r\n");
+    request.push_str(payload);
+    stream
+        .write_all(request.as_bytes())
+        .unwrap_or_else(|error| panic!("send: {error}"));
+    let mut raw = Vec::new();
+    stream
+        .read_to_end(&mut raw)
+        .unwrap_or_else(|error| panic!("receive: {error}"));
+    let raw = String::from_utf8_lossy(&raw).into_owned();
+    let (head, body) = raw.split_once("\r\n\r\n").unwrap_or((raw.as_str(), ""));
+    let mut lines = head.lines();
+    let status = lines
+        .next()
+        .and_then(|line| line.split(' ').nth(1))
+        .and_then(|code| code.parse().ok())
+        .unwrap_or_else(|| panic!("status line in {head}"));
+    Reply {
+        status,
+        headers: lines
+            .filter_map(|line| line.split_once(':'))
+            .map(|(name, value)| (name.trim().to_owned(), value.trim().to_owned()))
+            .collect(),
+        body: body.to_owned(),
+    }
+}
+
+/// `forge new --api-auth` against a real database and server: the owner
+/// signs in through `POST /auth/login`, uses the tenant-scoped resource
+/// with the bearer token, signs out, and the token is refused afterwards.
+fn sign_in_with_a_bearer_token_and_use_the_resource(root: &Path, binary: &str) {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap_or_else(|error| panic!("{error}"));
+    runtime.block_on(async {
+        let database = TestDatabase::<sqlx::Postgres>::create_empty()
+            .await
+            .unwrap_or_else(|error| panic!("test database: {error}"));
+        let url = database.url().expose().to_owned();
+        let migration = [("FORGE_MIGRATION_DATABASE_URL", url.as_str())];
+        run(root, binary, &["migrate"], &migration);
+        let created = run_unchecked(
+            root,
+            binary,
+            &[
+                "setup",
+                "--tenant",
+                "acme",
+                "--email",
+                "owner@example.com",
+                "--password-stdin",
+            ],
+            &migration,
+            Some(&format!("{OWNER_PASSWORD}\n")),
+        );
+        assert!(created.status.success(), "{created:?}");
+
+        let port = free_port();
+        let bind = format!("127.0.0.1:{port}");
+        let mut serve = command(
+            root,
+            binary,
+            &["serve"],
+            &[("FORGE_DATABASE_URL", &url), ("FORGE_HTTP_ADDR", &bind)],
+        );
+        let server = Server(
+            serve
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap_or_else(|error| panic!("serve: {error}")),
+        );
+        let mut ready = false;
+        for _ in 0..200 {
+            if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                ready = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(ready, "the server did not start on {bind}");
+
+        let refused = api_request(port, "GET", "/v1/products", None, None);
+        assert_eq!(refused.status, 401, "{}", refused.body);
+        assert_eq!(
+            refused.header("www-authenticate"),
+            Some("Bearer realm=\"forge\"")
+        );
+        let wrong = api_request(
+            port,
+            "POST",
+            "/auth/login",
+            None,
+            Some(r#"{"email":"owner@example.com","password":"not the password","tenant":"acme"}"#),
+        );
+        assert_eq!(wrong.status, 401, "{}", wrong.body);
+        let login = format!(
+            r#"{{"email":"owner@example.com","password":"{OWNER_PASSWORD}","tenant":"acme"}}"#
+        );
+        let signed_in = api_request(port, "POST", "/auth/login", None, Some(&login));
+        assert_eq!(signed_in.status, 200, "{}", signed_in.body);
+        assert_eq!(signed_in.header("cache-control"), Some("no-store"));
+        let token = signed_in
+            .body
+            .split("\"access_token\":\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .unwrap_or_else(|| panic!("a token in {}", signed_in.body))
+            .to_owned();
+        assert_eq!(token.len(), 64);
+
+        let session = api_request(port, "GET", "/v1/auth/session", Some(&token), None);
+        assert_eq!(session.status, 200, "{}", session.body);
+        assert!(
+            session.body.contains("\"roles\":[\"owner\"]"),
+            "{}",
+            session.body
+        );
+        let created = api_request(
+            port,
+            "POST",
+            "/v1/products",
+            Some(&token),
+            Some(r#"{"name":"Launch kit","price_cents":4200}"#),
+        );
+        assert_eq!(created.status, 201, "{}", created.body);
+        let location = created.header("location").unwrap_or_default().to_owned();
+        assert!(location.starts_with("/v1/products/"), "{location}");
+        let listed = api_request(port, "GET", "/v1/products", Some(&token), None);
+        assert_eq!(listed.status, 200, "{}", listed.body);
+        assert!(listed.body.contains("Launch kit"), "{}", listed.body);
+        let changed = api_request(
+            port,
+            "PATCH",
+            &location,
+            Some(&token),
+            Some(r#"{"version":1,"price_cents":null}"#),
+        );
+        assert_eq!(changed.status, 200, "{}", changed.body);
+        assert!(
+            changed.body.contains("\"price_cents\":null"),
+            "{}",
+            changed.body
+        );
+        let deleted = api_request(
+            port,
+            "DELETE",
+            &format!("{location}?version=2"),
+            Some(&token),
+            None,
+        );
+        assert_eq!(deleted.status, 204, "{}", deleted.body);
+
+        let signed_out = api_request(port, "POST", "/auth/logout", Some(&token), None);
+        assert_eq!(signed_out.status, 204, "{}", signed_out.body);
+        let revoked = api_request(port, "GET", "/v1/products", Some(&token), None);
+        assert_eq!(revoked.status, 401, "{}", revoked.body);
+        assert!(
+            revoked.body.contains("credentials_invalid"),
+            "{}",
+            revoked.body
+        );
+        drop(server);
+        database
+            .cleanup()
+            .await
+            .unwrap_or_else(|error| panic!("cleanup: {error}"));
+    });
 }

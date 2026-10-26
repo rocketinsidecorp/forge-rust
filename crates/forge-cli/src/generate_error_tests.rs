@@ -17,6 +17,7 @@ fn options(name: &str) -> NewApplication {
         views: false,
         forge: ForgeSource::GitTag,
         locale: Locale::En,
+        api_auth: false,
     }
 }
 

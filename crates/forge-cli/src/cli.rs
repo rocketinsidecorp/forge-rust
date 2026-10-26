@@ -63,6 +63,12 @@ pub(crate) enum Command {
         /// request layers.
         #[arg(long)]
         api: bool,
+        /// Also mount the JSON authentication API beside the sign-in pages:
+        /// POST /auth/login issues bearer tokens for API clients, POST
+        /// /auth/logout revokes them, GET /v1/auth/session shows the signed-in
+        /// client. Full-stack PostgreSQL applications only.
+        #[arg(long, conflicts_with = "api")]
+        api_auth: bool,
         /// Do not run `cargo generate-lockfile` after generation.
         #[arg(long)]
         skip_lockfile: bool,
@@ -585,6 +591,11 @@ pub(crate) enum GenerateCommand {
     /// authentication`; `forge new` already includes them). Writes only new
     /// files and prints the wiring to add by hand.
     Authentication {
+        /// Add the JSON authentication API (bearer tokens for API clients,
+        /// like `forge new --api-auth`); in an application that already has
+        /// the pages, only its files.
+        #[arg(long)]
+        api_auth: bool,
         /// List the files that would be created and the wiring, without
         /// writing anything.
         #[arg(long)]
@@ -610,6 +621,14 @@ pub(crate) enum GenerateCommand {
         #[command(flatten)]
         resource: ResourceArgs,
     },
+    /// Create a model plus its JSON API through every ring: migration,
+    /// entity, port, use cases, repository, /v1/<plural> handlers behind
+    /// bearer tokens and tests (like `rails generate resource`). Writes only
+    /// new files and prints the wiring to add by hand.
+    Resource {
+        #[command(flatten)]
+        resource: ResourceArgs,
+    },
     /// Create read-only GET pages (or JSON endpoints with --api), their
     /// routes, views and tests, without persistence (like `rails generate
     /// controller`). Routes ask the access policy for NAME:read unless
@@ -632,9 +651,9 @@ pub(crate) enum GenerateCommand {
         job: JobArgs,
     },
     /// Create an HTML CRUD resource through every ring: migration, entity,
-    /// port, use cases, repository, handlers, views and tests (like
-    /// `rails generate scaffold`). Writes only new files and prints the
-    /// wiring to add by hand.
+    /// port, use cases, repository, handlers, views and tests, plus the JSON
+    /// API of `generate resource` (like `rails generate scaffold`). Writes
+    /// only new files and prints the wiring to add by hand.
     #[command(group(
         ArgGroup::new("scope")
             .required(true)
@@ -774,6 +793,14 @@ pub(crate) struct DestroyArgs {
 pub(crate) enum DestroyCommand {
     /// Remove what `forge generate model` created.
     Model {
+        #[command(flatten)]
+        resource: ResourceArgs,
+        #[command(flatten)]
+        flags: DestroyArgs,
+    },
+    /// Remove what `forge generate resource` created (the shared API access
+    /// module stays).
+    Resource {
         #[command(flatten)]
         resource: ResourceArgs,
         #[command(flatten)]

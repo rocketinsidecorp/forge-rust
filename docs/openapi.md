@@ -266,6 +266,7 @@ own:
 | a request body (`Json<T>`, `Operation::request`) | `413` (`text/plain`, `FORGE_HTTP_MAX_BODY_BYTES`), `415` (`unsupported_media_type`), `422` (`invalid_json`) |
 | `authenticated()` | `401` (`text/plain`), `security: sessionCookie` |
 | `permission("posts:write")` | `401`, `403` (`text/plain`), `security: sessionCookie`, `x-forge-permission` |
+| `bearer()` (with or without `permission`) | the route authenticates an API client's `Authorization: Bearer` token: `security: bearerAuth` (Forge-Go's scheme, `type: http`, `scheme: bearer`), and its `401`/`403` are `ErrorReport`s (`credentials_required`, `credentials_invalid`, `permission_denied`, answered by `forge::web::bearer_refusal`) |
 
 A response with its own body and an error status goes in `response(...)`
 (readiness answers `503` with a `HealthReport`; a guard that answers text,

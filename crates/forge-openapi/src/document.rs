@@ -23,6 +23,9 @@ pub const JSON_SCHEMA_DIALECT: &str = "https://json-schema.org/draft/2020-12/sch
 pub const SESSION_SCHEME: &str = "sessionCookie";
 /// The cookie Forge sessions authenticate with.
 pub const SESSION_COOKIE: &str = "__Host-forge_session";
+/// The security scheme of routes that authenticate an API client's bearer
+/// token (`Operation::bearer`), Forge-Go's name.
+pub const BEARER_SCHEME: &str = "bearerAuth";
 
 pub(crate) const JSON_MEDIA_TYPE: &str = "application/json";
 pub(crate) const TEXT_MEDIA_TYPE: &str = "text/plain";
@@ -167,6 +170,7 @@ impl Document {
         let mut undocumented = Vec::new();
         let mut documented = Vec::new();
         let mut uses_session = false;
+        let mut uses_bearer = false;
         for route in sorted {
             let pattern = format!("{} {}", route.method, route.path);
             let Some(operation) = &route.operation else {
@@ -216,7 +220,9 @@ impl Document {
                 )));
             }
             operation_ids.insert(id, pattern.clone());
-            uses_session |= operation.permission.is_some() || operation.authenticated;
+            let secured = operation.permission.is_some() || operation.authenticated;
+            uses_session |= secured && !operation.bearer;
+            uses_bearer |= secured && operation.bearer;
             let item = paths.entry(documented_as.clone()).or_default();
             if item.contains_key(&method) {
                 // `/files/{key}` and `/files/{key...}` are distinct routes
@@ -244,18 +250,30 @@ impl Document {
         }
         let mut components = Map::new();
         components.insert("schemas".to_owned(), Value::Object(schemas));
+        let mut schemes = Map::new();
         if uses_session {
-            components.insert(
-                "securitySchemes".to_owned(),
+            schemes.insert(
+                SESSION_SCHEME.to_owned(),
                 json!({
-                    SESSION_SCHEME: {
-                        "type": "apiKey",
-                        "in": "cookie",
-                        "name": SESSION_COOKIE,
-                        "description": "A Forge session: the cookie signing in sets.",
-                    }
+                    "type": "apiKey",
+                    "in": "cookie",
+                    "name": SESSION_COOKIE,
+                    "description": "A Forge session: the cookie signing in sets.",
                 }),
             );
+        }
+        if uses_bearer {
+            schemes.insert(
+                BEARER_SCHEME.to_owned(),
+                json!({
+                    "type": "http",
+                    "scheme": "bearer",
+                    "description": "A Forge session token: Authorization: Bearer <token>.",
+                }),
+            );
+        }
+        if !schemes.is_empty() {
+            components.insert("securitySchemes".to_owned(), Value::Object(schemes));
         }
         let mut info_object = json!({ "title": info.title, "version": info.version });
         if let (Some(description), Some(object)) = (&info.description, info_object.as_object_mut())
@@ -424,13 +442,21 @@ fn operation_object(
         implied.push((415, None));
         implied.push((422, None));
     }
+    // A bearer route answers its refusals as JSON error reports (Forge-Go's
+    // `credentials_required`, `credentials_invalid`, `permission_denied`);
+    // a session route's access policy answers them as text.
+    let (scheme, refusal) = if operation.bearer {
+        (BEARER_SCHEME, None)
+    } else {
+        (SESSION_SCHEME, Some(Body::Text))
+    };
     if operation.permission.is_some() || operation.authenticated {
-        result.insert("security".to_owned(), json!([{ SESSION_SCHEME: [] }]));
-        implied.push((401, Some(Body::Text)));
+        result.insert("security".to_owned(), json!([{ scheme: [] }]));
+        implied.push((401, refusal));
     }
     if let Some(permission) = &operation.permission {
         result.insert("x-forge-permission".to_owned(), json!(permission));
-        implied.push((403, Some(Body::Text)));
+        implied.push((403, refusal));
     }
     if operation.responses.is_empty() {
         return Err("cannot describe: the operation declares no response".to_owned());

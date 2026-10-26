@@ -8,8 +8,10 @@ Forge did not edit any existing file. Wire the resource by hand:
        src/application/use_cases/mod.rs       pub mod events;
        src/infrastructure/database/mod.rs     pub mod events;
        src/adapters/http/mod.rs               pub mod access;
+       src/adapters/http/mod.rs               pub mod api_access;
        src/adapters/http/mod.rs               pub mod streams;
        src/adapters/http/mod.rs               pub mod events;
+       src/adapters/http/mod.rs               pub mod events_api;
        src/adapters/http/views/mod.rs         pub mod events;
 
   2. In src/bootstrap/mod.rs, at the end of `fn compose`, before `Ok(())`:
@@ -52,13 +54,23 @@ Forge did not edit any existing file. Wire the resource by hand:
     crate::adapters::http::events::routes(
         composition.router(),
         &site,
-        events,
+        events.clone(),
         std::sync::Arc::new(access),
         &streams,
     )?;
+    // events JSON API (/v1/events): tenant-scoped, for bearer tokens. This
+    // application issues none yet, so DenyAll refuses every request: run
+    // `forge generate authentication --api-auth`, then pass BearerTenantAccess
+    // (src/adapters/http/api_access.rs) here.
+    crate::adapters::http::events_api::routes(
+        composition.router(),
+        events,
+        std::sync::Arc::new(crate::adapters::http::api_access::DenyAll),
+    )?;
 
   Every route asks the access policy for `events:read` or `events:write`
-  first; src/adapters/http/access.rs explains the deny-by-default choice.
+  first; src/adapters/http/access.rs explains the deny-by-default choice for the
+  pages, src/adapters/http/api_access.rs for the JSON API under /v1/events.
   Live updates: create, update and delete publish to the `events` channel of the tenant, and
   the index page subscribes; a stream is served only to callers the same policy
   grants `events:read` (src/adapters/http/streams.rs).
@@ -87,6 +99,7 @@ Forge did not edit any existing file. Wire the resource by hand:
        src/application/use_cases/mod.rs       pub mod posts;
        src/infrastructure/database/mod.rs     pub mod posts;
        src/adapters/http/mod.rs               pub mod posts;
+       src/adapters/http/mod.rs               pub mod posts_api;
        src/adapters/http/views/mod.rs         pub mod posts;
 
   2. In src/bootstrap/mod.rs, at the end of `fn compose`, before `Ok(())`:
@@ -101,13 +114,22 @@ Forge did not edit any existing file. Wire the resource by hand:
     crate::adapters::http::posts::routes(
         composition.router(),
         &site,
-        posts,
+        posts.clone(),
         std::sync::Arc::new(crate::adapters::http::access::DenyAll),
         &streams,
     )?;
+    // posts JSON API (/v1/posts): global. DenyAll refuses every request until
+    // you decide who may use it: implement ApiGlobalAccess
+    // (src/adapters/http/api_access.rs).
+    crate::adapters::http::posts_api::routes(
+        composition.router(),
+        posts,
+        std::sync::Arc::new(crate::adapters::http::api_access::DenyAll),
+    )?;
 
   Every route asks the access policy for `posts:read` or `posts:write`
-  first; src/adapters/http/access.rs explains the deny-by-default choice.
+  first; src/adapters/http/access.rs explains the deny-by-default choice for the
+  pages, src/adapters/http/api_access.rs for the JSON API under /v1/posts.
   Live updates: create, update and delete publish to the `posts` channel, and
   the index page subscribes; a stream is served only to callers the same policy
   grants `posts:read` (src/adapters/http/streams.rs).

@@ -6,6 +6,15 @@ use crate::generate::{Database, ForgeSource, NewApplication, create_application}
 const VERSION: &str = "1760832000000000000";
 
 fn application(database: Database, views: bool) -> (tempfile::TempDir, PathBuf) {
+    application_with(database, views, false)
+}
+
+/// An application; `api_auth` is `forge new --api-auth` (bearer tokens).
+fn application_with(
+    database: Database,
+    views: bool,
+    api_auth: bool,
+) -> (tempfile::TempDir, PathBuf) {
     let parent = tempfile::tempdir().unwrap_or_else(|error| panic!("temporary directory: {error}"));
     let options = NewApplication {
         name: "shop".to_owned(),
@@ -15,6 +24,7 @@ fn application(database: Database, views: bool) -> (tempfile::TempDir, PathBuf) 
         views,
         forge: ForgeSource::Path("../forge/crates/forge".to_owned()),
         locale: crate::generate::Locale::En,
+        api_auth,
     };
     let root = create_application(parent.path(), &options)
         .unwrap_or_else(|error| panic!("application: {error}"));
@@ -101,7 +111,14 @@ fn tree(root: &Path) -> BTreeMap<String, String> {
 /// every generated file plus `WIRING.txt`. Regenerate with
 /// `FORGE_BLESS=1 cargo test -p forge-cli` and review the diff.
 fn assert_golden(case: &str, database: Database, scaffolds: &[ScaffoldOptions]) {
-    let (_parent, root) = application(database, true);
+    assert_golden_in(case, application(database, true), scaffolds);
+}
+
+fn assert_golden_in(
+    case: &str,
+    (_parent, root): (tempfile::TempDir, PathBuf),
+    scaffolds: &[ScaffoldOptions],
+) {
     let before = tree(&root);
     let mut expected = BTreeMap::new();
     let mut wiring = String::new();
@@ -247,6 +264,36 @@ fn an_access_module_whose_global_access_returns_no_principal_is_refused_with_ins
 #[test]
 fn postgresql_global_post_matches_the_golden_output() {
     assert_golden("postgresql-post-global", Database::Postgresql, &[post()]);
+}
+
+/// `forge generate resource` in a `forge new --api-auth` application: the
+/// model, the JSON API behind bearer tokens and the shared API access
+/// module, wired with `BearerTenantAccess`.
+#[test]
+fn postgresql_tenant_scoped_resource_matches_the_golden_output() {
+    let product = ScaffoldOptions {
+        layers: Layers::Resource,
+        ..options(
+            "product",
+            &["name:string", "summary:text?", "price_cents:integer"],
+            Scope::Tenant,
+        )
+    };
+    assert_golden_in(
+        "postgresql-product-resource",
+        application_with(Database::Postgresql, true, true),
+        &[product],
+    );
+}
+
+/// A global resource on MySQL: the JSON API stays closed (`DenyAll`).
+#[test]
+fn mysql_global_resource_matches_the_golden_output() {
+    let tag = ScaffoldOptions {
+        layers: Layers::Resource,
+        ..options("tag", &["label:string", "active:boolean?"], Scope::Global)
+    };
+    assert_golden("mysql-tag-resource", Database::Mysql, &[tag]);
 }
 
 #[test]
@@ -439,7 +486,7 @@ fn dry_run_lists_the_files_and_writes_nothing() {
     );
 
     assert_eq!(tree(&root), before);
-    assert_eq!(outcome.created.len(), 18);
+    assert_eq!(outcome.created.len(), 21);
     assert!(
         outcome
             .created
@@ -459,6 +506,7 @@ fn the_default_locale_gets_the_english_text_too() {
         views: true,
         forge: ForgeSource::Path("../forge/crates/forge".to_owned()),
         locale: crate::generate::Locale::PtBr,
+        api_auth: false,
     };
     let root = create_application(parent.path(), &options)
         .unwrap_or_else(|error| panic!("application: {error}"));

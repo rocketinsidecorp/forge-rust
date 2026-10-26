@@ -242,6 +242,7 @@ pub struct Operation {
     pub(crate) deprecated: bool,
     pub(crate) permission: Option<String>,
     pub(crate) authenticated: bool,
+    pub(crate) bearer: bool,
     pub(crate) params: Vec<Param>,
     pub(crate) request: Option<TypeRef>,
     pub(crate) responses: Vec<Response>,
@@ -304,6 +305,18 @@ impl Operation {
     /// adds the `401` refusal.
     #[must_use]
     pub fn authenticated(mut self) -> Self {
+        self.authenticated = true;
+        self
+    }
+
+    /// The route authenticates an API client's `Authorization: Bearer`
+    /// token (security scheme `bearerAuth`) instead of the session cookie,
+    /// and needs a signed-in client: it adds the `401` refusal, and with a
+    /// [`permission`](Self::permission) the `403`, both as JSON error
+    /// reports.
+    #[must_use]
+    pub fn bearer(mut self) -> Self {
+        self.bearer = true;
         self.authenticated = true;
         self
     }

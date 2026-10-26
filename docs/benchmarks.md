@@ -174,12 +174,13 @@ counts as an error and its latency is not recorded.
 
 Differences from Forge-Go's scenarios, none of them a hidden change:
 
-- **`show_json` is not run.** It is a `GET` of one row as JSON with a bearer
-  token. A Forge-Rust application has no bearer-token login and `forge generate
-  scaffold` generates HTML pages only (JSON scaffolds are "not available yet",
-  [CLI](cli.md#refusals)), so there is no such request to send. The load
-  generator knows the name and refuses it with that reason. When a JSON
-  scaffold exists, the scenario joins the report with Forge-Go's request.
+- **`show_json` is not run yet.** It is a `GET` of one row as JSON with a
+  bearer token. Generated applications can now serve it (`forge new
+  --api-auth` and the scaffold's `/v1/<plural>` API,
+  [ADR 0045](adr/0045-json-resources-and-bearer-api-authentication.md)), but
+  the load generator does not sign in for a token yet: it knows the name and
+  refuses it. Once it does, the scenario joins the report with Forge-Go's
+  request.
 - `health` is `GET /health/ready`. In Forge-Go `/health` is the readiness
   probe that pings the database; in Forge-Rust `/health` and `/health/live`
   never touch the database and `/health/ready` is the probe that does. The

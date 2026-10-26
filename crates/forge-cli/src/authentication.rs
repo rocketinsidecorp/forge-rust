@@ -7,14 +7,19 @@
 //! the Spanish and Brazilian Portuguese files when the application has those
 //! locales). The generator writes only new files, all or nothing, never
 //! edits an existing file and prints the wiring to add by hand.
+//!
+//! With `--api-auth` it also adds the JSON authentication API of `forge new
+//! --api-auth` (bearer tokens for API clients, Forge-Go's flag of the same
+//! name); in an application that already has every page file it writes
+//! only the API's files.
 
 use std::fs;
 use std::path::Path;
 
 use crate::CliError;
 use crate::generate::{
-    LOCALES, LOCALES_DIRECTORY, Locale, authentication_compose_statements, authentication_files,
-    locale_file,
+    LOCALES, LOCALES_DIRECTORY, Locale, api_authentication_compose_statements,
+    api_authentication_files, authentication_compose_statements, authentication_files, locale_file,
 };
 use crate::scaffold::{File, write_all};
 
@@ -71,22 +76,59 @@ const REQUIRED: &[(&str, &[&str])] = &[
     ),
 ];
 
-/// Generates the authentication files in the application at `root`.
-pub(crate) fn generate(root: &Path, dry_run: bool) -> Result<Outcome, CliError> {
+/// What the JSON authentication API uses besides the pages' infrastructure.
+const API_REQUIRED: &[(&str, &[&str])] = &[
+    (
+        "src/infrastructure/accounts/mod.rs",
+        &["pub struct PgTenantDirectory", "pub struct PgMfaStore"],
+    ),
+    (
+        "migrations/00000000000000000004_forge_mfa.up.sql",
+        &["CREATE TABLE forge_totp_factors"],
+    ),
+];
+
+/// Generates the authentication files in the application at `root`: the
+/// pages, and with `api_auth` the JSON API (only the API when every page
+/// file is already there).
+pub(crate) fn generate(root: &Path, api_auth: bool, dry_run: bool) -> Result<Outcome, CliError> {
     inspect(root)?;
-    let mut files: Vec<File> = authentication_files()
+    let mut pages: Vec<File> = authentication_files()
         .into_iter()
         .map(|(path, content)| File {
             path: path.to_owned(),
             content,
         })
         .collect();
-    files.extend(locale_files(root).into_iter().map(|(path, content)| File {
+    pages.extend(locale_files(root).into_iter().map(|(path, content)| File {
         path,
         content: content.to_owned(),
     }));
+    let with_pages = !(api_auth && pages.iter().all(|file| root.join(&file.path).is_file()));
+    let mut files = if with_pages { pages } else { Vec::new() };
+    if api_auth {
+        if !with_pages {
+            for (file, items) in API_REQUIRED {
+                let source = read(root, file).unwrap_or_default();
+                if let Some(item) = items.iter().find(|item| !source.contains(**item)) {
+                    return refuse(format!(
+                        "{file} has no `{item}`; the JSON authentication API uses the \
+                         PostgreSQL identity infrastructure `forge new` generates"
+                    ));
+                }
+            }
+        }
+        files.extend(
+            api_authentication_files()
+                .into_iter()
+                .map(|(path, content)| File {
+                    path: path.to_owned(),
+                    content,
+                }),
+        );
+    }
     refuse_collisions(root, &files)?;
-    let wiring = wiring()?;
+    let wiring = wiring(with_pages, api_auth)?;
     if !dry_run {
         write_all(root, &files)?;
     }
@@ -214,9 +256,17 @@ fn refuse_collisions(root: &Path, files: &[File]) -> Result<(), CliError> {
             .filter_map(Result::ok)
             .map(|entry| entry.file_name().to_string_lossy().into_owned())
             .filter(|name| {
-                name.ends_with("_forge_authentication.up.sql")
-                    || name.ends_with("_forge_mfa.up.sql")
-                    || name.ends_with("_forge_login_throttle.up.sql")
+                let pages = files
+                    .iter()
+                    .any(|file| file.path.ends_with("_forge_authentication.up.sql"));
+                let api = files
+                    .iter()
+                    .any(|file| file.path.ends_with("_forge_bearer_sessions.up.sql"));
+                (pages
+                    && (name.ends_with("_forge_authentication.up.sql")
+                        || name.ends_with("_forge_mfa.up.sql")
+                        || name.ends_with("_forge_login_throttle.up.sql")))
+                    || (api && name.ends_with("_forge_bearer_sessions.up.sql"))
             })
             .map(|name| format!("migrations/{name}"))
             .filter(|path| !existing.contains(path))
@@ -252,48 +302,87 @@ fn listed(existing: &[String]) -> String {
     lines.join("\n  ")
 }
 
-/// The module declarations and composition-root lines to add by hand.
-fn wiring() -> Result<String, CliError> {
-    let Some(statements) = authentication_compose_statements() else {
-        return refuse("the composition template has no authentication wiring");
+/// The module declarations and composition-root lines to add by hand: the
+/// pages' when `pages`, the JSON authentication API's when `api`.
+fn wiring(pages: bool, api: bool) -> Result<String, CliError> {
+    let mut statements = String::new();
+    if pages {
+        let Some(pages) = authentication_compose_statements() else {
+            return refuse("the composition template has no authentication wiring");
+        };
+        statements.push_str(&pages);
+    }
+    if api {
+        let Some(api) = api_authentication_compose_statements() else {
+            return refuse("the composition template has no JSON authentication API wiring");
+        };
+        statements.push_str(&api);
+    }
+    let what = if pages {
+        "pages"
+    } else {
+        "JSON authentication API"
     };
-    let mut out = String::from(
-        "\nForge did not edit any existing file. Wire the pages by hand:\n\n  \
-         1. Declare the new modules (each in the listed file, keeping `mod` lines sorted):\n\n",
+    let mut out = format!(
+        "\nForge did not edit any existing file. Wire the {what} by hand:\n\n  \
+         1. Declare the new modules (each in the listed file, keeping `mod` lines sorted):\n\n"
     );
-    for (file, module) in [
-        ("src/infrastructure/mod.rs", "accounts"),
-        ("src/adapters/http/mod.rs", "authentication"),
-        ("src/adapters/http/views/mod.rs", "authentication"),
-        ("src/bootstrap/mod.rs", "setup"),
-    ] {
+    let mut declarations = Vec::new();
+    if pages {
+        declarations.extend([
+            ("src/infrastructure/mod.rs", "accounts"),
+            ("src/adapters/http/mod.rs", "authentication"),
+            ("src/adapters/http/views/mod.rs", "authentication"),
+            ("src/bootstrap/mod.rs", "setup"),
+        ]);
+    }
+    if api {
+        declarations.extend([
+            ("src/infrastructure/mod.rs", "bearer_sessions"),
+            ("src/adapters/http/mod.rs", "api_authentication"),
+        ]);
+    }
+    for (file, module) in declarations {
         out.push_str(&format!("       {file:<38} pub mod {module};\n"));
     }
     out.push_str(
         "\n  2. In src/bootstrap/mod.rs, at the end of `fn compose`, before `Ok(())`:\n\n",
     );
     out.push_str(&statements);
-    out.push_str(
-        "\n  3. In src/bootstrap/mod.rs, in `fn run`, before `.run()`:\n\n        \
-         .command(\"setup\", setup::SUMMARY, setup::run)\n",
-    );
-    out.push_str(
-        "\n  Tenant-scoped scaffolds grant the `owner` role that `setup` gives the first\n  \
-         member; signed-out browsers asking for their pages are sent to /session/new.\n  \
-         Then apply the migration and create the first owner:\n\n    \
-         FORGE_MIGRATION_DATABASE_URL=... cargo run -- migrate\n    \
-         FORGE_MIGRATION_DATABASE_URL=... cargo run -- setup --tenant acme --email owner@example.com\n\n  \
-         Reset links are emailed once FORGE_MAIL_URL, FORGE_MAIL_FROM and\n  \
-         FORGE_AUTH_PASSWORD_RESET_URL are set (the `mail` feature of `forge`, on with\n  \
-         `views`); until then nothing is delivered and the page answers the same.\n  \
-         They go only to the login the credential store returns: if\n  \
-         src/infrastructure/auth/mod.rs predates this generator, select `login` in\n  \
-         `find_by_login` and add `.with_login(login)` to the credential, as `forge new`\n  \
-         does; without it no link is delivered.\n\n  \
-         Two-factor authentication (/mfa, /session/mfa) needs FORGE_AUTH_MFA_KEY,\n  \
-         canonical unpadded base64url of 32 random bytes:\n\n    \
-         export FORGE_AUTH_MFA_KEY=$(openssl rand -base64 32 | tr '+/' '-_' | tr -d '=')\n",
-    );
+    if pages {
+        out.push_str(
+            "\n  3. In src/bootstrap/mod.rs, in `fn run`, before `.run()`:\n\n        \
+             .command(\"setup\", setup::SUMMARY, setup::run)\n",
+        );
+        out.push_str(
+            "\n  Tenant-scoped scaffolds grant the `owner` role that `setup` gives the first\n  \
+             member; signed-out browsers asking for their pages are sent to /session/new.\n  \
+             Then apply the migration and create the first owner:\n\n    \
+             FORGE_MIGRATION_DATABASE_URL=... cargo run -- migrate\n    \
+             FORGE_MIGRATION_DATABASE_URL=... cargo run -- setup --tenant acme --email owner@example.com\n\n  \
+             Reset links are emailed once FORGE_MAIL_URL, FORGE_MAIL_FROM and\n  \
+             FORGE_AUTH_PASSWORD_RESET_URL are set (the `mail` feature of `forge`, on with\n  \
+             `views`); until then nothing is delivered and the page answers the same.\n  \
+             They go only to the login the credential store returns: if\n  \
+             src/infrastructure/auth/mod.rs predates this generator, select `login` in\n  \
+             `find_by_login` and add `.with_login(login)` to the credential, as `forge new`\n  \
+             does; without it no link is delivered.\n\n  \
+             Two-factor authentication (/mfa, /session/mfa) needs FORGE_AUTH_MFA_KEY,\n  \
+             canonical unpadded base64url of 32 random bytes:\n\n    \
+             export FORGE_AUTH_MFA_KEY=$(openssl rand -base64 32 | tr '+/' '-_' | tr -d '=')\n",
+        );
+    }
+    if api {
+        out.push_str(
+            "\n  The JSON authentication API: apply its migration (forge_bearer_sessions),\n  \
+             then sign in for a bearer token and use it:\n\n    \
+             forge migrate\n    \
+             curl -s -X POST http://127.0.0.1:3000/auth/login -H 'Content-Type: application/json' \\\n      \
+             -d '{\"email\":\"owner@example.com\",\"password\":\"...\",\"tenant\":\"acme\"}'\n    \
+             curl -s http://127.0.0.1:3000/v1/auth/session -H \"Authorization: Bearer $TOKEN\"\n    \
+             curl -s -X POST http://127.0.0.1:3000/auth/logout -H \"Authorization: Bearer $TOKEN\"\n",
+        );
+    }
     Ok(out)
 }
 
@@ -303,6 +392,14 @@ mod tests {
     use crate::generate::{Database, ForgeSource, NewApplication, create_application};
 
     fn application(database: Database, views: bool) -> (tempfile::TempDir, std::path::PathBuf) {
+        application_with(database, views, false)
+    }
+
+    fn application_with(
+        database: Database,
+        views: bool,
+        api_auth: bool,
+    ) -> (tempfile::TempDir, std::path::PathBuf) {
         let parent = tempfile::tempdir().expect("temporary directory");
         let root = create_application(
             parent.path(),
@@ -314,6 +411,7 @@ mod tests {
                 views,
                 forge: ForgeSource::GitTag,
                 locale: crate::generate::Locale::En,
+                api_auth,
             },
         )
         .expect("application");
@@ -340,10 +438,10 @@ mod tests {
         let (_parent, root) = application(Database::Postgresql, true);
         let original = strip(&root);
 
-        let dry = generate(&root, true).expect("dry run");
+        let dry = generate(&root, false, true).expect("dry run");
         assert!(original.iter().all(|(path, _)| !root.join(path).exists()));
 
-        let outcome = generate(&root, false).expect("generation");
+        let outcome = generate(&root, false, false).expect("generation");
         assert_eq!(outcome.created, dry.created);
         assert_eq!(outcome.wiring, dry.wiring);
         for (path, content) in &original {
@@ -376,7 +474,7 @@ mod tests {
     #[test]
     fn existing_files_are_never_overwritten() {
         let (_parent, root) = application(Database::Postgresql, true);
-        let error = generate(&root, false).expect_err("forge new already wrote them");
+        let error = generate(&root, false, false).expect_err("forge new already wrote them");
         let message = error.to_string();
         assert!(message.contains("refusing to overwrite"), "{message}");
         assert!(message.contains("... and "), "{message}");
@@ -389,7 +487,7 @@ mod tests {
             "-- applied before\n",
         )
         .expect("write");
-        let error = generate(&root, false).expect_err("migration exists");
+        let error = generate(&root, false, false).expect_err("migration exists");
         assert!(
             error
                 .to_string()
@@ -412,7 +510,9 @@ mod tests {
             current.replace("pub fn with_idle_timeout", "pub fn without_it"),
         )
         .expect("write");
-        let message = generate(&root, true).expect_err("refused").to_string();
+        let message = generate(&root, false, true)
+            .expect_err("refused")
+            .to_string();
         assert!(message.contains("`pub fn with_idle_timeout`"), "{message}");
         assert!(message.contains("\"Session idle timeout\""), "{message}");
 
@@ -421,7 +521,9 @@ mod tests {
             root.join("migrations/00000000000000000006_forge_session_idle_timeout.up.sql"),
         )
         .expect("remove");
-        let message = generate(&root, true).expect_err("refused").to_string();
+        let message = generate(&root, false, true)
+            .expect_err("refused")
+            .to_string();
         assert!(message.contains("ADD COLUMN last_seen_at"), "{message}");
         assert!(!root.join("src/adapters/http/authentication.rs").exists());
     }
@@ -436,7 +538,7 @@ mod tests {
         assert!(!text.contains("f5"), "{text}");
         assert!(text.contains("... and 15 more"), "{text}");
         let (_parent, root) = application(Database::Postgresql, true);
-        let message = generate(&root, false)
+        let message = generate(&root, false, false)
             .expect_err("forge new already wrote them")
             .to_string();
         assert!(message.lines().count() <= 10, "{message}");
@@ -452,11 +554,13 @@ mod tests {
             (Database::Postgresql, false, "--api"),
         ] {
             let (_parent, root) = application(database, views);
-            let message = generate(&root, true).expect_err("refused").to_string();
+            let message = generate(&root, false, true)
+                .expect_err("refused")
+                .to_string();
             assert!(message.contains(reason), "{database:?} {views}: {message}");
         }
         let empty = tempfile::tempdir().expect("temporary directory");
-        assert!(generate(empty.path(), true).is_err());
+        assert!(generate(empty.path(), false, true).is_err());
     }
 
     #[test]
@@ -464,7 +568,111 @@ mod tests {
         let (_parent, root) = application(Database::Postgresql, true);
         strip(&root);
         fs::write(root.join("src/infrastructure/audit/mod.rs"), "//! audit\n").expect("write");
-        let message = generate(&root, true).expect_err("refused").to_string();
+        let message = generate(&root, false, true)
+            .expect_err("refused")
+            .to_string();
         assert!(message.contains("PgAuditSink"), "{message}");
+    }
+
+    /// `forge new --api-auth` writes the JSON authentication API and wires
+    /// it in `compose`; without the flag nothing of it exists.
+    #[test]
+    fn forge_new_api_auth_writes_and_wires_the_json_api() {
+        let (_parent, root) = application_with(Database::Postgresql, true, true);
+        for (path, content) in api_authentication_files() {
+            assert_eq!(
+                fs::read_to_string(root.join(path)).expect("written"),
+                content,
+                "{path}"
+            );
+        }
+        let bootstrap = fs::read_to_string(root.join("src/bootstrap/mod.rs")).expect("bootstrap");
+        let statements = api_authentication_compose_statements().expect("statements");
+        assert!(bootstrap.contains(&statements), "{bootstrap}");
+        assert!(statements.contains("api_authentication::routes("));
+        assert!(statements.trim_end().ends_with(")?;"), "{statements}");
+        for (file, declaration) in [
+            ("src/infrastructure/mod.rs", "pub mod bearer_sessions;"),
+            ("src/adapters/http/mod.rs", "pub mod api_authentication;"),
+        ] {
+            assert!(
+                fs::read_to_string(root.join(file))
+                    .expect("module")
+                    .contains(declaration),
+                "{file}"
+            );
+        }
+
+        let (_parent, plain) = application(Database::Postgresql, true);
+        for (path, _) in api_authentication_files() {
+            assert!(!plain.join(path).exists(), "{path}");
+        }
+        let bootstrap = fs::read_to_string(plain.join("src/bootstrap/mod.rs")).expect("bootstrap");
+        assert!(!bootstrap.contains("api_authentication"));
+    }
+
+    /// With the pages in place, `--api-auth` writes only the API's files,
+    /// byte-identical to `forge new --api-auth`, and prints only its wiring;
+    /// a second run refuses.
+    #[test]
+    fn api_auth_adds_only_the_json_api_to_an_application_with_the_pages() {
+        let (_parent, root) = application(Database::Postgresql, true);
+        let outcome = generate(&root, true, false).expect("generation");
+        let expected: Vec<String> = api_authentication_files()
+            .into_iter()
+            .map(|(path, _)| path.to_owned())
+            .collect();
+        assert_eq!(outcome.created, expected);
+        assert!(
+            outcome
+                .wiring
+                .contains("Wire the JSON authentication API by hand")
+        );
+        assert!(
+            outcome
+                .wiring
+                .contains("src/infrastructure/mod.rs              pub mod bearer_sessions;")
+        );
+        assert!(!outcome.wiring.contains("pub mod setup;"));
+        assert!(
+            outcome
+                .wiring
+                .contains(&api_authentication_compose_statements().expect("statements"))
+        );
+        assert!(outcome.wiring.contains("Authorization: Bearer $TOKEN"));
+
+        let again = generate(&root, true, true)
+            .expect_err("the API exists")
+            .to_string();
+        assert!(again.contains("refusing to overwrite"), "{again}");
+        fs::remove_file(root.join("src/adapters/http/api_authentication.rs")).expect("remove");
+        let migration = generate(&root, true, true)
+            .expect_err("migration exists")
+            .to_string();
+        assert!(migration.contains("forge_bearer_sessions"), "{migration}");
+    }
+
+    /// Without the pages, `--api-auth` writes both and prints both wirings.
+    #[test]
+    fn api_auth_without_the_pages_writes_both() {
+        let (_parent, root) = application(Database::Postgresql, true);
+        strip(&root);
+        let outcome = generate(&root, true, true).expect("dry run");
+        assert!(
+            outcome
+                .created
+                .contains(&"src/adapters/http/authentication.rs".to_owned())
+        );
+        assert!(
+            outcome
+                .created
+                .contains(&"src/adapters/http/api_authentication.rs".to_owned())
+        );
+        assert!(outcome.wiring.contains("Wire the pages by hand"));
+        assert!(outcome.wiring.contains("pub mod api_authentication;"));
+        assert!(outcome.wiring.contains(".command(\"setup\""));
+        let pages = authentication_compose_statements().expect("pages");
+        let api = api_authentication_compose_statements().expect("api");
+        assert!(outcome.wiring.contains(&format!("{pages}{api}")));
     }
 }

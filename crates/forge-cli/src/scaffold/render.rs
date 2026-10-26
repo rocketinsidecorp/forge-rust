@@ -83,6 +83,9 @@ const HTTP: &str = scaffold_template!("http.rs.tmpl");
 const VIEWS: &str = scaffold_template!("views.rs.tmpl");
 const TESTS_HTTP: &str = scaffold_template!("tests_http.rs.tmpl");
 const TESTS_REPOSITORY: &str = scaffold_template!("tests_repository.rs.tmpl");
+const API: &str = scaffold_template!("api.rs.tmpl");
+pub(crate) const API_ACCESS: &str = scaffold_template!("api_access.rs.tmpl");
+const TESTS_API: &str = scaffold_template!("tests_api.rs.tmpl");
 const PAGES: &[(&str, &str)] = &[
     (
         "index.html",
@@ -106,6 +109,18 @@ pub(crate) const ACCESS_PATH: &str = "src/adapters/http/access.rs";
 /// The shared live-update module, written by the first `--broadcast`
 /// scaffold.
 pub(crate) const STREAMS_PATH: &str = "src/adapters/http/streams.rs";
+/// The shared access-policy module of the JSON API, written by the first
+/// resource (or scaffold).
+pub(crate) const API_ACCESS_PATH: &str = "src/adapters/http/api_access.rs";
+
+/// The JSON API files a resource or scaffold writes.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct Api {
+    /// The `/v1/<plural>` handlers and their tests.
+    pub(crate) enabled: bool,
+    /// Write the shared API access module (the first JSON resource).
+    pub(crate) access_module: bool,
+}
 
 /// What `--broadcast` adds.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -125,14 +140,16 @@ pub(crate) struct File {
 
 /// Every file of `resource` for `backend`, in a stable order. `migration`
 /// is the version prefix of the migration pair; `access` adds the shared
-/// access-policy module; `locales` are the locales whose
-/// `config/locales/PLURAL.LOCALE.json` is written with the English text.
+/// access-policy module; `api` the JSON API (and its shared access module);
+/// `locales` are the locales whose `config/locales/PLURAL.LOCALE.json` is
+/// written with the English text.
 pub(crate) fn files(
     resource: &Resource,
     backend: Backend,
     migration: &str,
     access: bool,
     broadcast: Broadcast,
+    api: Api,
     locales: &[String],
 ) -> Vec<File> {
     let renderer = Renderer::new(resource, backend, broadcast.enabled);
@@ -159,6 +176,12 @@ pub(crate) fn files(
             REPOSITORY,
         ),
     ];
+    if api.access_module {
+        files.push(renderer.file(API_ACCESS_PATH.to_owned(), API_ACCESS));
+    }
+    if api.enabled {
+        files.push(renderer.file(format!("src/adapters/http/{plural}_api.rs"), API));
+    }
     if access {
         files.push(renderer.file(ACCESS_PATH.to_owned(), ACCESS));
     }
@@ -180,6 +203,9 @@ pub(crate) fn files(
         });
     }
     files.push(renderer.file(format!("tests/{plural}_http.rs"), TESTS_HTTP));
+    if api.enabled {
+        files.push(renderer.file(format!("tests/{plural}_api.rs"), TESTS_API));
+    }
     files.push(renderer.file(format!("tests/{plural}_repository.rs"), TESTS_REPOSITORY));
     files
 }
@@ -236,6 +262,7 @@ impl<'a> Renderer<'a> {
             // the sub-second timestamp test.
             "http_attributes" => self.tenant() || self.has(FieldType::Timestamp),
             "broadcast" => self.broadcast,
+            "required_fields" => self.fields().any(|field| !field.optional),
             // The HTTP test harness keeps the tenant of its routes when a
             // test needs it.
             "harness_tenant" => self.tenant() && (self.has(FieldType::Timestamp) || self.broadcast),
@@ -316,6 +343,23 @@ impl<'a> Renderer<'a> {
                 format!(
                     "    if let Err(denied) = state.access.authorize(&request, &state.{permission}).await {{\n        \
                      return denied.response();\n    \
+                     }}"
+                )
+            }
+        };
+
+        let api_authorize = |permission: &str| {
+            if tenant {
+                format!(
+                    "    let context = match state.access.authorize(&request, &state.{permission}).await {{\n        \
+                     Ok(context) => context,\n        \
+                     Err(denied) => return forge::web::bearer_refusal(denied),\n    \
+                     }};"
+                )
+            } else {
+                format!(
+                    "    if let Err(denied) = state.access.authorize(&request, &state.{permission}).await {{\n        \
+                     return forge::web::bearer_refusal(denied);\n    \
                      }}"
                 )
             }
@@ -462,6 +506,38 @@ impl<'a> Renderer<'a> {
             ("%%SUBSECOND_FORM%%", self.subsecond_form()),
             ("%%SHOWN_VALUE%%", shown_value(&resource.fields[0])),
             ("%%INVALID_FORM%%", self.invalid_form().0),
+            ("%%API_CORE_IMPORTS%%", http_core.join(", ")),
+            (
+                "%%API_ACCESS_TRAIT%%",
+                if tenant {
+                    "ApiTenantAccess"
+                } else {
+                    "ApiGlobalAccess"
+                }
+                .to_owned(),
+            ),
+            ("%%PAGE_SIZE_DOC%%", "`PAGE_SIZE`".to_owned()),
+            ("%%API_JSON_FIELDS%%", self.api_json_fields()),
+            ("%%API_NEW_FIELDS%%", self.api_new_fields()),
+            ("%%API_PATCH_FIELDS%%", self.api_patch_fields()),
+            ("%%API_APPLY_FIELDS%%", self.api_apply_fields()),
+            ("%%API_FIELD_LIST%%", self.api_field_list()),
+            ("%%API_AUTHORIZE_READ%%", api_authorize("read")),
+            ("%%API_AUTHORIZE_WRITE%%", api_authorize("write")),
+            ("%%API_VALID_JSON%%", self.api_valid_json()),
+            ("%%API_INVALID_JSON%%", self.api_invalid_json().0),
+            ("%%API_INVALID_CODE%%", self.api_invalid_json().1.to_owned()),
+            (
+                "%%API_EMPTY_BODY%%",
+                if self.fields().any(|field| !field.optional) {
+                    "\"{}\", ".to_owned()
+                } else {
+                    String::new()
+                },
+            ),
+            ("%%API_FIRST_FIELD%%", resource.fields[0].name.clone()),
+            ("%%API_FIRST_VALUE%%", api_sample(&resource.fields[0])),
+            ("%%API_CHANGED_VALUE%%", api_changed(&resource.fields[0])),
             ("%%INVALID_MESSAGE%%", self.invalid_form().1),
         ]
     }
@@ -995,6 +1071,110 @@ impl<'a> Renderer<'a> {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    // ----------------------------------------------------------- JSON API
+
+    fn api_json_fields(&self) -> String {
+        self.fields()
+            .map(|field| format!("    pub {}: {},", field.name, rust_type(field)))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn api_new_fields(&self) -> String {
+        self.fields()
+            .map(|field| {
+                let member = format!("    pub {}: {},", field.name, rust_type(field));
+                if field.optional {
+                    format!(
+                        "    #[serde(default, skip_serializing_if = \"Option::is_none\")]\n{member}"
+                    )
+                } else {
+                    member
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn api_patch_fields(&self) -> String {
+        self.fields()
+            .map(|field| {
+                format!(
+                    "    #[serde(default, skip_serializing_if = \"Patch::is_absent\")]\n    \
+                     pub {}: Patch<{}>,",
+                    field.name,
+                    base_type(field)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn api_apply_fields(&self) -> String {
+        self.fields()
+            .map(|field| {
+                let name = &field.name;
+                let (null, value) = if field.optional {
+                    (
+                        format!("attributes.{name} = None"),
+                        format!("attributes.{name} = Some(value)"),
+                    )
+                } else {
+                    (
+                        format!("return Err(not_null(\"{name}\"))"),
+                        format!("attributes.{name} = value"),
+                    )
+                };
+                format!(
+                    "        match self.{name} {{\n            \
+                     Patch::Absent => {{}}\n            \
+                     Patch::Null => {null},\n            \
+                     Patch::Value(value) => {value},\n        \
+                     }}"
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn api_field_list(&self) -> String {
+        self.fields()
+            .map(|field| field.name.clone())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    fn api_valid_json(&self) -> String {
+        let members: Vec<String> = self
+            .fields()
+            .map(|field| format!("\"{}\": {}", field.name, api_sample(field)))
+            .collect();
+        format!("{{{}}}", members.join(", "))
+    }
+
+    /// A JSON body with one value that breaks a rule, and the code of its
+    /// refusal: blank text breaks a domain rule, a value of the wrong type
+    /// does not decode.
+    fn api_invalid_json(&self) -> (String, &'static str) {
+        let fields = &self.resource.fields;
+        let (target, value, code) = match fields.iter().find(|field| field.kind.is_textual()) {
+            Some(field) => (&field.name, "\" \"".to_owned(), "validation_failed"),
+            None => (&fields[0].name, "[]".to_owned(), "invalid_json"),
+        };
+        let members: Vec<String> = fields
+            .iter()
+            .map(|field| {
+                let sample = if &field.name == target {
+                    value.clone()
+                } else {
+                    api_sample(field)
+                };
+                format!("\"{}\": {sample}", field.name)
+            })
+            .collect();
+        (format!("{{{}}}", members.join(", ")), code)
     }
 
     // --------------------------------------------------------------- HTTP
@@ -1559,6 +1739,39 @@ fn shown_value(field: &Field) -> String {
         FieldType::Boolean => "Yes".to_owned(),
         FieldType::Timestamp => "2026-01-02T03:04:05Z".to_owned(),
         FieldType::Uuid => SAMPLE_UUID.to_owned(),
+    }
+}
+
+/// The JSON value the API tests send for `field`.
+fn api_sample(field: &Field) -> String {
+    match field.kind {
+        FieldType::String | FieldType::Text => format!("\"{}\"", sample_text(field)),
+        FieldType::Integer => "42".to_owned(),
+        FieldType::Boolean => "true".to_owned(),
+        FieldType::Timestamp => "\"2026-01-02T03:04:05Z\"".to_owned(),
+        FieldType::Uuid => format!("\"{SAMPLE_UUID}\""),
+    }
+}
+
+/// Another valid JSON value for `field`, for the `PATCH` test.
+fn api_changed(field: &Field) -> String {
+    match field.kind {
+        FieldType::String | FieldType::Text => "\"Changed\"".to_owned(),
+        FieldType::Integer => "7".to_owned(),
+        FieldType::Boolean => "false".to_owned(),
+        FieldType::Timestamp => "\"2027-03-04T05:06:07Z\"".to_owned(),
+        FieldType::Uuid => "\"01890a5d-ac96-774b-bcce-b302099a8057\"".to_owned(),
+    }
+}
+
+/// The Rust type of `field` without `Option`.
+fn base_type(field: &Field) -> &'static str {
+    match field.kind {
+        FieldType::String | FieldType::Text => "String",
+        FieldType::Integer => "i64",
+        FieldType::Boolean => "bool",
+        FieldType::Timestamp => "Timestamp",
+        FieldType::Uuid => "Uuid",
     }
 }
 

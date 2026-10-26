@@ -285,6 +285,117 @@ fn cause_chain(failure: &ForgeError) -> String {
     chain
 }
 
+/// One member of a JSON `PATCH` body, Forge-Go's `PatchField`: a member left
+/// out is [`Patch::Absent`] (the value stays as it is), `null` is
+/// [`Patch::Null`] (clears an optional value; refuse it for a required one)
+/// and anything else is [`Patch::Value`].
+///
+/// Declare it with `#[serde(default, skip_serializing_if =
+/// "Patch::is_absent")]`, so a missing member decodes as `Absent` and the
+/// OpenAPI document describes the member as optional and nullable:
+///
+/// ```
+/// use forge::openapi::OpenApiSchema;
+/// use forge::web::Patch;
+///
+/// #[derive(serde::Deserialize, OpenApiSchema)]
+/// struct PostChanges {
+///     version: i64,
+///     #[serde(default, skip_serializing_if = "Patch::is_absent")]
+///     title: Patch<String>,
+///     #[serde(default, skip_serializing_if = "Patch::is_absent")]
+///     subtitle: Patch<String>,
+/// }
+///
+/// let changes: PostChanges = serde_json::from_str(r#"{"version": 3, "subtitle": null}"#)?;
+/// assert_eq!(changes.title, Patch::Absent);
+/// assert_eq!(changes.subtitle, Patch::Null);
+/// # Ok::<(), serde_json::Error>(())
+/// ```
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum Patch<T> {
+    /// The member was left out: keep the stored value.
+    #[default]
+    Absent,
+    /// The member was `null`: clear an optional value.
+    Null,
+    /// The new value.
+    Value(T),
+}
+
+impl<T> Patch<T> {
+    /// Whether the member was left out (for `skip_serializing_if`).
+    #[must_use]
+    pub const fn is_absent(&self) -> bool {
+        matches!(self, Self::Absent)
+    }
+}
+
+impl<'de, T: serde::Deserialize<'de>> serde::Deserialize<'de> for Patch<T> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Option::<T>::deserialize(deserializer).map(|value| value.map_or(Self::Null, Self::Value))
+    }
+}
+
+impl<T: OpenApiSchema> OpenApiSchema for Patch<T> {
+    fn schema(generator: &mut forge_openapi::SchemaGenerator) -> forge_openapi::Schema {
+        <Option<T> as OpenApiSchema>::schema(generator)
+    }
+}
+
+/// The JSON refusal of a route that authenticates an API client's bearer
+/// token (`forge::tenancy::resolve_bearer`, `BearerSession::authorize`),
+/// with Forge-Go's codes: `401 credentials_required` without an
+/// `Authorization` header, `401 credentials_invalid` for a malformed,
+/// unknown, expired, idle or revoked token (both with `WWW-Authenticate:
+/// Bearer realm="forge"`), `403 permission_denied`, and `503
+/// authentication_unavailable` when a store failed. The body never says
+/// which proof failed.
+#[must_use]
+pub fn bearer_refusal(denied: forge_tenancy::BearerDenied) -> Response {
+    use forge_tenancy::BearerDenied;
+
+    let (status, category, code, message) = match denied {
+        BearerDenied::MissingCredentials => (
+            StatusCode::UNAUTHORIZED,
+            ErrorCategory::Unauthenticated,
+            "credentials_required",
+            "authentication is required",
+        ),
+        BearerDenied::InvalidCredentials => (
+            StatusCode::UNAUTHORIZED,
+            ErrorCategory::Unauthenticated,
+            "credentials_invalid",
+            "credentials are invalid or expired",
+        ),
+        BearerDenied::Forbidden => (
+            StatusCode::FORBIDDEN,
+            ErrorCategory::Forbidden,
+            "permission_denied",
+            "permission denied",
+        ),
+        BearerDenied::Unavailable => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            ErrorCategory::Infrastructure,
+            "authentication_unavailable",
+            "service temporarily unavailable",
+        ),
+    };
+    let failure = ForgeError::new(category, code, message)
+        .with_retryable(denied == BearerDenied::Unavailable);
+    if denied == BearerDenied::Unavailable {
+        warn!(code, "bearer authentication unavailable");
+    }
+    let mut response = json(status, &failure.report());
+    if status == StatusCode::UNAUTHORIZED {
+        response.headers_mut().insert(
+            forge_http::header::WWW_AUTHENTICATE,
+            forge_http::HeaderValue::from_static(forge_auth::BEARER_CHALLENGE),
+        );
+    }
+    response
+}
+
 #[cfg(test)]
 mod web_tests;
 
@@ -296,6 +407,75 @@ mod tests {
     use bytes::Bytes;
     use forge_http::{HeaderMap, Method, Request, Response, StatusCode, Uri};
     use uuid::Uuid;
+
+    #[test]
+    fn patch_members_tell_absent_null_and_values_apart() {
+        #[derive(serde::Deserialize, forge_openapi::OpenApiSchema)]
+        #[openapi(crate = "forge_openapi")]
+        struct Changes {
+            version: i64,
+            #[serde(default, skip_serializing_if = "Patch::is_absent")]
+            title: Patch<String>,
+            #[serde(default, skip_serializing_if = "Patch::is_absent")]
+            count: Patch<i64>,
+        }
+
+        let changes: Changes =
+            serde_json::from_str(r#"{"version": 1, "title": "Hi", "count": null}"#)
+                .expect("decodes");
+        assert_eq!(changes.version, 1);
+        assert_eq!(changes.title, Patch::Value("Hi".to_owned()));
+        assert_eq!(changes.count, Patch::Null);
+        let empty: Changes = serde_json::from_str(r#"{"version": 2}"#).expect("decodes");
+        assert!(empty.title.is_absent() && empty.count.is_absent());
+        assert!(serde_json::from_str::<Changes>(r#"{"version": 2, "count": "x"}"#).is_err());
+
+        let (_, components) = forge_openapi::schema_of::<Changes>().expect("schema");
+        let text = serde_json::Value::Object(components).to_string();
+        assert!(text.contains(r#""required":["version"]"#), "{text}");
+        assert!(text.contains("null"), "{text}");
+    }
+
+    #[test]
+    fn bearer_refusals_carry_go_codes_and_the_bearer_challenge() {
+        use forge_tenancy::BearerDenied;
+
+        for (denied, status, code) in [
+            (
+                BearerDenied::MissingCredentials,
+                StatusCode::UNAUTHORIZED,
+                "credentials_required",
+            ),
+            (
+                BearerDenied::InvalidCredentials,
+                StatusCode::UNAUTHORIZED,
+                "credentials_invalid",
+            ),
+            (
+                BearerDenied::Forbidden,
+                StatusCode::FORBIDDEN,
+                "permission_denied",
+            ),
+            (
+                BearerDenied::Unavailable,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "authentication_unavailable",
+            ),
+        ] {
+            let response = bearer_refusal(denied);
+            assert_eq!(response.status(), status, "{denied:?}");
+            assert_eq!(body(&response)["code"], code, "{denied:?}");
+            let challenge = response
+                .headers()
+                .get(forge_http::header::WWW_AUTHENTICATE)
+                .and_then(|value| value.to_str().ok());
+            if status == StatusCode::UNAUTHORIZED {
+                assert_eq!(challenge, Some("Bearer realm=\"forge\""));
+            } else {
+                assert_eq!(challenge, None);
+            }
+        }
+    }
 
     #[tokio::test]
     async fn at_least_pads_fast_work_and_never_shortens_it() {

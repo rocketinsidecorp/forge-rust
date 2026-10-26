@@ -385,6 +385,37 @@ two-factor on, replacing the authenticator and turning it off sign the
 account out everywhere. An invalid key stops startup; without a key the
 settings page says two-factor is unavailable and an account that has it
 cannot sign in. With Docker, export the key before `docker compose up`.
+%%if api_auth%%
+
+### JSON API sign-in (bearer tokens)
+
+`forge new --api-auth` added the JSON authentication API
+(`src/adapters/http/api_authentication.rs`): API clients sign in for a bearer
+token bound to the tenant they name, send it as `Authorization: Bearer`, and
+revoke it. With the server running and the owner created (see Sign in):
+
+```bash
+forge migrate                 # forge_bearer_sessions
+TOKEN=$(curl -s -X POST http://127.0.0.1:3000/auth/login -H 'Content-Type: application/json' \
+  -d '{"email":"owner@example.com","password":"your password","tenant":"acme"}' \
+  | sed -n 's/.*"access_token":"\([0-9a-f]*\)".*/\1/p')
+curl -s http://127.0.0.1:3000/v1/auth/session -H "Authorization: Bearer $TOKEN"
+curl -s -X POST http://127.0.0.1:3000/auth/logout -H "Authorization: Bearer $TOKEN" -o /dev/null -w '%{http_code}\n'   # 204
+```
+
+| Method | Path | Answer |
+| --- | --- | --- |
+| `POST` | `/auth/login` | `200` `{"access_token", "token_type": "Bearer", "expires_at"}`; `401 credentials_invalid`; `403 mfa_required`; `429 login_throttled` |
+| `POST` | `/auth/logout` | `204`, also for an unknown or revoked token |
+| `GET` | `/v1/auth/session` | `{"subject_id", "tenant_id", "roles"}` |
+
+Tokens are stored only as SHA-256 digests, last 24 hours, end after
+`FORGE_AUTH_SESSION_IDLE_TIMEOUT` without a request, and end at once when the
+account's password changes, the account is disabled or turns two-factor on.
+Attempts count in the sign-in pages' throttle. An account with two-factor
+authentication signs in through the pages only. `forge generate resource`
+writes JSON CRUD endpoints under `/v1` that accept these tokens.
+%%end%%
 %%end%%
 
 %%end%%

@@ -49,8 +49,8 @@ mod status;
 mod validate;
 
 pub use document::{
-    BuildError, Document, Info, JSON_SCHEMA_DIALECT, Route, SESSION_COOKIE, SESSION_SCHEME,
-    VERSION, schema_of,
+    BEARER_SCHEME, BuildError, Document, Info, JSON_SCHEMA_DIALECT, Route, SESSION_COOKIE,
+    SESSION_SCHEME, VERSION, schema_of,
 };
 /// `#[derive(OpenApiSchema)]`: the schema of a struct or unit-only enum from
 /// its fields and serde attributes.

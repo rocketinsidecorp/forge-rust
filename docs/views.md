@@ -391,6 +391,20 @@ of the router it is added to:
   bytes and re-encode to the same text, or the 64 lowercase hex digits of
   the token; constant-time comparison). The query string is never read;
   repeated or malformed values are refused.
+- Like Forge-Go's `csrf.Protection`, a request a cross-site page cannot
+  produce passes without a valid token, never without the cross-site check:
+  one with exactly one `Authorization: Bearer` header (the JSON API of
+  `forge new --api-auth` and `forge generate resource`), or a JSON body
+  (`Content-Type: application/json`, which a browser sends cross-origin only
+  after a CORS preflight Forge does not grant). Such a request is not marked
+  verified (`csrf_verified` is `None`) and gets no `_method` override, so the
+  sign-in pages still refuse it, and cookie-authenticated routes keep their
+  session-bound token check ([ADR 0045](adr/0045-json-resources-and-bearer-api-authentication.md)).
+  A handler you write that authenticates by session cookie and changes
+  state must therefore check `csrf_verified(&request)` or call
+  `enforce_csrf` itself: for a bearer- or JSON-shaped request it is
+  protected only by the cross-site check and the browser's CORS preflight,
+  as with Forge-Go's `auth.RequireCSRF`.
 - The unmasked token stays accepted in the header for good. That is
   harmless: masking is a public transform anyone holding the token can
   apply, so it only keeps the token's bytes from repeating in pages; a

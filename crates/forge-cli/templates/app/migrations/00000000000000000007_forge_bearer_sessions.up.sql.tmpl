@@ -1,0 +1,78 @@
+-- Bearer sessions of API clients (`forge new --api-auth`, Forge-Go's JSON
+-- sign-in): issued by POST /auth/login for the tenant named at sign-in,
+-- presented as `Authorization: Bearer <token>`. Only the SHA-256 digest of
+-- the token is stored. Kept apart from forge_sessions, so a browser cookie
+-- is never accepted as a bearer token or the other way round.
+--
+-- A session also ends, without a write, when the account's password changes
+-- (credential_version no longer matches forge_principals.version: a reset
+-- or a sign-in that upgrades the hash), when the account is disabled, when
+-- it turns two-factor authentication on (the JSON sign-in issues no session
+-- to such an account), and after FORGE_AUTH_SESSION_IDLE_TIMEOUT without a
+-- request (last_seen_at, like forge_sessions).
+
+CREATE TABLE forge_bearer_sessions (
+    id uuid PRIMARY KEY,
+    principal_id uuid NOT NULL REFERENCES forge_principals(id) ON DELETE CASCADE,
+    tenant_id uuid NOT NULL REFERENCES forge_tenants(id) ON DELETE CASCADE,
+    credential_digest bytea NOT NULL UNIQUE,
+    credential_version bigint NOT NULL CHECK (credential_version > 0),
+    issued_at timestamptz NOT NULL,
+    expires_at timestamptz NOT NULL,
+    revoked_at timestamptz,
+    last_seen_at timestamptz NOT NULL DEFAULT now(),
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    CHECK (octet_length(credential_digest) = 32),
+    CHECK (expires_at > issued_at),
+    CHECK (revoked_at IS NULL OR revoked_at >= issued_at)
+);
+
+CREATE INDEX forge_bearer_sessions_principal_active
+ON forge_bearer_sessions (principal_id, expires_at DESC)
+WHERE revoked_at IS NULL;
+
+CREATE FUNCTION forge_guard_bearer_session_update()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    IF NEW.id IS DISTINCT FROM OLD.id
+        OR NEW.principal_id IS DISTINCT FROM OLD.principal_id
+        OR NEW.tenant_id IS DISTINCT FROM OLD.tenant_id
+        OR NEW.credential_digest IS DISTINCT FROM OLD.credential_digest
+        OR NEW.credential_version IS DISTINCT FROM OLD.credential_version
+        OR NEW.issued_at IS DISTINCT FROM OLD.issued_at
+        OR NEW.expires_at IS DISTINCT FROM OLD.expires_at
+        OR NEW.created_at IS DISTINCT FROM OLD.created_at
+    THEN
+        RAISE EXCEPTION 'forge bearer session identity, tenant, secret and lifetime are immutable';
+    END IF;
+
+    IF OLD.revoked_at IS NOT NULL
+        AND NEW.revoked_at IS DISTINCT FROM OLD.revoked_at
+    THEN
+        RAISE EXCEPTION 'forge bearer session revocation is monotonic';
+    END IF;
+
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER forge_bearer_sessions_guard_update
+BEFORE UPDATE ON forge_bearer_sessions
+FOR EACH ROW
+EXECUTE FUNCTION forge_guard_bearer_session_update();
+
+REVOKE ALL ON TABLE forge_bearer_sessions FROM PUBLIC;
+
+-- The runtime role issues, resolves, touches and revokes bearer sessions;
+-- it can change nothing else of a row.
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'app_runtime') THEN
+        REVOKE ALL ON TABLE forge_bearer_sessions FROM app_runtime;
+        GRANT SELECT, INSERT ON TABLE forge_bearer_sessions TO app_runtime;
+        GRANT UPDATE (revoked_at, last_seen_at) ON TABLE forge_bearer_sessions TO app_runtime;
+    END IF;
+END
+$$;

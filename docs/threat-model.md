@@ -278,6 +278,37 @@ timeout a stolen session cookie stays usable as long as it is used, up to
 the 24-hour lifetime, and an application generated before the idle timeout
 has none until it adopts it. Two-factor authentication has its own review below.
 
+## Bearer-token API authentication and JSON resources review
+
+Review date: 2026-10-26
+([ADR 0045](adr/0045-json-resources-and-bearer-api-authentication.md)).
+Scope: `forge new --api-auth` (`POST /auth/login`, `POST /auth/logout`,
+`GET /v1/auth/session`), `forge_bearer_sessions`, the `/v1/<plural>` APIs of
+`forge generate resource` and the scaffold, and the CSRF rule for bearer
+and JSON requests.
+
+| Threat | Control | Verification |
+| --- | --- | --- |
+| Token theft from the database | 256 bits from the OS CSPRNG (`SessionBearerToken::generate`, `getrandom`); only the SHA-256 digest is stored and looked up (unique index), never logged, `Debug` redacted; the response is `no-store` | `forge-auth` bearer tests; generated `bearer_sessions_are_tenant_bound_found_by_digest_and_revoked_for_good` (stored bytes are the digest) |
+| Token guessing or timing on the comparison | No comparison involves the secret: the server looks up the digest of what was presented; in-memory stores compare digests with `subtle` (`SessionCredentialDigest::matches`) | `forge-tenancy` testing-store tests |
+| Ambiguous or smuggled credentials | Exactly one `Authorization` header, `Bearer`, one space, a canonical 64-hex token; a repeated header, a comma, another scheme, extra whitespace or another encoding is `401 credentials_invalid`; cookies, query parameters and `X-Tenant-*` headers are never read; a browser cookie session is not a bearer session (separate table) | `a_missing_header_is_missing_and_everything_else_invalid`; generated `missing_malformed_and_unknown_tokens_are_refused`, `a_request_without_a_valid_token_is_unauthorized` |
+| Cross-tenant access with a valid token | The tenant is the one named at sign-in and stored with the session; every request resolves the membership in that tenant and the RBAC grant again; repositories bind it in every statement and PostgreSQL row-level security applies (ADR 0011) | `another_tenants_membership_does_not_count`; generated `another_tenants_rows_are_invisible`; repository RLS tests |
+| Stale authorization after a role change or suspension | Roles are never copied into the token: membership and grants are read per request; a suspended membership is `403` | `expired_revoked_ungranted_and_suspended_are_refused`; generated `a_role_without_the_permission_is_forbidden` |
+| Token survives a password reset, a disabled account or a new second factor | The store binds a session to `forge_principals.version` and resolves it only while the version matches, the account is enabled and has no TOTP factor; the sign-in re-checks the verified version after the insert | generated PostgreSQL `a_password_change_two_factor_or_a_disabled_account_ends_bearer_sessions` |
+| Password guessing through the JSON sign-in | The pages' `sign_in` throttle keys and limits (one budget for both), one `401 credentials_invalid` for every wrong field, Argon2id for unknown logins, `429` with `Retry-After`, audited `auth.sign_in` | generated `every_wrong_sign_in_is_the_same_401_and_issues_nothing`, `sign_in_is_throttled_with_the_pages_budget` |
+| Second factor bypassed through the API | An account with a TOTP factor gets `403 mfa_required` and no token; its earlier tokens stop resolving | `an_account_with_two_factor_authentication_gets_no_token`; PostgreSQL test above |
+| Long-lived or unattended tokens | 24-hour lifetime, `FORGE_AUTH_SESSION_IDLE_TIMEOUT` (use recorded at most once a minute, fail closed), idempotent revocation at `/auth/logout` (audited `auth.sign_out`) | `bearer_sessions_end_after_the_idle_timeout`, `sign_out_revokes_the_token_and_is_idempotent`; the generator e2e signs out and sees the token refused |
+| CSRF through the API | A browser never adds `Authorization` by itself and sends `application/json` cross-origin only after a CORS preflight Forge does not grant, so the CSRF layer passes such requests without a token **after** its cross-site check, unverified and without `_method`; cookie-authenticated routes keep their session-bound check | `forge-views` `bearer_and_json_requests_pass_unverified_but_never_cross_site`; generated `the_csrf_layer_lets_json_and_bearer_requests_through` |
+| A new resource public by accident | Every route asks its access policy first; the printed wiring is `DenyAll` for global resources, without bearer tokens and on MySQL, MariaDB and SQLite; the use cases re-check the grant | generated `the_generated_deny_all_default_refuses_every_route`, `the_use_cases_refuse_a_context_granted_for_another_permission` |
+
+Residual risks: a stolen token works for anyone who holds it until it
+expires, idles out, is revoked or the password changes (as Forge-Go's);
+anyone who can add a CORS grant to the application reopens the JSON CSRF
+exemption, so a CORS layer must never allow credentials from other origins;
+accounts with two-factor cannot use the API until `/auth/mfa/complete` is
+ported; the JSON sign-in is another place a password is entered, so remove
+its wiring when no API client signs in.
+
 ## Phase 4 review: jobs, schedules and the outbox
 
 Review date: 2026-10-19 ([ADR 0025](adr/0025-durable-jobs-scheduler-and-outbox.md),

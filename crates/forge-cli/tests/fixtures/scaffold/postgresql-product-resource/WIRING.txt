@@ -1,0 +1,72 @@
+
+Forge did not edit any existing file. Wire the resource by hand:
+
+  1. Declare the new modules (each in the listed file, keeping `mod` lines sorted):
+
+       src/domain/entities/mod.rs             pub mod product;
+       src/application/ports/mod.rs           pub mod product_repository;
+       src/application/use_cases/mod.rs       pub mod products;
+       src/infrastructure/database/mod.rs     pub mod products;
+       src/adapters/http/mod.rs               pub mod api_access;
+       src/adapters/http/mod.rs               pub mod products_api;
+
+  2. In src/bootstrap/mod.rs, at the end of `fn compose`, before `Ok(())`:
+
+    let products =
+        crate::application::use_cases::products::ProductService::new(std::sync::Arc::new(
+            crate::infrastructure::database::products::PgProductRepository::new(
+                composition.postgres()?.clone(),
+            ),
+        ));
+    // products JSON API (/v1/products): tenant-scoped. The bearer token of
+    // POST /auth/login names the tenant; RBAC denies every role `policy` does
+    // not name: the `owner` role (`setup` gives it to the first member) may read
+    // and write; grant other tenant roles here.
+    let mut policy = forge::security::RbacPolicy::new();
+    let owner = forge::security::Role::new("owner").map_err(forge::ComposeError::other)?;
+    for permission in [
+        crate::application::use_cases::products::READ_PERMISSION,
+        crate::application::use_cases::products::WRITE_PERMISSION,
+    ] {
+        let permission =
+            forge::security::Permission::new(permission).map_err(forge::ComposeError::other)?;
+        policy.allow(owner.clone(), permission);
+    }
+    let pool = composition.postgres()?.pool().clone();
+    // Tokens end after FORGE_AUTH_SESSION_IDLE_TIMEOUT without a request.
+    let bearer_sessions =
+        crate::infrastructure::bearer_sessions::PostgresBearerSessionStore::new(pool.clone())
+            .with_idle_timeout(
+                forge::auth::SessionIdleTimeout::new(
+                    composition.config().auth.session_idle_timeout,
+                )
+                .map_err(forge::ComposeError::other)?,
+            );
+    crate::adapters::http::products_api::routes(
+        composition.router(),
+        products,
+        std::sync::Arc::new(crate::adapters::http::api_access::BearerTenantAccess::new(
+            std::sync::Arc::new(bearer_sessions),
+            std::sync::Arc::new(crate::infrastructure::tenancy::PgMembershipStore::new(pool)),
+            policy,
+        )),
+    )?;
+
+  Every route of /v1/products asks the access policy for `products:read` or
+  `products:write` first; src/adapters/http/api_access.rs explains the
+  deny-by-default choice.
+  The JSON API takes the bearer tokens of POST /auth/login:
+
+    curl -s http://127.0.0.1:3000/v1/products -H "Authorization: Bearer $TOKEN"
+
+  To allow a read-only tenant role, add after `let mut policy`, for example:
+
+    let viewer = forge::security::Role::new("viewer").map_err(forge::ComposeError::other)?;
+    let read =
+        forge::security::Permission::new(crate::application::use_cases::products::READ_PERMISSION)
+            .map_err(forge::ComposeError::other)?;
+    policy.allow(viewer, read);
+
+  Then apply the migration (`cargo run -- migrate` with FORGE_MIGRATION_DATABASE_URL)
+  and run `cargo test` (repository tests on a database server need
+  `cargo test -- --include-ignored` and FORGE_TEST_* URLs, see docs/database.md).

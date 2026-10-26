@@ -26,7 +26,17 @@
 //!   otherwise an `Origin` header must name the request's `Host`;
 //! - after a successful check, a `POST` form may tunnel `PATCH`, `PUT` or
 //!   `DELETE` in `_method` ([`method_override`]); the request method is
-//!   rewritten before routing.
+//!   rewritten before routing;
+//! - like Forge-Go's `csrf.Protection`, requests a cross-site page cannot
+//!   produce pass without a valid token, never without the cross-site
+//!   check: those with exactly one `Authorization: Bearer` header, which a
+//!   browser never adds on its own, and those with a JSON body
+//!   (`Content-Type: application/json`), which a browser sends cross-origin
+//!   only after a CORS preflight Forge does not grant. Unless they carry the
+//!   cookie's token they are not marked verified ([`csrf_verified`] is
+//!   `None`) and get no `_method` override, so a handler that requires the
+//!   check still refuses them, and cookie-authenticated routes keep their
+//!   session-bound token check.
 //!
 //! Every refusal is `403 Forbidden` with a generic body; the reason is
 //! logged without token values.
@@ -409,12 +419,31 @@ fn check_origin(request: &Request) -> Result<(), CsrfError> {
     }
 }
 
-/// Checks an unsafe request and returns the verified cookie token.
+/// Whether a cross-site page cannot have produced `request`: it carries
+/// exactly one `Authorization: Bearer <credential>` header (a browser never
+/// adds one by itself), or a JSON body (sent cross-origin only after a CORS
+/// preflight). Forge-Go's `bearerRequest` and `jsonRequest`.
+fn api_request(request: &Request) -> bool {
+    let mut authorization = request.headers().get_all(header::AUTHORIZATION).iter();
+    let bearer = match (authorization.next(), authorization.next()) {
+        (Some(value), None) => value
+            .to_str()
+            .ok()
+            .and_then(|value| value.split_once(' '))
+            .is_some_and(|(scheme, credential)| {
+                scheme.eq_ignore_ascii_case("bearer") && !credential.trim().is_empty()
+            }),
+        _ => false,
+    };
+    bearer || request.is_json()
+}
+
+/// Checks the token of an unsafe request (its origin is already checked)
+/// and returns the verified cookie token.
 fn verify(
     request: &Request,
     cookie: Result<Option<CsrfToken>, CsrfError>,
 ) -> Result<CsrfToken, CsrfError> {
-    check_origin(request)?;
     let cookie = cookie?.ok_or(CsrfError::MissingCookie)?;
     let presented = presented_csrf_token(request)?.ok_or(CsrfError::MissingToken)?;
     if tokens_equal(&cookie, &presented) {
@@ -490,9 +519,20 @@ impl Middleware for CsrfProtection {
                 // A missing or invalid cookie is replaced if the page needs a
                 // token; safe requests are never refused.
                 CsrfState::new(cookie.ok().flatten())
+            } else if let Err(reason) = check_origin(&request) {
+                return refuse(&request, reason);
             } else {
-                let token = match verify(&request, cookie) {
+                let token = match verify(&request, cookie.clone()) {
                     Ok(token) => token,
+                    // Bearer and JSON requests pass without a valid token,
+                    // unverified and without a method override.
+                    Err(_) if api_request(&request) => {
+                        let state = CsrfState::new(cookie.ok().flatten());
+                        request.extensions_mut().insert(state.clone());
+                        let mut response = next.run(request).await;
+                        finish(&state, &mut response);
+                        return response;
+                    }
                     Err(reason) => return refuse(&request, reason),
                 };
                 let verified = CsrfVerified::after_check();
@@ -808,6 +848,80 @@ mod tests {
             &format!("{CSRF_FIELD_NAME}={TOKEN}"),
         ))
         .await;
+    }
+
+    /// Forge-Go's rule: a request a cross-site page cannot produce (one
+    /// `Authorization: Bearer` header, or a JSON body) passes without a
+    /// token, unverified and without a method override; the cross-site
+    /// check still applies.
+    #[tokio::test]
+    async fn bearer_and_json_requests_pass_unverified_but_never_cross_site() {
+        let bearer = format!("Bearer {}", "ab".repeat(32));
+        for headers in [
+            vec![("authorization", bearer.as_str())],
+            vec![("authorization", "bearer anything")],
+            vec![("content-type", "application/json")],
+            vec![("content-type", "application/json; charset=utf-8")],
+            vec![("authorization", bearer.as_str()), ("cookie", "theme=dark")],
+        ] {
+            let response = send(request(Method::POST, "/items", &headers, "{}")).await;
+            assert_eq!(response.status(), StatusCode::OK, "{headers:?}");
+            assert_eq!(text(&response), "POST false", "{headers:?}");
+        }
+        // With the cookie's token a JSON request is verified as before.
+        let verified = send(request(
+            Method::POST,
+            "/items",
+            &[
+                ("cookie", &cookie(TOKEN)),
+                (CSRF_HEADER_NAME, TOKEN),
+                ("content-type", "application/json"),
+            ],
+            "{}",
+        ))
+        .await;
+        assert_eq!(text(&verified), "POST true");
+        // A bearer form cannot tunnel another method.
+        let tunnelled = send(request(
+            Method::POST,
+            "/items",
+            &[("authorization", bearer.as_str()), ("content-type", FORM)],
+            &format!("{METHOD_FIELD_NAME}=delete"),
+        ))
+        .await;
+        assert_eq!(text(&tunnelled), "POST false");
+
+        for headers in [
+            vec![
+                ("authorization", bearer.as_str()),
+                ("sec-fetch-site", "cross-site"),
+            ],
+            vec![
+                ("content-type", "application/json"),
+                ("sec-fetch-site", "same-site"),
+            ],
+            vec![
+                ("content-type", "application/json"),
+                ("origin", "https://evil.example"),
+                ("host", "shop.example"),
+            ],
+            // Not requests a page cannot produce: refused without a token.
+            vec![("authorization", "Bearer ")],
+            vec![("authorization", "Basic dXNlcjpwYXNz")],
+            vec![
+                ("authorization", bearer.as_str()),
+                ("authorization", bearer.as_str()),
+            ],
+            vec![("content-type", "text/plain")],
+            vec![("content-type", FORM)],
+            vec![
+                ("content-type", "application/json"),
+                ("content-type", "application/json"),
+            ],
+        ] {
+            let response = send(request(Method::POST, "/items", &headers, "{}")).await;
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{headers:?}");
+        }
     }
 
     #[tokio::test]

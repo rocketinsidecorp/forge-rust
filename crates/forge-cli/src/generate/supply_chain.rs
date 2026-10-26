@@ -32,17 +32,21 @@ const DATABASES: [Database; 5] = [
 ];
 
 /// Every combination of the options a template can test: each backend and
-/// none, with and without Docker, full-stack and `--api`.
+/// none, with and without Docker, full-stack and `--api`, with and without
+/// `--api-auth`.
 fn every_condition() -> Vec<Conditions> {
     let mut all = Vec::new();
     for database in DATABASES {
         for docker in [true, false] {
             for views in [true, false] {
-                all.push(Conditions {
-                    docker,
-                    database,
-                    views,
-                });
+                for api_auth in [true, false] {
+                    all.push(Conditions {
+                        docker,
+                        database,
+                        views,
+                        api_auth,
+                    });
+                }
             }
         }
     }
@@ -124,6 +128,7 @@ fn every_rendered_workflow_passes_the_supply_chain_gate() {
                 views: conditions.views,
                 forge: ForgeSource::GitTag,
                 locale: Locale::En,
+                api_auth: false,
             };
             let root = create_application(parent.path(), &options)
                 .unwrap_or_else(|error| panic!("{error}"));
@@ -250,6 +255,7 @@ fn a_generated_tool_configuration_is_found_anywhere_in_the_application() {
         views: false,
         forge: ForgeSource::GitTag,
         locale: Locale::En,
+        api_auth: false,
     };
     let root =
         create_application(parent.path(), &options).unwrap_or_else(|error| panic!("{error}"));

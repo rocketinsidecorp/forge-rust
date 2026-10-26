@@ -102,10 +102,18 @@ fn execute(
             skip_ci,
             database,
             api,
+            api_auth,
             skip_lockfile,
             forge_path,
             locale,
         } => {
+            if api_auth && database != generate::Database::Postgresql {
+                return Err(CliError::Authentication(
+                    "--api-auth needs PostgreSQL: Forge persists identities and bearer sessions \
+                     only in PostgreSQL today (ADR 0021)"
+                        .to_owned(),
+                ));
+            }
             let options = NewApplication {
                 name,
                 docker: !skip_docker,
@@ -114,6 +122,7 @@ fn execute(
                 views: !api,
                 forge: forge_path.map_or(ForgeSource::GitTag, ForgeSource::Path),
                 locale,
+                api_auth,
             };
             let destination = generate::create_application(current_dir, &options)?;
             writeln!(
@@ -141,8 +150,8 @@ fn execute(
             Ok(())
         }
         Command::Generate { generator } => match generator {
-            GenerateCommand::Authentication { dry_run } => {
-                let outcome = authentication::generate(current_dir, dry_run)?;
+            GenerateCommand::Authentication { api_auth, dry_run } => {
+                let outcome = authentication::generate(current_dir, api_auth, dry_run)?;
                 let verb = if dry_run { "would create" } else { "create" };
                 for path in &outcome.created {
                     writeln!(output, "  {verb:<12} {path}").map_err(CliError::Output)?;
@@ -193,6 +202,28 @@ fn execute(
                 }
                 if outcome.reused_streams {
                     writeln!(output, "  {:<12} src/adapters/http/streams.rs", "reuse")
+                        .map_err(CliError::Output)?;
+                }
+                if outcome.reused_api_access {
+                    writeln!(output, "  {:<12} {}", "reuse", scaffold::API_ACCESS_PATH)
+                        .map_err(CliError::Output)?;
+                }
+                write!(output, "{}", outcome.wiring).map_err(CliError::Output)
+            }
+            GenerateCommand::Resource { resource } => {
+                let options = resource_options(resource, Layers::Resource, false);
+                let version = generate::migration_version(current_dir)?;
+                let outcome = scaffold::generate(current_dir, &options, &version)?;
+                let verb = if options.dry_run {
+                    "would create"
+                } else {
+                    "create"
+                };
+                for path in &outcome.created {
+                    writeln!(output, "  {verb:<12} {path}").map_err(CliError::Output)?;
+                }
+                if outcome.reused_api_access {
+                    writeln!(output, "  {:<12} {}", "reuse", scaffold::API_ACCESS_PATH)
                         .map_err(CliError::Output)?;
                 }
                 write!(output, "{}", outcome.wiring).map_err(CliError::Output)
@@ -590,6 +621,18 @@ fn run_destroy(
     let (plan, flags) = match generator {
         DestroyCommand::Model { resource, flags } => {
             let options = resource_options(resource, Layers::Model, false);
+            let (files, unwire, owned_elsewhere) = scaffold::plan_destroy(root, &options)?;
+            (
+                DestroyPlan {
+                    files,
+                    unwire,
+                    owned_elsewhere,
+                },
+                destroy_flags(options.dry_run, flags),
+            )
+        }
+        DestroyCommand::Resource { resource, flags } => {
+            let options = resource_options(resource, Layers::Resource, false);
             let (files, unwire, owned_elsewhere) = scaffold::plan_destroy(root, &options)?;
             (
                 DestroyPlan {
