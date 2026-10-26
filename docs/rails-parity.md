@@ -79,7 +79,8 @@ the work is finished and waiting for its review; **Planned** means not started.
   Rust's free enqueue functions take only a transaction; Rust announces with
   a trigger that reads that setting, so schedule ticks are announced too.
   Forge-Go adopts `FORGE_JOBS_NOTIFY` with the same meaning (tracked in
-  forge-rust#80).
+  [forge-go#72](https://github.com/rocketinsidecorp/forge-go/issues/72), next
+  Go jobs package, before v0.1.0).
   (2) Go exposes `Worker.Listening()`; Rust logs the subscription instead.
   (3) Go's idle poll doubles to `MaxPollInterval` (10 s); Rust polls every
   `poll_interval` (1 s).
