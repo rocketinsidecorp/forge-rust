@@ -317,7 +317,8 @@ Notes on the generated package:
   `.routes(crate::adapters::http::routes)`.
 - Database applications (full-stack and `--api`) have a `forge` dev-dependency with the
   `testing` feature, so repository tests can use
-  `forge::db::testing::TestDatabase`.
+  `forge::db::testing::TestDatabase` and, on PostgreSQL,
+  `forge::db::testing::RlsTestDatabase` (migration and runtime roles per test).
 
 - `tests/architecture.rs` is a real test that scans source imports. It fails
   when `src/domain` imports `application`, `adapters`, `infrastructure`,
@@ -518,7 +519,7 @@ src/adapters/http/posts.rs                   routes and handlers
 src/adapters/http/views/posts.rs             Askama view models
 templates/posts/{index,show,new,edit,_form,not_found}.html
 tests/posts_http.rs                          HTML flow with an in-memory port
-tests/posts_repository.rs                    repository against TestDatabase
+tests/posts_repository.rs                    repository as the runtime role (RlsTestDatabase on PostgreSQL)
 ```
 
 Generated Rust is formatted with the application's pinned `rustfmt` before

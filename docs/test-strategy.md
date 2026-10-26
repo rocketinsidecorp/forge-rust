@@ -102,7 +102,8 @@ heartbeat expiry, cancellation, concurrency keys, fairness, and saturation.
 
 Phase 4 implementation: `forge-jobs` and `forge-events` run their PostgreSQL
 suites as a per-test non-superuser, non-owner runtime role
-(`forge_jobs::testing::RlsTestDatabase`); they are `#[ignore]`d unless
+(`forge::db::testing::RlsTestDatabase`, re-exported as
+`forge_jobs::testing::RlsTestDatabase`); they are `#[ignore]`d unless
 `FORGE_TEST_DATABASE_URL` is set and `--include-ignored` is passed. The cron
 evaluator is checked against a minute-by-minute oracle on generated
 expressions and against arbitrary input that must never panic. Concurrency
@@ -152,8 +153,12 @@ row-level-security tests and the scaffold migrations' `migrate`/`rollback`.
 Every scaffold ships tests: domain validation, the HTML flow through the real
 CSRF/flash/method-override layers with an in-memory port (CSRF refusal, `422`,
 `303`, `404`, `409`, the `DenyAll` default) and the repository against
-`TestDatabase` (optimistic locking, cursor pages, cross-tenant isolation and,
-on PostgreSQL, RLS with a role that cannot bypass it).
+`TestDatabase` (optimistic locking, cursor pages, cross-tenant isolation). On
+PostgreSQL the repository tests run as a fresh runtime role
+(`RlsTestDatabase`, ADR 0044) that row-level security binds, and a generated
+test proves that role cannot run DDL (`CREATE`, temporary tables included,
+`ALTER`, `TRUNCATE`, `DROP`, and for tenant resources disabling RLS or
+dropping the policy).
 
 The generated sign-in pages ([ADR 0026](adr/0026-authentication-pages-and-setup.md))
 ship `tests/authentication_http.rs` (the pages through the real CSRF and

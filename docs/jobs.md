@@ -381,7 +381,8 @@ FORGE_TEST_DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5432/postgres \
 ```
 
 They run as a non-superuser, non-owner runtime role created per test
-(`forge_jobs::testing::RlsTestDatabase`, feature `testing`), and cover
+(`forge::db::testing::RlsTestDatabase`, re-exported as
+`forge_jobs::testing::RlsTestDatabase`, feature `testing`), and cover
 transactional enqueue, many concurrent workers without double execution,
 lease expiry and fencing, retries and dead jobs, timeouts, panics, graceful
 drain, exactly-once schedule ticks across two runtimes, RLS tenant isolation,

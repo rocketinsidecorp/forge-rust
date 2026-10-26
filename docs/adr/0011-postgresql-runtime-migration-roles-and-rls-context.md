@@ -3,6 +3,7 @@
 - Status: Accepted
 - Date: 2026-09-27
 - Refines: [ADR 0004](0004-tenancy-and-rls.md), [ADR 0007](0007-sqlx-postgresql-first.md)
+- Refined by: [ADR 0044](0044-refused-row-level-security-bypass-and-runtime-role-tests.md)
 
 ## Context
 
