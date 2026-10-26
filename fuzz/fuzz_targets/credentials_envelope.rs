@@ -16,31 +16,11 @@ use libfuzzer_sys::fuzz_target;
 
 const KEY_BYTES: [u8; 32] = [0x42; 32];
 
-/// Whether `shown` repeats the key text. Key text that is a piece of the
-/// error message's own fixed wording ("credentials: ke") is not an echo, so a
-/// match counts only when the same key with its letters and digits shifted is
-/// echoed too: a coincidence with the template cannot follow the key. Found
-/// by this target (seed `key-text-in-error-template`).
-fn echoes(key_text: &str, shown: &str) -> bool {
-    let key = key_text.trim();
-    if key.len() < 8 || !shown.contains(key) {
-        return false;
-    }
-    let shifted: String = key
-        .chars()
-        .map(|character| match character {
-            'z' => 'a',
-            'Z' => 'A',
-            '9' => '0',
-            other if other.is_ascii_alphanumeric() => char::from(other as u8 + 1),
-            other => other,
-        })
-        .collect();
-    match parse_keys(&shifted) {
-        Err(error) => error.to_string().contains(&shifted),
-        Ok(_) => false,
-    }
-}
+// The closed set of `parse_keys` failure messages, with its tests in
+// crates/forge-credentials/tests/key_error_oracle.rs.
+#[path = "../oracles/credentials_key_errors.rs"]
+mod key_errors;
+use key_errors::is_fixed_message;
 
 fuzz_target!(|data: &[u8]| {
     let mut fields = data.splitn(3, |byte| *byte == 0);
@@ -52,8 +32,8 @@ fuzz_target!(|data: &[u8]| {
     if let Err(error) = parse_keys(&key_text) {
         let shown = error.to_string();
         assert!(
-            !echoes(&key_text, &shown),
-            "an error echoed the key: {key_text:?} -> {shown:?}"
+            is_fixed_message(&shown),
+            "a key error carries text outside its fixed wording: {key_text:?} -> {shown:?}"
         );
     }
 
