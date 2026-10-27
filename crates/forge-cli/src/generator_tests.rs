@@ -1248,6 +1248,13 @@ fn controllers_refuse_what_they_cannot_guard_or_place() {
         dry_run: false,
     };
     assert!(refused(controller::generate(&root, &options)).contains("at most 20 actions"));
+    for name in ["forge", "std"] {
+        assert!(
+            refused(controller::generate(&root, &controller(name, &["index"])))
+                .contains("crate the generated code uses"),
+            "{name}"
+        );
+    }
     for name in ["protect", "public", "site", "generated_routes"] {
         assert!(
             refused(controller::generate(&root, &controller(name, &["index"])))

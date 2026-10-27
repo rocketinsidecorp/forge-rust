@@ -467,17 +467,48 @@ fn declared_module(line: &str) -> Option<&str> {
 
 /// `source` with `pub mod name;` added in sorted order, `None` when it is
 /// already there, or the line that declares `name` another way.
+/// Whether `line` is an outer attribute or doc comment, which belongs to
+/// the item below it (`#[cfg(test)]`, `#[path = "..."]`, `/// docs`).
+fn attaches(line: &str) -> bool {
+    let line = line.trim_start();
+    line.starts_with("#[") || (line.starts_with("///") && !line.starts_with("////"))
+}
+
+/// The first line of the attributes and doc comments attached to the item
+/// on line `index` (`index` itself when there are none).
+fn attached_start(lines: &[&str], index: usize) -> usize {
+    let mut start = index;
+    while start > 0 && attaches(lines[start - 1]) {
+        start -= 1;
+    }
+    start
+}
+
+/// How `name` is declared at `index`, when not exactly as the generators
+/// write it: another visibility or form, or with attributes or docs, which
+/// the generators neither write nor remove.
+fn foreign_declaration(lines: &[&str], index: usize, canonical: &str) -> Option<String> {
+    let start = attached_start(lines, index);
+    (lines[index].trim_end() != canonical || start < index).then(|| {
+        lines[start..=index]
+            .iter()
+            .map(|line| line.trim_end())
+            .collect::<Vec<_>>()
+            .join(" ")
+    })
+}
+
 fn declare(source: &str, name: &str) -> Result<Option<String>, String> {
     let canonical = format!("pub mod {name};");
     let lines: Vec<&str> = source.lines().collect();
-    for line in &lines {
-        if declared_module(line) == Some(name) {
-            return if line.trim_end() == canonical {
-                Ok(None)
-            } else {
-                Err(line.trim_end().to_owned())
-            };
-        }
+    if let Some(index) = lines
+        .iter()
+        .position(|line| declared_module(line) == Some(name))
+    {
+        return match foreign_declaration(&lines, index, &canonical) {
+            None => Ok(None),
+            Some(declaration) => Err(declaration),
+        };
     }
     let declarations: Vec<(usize, &str)> = lines
         .iter()
@@ -490,10 +521,12 @@ fn declare(source: &str, name: &str) -> Result<Option<String>, String> {
         .collect();
     let mut out: Vec<String> = lines.iter().map(|line| (*line).to_owned()).collect();
     if let Some((first, _)) = declarations.first() {
+        // Before the attributes and docs of the declaration that sorts after
+        // it, which belong to that item and never to the new one.
         let position = declarations
             .iter()
             .find(|(_, module)| *module > name)
-            .map(|(index, _)| *index)
+            .map(|(index, _)| attached_start(&lines, *index))
             .or_else(|| declarations.last().map(|(index, _)| index + 1))
             .unwrap_or(*first);
         out.insert(position, canonical);
@@ -527,8 +560,10 @@ fn undeclare(source: &str, name: &str) -> Result<Option<String>, String> {
     else {
         return Ok(None);
     };
-    if lines[index].trim_end() != canonical {
-        return Err(lines[index].trim_end().to_owned());
+    // A declaration with attributes or docs was not written by a generator:
+    // removing only its line would hand them to the next item.
+    if let Some(declaration) = foreign_declaration(&lines, index, &canonical) {
+        return Err(declaration);
     }
     let mut out: Vec<String> = lines.iter().map(|line| (*line).to_owned()).collect();
     out.remove(index);

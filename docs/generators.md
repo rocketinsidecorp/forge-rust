@@ -24,7 +24,10 @@ Forge-Go ADR 0041). Every generator follows the same rules:
   sign-in pages need a signed-in member granted the permission (the `owner`
   role `forge setup` creates is); anything else answers `403` (`DenyAll`)
   until the application decides, or `--public` says so for a global
-  resource of an application without Forge identity.
+  resource of an application without Forge identity. (That refusal of
+  `--public` with identity is the scaffold's and the resource's: `forge
+  generate controller --public` still mounts read-only `GET` pages without a
+  guard in any application, as Forge-Go's does.)
 - **Validated names.** Names and fields become Rust identifiers, file names,
   SQL identifiers and URL segments, so they are strict lowercase
   `snake_case` (letters, digits, single underscores, starting with a letter,
@@ -52,7 +55,9 @@ that file and rewrite it whole, formatted with the application's rustfmt:
   sign-in, CSRF, a membership in the session's tenant and the `owner` role
   granted the permissions) and `public` (`--public`);
 - a `// forge:checksum` line records what the generators wrote: a hand edit
-  is refused, and nothing is written;
+  is refused, and nothing is written (it detects accidental edits; anyone
+  who can write the file can also sign it again, so it is no defense against
+  a deliberate change);
 - running a generator again with the same arguments changes nothing
   (`identical`); the same block with other code (other arguments, another
   Forge version) is refused until `forge destroy` takes it out.

@@ -8,6 +8,13 @@
 //! `/v1/products` as JSON with the session cookie and `X-CSRF-Token`; on
 //! SQLite the same CRUD runs on the `--public` routes.
 //!
+//! On PostgreSQL two generators run after the Quickstart's lines and before
+//! `forge dev` (then `forge migrate`): a global scaffold, `note`, which must
+//! answer `403` to the signed-in owner, and a tenant-scoped JSON resource,
+//! `order`, which takes the session with the CSRF header (D29). At the end
+//! `forge dev` is stopped with SIGTERM and the test proves its application
+//! stopped too: no process left, the port closed.
+//!
 //! Two lines are adapted, and only these: `forge new` also gets
 //! `--forge-path` (the Forge of this checkout), and on PostgreSQL the
 //! `docker compose up` line becomes a database and the migration and runtime
@@ -93,18 +100,107 @@ fn words(line: &str) -> Vec<String> {
     words
 }
 
-/// `forge dev`, in its own process group so the application it runs stops
-/// with it when dropped.
-struct Dev(Child);
+/// `forge dev`. Its application leads a process group of its own (so a
+/// terminal's Ctrl-C reaches only the CLI), so it is stopped through `forge
+/// dev`: SIGTERM, which stops and reaps the application, then, only past a
+/// deadline, SIGKILL for `forge dev` and the application's group alike.
+/// [`Dev::stop`] proves nothing survives; dropping a `Dev` (an assertion
+/// failed) stops it the same way without asserting.
+struct Dev {
+    child: Option<Child>,
+    port: u16,
+}
+
+/// How long `forge dev` gets to stop its application after SIGTERM: its own
+/// grace period for the application, and some.
+const STOP_DEADLINE: Duration = Duration::from_secs(30);
+
+/// The processes whose parent is `parent` (`/proc/PID/stat`).
+fn children_of(parent: i32) -> Vec<i32> {
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<i32>().ok())
+        .filter(|pid| {
+            fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .and_then(|stat| {
+                    // `PID (COMM) STATE PPID ...`; COMM may hold spaces or `)`.
+                    let (_, rest) = stat.rsplit_once(')')?;
+                    rest.split_whitespace().nth(1)?.parse::<i32>().ok()
+                })
+                == Some(parent)
+        })
+        .collect()
+}
+
+impl Dev {
+    /// Stops `forge dev` and its application; returns the application
+    /// processes that were running, and whether `forge dev` stopped by
+    /// itself within [`STOP_DEADLINE`].
+    fn shut_down(&mut self) -> (Vec<i32>, bool) {
+        use rustix::process::{Pid, Signal, kill_process, kill_process_group};
+        let Some(mut child) = self.child.take() else {
+            return (Vec::new(), true);
+        };
+        let raw = i32::try_from(child.id()).unwrap_or_default();
+        let Some(pid) = Pid::from_raw(raw) else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return (Vec::new(), false);
+        };
+        let applications = children_of(raw);
+        let _ = kill_process(pid, Signal::TERM);
+        let (exited, waited) = mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let status = child.wait();
+            let _ = exited.send(());
+            status
+        });
+        let stopped = waited.recv_timeout(STOP_DEADLINE).is_ok();
+        if !stopped {
+            // forge dev did not stop: kill it and the application's group.
+            let _ = kill_process(pid, Signal::KILL);
+            for application in &applications {
+                if let Some(group) = Pid::from_raw(*application) {
+                    let _ = kill_process_group(group, Signal::KILL);
+                }
+            }
+        }
+        let _ = waiter.join();
+        (applications, stopped)
+    }
+
+    /// Stops `forge dev` and asserts that its application stopped with it:
+    /// its processes are gone and its port refuses connections.
+    fn stop(mut self) {
+        let (applications, stopped) = self.shut_down();
+        assert!(
+            stopped,
+            "forge dev did not stop within {STOP_DEADLINE:?} of SIGTERM"
+        );
+        assert!(!applications.is_empty(), "forge dev ran no application");
+        for application in applications {
+            let alive = rustix::process::Pid::from_raw(application)
+                .is_some_and(|pid| rustix::process::test_kill_process(pid).is_ok());
+            assert!(
+                !alive,
+                "the application (pid {application}) outlived forge dev"
+            );
+        }
+        assert!(
+            TcpStream::connect(("127.0.0.1", self.port)).is_err(),
+            "port {} still accepts connections after forge dev stopped",
+            self.port
+        );
+    }
+}
 
 impl Drop for Dev {
     fn drop(&mut self) {
-        use rustix::process::{Pid, Signal, kill_process_group};
-        // forge dev and the application it runs share the group: both stop.
-        if let Some(pid) = i32::try_from(self.0.id()).ok().and_then(Pid::from_raw) {
-            let _ = kill_process_group(pid, Signal::KILL);
-        }
-        let _ = self.0.wait();
+        let _ = self.shut_down();
     }
 }
 
@@ -112,11 +208,9 @@ impl Dev {
     /// Starts `forge dev` on an ephemeral loopback port and returns it with
     /// the port of the application's `listening` log line.
     fn start(root: &Path, arguments: &[&str]) -> (Self, u16) {
-        use std::os::unix::process::CommandExt as _;
         let mut command = forge(root, arguments);
         command
             .env("FORGE_HTTP_ADDR", "127.0.0.1:0")
-            .process_group(0)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -147,7 +241,10 @@ impl Dev {
                 }
             });
         }
-        let dev = Self(child);
+        let mut dev = Self {
+            child: Some(child),
+            port: 0,
+        };
         // The first build compiles Forge and every dependency.
         let deadline = Instant::now() + Duration::from_secs(1_800);
         let mut log = String::new();
@@ -155,6 +252,7 @@ impl Dev {
             match reported.recv_timeout(left) {
                 Ok(line) => {
                     if let Some(address) = listening_address(&line) {
+                        dev.port = address.port();
                         return (dev, address.port());
                     }
                     log.push_str(&line);
@@ -508,7 +606,7 @@ fn readme_quickstart_postgresql() {
     // session cookie, the CSRF header and the owner's permission (D29).
     let orders: &[&str] = &["g", "resource", "order", "total:integer", "--tenant-scoped"];
     let migrate: &[&str] = &["migrate"];
-    let (_root, _dev, port) = run_quickstart(
+    let (_root, dev, port) = run_quickstart(
         parent.path(),
         &[],
         &mut |root| {
@@ -591,13 +689,14 @@ fn readme_quickstart_postgresql() {
     let mut stranger = Client::new(port);
     let signed_out = stranger.send("GET", "/v1/orders", &[("Accept", "application/json")], "");
     assert_eq!(signed_out.status, 401, "{}", signed_out.body);
+    dev.stop();
 }
 
 #[test]
 #[ignore = "slow: builds a generated application"]
 fn readme_quickstart_sqlite3() {
     let parent = tempfile::tempdir().unwrap_or_else(|error| panic!("{error}"));
-    let (_root, _dev, port) = run_quickstart(
+    let (_root, dev, port) = run_quickstart(
         parent.path(),
         &["-d", "sqlite3"],
         &mut |_| panic!("a SQLite Quickstart starts no database server"),
@@ -607,4 +706,5 @@ fn readme_quickstart_sqlite3() {
     // --public: no sign-in, the forms still need their CSRF token.
     crud(&mut client);
     json_api(&mut client, false);
+    dev.stop();
 }

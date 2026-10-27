@@ -217,6 +217,11 @@ const RESERVED_LOCALS: &[&str] = &[
     "version",
 ];
 
+/// Crates generated code names by path (`forge::...`, `std::...`); `crate`,
+/// `self` and `super` are Rust keywords, refused already. A module of one of
+/// these names would shadow the crate in the code around it.
+pub(crate) const CRATE_NAMES: &[&str] = &["alloc", "core", "forge", "std"];
+
 /// Plural names that would collide with framework routes or generated
 /// modules (`/health`, `/assets`, `/streams`, `/tenants/{tenant_id}/...`,
 /// `adapters::http::views`, `adapters::http::access` and
@@ -251,6 +256,13 @@ pub(crate) fn parse(
         }
     };
     for name in [&singular, &plural] {
+        if CRATE_NAMES.contains(&name.as_str()) {
+            return invalid(format!(
+                "`{name}` is the name of a crate the generated code uses by path ({}); choose \
+                 another resource name or --plural",
+                CRATE_NAMES.join(", ")
+            ));
+        }
         if crate::wiring::SEAM_NAMES.contains(&name.as_str()) {
             return invalid(format!(
                 "`{name}` names a guard, shared block or part of the generated routes seam \
@@ -641,6 +653,36 @@ mod tests {
                 .map(|error| error.to_string())
                 .unwrap_or_default();
             assert!(as_plural.contains("routes seam"), "{name}: {as_plural}");
+        }
+    }
+
+    /// Names of crates the generated code uses by path are refused as a
+    /// resource or a plural, as are `crate`, `self` and `super` (keywords).
+    #[test]
+    fn rejects_the_names_of_crates_used_by_path() {
+        for name in ["alloc", "core", "forge", "std"] {
+            let as_plural = parse("thing", &["a:string".to_owned()], Scope::Global, Some(name))
+                .err()
+                .map(|error| error.to_string())
+                .unwrap_or_default();
+            assert!(
+                as_plural.contains("crate the generated code uses"),
+                "{name}: {as_plural}"
+            );
+            let as_name = parse(name, &["a:string".to_owned()], Scope::Global, None)
+                .err()
+                .map(|error| error.to_string())
+                .unwrap_or_default();
+            assert!(
+                as_name.contains("crate the generated code uses"),
+                "{name}: {as_name}"
+            );
+        }
+        for keyword in ["crate", "self", "super"] {
+            assert!(
+                parse(keyword, &["a:string".to_owned()], Scope::Global, None).is_err(),
+                "{keyword}"
+            );
         }
     }
 

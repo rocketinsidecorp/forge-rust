@@ -180,6 +180,13 @@ fn validate(options: &ControllerOptions) -> Result<(), CliError> {
              names; name it `{stem}`"
         )));
     }
+    if crate::scaffold::CRATE_NAMES.contains(&name.as_str()) {
+        return Err(fail(format!(
+            "controller name `{name}` is the name of a crate the generated code uses by path \
+             ({}); choose another name",
+            crate::scaffold::CRATE_NAMES.join(", ")
+        )));
+    }
     if crate::wiring::SEAM_NAMES.contains(&name.as_str()) {
         return Err(fail(format!(
             "controller name `{name}` names a guard, shared block or part of the generated routes \

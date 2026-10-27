@@ -23,7 +23,7 @@ pub(crate) use render::column_migration;
 pub(crate) use render::{ACCESS_PATH, API_ACCESS_PATH};
 use render::{Api, Broadcast, STREAMS_PATH};
 pub(crate) use spec::Scope;
-pub(crate) use spec::{parse_columns, pascal_case, sentence_case};
+pub(crate) use spec::{CRATE_NAMES, parse_columns, pascal_case, sentence_case};
 
 use crate::CliError;
 use crate::destroy::Unwire;

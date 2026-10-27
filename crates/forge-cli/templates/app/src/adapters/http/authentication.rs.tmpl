@@ -1478,6 +1478,7 @@ async fn confirm_mfa_change(pages: Arc<Pages>, request: Request, change: MfaChan
                 return unavailable("csrf_token_unavailable");
             };
             set_cookie(&mut response, &session_remove_cookie());
+            set_cookie(&mut response, &tenant_remove_cookie());
             set_cookie(&mut response, &csrf_cookie(&secrets.csrf));
             response
         }

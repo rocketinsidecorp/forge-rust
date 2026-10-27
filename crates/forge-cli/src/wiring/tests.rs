@@ -653,3 +653,77 @@ fn edits_are_written_whole_and_leave_no_temporary_file() {
     assert!(apply(root, &[first, blocked]).is_err());
     assert_eq!(read(root, "src/domain/entities/mod.rs"), before);
 }
+
+/// A new declaration never lands under the attributes or docs of the item
+/// after it (a `#[cfg(test)]` module would otherwise hand its attribute to a
+/// production one).
+#[test]
+fn a_declaration_goes_above_the_attributes_and_docs_of_the_next_item() {
+    for attached in [
+        "#[cfg(test)]",
+        "#[path = \"fixtures/zz.rs\"]",
+        "/// Fixtures for the tests.",
+    ] {
+        let source = format!("pub mod alpha;\n{attached}\npub mod zz_fixtures;\n");
+        let declared = declare(&source, "product")
+            .expect("declared")
+            .expect("changed");
+        assert_eq!(
+            declared,
+            format!("pub mod alpha;\npub mod product;\n{attached}\npub mod zz_fixtures;\n")
+        );
+        // Taking it back out restores the file, attributes in place.
+        assert_eq!(
+            undeclare(&declared, "product").expect("undeclared"),
+            Some(source.clone())
+        );
+    }
+    // Two attached lines, at the start of the declarations.
+    let source = "/// Docs.\n#[cfg(test)]\npub mod zz_fixtures;\n";
+    assert_eq!(
+        declare(source, "product").expect("declared"),
+        Some(format!("pub mod product;\n{source}"))
+    );
+}
+
+/// A module declared with attributes or docs was not written by a generator:
+/// neither declare nor undeclare touches it, so no attribute is ever left to
+/// apply to the next item.
+#[test]
+fn a_declaration_with_attributes_or_docs_is_refused_both_ways() {
+    for attached in ["#[cfg(test)]", "#[path = \"p.rs\"]", "/// Products."] {
+        let source = format!("pub mod alpha;\n{attached}\npub mod product;\npub mod zeta;\n");
+        for result in [declare(&source, "product"), undeclare(&source, "product")] {
+            let refused = result.expect_err("refused");
+            assert!(refused.contains(attached), "{refused}");
+            assert!(refused.contains("pub mod product;"), "{refused}");
+        }
+    }
+    // A plain comment is not attached and changes nothing.
+    let source = "// grouped\npub mod product;\n";
+    assert_eq!(declare(source, "product"), Ok(None));
+    assert_eq!(
+        undeclare(source, "product"),
+        Ok(Some("// grouped\n".to_owned()))
+    );
+}
+
+/// The reviewer's case through the whole edit, rustfmt included: a
+/// `#[cfg(test)]` module stays test-only after a scaffold and its destroy.
+#[test]
+fn a_test_only_module_stays_test_only_through_generate_and_destroy() {
+    let directory = application(true);
+    let root = directory.path();
+    let path = "src/domain/entities/mod.rs";
+    let original = "//! Entities.\n\n#[cfg(test)]\npub mod zz_fixtures;\n";
+    fs::write(root.join(path), original).expect("write");
+
+    wire(root, &products(), false);
+    assert_eq!(
+        read(root, path),
+        "//! Entities.\n\npub mod product;\n#[cfg(test)]\npub mod zz_fixtures;\n"
+    );
+
+    wire(root, &products(), true);
+    assert_eq!(read(root, path), original);
+}
