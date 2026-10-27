@@ -13,9 +13,11 @@ use std::fs;
 use std::path::Path;
 
 use crate::CliError;
+use crate::destroy::Unwire;
 use crate::generate::render_template;
 use crate::generators::{self, MAX_NAME_LENGTH, Planned, Role};
 use crate::scaffold::{self, ACCESS_PATH, pascal_case};
+use crate::wiring::{self, Block, Registration};
 
 const GENERATOR: &str = "controller";
 
@@ -87,6 +89,8 @@ pub(crate) struct ControllerOptions {
 pub(crate) struct Outcome {
     pub(crate) files: Vec<Planned>,
     pub(crate) reused_access: bool,
+    /// The module declarations and routes registered.
+    pub(crate) edits: Vec<wiring::Edit>,
     pub(crate) wiring: String,
 }
 
@@ -115,31 +119,55 @@ fn fail(reason: impl Into<String>) -> CliError {
 pub(crate) fn generate(root: &Path, options: &ControllerOptions) -> Result<Outcome, CliError> {
     let plan = plan(root, options, false)?;
     generators::refuse_overwrite(root, GENERATOR, &plan.files)?;
-    let wiring = wiring(root, options, &plan)?;
+    let parts = wiring(options, &plan, true);
+    let (text, edits) = if wiring::has_seam(root) {
+        let edits = wiring::plan(root, &parts.registration(options), false, &|reason| {
+            fail(reason)
+        })?;
+        (parts.notes, edits)
+    } else {
+        (parts.printed(root)?, Vec::new())
+    };
     if !options.dry_run {
-        generators::write(root, &plan.files)?;
+        generators::write_and_wire(root, &plan.files, &edits)?;
     }
     Ok(Outcome {
         files: plan.files,
         reused_access: plan.access_exists && plan.permission != Permission::None,
-        wiring,
+        edits,
+        wiring: text,
     })
 }
 
 /// What `forge destroy controller` removes: the controller's own files (not
-/// the shared access module) and the wiring to take out.
+/// the shared access module), and its module declarations and routes (or,
+/// without the seam, the printed wiring to take out).
 pub(crate) fn plan_destroy(
     root: &Path,
     options: &ControllerOptions,
-) -> Result<(Vec<Planned>, String), CliError> {
+) -> Result<(Vec<Planned>, Unwire), CliError> {
     let plan = plan(root, options, true)?;
-    let wiring = wiring(root, options, &plan)?;
+    let parts = wiring(options, &plan, false);
+    let unwire = if wiring::has_seam(root) {
+        Unwire::Edits(wiring::plan(
+            root,
+            &parts.registration(options),
+            true,
+            &|reason| {
+                CliError::Destroy(format!(
+                    "refusing to destroy, nothing was removed: {reason}"
+                ))
+            },
+        )?)
+    } else {
+        Unwire::Printed(parts.printed(root)?)
+    };
     let files = plan
         .files
         .into_iter()
         .filter(|file| file.role != Role::Shared)
         .collect();
-    Ok((files, wiring))
+    Ok((files, unwire))
 }
 
 /// Checks the arguments; touches no files.
@@ -150,6 +178,20 @@ fn validate(options: &ControllerOptions) -> Result<(), CliError> {
         return Err(fail(format!(
             "controller name `{name}` ends in _controller, which Forge adds to the module \
              names; name it `{stem}`"
+        )));
+    }
+    if crate::scaffold::CRATE_NAMES.contains(&name.as_str()) {
+        return Err(fail(format!(
+            "controller name `{name}` is the name of a crate the generated code uses by path \
+             ({}); choose another name",
+            crate::scaffold::CRATE_NAMES.join(", ")
+        )));
+    }
+    if crate::wiring::SEAM_NAMES.contains(&name.as_str()) {
+        return Err(fail(format!(
+            "controller name `{name}` names a guard, shared block or part of the generated routes \
+             seam (src/bootstrap/routes_gen.rs: {}); choose another name",
+            crate::wiring::SEAM_NAMES.join(", ")
         )));
     }
     if RESERVED_NAMES.contains(&name.as_str()) {
@@ -485,16 +527,54 @@ fn plan(root: &Path, options: &ControllerOptions, destroy: bool) -> Result<Plan,
     })
 }
 
-/// The module declarations and composition-root lines that mount the
-/// routes, printed after generation (and by `forge destroy` to take out).
-fn wiring(root: &Path, options: &ControllerOptions, plan: &Plan) -> Result<String, CliError> {
+/// What a controller wires: its module declarations, the statements that
+/// mount its routes (with the seam's `site`), and what to know after.
+struct Parts {
+    declarations: Vec<(&'static str, String)>,
+    /// The statements as the seam passes `site` (its `&Arc<Site>`).
+    code: String,
+    /// The statements as `compose` passes it (`&site`).
+    printed_code: String,
+    notes: String,
+}
+
+impl Parts {
+    fn registration(&self, options: &ControllerOptions) -> Registration {
+        Registration {
+            modules: self
+                .declarations
+                .iter()
+                .map(|(file, module)| ((*file).to_owned(), module.clone()))
+                .collect(),
+            routes: Some(Block::scoped("controller", &options.name, &self.code)),
+            shared: Vec::new(),
+        }
+    }
+
+    /// The wiring printed for an application without the seam.
+    fn printed(&self, root: &Path) -> Result<String, CliError> {
+        let mut out = String::from(
+            "\nForge did not edit any existing file. Wire the controller by hand:\n\n  \
+             1. Declare the new modules (each in the listed file, keeping `mod` lines sorted):\n\n",
+        );
+        for (file, module) in &self.declarations {
+            out.push_str(&format!("       {file:<38} pub mod {module};\n"));
+        }
+        out.push_str(
+            "\n  2. In src/bootstrap/mod.rs, at the end of `fn compose`, before `Ok(())`:\n\n",
+        );
+        out.push_str(&scaffold::format_statements(root, &self.printed_code)?);
+        out.push_str(&self.notes);
+        Ok(out)
+    }
+}
+
+/// The module declarations and the lines that mount the routes. `generating`:
+/// the shared access module is declared when this generation writes it.
+fn wiring(options: &ControllerOptions, plan: &Plan, generating: bool) -> Parts {
     let name = &options.name;
-    let mut out = String::from(
-        "\nForge did not edit any existing file. Wire the controller by hand:\n\n  \
-         1. Declare the new modules (each in the listed file, keeping `mod` lines sorted):\n\n",
-    );
     let mut declarations = Vec::new();
-    if plan.permission != Permission::None && !plan.access_exists {
+    if generating && plan.permission != Permission::None && !plan.access_exists {
         declarations.push(("src/adapters/http/mod.rs", "access".to_owned()));
     }
     declarations.push(("src/adapters/http/mod.rs", format!("{name}_controller")));
@@ -504,51 +584,53 @@ fn wiring(root: &Path, options: &ControllerOptions, plan: &Plan) -> Result<Strin
             format!("{name}_controller"),
         ));
     }
-    for (file, module) in &declarations {
-        out.push_str(&format!("       {file:<38} pub mod {module};\n"));
-    }
-    out.push_str(
-        "\n  2. In src/bootstrap/mod.rs, at the end of `fn compose`, before `Ok(())`:\n\n",
-    );
-    let site = if options.api { "" } else { "&site, " };
-    let code = if options.public {
-        format!(
-            "    // {name} controller: public (--public), anyone may call its routes.\n    \
+    let code_for = |site: &str| {
+        let site = if options.api { "" } else { site };
+        if options.public {
+            format!(
+                "    // {name} controller: public (--public), anyone may call its routes.\n    \
              crate::adapters::http::{name}_controller::routes(composition.router(), {site})?;\n"
-        )
-    } else {
-        format!(
-            "    // {name} controller: DenyAll refuses every request until you decide who may\n    \
+            )
+        } else {
+            format!(
+                "    // {name} controller: DenyAll refuses every request until you decide who may\n    \
              // read `{name}:read`: implement GlobalAccess (src/adapters/http/access.rs).\n    \
              crate::adapters::http::{name}_controller::routes(\n        \
              composition.router(),\n        \
              {site}std::sync::Arc::new(crate::adapters::http::access::DenyAll),\n    \
              )?;\n"
-        )
+            )
+        }
     };
-    out.push_str(&scaffold::format_statements(root, &code)?);
+    let code = code_for("site, ");
+    let printed_code = code_for("&site, ");
     let routes: Vec<String> = options
         .actions
         .iter()
         .map(|action| format!("GET {}", path(options, action)))
         .collect();
-    out.push_str(&format!("\n  Routes: {}.\n", routes.join(", ")));
+    let mut notes = format!("\n  Routes: {}.\n", routes.join(", "));
     match plan.permission {
-        Permission::None => out.push_str(&format!(
+        Permission::None => notes.push_str(&format!(
             "  WARNING: --public mounts the {name} routes without a guard: anyone who can \
              reach\n  the server can call them.\n"
         )),
-        Permission::Own => out.push_str(&format!(
+        Permission::Own => notes.push_str(&format!(
             "  Every route asks the access policy for `{name}:read`\n  \
              (crate::adapters::http::{name}_controller::READ_PERMISSION, declared here);\n  \
              src/adapters/http/access.rs explains the deny-by-default choice.\n"
         )),
-        Permission::Reused => out.push_str(&format!(
+        Permission::Reused => notes.push_str(&format!(
             "  Every route asks the access policy for `{name}:read`, which\n  \
              src/application/use_cases/{name}.rs already declares: the controller reuses it\n  \
              (a permission has one owner). Destroy this controller before that model.\n"
         )),
     }
-    out.push_str("\n  Then run `forge test`.\n");
-    Ok(out)
+    notes.push_str("\n  Then run `forge test`.\n");
+    Parts {
+        declarations,
+        code,
+        printed_code,
+        notes,
+    }
 }

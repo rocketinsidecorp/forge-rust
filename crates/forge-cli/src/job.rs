@@ -1,4 +1,4 @@
-//! `forge generate job NAME [field:type...] --queue` (ADR 0038): a typed job
+//! `forge generate job NAME [field:type...] [--queue]` (ADR 0038): a typed job
 //! of the persistent PostgreSQL queue (`forge::jobs`, ADR 0025) with its
 //! handler, registration, enqueue function and tests that need no
 //! database.
@@ -47,7 +47,6 @@ const TESTS: &str = include_str!("../templates/job/tests.rs.tmpl");
 pub(crate) struct JobOptions {
     pub(crate) name: String,
     pub(crate) fields: Vec<String>,
-    pub(crate) queue: bool,
     pub(crate) dry_run: bool,
 }
 
@@ -119,13 +118,6 @@ fn parse_field(declaration: &str) -> Result<Field, CliError> {
 }
 
 fn validate(options: &JobOptions) -> Result<Vec<Field>, CliError> {
-    if !options.queue {
-        return Err(fail(
-            "pass --queue: Forge-Rust jobs run on the persistent PostgreSQL queue \
-             (`forge::jobs`), and a recurring job is a queue job with a `Schedule` \
-             (docs/jobs.md). Usage: forge generate job NAME [field:type...] --queue",
-        ));
-    }
     let name = &options.name;
     generators::snake_case("job name", name, MAX_NAME_LENGTH).map_err(fail)?;
     let type_name = pascal_case(name);
@@ -305,16 +297,14 @@ mod tests {
         JobOptions {
             name: "send_welcome".to_owned(),
             fields: fields.iter().map(|field| (*field).to_owned()).collect(),
-            queue: true,
             dry_run: false,
         }
     }
 
     #[test]
     fn arguments_are_validated_before_reading_the_application() {
-        let mut without_queue = options(&[]);
-        without_queue.queue = false;
-        assert!(validate(&without_queue).is_err());
+        // Without --queue too: every Forge-Rust job is a queue job.
+        assert!(validate(&options(&[])).is_ok());
         for fields in [
             &["user_id"][..],
             &["user_id:float"][..],

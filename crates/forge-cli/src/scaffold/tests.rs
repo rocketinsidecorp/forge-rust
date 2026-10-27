@@ -38,6 +38,7 @@ fn options(name: &str, fields: &[&str], scope: Scope) -> ScaffoldOptions {
         scope,
         plural: None,
         broadcast: false,
+        public: false,
         dry_run: false,
         layers: Layers::Scaffold,
     }
@@ -68,6 +69,33 @@ fn event() -> ScaffoldOptions {
         ],
         Scope::Tenant,
     )
+}
+
+/// What a generation printed and registered: its notes, then each edit and
+/// the content it wrote (the module declarations and the routes seam).
+fn wired(outcome: &Outcome) -> String {
+    let mut text = outcome.wiring.clone();
+    for edit in &outcome.edits {
+        text.push_str(&format!(
+            "\n{} {} ({})\n",
+            edit.verb, edit.path, edit.detail
+        ));
+        text.push_str(edit.content.as_deref().unwrap_or_default());
+    }
+    text
+}
+
+/// Turns an application into one created before the routes seam: `compose`
+/// does not call it, so generators print their wiring.
+fn without_seam(root: &Path) {
+    let path = root.join("src/bootstrap/mod.rs");
+    let bootstrap = fs::read_to_string(&path).unwrap_or_default();
+    let kept: Vec<&str> = bootstrap
+        .lines()
+        .filter(|line| !line.contains("routes_gen"))
+        .collect();
+    fs::write(&path, kept.join("\n") + "\n").unwrap_or_else(|error| panic!("{error}"));
+    assert!(!crate::wiring::has_seam(root));
 }
 
 fn ok(root: &Path, options: &ScaffoldOptions) -> Outcome {
@@ -124,7 +152,7 @@ fn assert_golden_in(
     let mut wiring = String::new();
     for options in scaffolds {
         let outcome = ok(&root, options);
-        wiring.push_str(&outcome.wiring);
+        wiring.push_str(&wired(&outcome));
     }
     for (path, content) in tree(&root) {
         if before.get(&path) != Some(&content) {
@@ -181,7 +209,7 @@ fn the_streams_module_is_written_once_and_reused() {
     let plain = ok(&root, &post());
     assert!(!plain.created.iter().any(|path| path == STREAMS_PATH));
     assert!(!root.join("templates/posts/_row.html").exists());
-    assert!(!plain.wiring.contains("Streams::register"));
+    assert!(!wired(&plain).contains("Streams::register"));
 
     let first = ok(&root, &broadcasting(event()));
     assert!(first.created.iter().any(|path| path == STREAMS_PATH));
@@ -192,24 +220,30 @@ fn the_streams_module_is_written_once_and_reused() {
             .any(|path| path == "templates/events/_row.html")
     );
     assert!(!first.reused_streams);
-    assert!(first.wiring.contains("pub mod streams;"));
+    assert!(wired(&first).contains("pub mod streams;"));
     // SQLite has no LISTEN/NOTIFY: the wiring says so and stays in process.
     assert!(
-        first.wiring.contains("Fanout::InProcess"),
+        wired(&first).contains("Fanout::InProcess"),
         "{}",
-        first.wiring
+        wired(&first)
     );
-    assert!(!first.wiring.contains("Fanout::Postgres"));
-    assert!(first.wiring.contains("&streams,"));
+    assert!(!wired(&first).contains("Fanout::Postgres"));
+    assert!(wired(&first).contains("&streams,"));
 
     let mut note = options("note", &["body:text"], Scope::Global);
     note.broadcast = true;
     let second = ok(&root, &note);
     assert!(!second.created.iter().any(|path| path == STREAMS_PATH));
     assert!(second.reused_streams);
-    assert!(!second.wiring.contains("Streams::register"));
-    assert!(!second.wiring.contains("pub mod streams;"));
-    assert!(second.wiring.contains("&streams,"));
+    // The transport is registered once, for both resources.
+    assert_eq!(wired(&second).matches("Streams::register").count(), 1);
+    assert!(
+        second
+            .edits
+            .iter()
+            .all(|edit| !edit.detail.contains("pub mod streams;"))
+    );
+    assert!(wired(&second).contains("&streams,"));
 }
 
 #[test]
@@ -223,7 +257,7 @@ fn broadcast_needs_the_feature_and_an_intact_streams_module() {
     .unwrap_or_else(|error| panic!("{error}"));
     assert!(refusal(&root, &broadcasting(post())).contains("`broadcast` feature"));
     assert!(
-        ok(&root, &post()).wiring.contains("posts"),
+        wired(&ok(&root, &post())).contains("posts"),
         "plain scaffolds still work"
     );
 
@@ -309,7 +343,7 @@ fn output_is_deterministic_and_covers_every_ring() {
     let again = ok(&second, &event());
 
     assert_eq!(outcome.created, again.created);
-    assert_eq!(outcome.wiring, again.wiring);
+    assert_eq!(wired(&outcome), wired(&again));
     assert_eq!(tree(&first), tree(&second));
     for path in [
         "migrations/1760832000000000000_create_events.up.sql",
@@ -404,8 +438,9 @@ fn other_backends_scope_tenants_by_predicate_without_postgresql_features() {
 }
 
 #[test]
-fn wiring_is_printed_and_never_written() {
+fn wiring_is_printed_and_never_written_without_the_seam() {
     let (_parent, root) = application(Database::Postgresql, true);
+    without_seam(&root);
     let bootstrap = fs::read_to_string(root.join("src/bootstrap/mod.rs")).unwrap_or_default();
     let http = fs::read_to_string(root.join("src/adapters/http/mod.rs")).unwrap_or_default();
 
@@ -429,9 +464,9 @@ fn wiring_is_printed_and_never_written() {
         "composition.postgres()?.clone()",
     ] {
         assert!(
-            outcome.wiring.contains(needle),
+            wired(&outcome).contains(needle),
             "{needle}\n{}",
-            outcome.wiring
+            wired(&outcome)
         );
     }
     assert!(!outcome.reused_access);
@@ -440,36 +475,21 @@ fn wiring_is_printed_and_never_written() {
     let second = ok(&root, &event());
     assert!(second.reused_access);
     assert!(!second.created.iter().any(|path| path == ACCESS_PATH));
-    assert!(!second.wiring.contains("pub mod access;"));
-    assert!(second.wiring.contains("SessionTenantAccess::new("));
-    assert!(second.wiring.contains("PgMembershipStore::new(pool)"));
+    assert!(!wired(&second).contains("pub mod access;"));
+    assert!(wired(&second).contains("SessionTenantAccess::new("));
+    assert!(wired(&second).contains("PgMembershipStore::new(pool)"));
     // The session store the scaffold's routes authenticate with ends sessions
     // after the configured idle timeout, like the sign-in pages' store.
-    assert_every_session_store_has_the_idle_timeout(&second.wiring);
+    assert_every_session_store_has_the_idle_timeout(&wired(&second));
     // RBAC matches exactly: the owner `setup` creates gets both permissions,
     // and nothing else is granted.
-    assert!(
-        second
-            .wiring
-            .contains("let mut policy = forge::security::RbacPolicy::new();")
-    );
-    assert!(
-        second
-            .wiring
-            .contains("forge::security::Role::new(\"owner\")")
-    );
-    assert!(
-        second
-            .wiring
-            .contains("policy.allow(owner.clone(), permission);")
-    );
-    assert!(second.wiring.contains("policy.allow(viewer, read);"));
-    assert!(second.wiring.contains("use_cases::events::READ_PERMISSION"));
-    assert!(
-        second
-            .wiring
-            .contains("use_cases::events::WRITE_PERMISSION")
-    );
+    assert!(wired(&second).contains("let mut policy = forge::security::RbacPolicy::new();"));
+    assert!(wired(&second).contains("forge::security::Role::new(\"owner\")"));
+    assert!(wired(&second).contains("policy.allow(owner.clone(), permission);"));
+    // Other roles: the application declares its own `protect`.
+    assert!(wired(&second).contains("Declare `fn protect` with this signature"));
+    assert!(wired(&second).contains("use_cases::events::READ_PERMISSION"));
+    assert!(wired(&second).contains("use_cases::events::WRITE_PERMISSION"));
 }
 
 #[test]
@@ -492,7 +512,7 @@ fn dry_run_lists_the_files_and_writes_nothing() {
             .created
             .contains(&"config/locales/posts.en.json".to_owned())
     );
-    assert!(outcome.wiring.contains("composition.sqlite()?.clone()"));
+    assert!(wired(&outcome).contains("composition.sqlite()?.clone()"));
 }
 
 #[test]
@@ -590,12 +610,28 @@ fn refuses_to_overwrite_anything_and_writes_nothing() {
         .unwrap_or_else(|error| panic!("{error}"));
     ok(&root, &post());
     let after = tree(&root);
-    let reason = match generate(&root, &post(), "1760832000000000001") {
+    // The same arguments again change nothing, whatever the version.
+    let again = ok_at(&root, &post(), "1760832000000000001");
+    assert!(again.identical);
+    assert!(
+        again.edits.iter().all(|edit| edit.content.is_none()),
+        "{:?}",
+        again.edits
+    );
+    assert_eq!(tree(&root), after);
+    // Other arguments for the same resource are refused.
+    let mut other = post();
+    other.fields.push("summary:text?".to_owned());
+    let reason = match generate(&root, &other, "1760832000000000001") {
         Ok(_) => panic!("a second scaffold of posts must be refused"),
         Err(error) => error.to_string(),
     };
     assert!(reason.contains("_create_posts.up.sql"), "{reason}");
     assert_eq!(tree(&root), after);
+}
+
+fn ok_at(root: &Path, options: &ScaffoldOptions, version: &str) -> Outcome {
+    generate(root, options, version).unwrap_or_else(|error| panic!("scaffold: {error}"))
 }
 
 #[test]
@@ -679,13 +715,109 @@ fn assert_every_session_store_has_the_idle_timeout(wiring: &str) {
     let stores: Vec<&str> = wiring.split("PostgresSessionStore::new(").skip(1).collect();
     assert!(!stores.is_empty(), "{wiring}");
     for after in stores {
-        let statement = after.split(';').next().unwrap_or_default();
+        let statement = after
+            .split(';')
+            .next()
+            .unwrap_or_default()
+            .split_whitespace()
+            .collect::<String>()
+            .replace(",)", ")");
         assert!(
             statement.contains(".with_idle_timeout(")
                 && statement.contains(
                     "forge::auth::SessionIdleTimeout::new(composition.config().auth.session_idle_timeout)"
                 ),
             "a session store without the configured idle timeout:\n{wiring}"
+        );
+    }
+}
+
+/// `forge generate migration add_X_to_TABLE` (D26): one ALTER TABLE per
+/// field in each dialect, required columns defaulting to their type's zero
+/// value, and the reverse for remove_X_from_TABLE.
+#[test]
+fn column_migrations_follow_each_dialect() {
+    let fields = spec::parse_columns(
+        "orders",
+        &[
+            "sku:string".to_owned(),
+            "note:text".to_owned(),
+            "total:int".to_owned(),
+            "paid:bool".to_owned(),
+            "shipped_at:time?".to_owned(),
+        ],
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
+    let (up, down) = column_migration(
+        "orders",
+        &fields,
+        Backend::Postgresql,
+        false,
+        "add_x_to_orders",
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
+    assert!(up.starts_with("-- add_x_to_orders\n"), "{up}");
+    for expected in [
+        "ALTER TABLE \"orders\" ADD COLUMN \"sku\" text NOT NULL DEFAULT '' CONSTRAINT",
+        "ALTER TABLE \"orders\" ADD COLUMN \"note\" text NOT NULL DEFAULT ''",
+        "ALTER TABLE \"orders\" ADD COLUMN \"total\" bigint NOT NULL DEFAULT 0;",
+        "ALTER TABLE \"orders\" ADD COLUMN \"paid\" boolean NOT NULL DEFAULT FALSE;",
+        "ALTER TABLE \"orders\" ADD COLUMN \"shipped_at\" timestamptz;",
+    ] {
+        assert!(up.contains(expected), "{expected}\n{up}");
+    }
+    assert!(
+        down.contains("ALTER TABLE \"orders\" DROP COLUMN \"shipped_at\";"),
+        "{down}"
+    );
+
+    let (up, _) = column_migration("orders", &fields, Backend::MySql, false, "add_x_to_orders")
+        .unwrap_or_else(|error| panic!("{error}"));
+    assert!(
+        up.contains("`note` MEDIUMTEXT NOT NULL DEFAULT ('')"),
+        "{up}"
+    );
+    assert!(up.contains("`paid` BOOLEAN NOT NULL DEFAULT FALSE"), "{up}");
+
+    let (up, down) = column_migration(
+        "orders",
+        &fields,
+        Backend::Sqlite,
+        true,
+        "remove_x_from_orders",
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
+    assert!(
+        up.contains("ALTER TABLE \"orders\" DROP COLUMN \"paid\";"),
+        "{up}"
+    );
+    assert!(
+        down.starts_with("-- Reverts remove_x_from_orders: the columns come back"),
+        "{down}"
+    );
+    assert!(
+        down.contains("\"paid\" INTEGER NOT NULL DEFAULT 0 CONSTRAINT"),
+        "{down}"
+    );
+
+    for required in ["at:timestamp", "token:uuid"] {
+        let fields = spec::parse_columns("orders", &[required.to_owned()])
+            .unwrap_or_else(|error| panic!("{error}"));
+        let error = column_migration("orders", &fields, Backend::Postgresql, false, "add")
+            .err()
+            .unwrap_or_default();
+        assert!(error.contains("existing rows need a value"), "{error}");
+        assert!(error.contains("?)"), "{error}");
+    }
+    for (table, fields) in [
+        ("forge_users", vec!["a:string".to_owned()]),
+        ("orders", vec!["a:string".to_owned(), "a:text".to_owned()]),
+        ("orders", vec!["a:float".to_owned()]),
+        ("Orders", vec!["a:string".to_owned()]),
+    ] {
+        assert!(
+            spec::parse_columns(table, &fields).is_err(),
+            "{table} {fields:?}"
         );
     }
 }

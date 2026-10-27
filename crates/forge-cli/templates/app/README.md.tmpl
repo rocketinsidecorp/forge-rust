@@ -23,6 +23,84 @@ src/bootstrap       composition root and process lifecycle
 ```
 
 `tests/architecture.rs` fails when an inner ring imports an outer one.
+%%if database%%
+%%if views%%
+
+## Quickstart
+
+From an empty directory to a working CRUD at `/products`, with no code to
+edit: the generators declare their modules and mount their routes in
+`src/bootstrap/routes_gen.rs`.
+
+```bash
+%%if postgresql%%
+forge new %%APP_NAME%%%%QUICKSTART_NEW_FLAGS%%
+%%end%%
+%%if !postgresql%%
+forge new %%APP_NAME%% -d %%QUICKSTART_DATABASE%%
+%%end%%
+cd %%APP_NAME%%
+%%if !sqlite%%
+%%if docker%%
+docker compose up -d --wait db
+%%end%%
+%%end%%
+forge migrate
+%%if postgresql%%
+forge setup --tenant acme --email you@example.com --organization "Acme Inc"
+forge generate scaffold product name:string price:integer --tenant-scoped
+%%end%%
+%%if !postgresql%%
+forge generate scaffold product name:string price:integer --global --public
+%%end%%
+forge migrate
+forge dev
+```
+%%if postgresql%%
+
+`forge setup` asks for the owner's password twice (or reads
+`FORGE_SETUP_PASSWORD`). Then open `http://localhost:3000/session/new`, sign
+in with organization `acme`, and list, create, edit and delete products at
+`http://localhost:3000/products`. The pages and the JSON API at
+`/v1/products` need sign-in and the `products:read` and `products:write`
+permissions, which the scaffold's `protect` guard grants to the owner role.
+The JSON API authenticates the same session cookie%%QUICKSTART_BEARER%%;
+changes send the CSRF token in the `X-CSRF-Token` header:
+
+```bash
+jar=$(mktemp)
+token=$(curl -s -c "$jar" -H 'Accept: text/html' http://localhost:3000/session/new | sed -n 's/.*name="csrf_token" value="\([^"]*\)".*/\1/p' | head -n 1)
+read -rsp 'Password: ' password; echo
+curl -s -o /dev/null -b "$jar" -c "$jar" -H 'Accept: text/html' --data-urlencode "csrf_token=$token" --data-urlencode tenant=acme --data-urlencode email=you@example.com --data-urlencode "password=$password" http://localhost:3000/session
+curl -s -b "$jar" http://localhost:3000/v1/products
+curl -s -b "$jar" -c "$jar" -H "X-CSRF-Token: $(awk '$6 == "__Host-forge_csrf" {print $7}' "$jar")" -H 'Content-Type: application/json' -d '{"name":"Lamp","price":1999}' http://localhost:3000/v1/products
+```
+
+To grant other roles, declare `fn protect` with the signature of the
+generated one (in `src/bootstrap/routes_gen.rs`) in `src/bootstrap/mod.rs`;
+the generators then use yours.
+%%end%%
+%%if !postgresql%%
+
+Then open `http://localhost:3000/products`, and call the JSON API at
+`/v1/products`:
+
+```bash
+curl -s http://localhost:3000/v1/products
+curl -s -H 'Content-Type: application/json' -d '{"name":"Lamp","price":1999}' http://localhost:3000/v1/products
+```
+
+Forge identity (sign-in pages, `forge setup`) is PostgreSQL-only, so in this
+application generated routes are closed (`403`) unless generated with
+`--public`, which serves them to anyone who can reach the server, without
+signing in (forms still need their CSRF token), and needs `--global`. Use it
+for prototypes on your machine; to put your own authentication in front,
+declare `fn public` with the signature of the generated one (in
+`src/bootstrap/routes_gen.rs`) in `src/bootstrap/mod.rs`; the generators then
+use yours.
+%%end%%
+%%end%%
+%%end%%
 %%if views%%
 
 ## Views

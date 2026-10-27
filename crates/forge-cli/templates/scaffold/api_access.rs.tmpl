@@ -17,7 +17,12 @@
 //! - Global resources use an [`ApiGlobalAccess`]. Their rows are shared by
 //!   every tenant, so tenant roles cannot authorize them: implement
 //!   [`ApiGlobalAccess`] with your own rule (for example operators) and
-//!   replace [`DenyAll`] in `src/bootstrap/mod.rs`.
+//!   pass it instead of [`DenyAll`]. [`Public`] lets everyone in (`--public`,
+//!   applications without Forge identity only).
+//!
+//! In applications with the sign-in pages and no bearer tokens, the pages'
+//! `SessionTenantAccess` (`crate::adapters::http::access`) authorizes the
+//! tenant-scoped JSON routes with the session cookie instead.
 //!
 //! Refusals are JSON error reports with Forge-Go's codes
 //! (`forge::web::bearer_refusal`): `401 credentials_required` without a
@@ -70,6 +75,18 @@ impl ApiTenantAccess for DenyAll {
 impl ApiGlobalAccess for DenyAll {
     async fn authorize(&self, _: &Request, _: &Permission) -> Result<(), BearerDenied> {
         Err(BearerDenied::Forbidden)
+    }
+}
+
+/// Lets every request in: the explicit choice of `--public` for a global
+/// resource of an application without Forge identity.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Public;
+
+#[async_trait]
+impl ApiGlobalAccess for Public {
+    async fn authorize(&self, _: &Request, _: &Permission) -> Result<(), BearerDenied> {
+        Ok(())
     }
 }
 

@@ -95,22 +95,22 @@ fn serve(mut stream: TcpStream, app: &App) {
                     respond(&mut stream, "422 Unprocessable Entity", "", "no");
                 }
             }
-            post if post == format!("POST /tenants/{TENANT}/posts HTTP/1.1") => {
+            "POST /posts HTTP/1.1" => {
                 if signed_in && body.starts_with(&format!("csrf_token={SESSION}&title=")) {
                     let id = app.created.fetch_add(1, Ordering::Relaxed);
                     respond(
                         &mut stream,
                         "303 See Other",
-                        &format!("Location: /tenants/{TENANT}/posts/{id}\r\n"),
+                        &format!("Location: /posts/{id}\r\n"),
                         "",
                     );
                 } else {
                     respond(&mut stream, "403 Forbidden", "", "no");
                 }
             }
-            get if get == format!("GET /tenants/{TENANT}/posts HTTP/1.1") && signed_in => {
+            "GET /posts HTTP/1.1" if signed_in => {
                 let rows: String = (0..app.rows)
-                    .map(|id| format!("<tr><td><a href=\"/tenants/{TENANT}/posts/{id}/edit\">Edit</a></td></tr>"))
+                    .map(|id| format!("<tr><td><a href=\"/posts/{id}/edit\">Edit</a></td></tr>"))
                     .collect();
                 respond(&mut stream, "200 OK", "", &format!("<table>{rows}</table>"));
             }

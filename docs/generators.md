@@ -13,24 +13,78 @@ Forge-Go ADR 0041). Every generator follows the same rules:
   a symlink, and writes nothing at all when it refuses (files are created
   with `create_new`, and removed again if a later write fails). `--dry-run`
   prints the exact files without creating anything.
-- **Never edit your code.** `src/bootstrap/mod.rs` and the `mod.rs` files are
-  yours: a generator prints the `pub mod` lines and the statements to add,
-  and says where.
+- **No wiring to paste (D21).** A generator declares each module it writes
+  (`pub mod NAME;`, in sorted order) in the `mod.rs` of its directory, and
+  `scaffold`, `resource` and `controller` mount their routes in
+  `src/bootstrap/routes_gen.rs` (see [The routes seam](#the-routes-seam)).
+  `src/bootstrap/mod.rs` stays yours: no generator edits it. The mailer and
+  job generators print their registration, as Forge-Go's do.
 - **Never public by accident.** Anything that serves data asks an access
-  policy for a permission, and the printed wiring denies everyone
-  (`DenyAll`) until the application decides.
+  policy for a permission: tenant-scoped routes of an application with the
+  sign-in pages need a signed-in member granted the permission (the `owner`
+  role `forge setup` creates is); anything else answers `403` (`DenyAll`)
+  until the application decides, or `--public` says so for a global
+  resource of an application without Forge identity. (That refusal of
+  `--public` with identity is the scaffold's and the resource's: `forge
+  generate controller --public` still mounts read-only `GET` pages without a
+  guard in any application, as Forge-Go's does.)
 - **Validated names.** Names and fields become Rust identifiers, file names,
   SQL identifiers and URL segments, so they are strict lowercase
   `snake_case` (letters, digits, single underscores, starting with a letter,
-  at most 40 characters) and never a Rust keyword.
+  at most 40 characters) and never a Rust keyword. SQL keywords are fine
+  (`forge g resource order ...` makes the table `orders`): generated SQL
+  quotes every identifier.
+- **Field types** (D22): `integer`, `boolean`, `timestamp`, `string`, `text`
+  and `uuid`, with Forge-Go's `int`, `bool` and `time` and Rails' `datetime`
+  as aliases; a trailing `?` makes a field optional.
+- **Aliases.** `forge g` is `forge generate` and `forge d` is `forge
+  destroy` (D25).
+
+## The routes seam
+
+`forge new` writes `src/bootstrap/routes_gen.rs` with an empty
+`generated_routes` function, which `compose` calls last. The generators own
+that file and rewrite it whole, formatted with the application's rustfmt:
+
+- each generator adds a block opened by a `// forge:KIND NAME` comment
+  (`// forge:scaffold products`), in its own scope, and `forge destroy` takes
+  it back out;
+- the shared blocks a block needs come once, before it, and go with the last
+  block that uses them: the live-update `streams`, and the guards, which are
+  module-level functions of `mod guards`: `protect` (tenant-scoped routes:
+  sign-in, CSRF, a membership in the session's tenant and the `owner` role
+  granted the permissions) and `public` (`--public`);
+- a `// forge:checksum` line records what the generators wrote: a hand edit
+  is refused, and nothing is written (it detects accidental edits; anyone
+  who can write the file can also sign it again, so it is no defense against
+  a deliberate change);
+- running a generator again with the same arguments changes nothing
+  (`identical`); the same block with other code (other arguments, another
+  Forge version) is refused until `forge destroy` takes it out.
+
+To replace a guard (to grant other roles, or put your own authentication in
+front of `--public` routes), declare a function of that name with the
+generated signature in `src/bootstrap/mod.rs` (or in another module of
+`src/bootstrap`, imported there). The seam imports `super::*`: until a
+generator runs again and leaves its own guard out, the name is ambiguous and
+the build fails, so your guard is never silently ignored.
+
+Generators and `forge destroy` take `.forge/generate.lock` while they run,
+so two of them never edit the same files at once; the seam and the `mod.rs`
+files are replaced atomically (a temporary file, synced, then renamed).
+
+Tenant-scoped pages are at `/<plural>`: the tenant is the one the session
+signed in to (the `__Host-forge_tenant` cookie the sign-in pages set beside
+the session cookie), and every request checks an active membership in it.
+Live-update streams keep their `/tenants/{tenant_id}/streams` path.
 
 | Command | Creates | Rails |
 | ------- | ------- | ----- |
-| `forge generate migration NAME` | an empty up/down migration pair | `rails g migration` |
+| `forge generate migration NAME [field:type...]` | an up/down migration pair: `ALTER TABLE` statements for `add_X_to_TABLE` and `remove_X_from_TABLE` with fields, blank otherwise | `rails g migration` |
 | `forge generate model NAME field:type...` | migration, entity, repository port, use cases, SQLx repository, tests | `rails g model` |
 | `forge generate controller NAME ACTION...` | HTTP handlers, routes, views, tests; no persistence | `rails g controller` |
 | `forge generate mailer NAME METHOD...` | a mailer with subject, text and HTML templates, previews, tests | `rails g mailer` |
-| `forge generate job NAME [field:type...] --queue` | a typed job of the persistent queue, its handler, registration, enqueue function, tests | `rails g job` |
+| `forge generate job NAME [field:type...] [--queue]` | a typed job of the persistent queue, its handler, registration, enqueue function, tests | `rails g job` |
 | `forge generate resource NAME field:type...` | a model plus a JSON CRUD API under `/v1/<plural>`, behind bearer tokens | `rails g resource` |
 | `forge generate scaffold` | a resource plus HTML CRUD pages ([cli](cli.md#forge-generate-scaffold)) | `rails g scaffold` |
 | `forge generate view [DIR/]NAME` | one page in the layout, its view model, a test | |
@@ -61,8 +115,8 @@ src/infrastructure/database/posts.rs        PgPostRepository (MySql..., Sqlite..
 tests/posts_repository.rs                   against a real database
 ```
 
-The printed wiring declares the modules and builds the service where you
-need it:
+The generator declares the modules; build the service where you need it
+(the output shows how):
 
 ```rust
 let posts = crate::application::use_cases::posts::PostService::new(std::sync::Arc::new(
@@ -125,14 +179,17 @@ check every response against it.
 
 - **Tenant-scoped** resources take an `ApiTenantAccess`. In an application
   with bearer tokens (`forge new --api-auth`, or `forge generate
-  authentication --api-auth`) the printed wiring passes
+  authentication --api-auth`) the generated wiring passes
   `BearerTenantAccess`: exactly one `Authorization: Bearer` header with a
   live token, an active membership in the tenant **the token was issued
-  for** and an RBAC grant (`owner` gets both permissions; the output prints
-  a read-only `viewer` example). The tenant never comes from the path, the
-  query or a header, so a token works only in its own tenant. Without
-  bearer tokens, and on MySQL, MariaDB and SQLite, the wiring passes
-  `DenyAll` (`403`) and says what to do.
+  for** and an RBAC grant (`owner` gets both permissions). The tenant never
+  comes from the path, the query or a header, so a token works only in its
+  own tenant. Without bearer tokens, in an application with the sign-in
+  pages (D29), the `protect` guard authorizes the JSON API with the pages'
+  session cookie, the CSRF token in `X-CSRF-Token` and the same grants (the
+  first such resource writes the shared access module). On MySQL, MariaDB
+  and SQLite, and in `--api` applications, the wiring passes `DenyAll`
+  (`403`) and says what to do.
 - **Global** resources take an `ApiGlobalAccess`, wired with `DenyAll`
   until you implement your own rule: tenant roles cannot authorize rows
   every tenant shares. (Forge-Go lets tenant roles read a global resource and
@@ -200,9 +257,10 @@ full-stack application, `--api` ones also work in a `forge new --api` one.
 `routes` mounts every route behind a guard:
 
 - Without `--public` it takes an `Arc<dyn GlobalAccess>` and asks it for
-  `NAME:read` on every request. The printed wiring passes `DenyAll`;
-  implement `GlobalAccess` (see `src/adapters/http/access.rs`) to decide who
-  may read. Guarded controllers need a database application, whose session
+  `NAME:read` on every request. The generated wiring in
+  `src/bootstrap/routes_gen.rs` passes `DenyAll`; to decide who may read,
+  mount the controller's routes yourself in `compose` with your own
+  `GlobalAccess` (see `src/adapters/http/access.rs`) instead. Guarded controllers need a database application, whose session
   stores the access policy uses.
 - `--public` mounts the routes with no guard and prints a warning. Use it for
   pages anyone may read; it also works without a database.
@@ -279,7 +337,7 @@ forge generate scaffold product name:string --global           # refused
 forge generate view about                                      # refused
 ```
 
-The printed wiring goes at the end of `fn compose`, before `Ok(())`. An
+The generators mount their routes in `src/bootstrap/routes_gen.rs`. An
 API-only application has no Forge identity wiring (on PostgreSQL it has the
 identity, audit and session tables, but no sign-in, no sessions and no bearer
 tokens), so every route is wired with the `DenyAll` guard and answers `403`:
@@ -443,7 +501,9 @@ therefore be exact, and it works for code generated by any earlier version.
   when they become empty, except the application's layout directories.
 - `--dry-run` lists what would be removed. Nothing is removed through a
   symlink, and only regular files are removed.
-- No existing file is edited: destroy prints the wiring to take out.
+- Destroy takes the module declarations and the block of
+  `src/bootstrap/routes_gen.rs` back out (an application without the seam
+  gets the wiring to take out printed).
 
 Known limitations: a directory that becomes empty is removed even if it
 existed, empty, before the generator ran; and a file can still change in the
@@ -462,6 +522,6 @@ model, resource and scaffold), `controller.rs`, `mailer.rs`, `job.rs`, `view.rs`
 `destroy.rs`, and the templates in
 `crates/forge-cli/templates/{scaffold,controller,mailer,job,view}`.
 `crates/forge-cli/tests/scaffold.rs` generates every artifact into a fresh
-PostgreSQL application, applies the printed wiring, runs `cargo fmt --check`,
+PostgreSQL application (which registers its own modules and routes), runs `cargo fmt --check`,
 Clippy with warnings denied and `cargo test`, then destroys everything and
 checks the application is restored and still builds.

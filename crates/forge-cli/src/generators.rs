@@ -177,6 +177,23 @@ pub(crate) fn write(root: &Path, files: &[Planned]) -> Result<(), CliError> {
     write_all(root, &files)
 }
 
+/// Writes `files` (create-new, all or nothing), then the registrations in
+/// existing files; when those fail, the new files are removed again.
+pub(crate) fn write_and_wire(
+    root: &Path,
+    files: &[Planned],
+    edits: &[crate::wiring::Edit],
+) -> Result<(), CliError> {
+    write(root, files)?;
+    if let Err(error) = crate::wiring::apply(root, edits) {
+        for file in files.iter().rev() {
+            let _ = fs::remove_file(root.join(&file.path));
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
 /// Lists the created (or, with `--dry-run`, planned) files.
 pub(crate) fn report(
     output: &mut dyn io::Write,

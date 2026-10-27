@@ -172,7 +172,7 @@ struct DeleteForm {
 
 async fn index(state: Arc<%%TYPE%%Routes>, request: Request) -> Response {
 %%AUTHORIZE_READ%%
-    let collection = collection_path(%%CONTEXT_REF%%);
+    let collection = collection_path();
     let Ok(query) = request.query::<IndexQuery>() else {
         return not_found(&state, &request, &collection);
     };
@@ -196,7 +196,7 @@ async fn index(state: Arc<%%TYPE%%Routes>, request: Request) -> Response {
 
 async fn show(state: Arc<%%TYPE%%Routes>, request: Request) -> Response {
 %%AUTHORIZE_READ%%
-    let collection = collection_path(%%CONTEXT_REF%%);
+    let collection = collection_path();
     let Some(id) = path_id(&request) else {
         return not_found(&state, &request, &collection);
     };
@@ -213,8 +213,8 @@ async fn show(state: Arc<%%TYPE%%Routes>, request: Request) -> Response {
 }
 
 async fn new(state: Arc<%%TYPE%%Routes>, request: Request) -> Response {
-%%AUTHORIZE_WRITE%%
-    let collection = collection_path(%%CONTEXT_REF%%);
+%%AUTHORIZE_WRITE_ONLY%%
+    let collection = collection_path();
     render_new(
         &state,
         &request,
@@ -227,7 +227,7 @@ async fn new(state: Arc<%%TYPE%%Routes>, request: Request) -> Response {
 
 async fn create(state: Arc<%%TYPE%%Routes>, request: Request) -> Response {
 %%AUTHORIZE_WRITE%%
-    let collection = collection_path(%%CONTEXT_REF%%);
+    let collection = collection_path();
     let form: %%TYPE%%Form = match request.form() {
         Ok(form) => form,
         Err(error) => {
@@ -297,7 +297,7 @@ async fn create(state: Arc<%%TYPE%%Routes>, request: Request) -> Response {
 
 async fn edit(state: Arc<%%TYPE%%Routes>, request: Request) -> Response {
 %%AUTHORIZE_WRITE%%
-    let collection = collection_path(%%CONTEXT_REF%%);
+    let collection = collection_path();
     let Some(id) = path_id(&request) else {
         return not_found(&state, &request, &collection);
     };
@@ -317,7 +317,7 @@ async fn edit(state: Arc<%%TYPE%%Routes>, request: Request) -> Response {
 
 async fn update(state: Arc<%%TYPE%%Routes>, request: Request) -> Response {
 %%AUTHORIZE_WRITE%%
-    let collection = collection_path(%%CONTEXT_REF%%);
+    let collection = collection_path();
     let Some(id) = path_id(&request) else {
         return not_found(&state, &request, &collection);
     };
@@ -425,7 +425,7 @@ async fn update(state: Arc<%%TYPE%%Routes>, request: Request) -> Response {
 
 async fn destroy(state: Arc<%%TYPE%%Routes>, request: Request) -> Response {
 %%AUTHORIZE_WRITE%%
-    let collection = collection_path(%%CONTEXT_REF%%);
+    let collection = collection_path();
     let Some(id) = path_id(&request) else {
         return not_found(&state, &request, &collection);
     };
@@ -755,16 +755,7 @@ async fn publish_deleted(state: &%%TYPE%%Routes, %%CONTEXT_PARAM%%id: %%TYPE%%Id
 }
 
 %%end%%
-%%if tenant%%
-/// `/tenants/<tenant id>/%%RESOURCES%%` of the authorized tenant (never the
-/// raw path, which only selected the membership to check).
-fn collection_path(context: &TenantContext) -> String {
-    format!("/tenants/{}/%%RESOURCES%%", context.tenant_id())
-}
-%%end%%
-%%if global%%
 fn collection_path() -> String {
     "/%%RESOURCES%%".to_owned()
 }
-%%end%%
 %%PARSE_HELPERS%%

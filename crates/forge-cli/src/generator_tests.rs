@@ -8,7 +8,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::controller::{self, ControllerOptions};
-use crate::destroy::{self, DestroyFlags, DestroyPlan};
+use crate::destroy::{self, DestroyFlags, DestroyPlan, Unwire};
 use crate::generate::{Database, ForgeSource, Locale, NewApplication, create_application};
 use crate::job::{self, JobOptions};
 use crate::mailer::{self, MailerOptions};
@@ -59,6 +59,43 @@ fn tree(root: &Path) -> BTreeMap<String, String> {
     files
 }
 
+/// The tree after a destroy is the tree before the generation, but for the
+/// declarations of the shared `modules` (kept with their files) in
+/// src/adapters/http/mod.rs.
+fn assert_back_but_shared(
+    mut after: BTreeMap<String, String>,
+    mut before: BTreeMap<String, String>,
+    modules: &[&str],
+) {
+    let path = "src/adapters/http/mod.rs";
+    let declarations: Vec<String> = modules
+        .iter()
+        .map(|module| format!("pub mod {module};"))
+        .collect();
+    let http = after.remove(path).unwrap_or_default();
+    let kept: String = http
+        .lines()
+        .filter(|line| !declarations.iter().any(|declaration| declaration == line))
+        .map(|line| format!("{line}\n"))
+        .collect();
+    assert_eq!(Some(&kept), before.remove(path).as_ref());
+    assert_eq!(after, before);
+}
+
+/// What a generator printed and registered: its notes, then each edit (as
+/// `verb path (detail)`) and the content it wrote.
+fn wired(notes: &str, edits: &[crate::wiring::Edit]) -> String {
+    let mut text = notes.to_owned();
+    for edit in edits {
+        text.push_str(&format!(
+            "\n{} {} ({})\n",
+            edit.verb, edit.path, edit.detail
+        ));
+        text.push_str(edit.content.as_deref().unwrap_or_default());
+    }
+    text
+}
+
 fn resource(name: &str, fields: &[&str], scope: Scope, layers: Layers) -> ScaffoldOptions {
     ScaffoldOptions {
         name: name.to_owned(),
@@ -66,6 +103,7 @@ fn resource(name: &str, fields: &[&str], scope: Scope, layers: Layers) -> Scaffo
         scope,
         plural: None,
         broadcast: false,
+        public: false,
         dry_run: false,
         layers,
     }
@@ -170,16 +208,20 @@ fn a_model_is_the_scaffold_without_its_http_layer_byte_for_byte() {
     }
     assert!(!model_root.join(scaffold::ACCESS_PATH).exists());
     assert!(
-        model.wiring.contains("pub mod post_repository;"),
+        wired(&model.wiring, &model.edits).contains("pub mod post_repository;"),
         "{}",
-        model.wiring
+        wired(&model.wiring, &model.edits)
     );
     assert!(
-        model.wiring.contains("PgPostRepository::new"),
+        wired(&model.wiring, &model.edits).contains("PgPostRepository::new"),
         "{}",
-        model.wiring
+        wired(&model.wiring, &model.edits)
     );
-    assert!(!model.wiring.contains("adapters::http"), "{}", model.wiring);
+    assert!(
+        !wired(&model.wiring, &model.edits).contains("adapters::http"),
+        "{}",
+        wired(&model.wiring, &model.edits)
+    );
 
     // A scaffold of the same plural collides; destroying the model while a
     // scaffold's pages exist is refused.
@@ -232,21 +274,25 @@ fn a_resource_is_the_model_plus_the_json_api_and_collides_with_the_others() {
         VERSION,
     )
     .unwrap_or_else(|error| panic!("{error}"));
-    assert_eq!(
-        outcome.created,
-        [
-            format!("migrations/{VERSION}_create_posts.up.sql"),
-            format!("migrations/{VERSION}_create_posts.down.sql"),
-            "src/domain/entities/post.rs".to_owned(),
-            "src/application/ports/post_repository.rs".to_owned(),
-            "src/application/use_cases/posts.rs".to_owned(),
-            "src/infrastructure/database/posts.rs".to_owned(),
-            scaffold::API_ACCESS_PATH.to_owned(),
-            "src/adapters/http/posts_api.rs".to_owned(),
-            "tests/posts_api.rs".to_owned(),
-            "tests/posts_repository.rs".to_owned(),
-        ]
-    );
+    let mut created = outcome.created.clone();
+    created.sort();
+    let mut expected = vec![
+        format!("migrations/{VERSION}_create_posts.up.sql"),
+        format!("migrations/{VERSION}_create_posts.down.sql"),
+        "src/domain/entities/post.rs".to_owned(),
+        "src/application/ports/post_repository.rs".to_owned(),
+        "src/application/use_cases/posts.rs".to_owned(),
+        "src/infrastructure/database/posts.rs".to_owned(),
+        // The pages' session authorizes the JSON API (D29): the access
+        // module comes with the first such resource.
+        scaffold::ACCESS_PATH.to_owned(),
+        scaffold::API_ACCESS_PATH.to_owned(),
+        "src/adapters/http/posts_api.rs".to_owned(),
+        "tests/posts_api.rs".to_owned(),
+        "tests/posts_repository.rs".to_owned(),
+    ];
+    expected.sort();
+    assert_eq!(created, expected);
     let scaffolded = tree(&scaffold_root);
     for path in &outcome.created {
         assert_eq!(
@@ -255,20 +301,21 @@ fn a_resource_is_the_model_plus_the_json_api_and_collides_with_the_others() {
             "{path}"
         );
     }
-    assert!(!root.join(scaffold::ACCESS_PATH).exists());
-    // Without `--api-auth` nothing issues bearer tokens: the wiring stays
-    // closed and says how to open it.
+    // Without `--api-auth` the JSON API takes the session cookie of the
+    // sign-in pages behind the `protect` guard, never DenyAll or bearer
+    // tokens.
+    let wiring = wired(&outcome.wiring, &outcome.edits);
+    assert!(wiring.contains("let access = protect("), "{wiring}");
     assert!(
-        outcome.wiring.contains("api_access::DenyAll"),
-        "{}",
-        outcome.wiring
+        wiring.contains(
+            "crate::adapters::http::posts_api::routes(composition.router(), posts, access)"
+        ),
+        "{wiring}"
     );
-    assert!(
-        outcome
-            .wiring
-            .contains("forge generate authentication --api-auth")
-    );
-    assert!(!outcome.wiring.contains("BearerTenantAccess::new"));
+    assert!(wiring.contains("pub(super) fn protect("), "{wiring}");
+    assert!(wiring.contains("pub mod access;"), "{wiring}");
+    assert!(!wiring.contains("DenyAll"), "{wiring}");
+    assert!(!wiring.contains("BearerTenantAccess::new"), "{wiring}");
 
     for (layers, version) in [
         (Layers::Model, "1760832000000000001"),
@@ -283,10 +330,16 @@ fn a_resource_is_the_model_plus_the_json_api_and_collides_with_the_others() {
         .err()
         .map(|error| error.to_string())
         .unwrap_or_default();
-        assert!(
-            collision.contains("refusing to overwrite"),
-            "{layers:?}: {collision}"
-        );
+        // The model and the resource are already there, file for file: running
+        // them again changes nothing. The scaffold would add files.
+        if layers == Layers::Scaffold {
+            assert!(
+                collision.contains("refusing to overwrite"),
+                "{layers:?}: {collision}"
+            );
+        } else {
+            assert!(collision.is_empty(), "{layers:?}: {collision}");
+        }
     }
 
     let owned = destroy_resource(
@@ -322,7 +375,8 @@ fn a_resource_is_the_model_plus_the_json_api_and_collides_with_the_others() {
     );
     let mut after = tree(&root);
     assert!(after.remove(scaffold::API_ACCESS_PATH).is_some());
-    assert_eq!(after, before);
+    assert!(after.remove(scaffold::ACCESS_PATH).is_some());
+    assert_back_but_shared(after, before, &["access", "api_access"]);
 }
 
 /// In a `forge new --api-auth` application a tenant-scoped resource is wired
@@ -351,12 +405,11 @@ fn a_resource_takes_bearer_tokens_with_api_auth_and_needs_compose() {
     )
     .unwrap_or_else(|error| panic!("{error}"));
     assert!(
-        tenant.wiring.contains("BearerTenantAccess::new"),
+        wired(&tenant.wiring, &tenant.edits).contains("BearerTenantAccess::new"),
         "{}",
-        tenant.wiring
+        wired(&tenant.wiring, &tenant.edits)
     );
-    assert!(tenant.wiring.contains("PostgresBearerSessionStore::new"));
-    assert!(tenant.wiring.contains("policy.allow(viewer, read);"));
+    assert!(wired(&tenant.wiring, &tenant.edits).contains("PostgresBearerSessionStore::new"));
     let global = scaffold::generate(
         &root,
         &resource("tag", &["label:string"], Scope::Global, Layers::Resource),
@@ -365,11 +418,16 @@ fn a_resource_takes_bearer_tokens_with_api_auth_and_needs_compose() {
     .unwrap_or_else(|error| panic!("{error}"));
     assert!(global.reused_api_access);
     assert!(
-        global.wiring.contains("api_access::DenyAll"),
+        wired(&global.wiring, &global.edits).contains("api_access::DenyAll"),
         "{}",
-        global.wiring
+        wired(&global.wiring, &global.edits)
     );
-    assert!(!global.wiring.contains("pub mod api_access;"));
+    assert!(
+        global
+            .edits
+            .iter()
+            .all(|edit| !edit.detail.contains("pub mod api_access;"))
+    );
 
     // An application written before `--api` had `compose` is told to add it.
     let (_old_parent, old) = application(Database::Postgresql, false, Locale::En);
@@ -430,8 +488,11 @@ fn api_applications_get_resources_and_api_controllers_wired_deny_all() {
             ] {
                 assert!(created.iter().any(|created| created == path), "{path}");
             }
-            let wiring = &outcome.wiring;
-            assert!(wiring.contains("at the end of `fn compose`"), "{wiring}");
+            let wiring = &wired(&outcome.wiring, &outcome.edits);
+            assert!(
+                wiring.contains("wire src/bootstrap/routes_gen.rs"),
+                "{wiring}"
+            );
             assert!(wiring.contains("api_access::DenyAll"), "{wiring}");
             assert!(!wiring.contains("BearerTenantAccess::new"), "{wiring}");
             assert!(
@@ -471,16 +532,20 @@ fn an_api_controller_is_wired_deny_all_in_an_api_application() {
         );
         assert!(!tree(&api).contains_key("templates/status_checks/index.html"));
         assert!(
-            outcome.wiring.contains("at the end of `fn compose`"),
+            wired(&outcome.wiring, &outcome.edits).contains("wire src/bootstrap/routes_gen.rs"),
             "{}",
-            outcome.wiring
+            wired(&outcome.wiring, &outcome.edits)
         );
         assert!(
-            outcome.wiring.contains("access::DenyAll"),
+            wired(&outcome.wiring, &outcome.edits).contains("access::DenyAll"),
             "{}",
-            outcome.wiring
+            wired(&outcome.wiring, &outcome.edits)
         );
-        assert!(!outcome.wiring.contains("&site"), "{}", outcome.wiring);
+        assert!(
+            !wired(&outcome.wiring, &outcome.edits).contains("&site"),
+            "{}",
+            wired(&outcome.wiring, &outcome.edits)
+        );
         let after = tree(&api);
         assert_eq!(
             after
@@ -647,6 +712,18 @@ fn destroying_a_scaffold_keeps_shared_files_migrations_and_translations() {
     after.remove(scaffold::ACCESS_PATH);
     after.remove(scaffold::API_ACCESS_PATH);
     after.remove("src/adapters/http/streams.rs");
+    // The shared modules stay, and so do their declarations.
+    let http = after.remove("src/adapters/http/mod.rs").unwrap_or_default();
+    let kept: String = http
+        .lines()
+        .filter(|line| {
+            !["pub mod access;", "pub mod api_access;", "pub mod streams;"].contains(line)
+        })
+        .map(|line| format!("{line}\n"))
+        .collect();
+    assert_eq!(Some(&kept), before.get("src/adapters/http/mod.rs"));
+    let mut before = before;
+    before.remove("src/adapters/http/mod.rs");
     assert_eq!(after, before);
 }
 
@@ -679,16 +756,16 @@ fn a_controller_writes_guarded_pages_and_destroy_takes_them_back() {
     assert!(handlers.contains("route(router, &state, \"/pages/about_us\", about_us)?;"));
     assert!(!handlers.contains("Method::POST"));
     assert!(
-        outcome.wiring.contains("pub mod access;"),
+        wired(&outcome.wiring, &outcome.edits).contains("pub mod access;"),
         "{}",
-        outcome.wiring
+        wired(&outcome.wiring, &outcome.edits)
     );
     assert!(
-        outcome.wiring.contains("access::DenyAll"),
+        wired(&outcome.wiring, &outcome.edits).contains("access::DenyAll"),
         "{}",
-        outcome.wiring
+        wired(&outcome.wiring, &outcome.edits)
     );
-    assert!(outcome.wiring.contains("GET /pages, GET /pages/about_us"));
+    assert!(wired(&outcome.wiring, &outcome.edits).contains("GET /pages, GET /pages/about_us"));
 
     // Never overwrites; a second controller reuses the access module.
     let again = controller::generate(&root, &options)
@@ -700,7 +777,12 @@ fn a_controller_writes_guarded_pages_and_destroy_takes_them_back() {
     api.api = true;
     let reports = controller::generate(&root, &api).unwrap_or_else(|error| panic!("{error}"));
     assert!(reports.reused_access);
-    assert!(!reports.wiring.contains("pub mod access;"));
+    assert!(
+        reports
+            .edits
+            .iter()
+            .all(|edit| !edit.detail.contains("pub mod access;"))
+    );
     let json = fs::read_to_string(root.join("src/adapters/http/reports_controller.rs"))
         .unwrap_or_default();
     assert!(json.contains("\"/v1/reports/monthly\""), "{json}");
@@ -738,7 +820,7 @@ fn a_controller_writes_guarded_pages_and_destroy_takes_them_back() {
         .unwrap_or_else(|error| panic!("{error}"));
     let mut after = tree(&root);
     assert!(after.remove(scaffold::ACCESS_PATH).is_some());
-    assert_eq!(after, before);
+    assert_back_but_shared(after, before, &["access"]);
 }
 
 #[test]
@@ -756,9 +838,9 @@ fn a_controller_reuses_the_permission_its_model_declares() {
     );
     assert!(!handlers.contains("\"widgets:read\""));
     assert!(
-        outcome.wiring.contains("already declares"),
+        wired(&outcome.wiring, &outcome.edits).contains("already declares"),
         "{}",
-        outcome.wiring
+        wired(&outcome.wiring, &outcome.edits)
     );
 
     // The model cannot go while the controller depends on it.
@@ -833,7 +915,11 @@ fn controllers_are_validated_and_need_a_full_stack_application() {
     let mut public = controller("pages", &["index"]);
     public.public = true;
     let outcome = controller::generate(&plain, &public).unwrap_or_else(|error| panic!("{error}"));
-    assert!(outcome.wiring.contains("WARNING"), "{}", outcome.wiring);
+    assert!(
+        wired(&outcome.wiring, &outcome.edits).contains("WARNING"),
+        "{}",
+        wired(&outcome.wiring, &outcome.edits)
+    );
     assert!(!plain.join(scaffold::ACCESS_PATH).exists());
 }
 
@@ -871,7 +957,6 @@ fn mailers_and_jobs_round_trip_through_destroy() {
     let job_options = JobOptions {
         name: "send_welcome".to_owned(),
         fields: vec!["user_id:uuid".to_owned(), "note:string?".to_owned()],
-        queue: true,
         dry_run: false,
     };
     // `forge new` already declared the jobs and enabled the feature: the
@@ -893,7 +978,7 @@ fn mailers_and_jobs_round_trip_through_destroy() {
         mailer::plan_destroy(&root, &mailer_options).unwrap_or_else(|error| panic!("{error}"));
     let plan = DestroyPlan {
         files,
-        unwire,
+        unwire: Unwire::Printed(unwire),
         owned_elsewhere: None,
     };
     destroyed(&root, plan, DestroyFlags::default()).unwrap_or_else(|error| panic!("{error}"));
@@ -901,7 +986,7 @@ fn mailers_and_jobs_round_trip_through_destroy() {
         job::plan_destroy(&root, &job_options).unwrap_or_else(|error| panic!("{error}"));
     let plan = DestroyPlan {
         files,
-        unwire,
+        unwire: Unwire::Printed(unwire),
         owned_elsewhere: None,
     };
     destroyed(&root, plan, DestroyFlags::default()).unwrap_or_else(|error| panic!("{error}"));
@@ -1040,11 +1125,11 @@ fn a_model_for_mysql_prints_the_mysql_repository() {
     )
     .unwrap_or_else(|error| panic!("{error}"));
     assert!(
-        outcome.wiring.contains("MySqlPostRepository"),
+        wired(&outcome.wiring, &outcome.edits).contains("MySqlPostRepository"),
         "{}",
-        outcome.wiring
+        wired(&outcome.wiring, &outcome.edits)
     );
-    assert!(!outcome.wiring.contains("PgPostRepository"));
+    assert!(!wired(&outcome.wiring, &outcome.edits).contains("PgPostRepository"));
 }
 
 /// Generates a scaffold with `fields` and returns everything it wrote.
@@ -1163,6 +1248,20 @@ fn controllers_refuse_what_they_cannot_guard_or_place() {
         dry_run: false,
     };
     assert!(refused(controller::generate(&root, &options)).contains("at most 20 actions"));
+    for name in ["forge", "std"] {
+        assert!(
+            refused(controller::generate(&root, &controller(name, &["index"])))
+                .contains("crate the generated code uses"),
+            "{name}"
+        );
+    }
+    for name in ["protect", "public", "site", "generated_routes"] {
+        assert!(
+            refused(controller::generate(&root, &controller(name, &["index"])))
+                .contains("routes seam"),
+            "{name}"
+        );
+    }
 
     let empty = tempfile::tempdir().expect("temporary directory");
     assert!(
@@ -1313,7 +1412,6 @@ fn jobs_refuse_requests_and_applications_they_cannot_serve() {
     let job = |name: &str, fields: &[&str]| JobOptions {
         name: name.to_owned(),
         fields: fields.iter().map(|field| (*field).to_owned()).collect(),
-        queue: true,
         dry_run: false,
     };
     assert!(refused(job::generate(&root, &job("mod", &[]))).contains("`mod` is a Rust keyword"));
@@ -1512,16 +1610,15 @@ fn a_view_is_one_page_in_the_layout_and_destroy_takes_it_back() {
         "{test}"
     );
     assert!(
-        outcome
-            .wiring
-            .contains("src/adapters/http/views/mod.rs         pub mod pages_welcome_back_view;"),
+        wired(&outcome.wiring, &outcome.edits)
+            .contains("declare src/adapters/http/views/mod.rs (pub mod pages_welcome_back_view;)"),
         "{}",
-        outcome.wiring
+        wired(&outcome.wiring, &outcome.edits)
     );
     assert!(
-        outcome.wiring.contains("site.layout(&request)"),
+        wired(&outcome.wiring, &outcome.edits).contains("site.layout(&request)"),
         "{}",
-        outcome.wiring
+        wired(&outcome.wiring, &outcome.edits)
     );
 
     // Never overwrites; another directory is another page.

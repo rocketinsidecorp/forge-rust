@@ -21,8 +21,8 @@
 #   - forge-bench and forge-loadgen, the benchmark and load-generation
 #     harnesses (fuzz/ is outside the workspace);
 #   - crates/forge-cli/templates/, generated-app templates rendered as text,
-#     and the generated-application suite (forge-cli --test scaffold), left
-#     to CI's scaffold job;
+#     and the generated-application suites (forge-cli --test scaffold and
+#     --test readme_quickstart), left to CI's scaffold job;
 #   - test code: tests/ directories (cargo-llvm-cov's default) and the
 #     #[cfg(test)] modules kept in their own files (tests.rs, *_tests.rs,
 #     test_support.rs).

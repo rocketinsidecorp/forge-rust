@@ -17,14 +17,24 @@ use std::path::Path;
 
 use crate::CliError;
 use crate::generators::{Planned, Role, refuse_symlinks};
+use crate::wiring::{self, Edit};
+
+/// How the registrations of a generation come back out.
+#[derive(Debug)]
+pub(crate) enum Unwire {
+    /// The module declarations and the seam's block, taken out after the
+    /// files are removed (empty when there is nothing to take out).
+    Edits(Vec<Edit>),
+    /// An application without the seam: the wiring the generator printed,
+    /// to take out of the composition root and module declarations by hand.
+    Printed(String),
+}
 
 /// What one generator would create, found where it is.
 #[derive(Debug)]
 pub(crate) struct DestroyPlan {
     pub(crate) files: Vec<Planned>,
-    /// The wiring the generator printed, to take out of the composition
-    /// root and module declarations by hand.
-    pub(crate) unwire: String,
+    pub(crate) unwire: Unwire,
     /// Why the files still belong to, or are needed by, another generation
     /// (a model inside a scaffold, a model whose permission a controller
     /// reuses): the destroy is refused unless `--force`.
@@ -159,6 +169,11 @@ pub(crate) fn apply(
         ));
     }
     if !flags.dry_run {
+        if let Unwire::Edits(edits) = &plan.unwire {
+            // The declarations and routes go first: a failure leaves every
+            // file in place.
+            wiring::apply(root, edits)?;
+        }
         let mut removed: Vec<String> = Vec::new();
         for (path, checked) in &removable {
             if let Err(reason) = remove_checked(root, path, checked) {
@@ -189,17 +204,24 @@ pub(crate) fn apply(
         };
         writeln!(output, "{line}").map_err(CliError::Output)?;
     }
-    let wiring = plan
-        .unwire
-        .trim_start_matches('\n')
-        .split_once('\n')
-        .map_or(plan.unwire.as_str(), |(_, rest)| rest);
-    write!(
-        output,
-        "\nForge did not edit any existing file. Take out the wiring you added by hand, which \
-         the generator printed as:\n{wiring}\n  Then run `forge test`.\n"
-    )
-    .map_err(CliError::Output)
+    match &plan.unwire {
+        Unwire::Edits(edits) => {
+            wiring::report(output, flags.dry_run, edits)?;
+            writeln!(output, "\n  Then: forge test.").map_err(CliError::Output)
+        }
+        Unwire::Printed(printed) => {
+            let wiring = printed
+                .trim_start_matches('\n')
+                .split_once('\n')
+                .map_or(printed.as_str(), |(_, rest)| rest);
+            write!(
+                output,
+                "\nForge did not edit any existing file. Take out the wiring you added by hand, \
+                 which the generator printed as:\n{wiring}\n  Then run `forge test`.\n"
+            )
+            .map_err(CliError::Output)
+        }
+    }
 }
 
 /// Removes `path` only if it is still, right now, what was checked: not a

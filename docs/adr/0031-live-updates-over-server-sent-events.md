@@ -1,5 +1,11 @@
 # ADR 0031: Live updates: Turbo Streams over Server-Sent Events
 
+> **Update (2026-10-26, D29, [forge-rust#93](https://github.com/rocketinsidecorp/forge-rust/issues/93)).**
+> Tenant-scoped scaffold pages are now at `/<plural>`, the tenant being the
+> one the session signed in to (the `__Host-forge_tenant` cookie; membership
+> and RBAC are checked on every request); live-update streams keep their
+> `/tenants/{tenant_id}/streams` path. The text below is kept as decided.
+
 - Status: Accepted
 - Date: 2026-10-20
 - Refines: [ADR 0022](0022-server-rendered-views.md) (Turbo), [ADR 0024](0024-scaffold-generator.md) (scaffold)

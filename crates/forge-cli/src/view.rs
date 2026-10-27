@@ -8,9 +8,11 @@ use std::fs;
 use std::path::Path;
 
 use crate::CliError;
+use crate::destroy::Unwire;
 use crate::generate::render_template;
 use crate::generators::{self, MAX_NAME_LENGTH, Planned, Role};
 use crate::scaffold::{self, pascal_case};
+use crate::wiring::{self, Registration};
 
 const GENERATOR: &str = "view";
 
@@ -42,6 +44,8 @@ pub(crate) struct ViewOptions {
 #[derive(Debug)]
 pub(crate) struct Outcome {
     pub(crate) files: Vec<Planned>,
+    /// The module declaration registered.
+    pub(crate) edits: Vec<wiring::Edit>,
     pub(crate) wiring: String,
 }
 
@@ -142,13 +146,29 @@ fn plan(root: &Path, options: &ViewOptions) -> Result<(Names, Vec<Planned>), Cli
 pub(crate) fn generate(root: &Path, options: &ViewOptions) -> Result<Outcome, CliError> {
     let (names, files) = plan(root, options)?;
     generators::refuse_overwrite(root, GENERATOR, &files)?;
+    let (text, edits) = if wiring::has_seam(root) {
+        let edits = wiring::plan(root, &registration(&names), false, &|reason| fail(reason))?;
+        (usage(&names), edits)
+    } else {
+        (wiring(&names), Vec::new())
+    };
     if !options.dry_run {
-        generators::write(root, &files)?;
+        generators::write_and_wire(root, &files, &edits)?;
     }
     Ok(Outcome {
-        wiring: wiring(&names),
+        wiring: text,
+        edits,
         files,
     })
+}
+
+/// The view's module declaration.
+fn registration(names: &Names) -> Registration {
+    Registration {
+        modules: vec![(VIEWS_MODULE.to_owned(), names.module.clone())],
+        routes: None,
+        shared: Vec::new(),
+    }
 }
 
 /// What `forge destroy view` removes, the wiring to take out, and why the
@@ -157,7 +177,7 @@ pub(crate) fn generate(root: &Path, options: &ViewOptions) -> Result<Outcome, Cl
 pub(crate) fn plan_destroy(
     root: &Path,
     options: &ViewOptions,
-) -> Result<(Vec<Planned>, String, Option<String>), CliError> {
+) -> Result<(Vec<Planned>, Unwire, Option<String>), CliError> {
     let (names, files) = plan(root, options)?;
     let page = format!("templates/{}/{}.html", names.directory, names.name);
     let controller_views = format!("src/adapters/http/views/{}_controller.rs", names.directory);
@@ -176,11 +196,51 @@ pub(crate) fn plan_destroy(
             directory = names.directory
         )
     });
-    Ok((files, wiring(&names), owned_elsewhere))
+    let unwire = if wiring::has_seam(root) && owned_elsewhere.is_none() {
+        Unwire::Edits(wiring::plan(
+            root,
+            &registration(&names),
+            true,
+            &|reason| {
+                CliError::Destroy(format!(
+                    "refusing to destroy, nothing was removed: {reason}"
+                ))
+            },
+        )?)
+    } else if wiring::has_seam(root) {
+        Unwire::Edits(Vec::new())
+    } else {
+        Unwire::Printed(wiring(&names))
+    };
+    Ok((files, unwire, owned_elsewhere))
+}
+
+/// The `mod.rs` that declares the view modules.
+const VIEWS_MODULE: &str = "src/adapters/http/views/mod.rs";
+
+/// How to render the view, printed once its module is declared.
+fn usage(names: &Names) -> String {
+    let Names {
+        directory,
+        name,
+        module,
+        type_name,
+    } = names;
+    let title = pascal_case(name);
+    format!(
+        "\n  Render it from a handler that has the application's `Site` (as the welcome\n  \
+         page does in src/adapters/http/mod.rs):\n\n    \
+         forge::web::html(&crate::adapters::http::views::{module}::{type_name} {{\n        \
+         layout: site.layout(&request),\n        \
+         title: \"{title}\",\n        \
+         content: \"Find me in templates/{directory}/{name}.html\",\n    \
+         }})\n\n  \
+         Nothing routes to the page until a handler renders it. Then run `forge test`.\n"
+    )
 }
 
 /// The module declaration and the rendering call, printed after generation
-/// (and by `forge destroy` to take out).
+/// (and by `forge destroy` to take out) in an application without the seam.
 fn wiring(names: &Names) -> String {
     let Names {
         directory,

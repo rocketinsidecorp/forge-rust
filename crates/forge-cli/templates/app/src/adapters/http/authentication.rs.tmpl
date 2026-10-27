@@ -97,7 +97,8 @@ use crate::adapters::http::views::authentication::{
 use crate::infrastructure::security::{
     IssuedSession, LoginError, RequestAuthError, VerifiedPassword, authenticate_request,
     csrf_digest, enforce_csrf, issue_persisted_session, issue_session_secrets,
-    session_remove_cookie, session_set_cookie, verify_password, verify_principal_password,
+    session_remove_cookie, session_set_cookie, tenant_remove_cookie, tenant_set_cookie,
+    verify_password, verify_principal_password,
 };
 
 /// The sign-in page. Protected pages send signed-out browsers here.
@@ -630,6 +631,9 @@ async fn create_session(pages: Arc<Pages>, request: Request) -> Response {
     let notice = pages.site.i18n(&request).t("sessions.signed_in").text();
     let mut response = redirect(target, Flash::new().with_notice(notice));
     set_cookie(&mut response, &session_set_cookie(&issued.secrets.bearer));
+    // Tenant-scoped pages without `{tenant_id}` in their path (`/products`)
+    // check the membership in the tenant signed in to.
+    set_cookie(&mut response, &tenant_set_cookie(tenant));
     // The form CSRF cookie now holds the new session's CSRF token, so pages
     // render it and the session-bound check (ADR 0014) agrees.
     set_cookie(&mut response, &csrf_cookie(&issued.secrets.csrf));
@@ -1230,6 +1234,7 @@ async fn complete_mfa_challenge(pages: Arc<Pages>, request: Request) -> Response
     let notice = pages.site.i18n(&request).t("sessions.signed_in").text();
     let mut response = redirect(target, Flash::new().with_notice(notice));
     set_cookie(&mut response, &session_set_cookie(&issued.secrets.bearer));
+    set_cookie(&mut response, &tenant_set_cookie(signed_in.tenant_id));
     set_cookie(&mut response, &csrf_cookie(&issued.secrets.csrf));
     set_cookie(&mut response, &mfa_cookie_removal());
     response
@@ -1473,6 +1478,7 @@ async fn confirm_mfa_change(pages: Arc<Pages>, request: Request, change: MfaChan
                 return unavailable("csrf_token_unavailable");
             };
             set_cookie(&mut response, &session_remove_cookie());
+            set_cookie(&mut response, &tenant_remove_cookie());
             set_cookie(&mut response, &csrf_cookie(&secrets.csrf));
             response
         }
@@ -2281,6 +2287,7 @@ fn signed_out(location: &str, flash: Flash) -> Response {
     };
     let mut response = redirect(location, flash);
     set_cookie(&mut response, &session_remove_cookie());
+    set_cookie(&mut response, &tenant_remove_cookie());
     set_cookie(&mut response, &csrf_cookie(&secrets.csrf));
     response
 }

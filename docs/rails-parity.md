@@ -70,6 +70,39 @@ the work is finished and waiting for its review; **Planned** means not started.
 
 ## Parity follow-ups
 
+- End to end without editing code (D21, D22, D25, D26, D29;
+  [forge-rust#93](https://github.com/rocketinsidecorp/forge-rust/issues/93)):
+  both frameworks run the README Quickstart as written, from `forge new` to
+  a CRUD at `/products` with sign-in (PostgreSQL) or `--public` (SQLite),
+  in CI. Same commands and names: `forge g`/`forge d`; the generator-owned
+  routes seam (`routes_gen`, `forge:KIND NAME` blocks, `forge:checksum`,
+  verbs `wire`, `unwire`, `identical`, `would wire`); the guards `protect`
+  and `public`, replaced by declaring one of that name in the bootstrap
+  package/module; JSON routes of identity applications without bearer
+  sign-in authenticate the session cookie and require `X-CSRF-Token`;
+  `--public` only for `--global` resources of applications without identity
+  and with the seam; `generate migration add_X_to_TABLE|remove_X_from_TABLE
+  field:type...` as `ALTER TABLE` per dialect, with the blank-migration
+  warning; SQL keywords as names; `job` without `--queue`; field types
+  `integer boolean timestamp string text uuid` with `int bool time datetime`
+  as aliases. Differences: (1) Rust generators also declare `pub mod NAME;`
+  in the `mod.rs` files (Go packages need none), and `destroy` removes them.
+  (2) Rust guards are module-level functions of `mod guards` in
+  `routes_gen.rs` behind `use super::*`, so an application guard declared
+  after generation makes the name ambiguous (a compile error) until the
+  generator runs again, instead of being shadowed; Go has no
+  `protect_platform_write`/`protect_cookie` counterparts in Rust, whose
+  scaffolds have neither. (3) The permissions of `protect` are granted to
+  the `owner` role in code (the guard's RBAC policy), where Go's scaffold
+  migration grants them in the database. (4) Tenant-scoped Rust pages moved
+  from `/tenants/{tenant_id}/<plural>` to `/<plural>`, the tenant being the
+  one the session signed in to (a `__Host-forge_tenant` cookie set at
+  sign-in; the membership is checked on every request). (5) The Compose
+  service is `db` in Rust, `postgres`/`mysql`/`mariadb` in Go, so the
+  Quickstart's database line differs by that word. (6) The mailer and job
+  generators print their registration in both; Rust also prints their
+  `pub mod` lines.
+
 - Job wake-up and batches ([forge-rust#80](https://github.com/rocketinsidecorp/forge-rust/issues/80),
   [ADR 0046](adr/0046-job-wake-up-and-claim-batches.md)): both frameworks
   announce due jobs with `pg_notify('forge_jobs', queue)` at enqueue, ignore

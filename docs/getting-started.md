@@ -30,11 +30,12 @@ Forge is a Rust framework with Rails conventions, so the names carry over:
 | `rails credentials:edit` | `forge credentials edit` |
 | Kamal | `forge deploy` |
 
-One difference to know up front: **generators never edit existing files**, such
-as `src/bootstrap/mod.rs`, your composition root. They print the code to add
-and where, and you paste it. That is deliberate (the file is yours), and this
-guide shows each paste in full, with a small shell helper so that it is also
-copy-and-paste.
+One difference to know up front: **generators never edit your composition
+root**, `src/bootstrap/mod.rs`. They declare their modules in the `mod.rs`
+files and mount their routes in `src/bootstrap/routes_gen.rs`, a file they own
+and `compose` calls; nothing is pasted. The mailer and job generators print
+their registration (as Forge-Go's do), and this guide shows those pastes in
+full, with a small shell helper so that they are copy-and-paste too.
 
 Contents: [1 Prerequisites](#1-prerequisites) ·
 [2 Install the CLI](#2-install-the-cli) ·
@@ -64,10 +65,10 @@ Contents: [1 Prerequisites](#1-prerequisites) ·
   starts PostgreSQL 18 for you if you have Docker (with Compose). Without
   Docker, any PostgreSQL server you can reach as a superuser works; this guide
   was run against PostgreSQL 16.
-- **`psql`**, the PostgreSQL client, for the no-Docker setup in section 4 and
-  to look up a tenant id in section 5. **`curl`**, **`openssl`** and **`git`**
-  for a few commands, and **`perl`** (installed on macOS and Linux) for the
-  small edits the generators ask you to make by hand.
+- **`psql`**, the PostgreSQL client, for the no-Docker setup in section 4.
+  **`curl`**, **`openssl`** and **`git`** for a few commands, and **`perl`**
+  (installed on macOS and Linux) for the job registration the job generator
+  prints in section 9.
 - **Docker** only for the Compose database, `docker build`, the observability
   stack and the servers of `forge deploy`. Nothing else here needs it.
 
@@ -348,8 +349,9 @@ there is no `forge setup` (the application refuses it), no sign-in pages
 (`forge generate authentication` is refused, with the reason) and nothing that
 supplies a tenant, so scaffold with `--global` instead of `--tenant-scoped`;
 tenant isolation on SQLite rests on the application layer, not on row-level
-security. A scaffold's pages refuse everyone (`DenyAll`) until you replace it
-in the printed wiring with your own `GlobalAccess`. Sections 5 (without
+security. A scaffold's pages refuse everyone (`DenyAll`) unless generated with
+`--public` (open to anyone; see the README Quickstart) or mounted by you in
+`compose` with your own `GlobalAccess`. Sections 5 (without
 sign-in), 7, 8, 10, 11 and 14 apply; the rest of this guide was run on PostgreSQL. The
 same goes for `-d mysql` and `-d mariadb`; see
 [ADR 0021](adr/0021-selectable-database-backends.md) for what each backend has.
@@ -383,98 +385,54 @@ forge generate scaffold post title:string body:text --tenant-scoped --broadcast
   create       config/locales/posts.en.json
   create       tests/posts_http.rs
   create       tests/posts_repository.rs
+  declare      src/domain/entities/mod.rs  (pub mod post;)
+  ...
+  wire         src/bootstrap/routes_gen.rs  (scaffold posts)
 ```
 
 This is `rails g scaffold`: a migration, the entity, a repository port, use
 cases, a PostgreSQL repository, HTML pages with CSRF-protected forms,
-translations, live updates and tests for every layer. After the file list the generator prints
-the wiring (not repeated here).
+translations, live updates and tests for every layer. The `declare` and
+`wire` lines register them: nothing is left to paste.
 
 - `post` is the singular name (`snake_case` or `PascalCase`); fields are
   `name:type` with `type` one of `string`, `text`, `integer`, `boolean`,
   `timestamp`, `uuid`; a trailing `?` (quoted: `'subtitle:string?'`) makes a
   field optional.
 - `--tenant-scoped` binds every query to the signed-in organization (routes
-  live under `/tenants/{tenant_id}/`) and, on PostgreSQL, enforces it again
+  at `/posts`, for the organization signed in to) and, on PostgreSQL, enforces it again
   with row-level security. `--global` is for data every tenant shares.
 - `--broadcast` adds live updates over Server-Sent Events (section 5.2; it
   needs the `FORGE_STREAMS_KEY` setting in production, see [views](views.md)).
   Leave it out for a resource that does not change under the reader.
 - Add `--dry-run` to any generator to list its files without writing them.
 
-### 5.1 Wire it into the application
+### 5.1 Nothing to wire
 
-The wiring has two parts: eight `pub mod` lines, and a block of code at the
-end of `fn compose` in `src/bootstrap/mod.rs`, before its `Ok(())`. First a
-helper for the second part. It takes the code on standard input and inserts it
-at the end of `compose` (or of the function you name; section 9 uses
-`jobs_configure`). Define it once in terminal 2. The generators print the same
-code, and you may paste it into your editor instead:
+The generator declared its modules (the `declare` lines of its output: `pub
+mod post;` in `src/domain/entities/mod.rs` and so on, in sorted order) and
+mounted the routes in `src/bootstrap/routes_gen.rs` (the `wire` line), which
+`compose` calls last. That file belongs to the generators; read it to see the
+code they wrote:
+
+```sh
+cat src/bootstrap/routes_gen.rs
+```
+
+Its `protect` guard grants the `owner` role (the role `setup` gave you) both
+`posts:read` (index, show) and `posts:write` (new, create, edit, update,
+delete); permissions match exactly and every other role is denied. To grant
+another role, declare your own `fn protect` with the same signature in
+`src/bootstrap/mod.rs` and run the generator again
+([generators](generators.md#the-routes-seam)).
+
+Section 9 pastes the registration of a job into `jobs_configure` (the job
+generator prints it, as Forge-Go's does) with this helper; define it once in
+terminal 2. It takes the code on standard input and inserts it at the end of
+`compose` (or of the function you name):
 
 ```sh
 wire() { FN=${1:-compose} W=$(cat) perl -0pi -e 's/(fn $ENV{FN}\(.*?\n)(    Ok\(\(\)\)\n\})/$1$ENV{W}\n$2/s' src/bootstrap/mod.rs; }
-```
-
-The module lines (keeping each file's `mod` lines sorted):
-
-```sh
-echo 'pub mod post;' >> src/domain/entities/mod.rs
-echo 'pub mod post_repository;' >> src/application/ports/mod.rs
-echo 'pub mod posts;' >> src/application/use_cases/mod.rs
-perl -0pi -e 's/\n\nuse forge::tenancy/\n\npub mod posts;\n\nuse forge::tenancy/' src/infrastructure/database/mod.rs
-perl -0pi -e 's/^pub mod authentication;/pub mod access;\npub mod authentication;\npub mod posts;\npub mod streams;/m' src/adapters/http/mod.rs
-perl -0pi -e 's/^pub mod welcome;/pub mod posts;\npub mod welcome;/m' src/adapters/http/views/mod.rs
-```
-
-The composition. It grants the `owner` role (the role `setup` gave you) both
-`posts:read` (index, show) and `posts:write` (new, create, edit, update,
-delete); permissions match exactly and every other role is denied until you
-name it here:
-
-```sh
-wire <<'EOF'
-    // posts: tenant-scoped, under /tenants/{tenant_id}/posts.
-    let mut policy = forge::security::RbacPolicy::new();
-    let owner = forge::security::Role::new("owner").map_err(forge::ComposeError::other)?;
-    for permission in [
-        crate::application::use_cases::posts::READ_PERMISSION,
-        crate::application::use_cases::posts::WRITE_PERMISSION,
-    ] {
-        let permission =
-            forge::security::Permission::new(permission).map_err(forge::ComposeError::other)?;
-        policy.allow(owner.clone(), permission);
-    }
-    let pool = composition.postgres()?.pool().clone();
-    // Sessions end after FORGE_AUTH_SESSION_IDLE_TIMEOUT without a request.
-    let sessions = crate::infrastructure::auth::PostgresSessionStore::new(pool.clone())
-        .with_idle_timeout(
-            forge::auth::SessionIdleTimeout::new(composition.config().auth.session_idle_timeout)
-                .map_err(forge::ComposeError::other)?,
-        );
-    let access = crate::adapters::http::access::SessionTenantAccess::new(
-        std::sync::Arc::new(sessions),
-        std::sync::Arc::new(crate::infrastructure::tenancy::PgMembershipStore::new(pool)),
-        policy,
-    );
-    // Live updates, once for every broadcasting resource. FORGE_STREAMS_KEY
-    // (`openssl rand -base64 32`, the same on every replica) is required in
-    // production.
-    let streams =
-        crate::adapters::http::streams::Streams::register(composition, forge::Fanout::Postgres)?;
-    let posts = crate::application::use_cases::posts::PostService::new(std::sync::Arc::new(
-        crate::infrastructure::database::posts::PgPostRepository::new(
-            composition.postgres()?.clone(),
-        ),
-    ));
-    crate::adapters::http::posts::routes(
-        composition.router(),
-        &site,
-        posts,
-        std::sync::Arc::new(access),
-        &streams,
-    )?;
-EOF
-forge format
 ```
 
 Apply the migration (terminal 2 has the migration URL) and look at the routes.
@@ -490,29 +448,18 @@ forge routes | grep -E 'METHOD|posts'
 ... INFO forge::database::commands: applied migration app="blog" version=1792538664283175633 description="create posts"
 ... INFO forge::database::commands: migrations applied app="blog" count=1
 METHOD  PATH                                          ACTION  SOURCE
-GET     /tenants/{tenant_id}/posts                    -       src/adapters/http/posts.rs:99
-POST    /tenants/{tenant_id}/posts                    -       src/adapters/http/posts.rs:99
-GET     /tenants/{tenant_id}/posts/new                -       src/adapters/http/posts.rs:99
-DELETE  /tenants/{tenant_id}/posts/{id}               -       src/adapters/http/posts.rs:99
-GET     /tenants/{tenant_id}/posts/{id}               -       src/adapters/http/posts.rs:99
-PATCH   /tenants/{tenant_id}/posts/{id}               -       src/adapters/http/posts.rs:99
-PUT     /tenants/{tenant_id}/posts/{id}               -       src/adapters/http/posts.rs:99
-GET     /tenants/{tenant_id}/posts/{id}/edit          -       src/adapters/http/posts.rs:99
-```
-
-Look up your tenant id if you lost it (section 4 printed it):
-
-```sh
-psql "$FORGE_MIGRATION_DATABASE_URL" -Atc "select id from forge_tenants where slug = 'acme'"
-```
-
-```text
-01a15b83-4594-75f5-9685-f9591edbba09
+GET     /posts                                        -       src/adapters/http/posts.rs:99
+POST    /posts                                        -       src/adapters/http/posts.rs:99
+GET     /posts/new                                    -       src/adapters/http/posts.rs:99
+DELETE  /posts/{id}                                   -       src/adapters/http/posts.rs:99
+GET     /posts/{id}                                   -       src/adapters/http/posts.rs:99
+PATCH   /posts/{id}                                   -       src/adapters/http/posts.rs:99
+PUT     /posts/{id}                                   -       src/adapters/http/posts.rs:99
+GET     /posts/{id}/edit                              -       src/adapters/http/posts.rs:99
 ```
 
 Open <http://localhost:3000/session/new?tenant=acme>, sign in as
-`owner@example.com`, then open `http://localhost:3000/tenants/TENANT_ID/posts`
-with your id, click **New post**, fill in a title and a body and save. A blank
+`owner@example.com`, then open `http://localhost:3000/posts`, click **New post**, fill in a title and a body and save. A blank
 title shows the form again with `422` and the message beside the field.
 Signed-out visitors are sent to the sign-in page and back. Use `localhost` or
 `127.0.0.1`: the session cookies are `__Host-` cookies, which browsers accept
@@ -524,21 +471,20 @@ needs the CSRF token from the page it came from):
 
 ```sh
 B=http://localhost:3000 JAR=$(mktemp)
-TENANT_ID=$(psql "$FORGE_MIGRATION_DATABASE_URL" -Atc "select id from forge_tenants where slug = 'acme'")
 token() { sed -n 's/.*name="csrf_token" value="\([^"]*\)".*/\1/p' | head -1; }
 printf 'Owner password: '; read -rs OWNER_PASSWORD; echo   # bash or zsh
 T=$(curl -s -c $JAR -b $JAR "$B/session/new?tenant=acme" | token)
 printf '%s' "$OWNER_PASSWORD" | curl -s -o /dev/null -c $JAR -b $JAR -d "csrf_token=$T" -d tenant=acme -d email=owner@example.com --data-urlencode 'password@-' $B/session
 unset OWNER_PASSWORD
-T=$(curl -s -c $JAR -b $JAR $B/tenants/$TENANT_ID/posts/new | token)
-curl -si -c $JAR -b $JAR -d "csrf_token=$T" --data-urlencode "title=Hello Forge" --data-urlencode "body=My first post" $B/tenants/$TENANT_ID/posts | grep -iE '^(HTTP|location)'
-curl -s -b $JAR $B/tenants/$TENANT_ID/posts | grep '<td>Hello'
+T=$(curl -s -c $JAR -b $JAR $B/posts/new | token)
+curl -si -c $JAR -b $JAR -d "csrf_token=$T" --data-urlencode "title=Hello Forge" --data-urlencode "body=My first post" $B/posts | grep -iE '^(HTTP|location)'
+curl -s -b $JAR $B/posts | grep '<td>Hello'
 rm -f "$JAR"
 ```
 
 ```text
 HTTP/1.1 303 See Other
-location: /tenants/01a15b83-4594-75f5-9685-f9591edbba09/posts/01a15b84-d22d-7468-b872-fe5e744347c4
+location: /posts/01a15b84-d22d-7468-b872-fe5e744347c4
       <td>Hello Forge</td>
 ```
 
@@ -548,7 +494,7 @@ to `/session/mfa` and this script stops there; use the browser.)
 ### 5.2 Live updates
 
 Because the posts were scaffolded with `--broadcast`, the index page
-subscribes to a stream: open `/tenants/TENANT_ID/posts` in two browser windows,
+subscribes to a stream: open `/posts` in two browser windows,
 signed in to the same organization, and create, edit or delete a post in one;
 the other changes without a reload. The server pushes Turbo Streams over
 Server-Sent Events, on a channel whose name is signed (HMAC-SHA256, expiring
@@ -563,22 +509,21 @@ it with `curl -N` and, in another terminal, create a post:
 
 ```sh
 B=http://localhost:3000 JAR=$(mktemp)
-TENANT_ID=$(psql "$FORGE_MIGRATION_DATABASE_URL" -Atc "select id from forge_tenants where slug = 'acme'")
 token() { sed -n 's/.*name="csrf_token" value="\([^"]*\)".*/\1/p' | head -1; }
 printf 'Owner password: '; read -rs OWNER_PASSWORD; echo   # bash or zsh
 T=$(curl -s -c $JAR -b $JAR "$B/session/new?tenant=acme" | token)
 printf '%s' "$OWNER_PASSWORD" | curl -s -o /dev/null -c $JAR -b $JAR -d "csrf_token=$T" -d tenant=acme -d email=owner@example.com --data-urlencode 'password@-' $B/session
 unset OWNER_PASSWORD
-SRC=$(curl -s -b $JAR $B/tenants/$TENANT_ID/posts | sed -n 's/.*<turbo-stream-source src="\([^"]*\)".*/\1/p')
+SRC=$(curl -s -b $JAR $B/posts | sed -n 's/.*<turbo-stream-source src="\([^"]*\)".*/\1/p')
 curl -sN -b $JAR "$B$SRC"        # stays open; Ctrl-C ends it
 ```
 
-In a third terminal, with the same `$B`, `$JAR`, `$TENANT_ID` and `token`
+In a third terminal, with the same `$B`, `$JAR` and `token`
 (run it from the same shell session, or define them again):
 
 ```sh
-T=$(curl -s -c $JAR -b $JAR $B/tenants/$TENANT_ID/posts/new | token)
-curl -s -o /dev/null -c $JAR -b $JAR -d "csrf_token=$T" --data-urlencode "title=Hello Forge" --data-urlencode "body=My first post" $B/tenants/$TENANT_ID/posts
+T=$(curl -s -c $JAR -b $JAR $B/posts/new | token)
+curl -s -o /dev/null -c $JAR -b $JAR -d "csrf_token=$T" --data-urlencode "title=Hello Forge" --data-urlencode "body=My first post" $B/posts
 ```
 
 The first terminal prints the keep-alive and then the change, as the
@@ -592,7 +537,7 @@ data: <turbo-stream action="remove" target="posts_empty"></turbo-stream>
 data: <turbo-stream action="append" target="posts"><template><tr id="post_01a16f17-6a6d-7035-960e-6d14e0042555">
 data:       <td>Hello Forge</td>
 data:       <td>My first post</td>
-data:       <td><a href="/tenants/01a16f13-5299-721e-a22c-3e7da64be2a4/posts/01a16f17-6a6d-7035-960e-6d14e0042555">Show</a> <a href="/tenants/01a16f13-5299-721e-a22c-3e7da64be2a4/posts/01a16f17-6a6d-7035-960e-6d14e0042555/edit">Edit</a></td>
+data:       <td><a href="/posts/01a16f17-6a6d-7035-960e-6d14e0042555">Show</a> <a href="/posts/01a16f17-6a6d-7035-960e-6d14e0042555/edit">Edit</a></td>
 data: </tr></template></turbo-stream>
 data: 
 ```
@@ -649,20 +594,16 @@ forge generate model comment post_id:uuid body:text --tenant-scoped
 ```
 
 These are the scaffold's model files without the pages, the access policy and
-the stream. Declare the four modules it prints, apply the migration and test:
+the stream; the generator declared their four modules. Apply the migration and
+test:
 
 ```sh
-echo 'pub mod comment;' >> src/domain/entities/mod.rs
-echo 'pub mod comment_repository;' >> src/application/ports/mod.rs
-echo 'pub mod comments;' >> src/application/use_cases/mod.rs
-perl -0pi -e 's/\n\npub mod posts;/\n\npub mod comments;\npub mod posts;/' src/infrastructure/database/mod.rs
 forge migrate
 forge test
 ```
 
-The second wiring step it prints builds `CommentService` where you need it (in
-a handler or a job). Rust warns about an unused variable, so do not paste it
-before something uses it. For CRUD pages for comments use
+The output shows how to build `CommentService` where you need it (in a
+handler or a job). For CRUD pages for comments use
 `forge generate scaffold comment ...` instead of the model; a model and a
 scaffold of the same plural collide on purpose.
 
@@ -681,20 +622,9 @@ forge generate controller comments index
   reuse        src/adapters/http/access.rs
 ```
 
-Declare its two modules and paste its route registration, which the generator
-printed with `DenyAll`:
-
-```sh
-perl -0pi -e 's/^pub mod authentication;/pub mod authentication;\npub mod comments_controller;/m' src/adapters/http/mod.rs
-perl -0pi -e 's/^pub mod posts;/pub mod comments_controller;\npub mod posts;/m' src/adapters/http/views/mod.rs
-wire <<'EOF'
-    crate::adapters::http::comments_controller::routes(
-        composition.router(),
-        &site,
-        std::sync::Arc::new(crate::adapters::http::access::DenyAll),
-    )?;
-EOF
-```
+The generator declared its two modules and mounted its route in
+`src/bootstrap/routes_gen.rs` (`wire ... (controller comments)`), with
+`DenyAll`.
 
 Edit the page: the layout and the heading stay, replace the text in
 `templates/comments/index.html`, then check the route, the tests and the
@@ -725,9 +655,9 @@ HTTP/1.1 403 Forbidden
 ```
 
 The `403` is the point: a controller is never public by accident. It stays
-closed until you replace `DenyAll` with your own `GlobalAccess`
-implementation (`src/adapters/http/access.rs` explains it), or generate it
-with `--public` for pages anyone may read. Other actions are other arguments:
+closed until you mount its routes yourself in `compose` with your own
+`GlobalAccess` implementation (`src/adapters/http/access.rs` explains it),
+or generate it with `--public` for pages anyone may read. Other actions are other arguments:
 `forge generate controller reports monthly` is `GET /reports/monthly` guarded
 by `reports:read`, `--api` makes JSON handlers under `/v1`, and controllers
 answer `GET` only; anything that changes data is a scaffold
@@ -807,9 +737,10 @@ grep -n 'PostgresSessionStore::new' src/bootstrap/mod.rs                      # 
 PGOPTIONS='-c lock_timeout=5s' forge migrate   # or: cargo run -- migrate
 ```
 
-Every `PostgresSessionStore` built in `fn compose` must get the timeout, not
-only the sign-in pages' one: each tenant-scoped scaffold's wiring builds its
-own store for `SessionTenantAccess`, and a store left at
+Every `PostgresSessionStore` built in `fn compose` (and in the `protect` guard
+of `src/bootstrap/routes_gen.rs`, which the generators keep current) must get
+the timeout, not only the sign-in pages' one: the scaffold wiring of older
+applications builds its own store for `SessionTenantAccess`, and a store left at
 `PostgresSessionStore::new(pool.clone())` would keep the two-hour default
 whatever `FORGE_AUTH_SESSION_IDLE_TIMEOUT` says. Wiring printed by `forge
 generate scaffold` before the idle timeout becomes:
@@ -1471,9 +1402,11 @@ Review them, or pass --force to remove them anyway
 Without `--dry-run` it removes the files, and with `--force` even edited ones.
 Migrations are history: they stay unless you roll them back first
 (`forge rollback`) and then pass `--migrations`. Destroy never edits
-`src/bootstrap/mod.rs` (it prints the wiring to remove), never removes shared
-files and removes directories only when they become empty. It supports
-`model`, `scaffold`, `controller`, `mailer` and `job`.
+`src/bootstrap/mod.rs`: it takes the module declarations and the routes of
+`src/bootstrap/routes_gen.rs` back out (for a mailer or a job it prints the
+wiring to remove), never removes shared files and removes directories only
+when they become empty. It supports `model`, `resource`, `scaffold`, `view`,
+`controller`, `mailer` and `job`.
 
 ## 15. Where to go next
 

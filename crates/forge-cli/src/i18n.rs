@@ -518,6 +518,7 @@ mod tests {
                         scope: Scope::Tenant,
                         plural: None,
                         broadcast,
+                        public: false,
                         dry_run: false,
                         layers: crate::scaffold::Layers::Scaffold,
                     },

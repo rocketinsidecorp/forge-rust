@@ -215,6 +215,81 @@ pub(crate) fn migration(resource: &Resource, backend: Backend) -> (String, Strin
     Renderer::new(resource, backend, false).migration()
 }
 
+/// The statements of `forge generate migration add_X_to_TABLE` (or, with
+/// `remove`, `remove_X_from_TABLE`): one `ALTER TABLE ... ADD COLUMN` per
+/// field with the generated tables' types, checks and quoting, and `DROP
+/// COLUMN` to revert. Rows that already exist need a value: a required
+/// column defaults to its type's zero value, and a required timestamp or uuid
+/// column, which has none, is refused.
+pub(crate) fn column_migration(
+    table: &str,
+    fields: &[Field],
+    backend: Backend,
+    remove: bool,
+    name: &str,
+) -> Result<(String, String), String> {
+    let resource = Resource {
+        singular: table.to_owned(),
+        plural: table.to_owned(),
+        fields: fields.to_vec(),
+        scope: crate::scaffold::Scope::Global,
+    };
+    let renderer = Renderer::new(&resource, backend, false);
+    let q = |name: &str| backend.quote(name);
+    let mut adds = String::new();
+    let mut drops = String::new();
+    for field in fields {
+        let mut definition = renderer.column(field);
+        if !field.optional {
+            let zero = match (field.kind, backend) {
+                (FieldType::String, _)
+                | (FieldType::Text, Backend::Postgresql | Backend::Sqlite) => "''",
+                // MySQL takes a TEXT default only as an expression.
+                (FieldType::Text, Backend::MySql) => "('')",
+                (FieldType::Integer, _) | (FieldType::Boolean, Backend::Sqlite) => "0",
+                (FieldType::Boolean, _) => "FALSE",
+                (FieldType::Timestamp | FieldType::Uuid, _) => {
+                    let kind = if field.kind == FieldType::Uuid {
+                        "uuid"
+                    } else {
+                        "timestamp"
+                    };
+                    return Err(format!(
+                        "field `{name}`: existing rows need a value, and a required {kind} column \
+                         has no default; declare it optional ({name}:{kind}?) and fill it in a \
+                         later migration",
+                        name = field.name
+                    ));
+                }
+            };
+            // The default goes right after NOT NULL, before any CHECK.
+            definition = definition.replacen(" NOT NULL", &format!(" NOT NULL DEFAULT {zero}"), 1);
+        }
+        let column = definition.trim_start_matches(&q(&field.name)).trim_start();
+        adds.push_str(&format!(
+            "ALTER TABLE {} ADD COLUMN {} {column};\n",
+            q(table),
+            q(&field.name)
+        ));
+        drops.push_str(&format!(
+            "ALTER TABLE {} DROP COLUMN {};\n",
+            q(table),
+            q(&field.name)
+        ));
+    }
+    Ok(if remove {
+        (
+            format!("-- {name}\n{drops}"),
+            format!("-- Reverts {name}: the columns come back, their values do not.\n{adds}"),
+        )
+    } else {
+        (
+            format!("-- {name}\n{adds}"),
+            format!("-- Reverts {name}.\n{drops}"),
+        )
+    })
+}
+
 struct Renderer<'a> {
     resource: &'a Resource,
     backend: Backend,
@@ -286,11 +361,8 @@ impl<'a> Renderer<'a> {
         let type_name = pascal_case(singular);
         let (database, row, row_path, sqlx_database) = self.backend.types();
         let tenant = self.tenant();
-        let collection = if tenant {
-            format!("/tenants/{{tenant_id}}/{plural}")
-        } else {
-            format!("/{plural}")
-        };
+        // Tenant-scoped too: the tenant is the one the session signed in to.
+        let collection = format!("/{plural}");
         let mut core = vec!["Id"];
         if self.has(FieldType::Timestamp) {
             core.push("Timestamp");
@@ -396,7 +468,7 @@ impl<'a> Renderer<'a> {
             (
                 "%%ALLOW_ACCESS%%",
                 if tenant {
-                    "MemberOfRouteTenant"
+                    "MemberOfSessionTenant"
                 } else {
                     "AllowAll"
                 }
@@ -437,6 +509,14 @@ impl<'a> Renderer<'a> {
             ),
             ("%%AUTHORIZE_READ%%", authorize("read")),
             ("%%AUTHORIZE_WRITE%%", authorize("write")),
+            // The new-form page needs the grant, not the context.
+            (
+                "%%AUTHORIZE_WRITE_ONLY%%",
+                "    if let Err(denied) = state.access.authorize(&request, &state.write).await {\n        \
+                 return denied.response();\n    \
+                 }"
+                .to_owned(),
+            ),
             (
                 "%%EXECUTOR%%",
                 if tenant && self.backend == Backend::Postgresql {

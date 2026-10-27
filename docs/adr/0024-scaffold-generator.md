@@ -1,5 +1,13 @@
 # ADR 0024: `forge generate scaffold`: printed wiring and deny-by-default access
 
+> **Update (2026-10-26, D21/D29, [forge-rust#93](https://github.com/rocketinsidecorp/forge-rust/issues/93)).**
+> The printed wiring is superseded: generators declare their modules and
+> mount their routes in the generator-owned `src/bootstrap/routes_gen.rs`
+> ([generators](../generators.md#the-routes-seam)); tenant-scoped pages moved
+> from `/tenants/{tenant_id}/<plural>` to `/<plural>`, for the tenant the
+> session signed in to. Applications without the seam keep the printed
+> wiring. The decision below is kept as it was taken.
+
 - Status: Accepted
 - Date: 2026-10-19
 - Refines: [ADR 0022](0022-server-rendered-views.md) (decision 7), [ADR 0021](0021-selectable-database-backends.md), [ADR 0010](0010-session-and-tenant-authorization-context.md)

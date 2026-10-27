@@ -4,9 +4,10 @@
 //! The scenarios are those of Forge-Go's load generator
 //! (docs/benchmarks.md) with the requests of a generated Forge-Rust
 //! application: the CSRF field is `csrf_token`, the scaffold lives under
-//! `/tenants/{tenant_id}/{collection}`, and sessions are the cookies
-//! `__Host-forge_session` and `__Host-forge_csrf` (set by hand, because they
-//! are `Secure` and the application is on plain HTTP).
+//! `/{collection}` for the tenant the session signed in to, and sessions are
+//! the cookies `__Host-forge_session`, `__Host-forge_csrf` and
+//! `__Host-forge_tenant` (set by hand, because they are `Secure` and the
+//! application is on plain HTTP).
 
 use std::collections::BTreeMap;
 use std::net::{SocketAddr, ToSocketAddrs as _};
@@ -32,6 +33,7 @@ pub const ALL: [&str; 5] = [HEALTH, WELCOME, INDEX_HTML, SHOW_JSON, CREATE_FORM]
 pub const AVAILABLE: [&str; 4] = [HEALTH, WELCOME, INDEX_HTML, CREATE_FORM];
 
 const SESSION_COOKIE: &str = "__Host-forge_session";
+const TENANT_COOKIE: &str = "__Host-forge_tenant";
 const CSRF_COOKIE: &str = "__Host-forge_csrf";
 const CSRF_FIELD: &str = "csrf_token";
 
@@ -157,9 +159,14 @@ impl Target {
         ) else {
             return Err("sign-in set no session and CSRF cookies".to_owned());
         };
-        let cookies = format!("{SESSION_COOKIE}={session}; {CSRF_COOKIE}={csrf}");
+        // The tenant the session signed in to, which tenant-scoped pages use.
+        let tenant = signed_in
+            .set_cookie(TENANT_COOKIE)
+            .unwrap_or_else(|| cfg.tenant_id.clone());
+        let cookies =
+            format!("{SESSION_COOKIE}={session}; {CSRF_COOKIE}={csrf}; {TENANT_COOKIE}={tenant}");
 
-        let collection = format!("/tenants/{}/{}", cfg.tenant_id, cfg.collection);
+        let collection = format!("/{}", cfg.collection);
         let create = Request::new(
             &host,
             "POST",

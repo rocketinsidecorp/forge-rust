@@ -1,131 +1,369 @@
 
-Forge did not edit any existing file. Wire the resource by hand:
+  Every route asks the access policy for `events:read` or `events:write`
+  first; src/adapters/http/access.rs explains the deny-by-default choice for the
+  pages, src/adapters/http/api_access.rs for the JSON API under /v1/events.
+  The JSON API at /v1/events takes the session cookie of the sign-in pages;
+  changes send its CSRF token (the __Host-forge_csrf cookie) in X-CSRF-Token.
+  Live updates: create, update and delete publish to the `events` channel of the tenant, and
+  the index page subscribes; a stream is served only to callers the same policy
+  grants `events:read` (src/adapters/http/streams.rs).
+  Permissions match exactly: index and show need `events:read`, new, create,
+  edit, update and delete need `events:write`, which the `owner` role has.
+  Signed-out browsers are sent to /session/new (the sign-in pages of `forge new`
+  or `forge generate authentication`); the pages use the tenant of the session.
 
-  1. Declare the new modules (each in the listed file, keeping `mod` lines sorted):
+  Then: forge migrate, and forge dev (or forge test).
 
-       src/domain/entities/mod.rs             pub mod event;
-       src/application/ports/mod.rs           pub mod event_repository;
-       src/application/use_cases/mod.rs       pub mod events;
-       src/infrastructure/database/mod.rs     pub mod events;
-       src/adapters/http/mod.rs               pub mod access;
-       src/adapters/http/mod.rs               pub mod api_access;
-       src/adapters/http/mod.rs               pub mod streams;
-       src/adapters/http/mod.rs               pub mod events;
-       src/adapters/http/mod.rs               pub mod events_api;
-       src/adapters/http/views/mod.rs         pub mod events;
+declare src/domain/entities/mod.rs (pub mod event;)
+//! Entities: domain objects with identity and invariants.
 
-  2. In src/bootstrap/mod.rs, at the end of `fn compose`, before `Ok(())`:
+pub mod event;
 
-    // events: tenant-scoped, under /tenants/{tenant_id}/events. RBAC denies
-    // every role `policy` does not name: the `owner` role (`setup` gives it to
-    // the first member) may read and write; grant other tenant roles here.
-    let mut policy = forge::security::RbacPolicy::new();
-    let owner = forge::security::Role::new("owner").map_err(forge::ComposeError::other)?;
-    for permission in [
-        crate::application::use_cases::events::READ_PERMISSION,
-        crate::application::use_cases::events::WRITE_PERMISSION,
-    ] {
-        let permission =
-            forge::security::Permission::new(permission).map_err(forge::ComposeError::other)?;
-        policy.allow(owner.clone(), permission);
+declare src/application/ports/mod.rs (pub mod event_repository;)
+//! Ports: traits implemented by adapters and infrastructure.
+
+pub mod event_repository;
+
+declare src/application/use_cases/mod.rs (pub mod events;)
+//! Use cases: orchestration and transaction boundaries.
+
+pub mod events;
+
+declare src/infrastructure/database/mod.rs (pub mod events;)
+//! PostgreSQL infrastructure: least-privilege tenant transaction setup.
+
+pub mod events;
+
+use forge::tenancy::TenantContext;
+use sqlx::{PgPool, Postgres, Transaction};
+
+/// Starts a PostgreSQL transaction and installs tenant/principal settings only
+/// for that transaction.
+///
+/// RLS policies should read these values with current_setting(..., true). The
+/// third set_config argument is true, so pooled connections do not retain tenant
+/// identity after commit/rollback.
+pub async fn begin_tenant_transaction<'a>(
+    pool: &'a PgPool,
+    context: &TenantContext,
+) -> Result<Transaction<'a, Postgres>, sqlx::Error> {
+    let mut transaction = pool.begin().await?;
+
+    sqlx::query(
+        "SELECT set_config('forge.tenant_id', $1, true), \
+         set_config('forge.principal_id', $2, true)",
+    )
+    .bind(context.tenant_id().to_string())
+    .bind(context.principal_id().to_string())
+    .execute(&mut *transaction)
+    .await?;
+
+    Ok(transaction)
+}
+
+declare src/adapters/http/mod.rs (pub mod access; pub mod api_access; pub mod streams; pub mod events; pub mod events_api;)
+//! HTTP adapter. Handlers stay thin: decode the request, call a use case and
+//! map the result to a response, usually an HTML page rendered from a view
+//! model in `views` (or a `303` redirect after a form submission).
+
+pub mod access;
+pub mod api_access;
+pub mod authentication;
+pub mod events;
+pub mod events_api;
+pub mod status;
+pub mod streams;
+pub mod views;
+
+use std::sync::Arc;
+
+use forge::ComposeError;
+use forge::http::{Method, Request, Response, Router};
+use forge::i18n::Translator;
+
+use self::views::{Site, welcome::WelcomeIndex};
+
+/// Whether the welcome page links to the sign-in pages.
+const SIGN_IN: bool = true;
+
+/// Loads the site and registers the digested assets and the request layers
+/// every HTML page relies on (the request's locale, Content-Security-Policy,
+/// CSRF protection with the `_method` override, flash messages). Every page
+/// renders its layout from the returned site; `translator` is
+/// `views::locales::translator(config)`.
+pub fn site(router: &mut Router, translator: Translator) -> Result<Arc<Site>, ComposeError> {
+    let site = Arc::new(Site::load(translator)?);
+    site.register(router).map_err(ComposeError::other)?;
+    Ok(site)
+}
+
+/// Registers the application's routes. Forge adds `/health`, `/health/live`
+/// and `/health/ready` itself.
+pub fn routes(router: &mut Router, site: &Arc<Site>) -> Result<(), ComposeError> {
+    let index_site = Arc::clone(site);
+    router.route(Method::GET, "/", move |request: Request| {
+        let site = Arc::clone(&index_site);
+        async move { index(&site, &request) }
+    })?;
+    status::routes(router)?;
+    Ok(())
+}
+
+fn index(site: &Site, request: &Request) -> Response {
+    forge::web::html(&WelcomeIndex {
+        layout: site.layout(request),
+        logo: site.logo(),
+        application: env!("CARGO_PKG_NAME"),
+        sign_in: SIGN_IN,
+    })
+}
+
+declare src/adapters/http/views/mod.rs (pub mod events;)
+//! Server-rendered views (ADR 0022). A view model is a plain struct checked
+//! against its template in `templates/` at compile time by Askama; every
+//! `{{ value }}` is HTML-escaped unless the template opts out with `|safe`.
+//!
+//! [`Site`] configures the asset pipeline (the counterpart of Rails'
+//! `config/importmap.rb` and stylesheet tags) and the request's locale, and
+//! [`Layout`] is what every page hands to `templates/layouts/application.html`.
+//! Templates translate with `layout.i18n.t(KEY)` (see `locales`).
+
+pub mod authentication;
+pub mod events;
+pub mod locales;
+pub mod welcome;
+
+use std::error::Error;
+use std::sync::Arc;
+
+use forge::http::{Request, Router};
+use forge::i18n::Translator;
+use forge::views::{
+    AssetError, AssetSet, ContentSecurityPolicy, CsrfProtection, Flash, FlashLayer, I18n,
+    ImportMap, LocaleNegotiation, csrf_meta, csrf_token, flash, vendor,
+};
+
+// `FORGE_ASSETS`: every file under assets/, digested and embedded by build.rs.
+include!(concat!(env!("OUT_DIR"), "/forge_assets.rs"));
+
+/// Digested assets, the import map, the Content-Security-Policy and the
+/// translations shared by every page, built once at startup.
+#[derive(Debug)]
+pub struct Site {
+    translator: Arc<Translator>,
+    assets: AssetSet,
+    import_map: ImportMap,
+    policy: ContentSecurityPolicy,
+    stylesheet: String,
+    javascript: String,
+    logo: String,
+}
+
+impl Site {
+    /// Validates the embedded assets (the application's and the vendored
+    /// Turbo and Stimulus modules) and pins the JavaScript modules; pages
+    /// are translated with `translator` (`locales::translator`).
+    pub fn load(translator: Translator) -> Result<Self, Box<dyn Error + Send + Sync>> {
+        let assets = AssetSet::from_tables(&[FORGE_ASSETS, vendor::HOTWIRE_ASSETS])?;
+        // Bare specifiers that `import` statements in assets/*.js may use.
+        let import_map = ImportMap::builder()
+            .pin("@hotwired/turbo", vendor::TURBO_ASSET)
+            .pin("@hotwired/stimulus", vendor::STIMULUS_ASSET)
+            .build(&assets)?;
+        // Same-origin resources only; the import map is the one inline
+        // script, allowed by its hash.
+        let policy = ContentSecurityPolicy::strict().with_import_map(&import_map);
+        let stylesheet = asset_path(&assets, "application.css")?;
+        let javascript = asset_path(&assets, "application.js")?;
+        let logo = asset_path(&assets, "forge-rust-logo.png")?;
+        Ok(Self {
+            translator: Arc::new(translator),
+            assets,
+            import_map,
+            policy,
+            stylesheet,
+            javascript,
+            logo,
+        })
     }
-    let pool = composition.postgres()?.pool().clone();
-    // Sessions end after FORGE_AUTH_SESSION_IDLE_TIMEOUT without a request.
-    let sessions = crate::infrastructure::auth::PostgresSessionStore::new(pool.clone())
-        .with_idle_timeout(
-            forge::auth::SessionIdleTimeout::new(composition.config().auth.session_idle_timeout)
-                .map_err(forge::ComposeError::other)?,
-        );
-    let access = crate::adapters::http::access::SessionTenantAccess::new(
-        std::sync::Arc::new(sessions),
-        std::sync::Arc::new(crate::infrastructure::tenancy::PgMembershipStore::new(pool)),
-        policy,
-    );
+
+    /// Digested URL of `assets/forge-rust-logo.png`, shown by the welcome page.
+    pub fn logo(&self) -> &str {
+        &self.logo
+    }
+
+    /// Registers one route per digested asset and the request layers, from
+    /// the outermost: the request's locale (the `locale` cookie, then
+    /// `Accept-Language`, then the default; translated responses get
+    /// `Content-Language`), the Content-Security-Policy on every response,
+    /// CSRF protection for every unsafe request (it also applies the
+    /// `_method` override of HTML forms before routing) and flash messages.
+    pub fn register(&self, router: &mut Router) -> Result<(), AssetError> {
+        self.assets.register(router)?;
+        router
+            .layer(LocaleNegotiation::new(Arc::clone(&self.translator)))
+            .layer(self.policy.clone())
+            .layer(CsrfProtection::new())
+            .layer(FlashLayer::new());
+        Ok(())
+    }
+
+    /// The request's locale and the translator (`i18n.t(KEY).text()` in
+    /// handlers). Without the locale layer, the default locale.
+    pub fn i18n(&self, request: &Request) -> I18n {
+        I18n::from_request(request).unwrap_or_else(|| self.default_i18n())
+    }
+
+    /// The default locale, for what is rendered without a request: live
+    /// updates reach every subscriber in it (as Rails' broadcasts do).
+    pub fn default_i18n(&self) -> I18n {
+        I18n::new(
+            Arc::clone(&self.translator),
+            self.translator.default_locale(),
+        )
+    }
+
+    /// The layout data of a page rendered for `request`. Reading it consumes
+    /// the flash and issues the CSRF token the page's forms carry.
+    pub fn layout(&self, request: &Request) -> Layout<'_> {
+        Layout {
+            i18n: self.i18n(request),
+            csrf_meta: csrf_token(request).map(|token| csrf_meta(&token)),
+            flash: flash(request),
+            import_map: self.import_map.script_tag(),
+            stylesheet: &self.stylesheet,
+            javascript: &self.javascript,
+        }
+    }
+}
+
+fn asset_path(assets: &AssetSet, logical: &str) -> Result<String, Box<dyn Error + Send + Sync>> {
+    match assets.path(logical) {
+        Some(path) => Ok(path.to_owned()),
+        None => Err(format!("assets/{logical} is missing").into()),
+    }
+}
+
+/// What `templates/layouts/application.html` renders around every page;
+/// each page sets the document title in its `title` block.
+pub struct Layout<'a> {
+    /// The request's locale: `t`, `l`, `number` and `locale` in templates.
+    pub i18n: I18n,
+    /// `<meta name="csrf-token">` for Turbo and `fetch`. `None` only when
+    /// CSRF protection is not installed, and then every form is refused.
+    pub csrf_meta: Option<String>,
+    /// The one-shot notice/alert set by the previous response.
+    pub flash: Flash,
+    /// The `<script type="importmap">` element (allowed by hash in the CSP).
+    pub import_map: &'a str,
+    /// Digested URL of `assets/application.css`.
+    pub stylesheet: &'a str,
+    /// Digested URL of `assets/application.js`.
+    pub javascript: &'a str,
+}
+
+wire src/bootstrap/routes_gen.rs (scaffold events)
+// forge:checksum c5b87706a65b14a89e34c9a2ef90db92350fb77495f9ac41cb198bd98f6417fe
+//! Routes the generators mount. `forge generate scaffold`, `forge generate
+//! resource` and `forge generate controller` write this file, and `forge
+//! destroy` takes their blocks back out; each block starts with a `forge:`
+//! comment. Do not edit it: the generators refuse to change it once its
+//! checksum no longer matches. Mount your own routes in `compose`
+//! (src/bootstrap/mod.rs), which calls this function once.
+
+// A guard the application declares itself (a `fn protect` in
+// src/bootstrap/mod.rs) replaces the generated one below, which the
+// generators then leave out. Declaring one while the generated one is still
+// here makes the name ambiguous, a compile error rather than a guard silently
+// ignored: run the generator again.
+#[allow(unused_imports)]
+use super::*;
+use guards::*;
+
+/// Mounts the routes of the generated resources and controllers.
+pub(super) fn generated_routes(
+    composition: &mut forge::Composition<'_>,
+    site: &std::sync::Arc<crate::adapters::http::views::Site>,
+) -> Result<(), forge::ComposeError> {
+    // forge:streams streams
     // Live updates (--broadcast), once for every broadcasting resource. On
     // PostgreSQL every replica hears every change (LISTEN/NOTIFY); production
     // needs FORGE_STREAMS_KEY (`openssl rand -base64 32`, the same everywhere).
     let streams =
         crate::adapters::http::streams::Streams::register(composition, forge::Fanout::Postgres)?;
-    let events = crate::application::use_cases::events::EventService::new(std::sync::Arc::new(
-        crate::infrastructure::database::events::PgEventRepository::new(
-            composition.postgres()?.clone(),
-        ),
-    ));
-    crate::adapters::http::events::routes(
-        composition.router(),
-        &site,
-        events.clone(),
-        std::sync::Arc::new(access),
-        &streams,
-    )?;
-    // events JSON API (/v1/events): tenant-scoped, for bearer tokens. This
-    // application issues none yet, so DenyAll refuses every request: run
-    // `forge generate authentication --api-auth`, then pass BearerTenantAccess
-    // (src/adapters/http/api_access.rs) here.
-    crate::adapters::http::events_api::routes(
-        composition.router(),
-        events,
-        std::sync::Arc::new(crate::adapters::http::api_access::DenyAll),
-    )?;
+    // forge:scaffold events
+    {
+        // events: tenant-scoped, at /events of the tenant the session signed in to,
+        // for roles granted these permissions (the guard grants the owner role).
+        let access = protect(
+            composition,
+            &[
+                crate::application::use_cases::events::READ_PERMISSION,
+                crate::application::use_cases::events::WRITE_PERMISSION,
+            ],
+        )?;
+        let events = crate::application::use_cases::events::EventService::new(std::sync::Arc::new(
+            crate::infrastructure::database::events::PgEventRepository::new(
+                composition.postgres()?.clone(),
+            ),
+        ));
+        crate::adapters::http::events::routes(
+            composition.router(),
+            site,
+            events.clone(),
+            access.clone(),
+            &streams,
+        )?;
+        // events JSON API (/v1/events): the same session cookie and policy as the
+        // pages; changes send the session's CSRF token in X-CSRF-Token.
+        crate::adapters::http::events_api::routes(composition.router(), events, access)?;
+    }
+    Ok(())
+}
 
-  Every route asks the access policy for `events:read` or `events:write`
-  first; src/adapters/http/access.rs explains the deny-by-default choice for the
-  pages, src/adapters/http/api_access.rs for the JSON API under /v1/events.
-  Live updates: create, update and delete publish to the `events` channel of the tenant, and
-  the index page subscribes; a stream is served only to callers the same policy
-  grants `events:read` (src/adapters/http/streams.rs).
-  Permissions match exactly: index and show need `events:read`, new, create,
-  edit, update and delete need `events:write`. Signed-out browsers are sent
-  to /session/new (the sign-in pages of `forge new` or
-  `forge generate authentication`). To allow a read-only tenant role, add after
-  `let mut policy`, for example:
-
-    let viewer = forge::security::Role::new("viewer").map_err(forge::ComposeError::other)?;
-    let read =
-        forge::security::Permission::new(crate::application::use_cases::events::READ_PERMISSION)
-            .map_err(forge::ComposeError::other)?;
-    policy.allow(viewer, read);
-
-  Then apply the migration (`cargo run -- migrate` with FORGE_MIGRATION_DATABASE_URL)
-  and run `cargo test` (repository tests on a database server need
-  `cargo test -- --include-ignored` and FORGE_TEST_* URLs, see docs/database.md).
-
-Forge did not edit any existing file. Wire the resource by hand:
-
-  1. Declare the new modules (each in the listed file, keeping `mod` lines sorted):
-
-       src/domain/entities/mod.rs             pub mod post;
-       src/application/ports/mod.rs           pub mod post_repository;
-       src/application/use_cases/mod.rs       pub mod posts;
-       src/infrastructure/database/mod.rs     pub mod posts;
-       src/adapters/http/mod.rs               pub mod posts;
-       src/adapters/http/mod.rs               pub mod posts_api;
-       src/adapters/http/views/mod.rs         pub mod posts;
-
-  2. In src/bootstrap/mod.rs, at the end of `fn compose`, before `Ok(())`:
-
-    // posts: global. DenyAll refuses every request until you decide who may
-    // use them: implement GlobalAccess (src/adapters/http/access.rs).
-    let posts = crate::application::use_cases::posts::PostService::new(std::sync::Arc::new(
-        crate::infrastructure::database::posts::PgPostRepository::new(
-            composition.postgres()?.clone(),
-        ),
-    ));
-    crate::adapters::http::posts::routes(
-        composition.router(),
-        &site,
-        posts.clone(),
-        std::sync::Arc::new(crate::adapters::http::access::DenyAll),
-        &streams,
-    )?;
-    // posts JSON API (/v1/posts): global. DenyAll refuses every request until
-    // you decide who may use it: implement ApiGlobalAccess
-    // (src/adapters/http/api_access.rs).
-    crate::adapters::http::posts_api::routes(
-        composition.router(),
-        posts,
-        std::sync::Arc::new(crate::adapters::http::api_access::DenyAll),
-    )?;
+/// The guards of the generated routes.
+mod guards {
+    // forge:guard protect
+    /// The guard of tenant-scoped routes: sign-in, the CSRF token on changes, a
+    /// membership in the session's tenant, and the `owner` role (`forge setup`)
+    /// granted `permissions`. Declare `fn protect` with this signature in
+    /// src/bootstrap/mod.rs to grant other roles; the generators then use yours.
+    pub(super) fn protect(
+        composition: &mut forge::Composition<'_>,
+        permissions: &[&str],
+    ) -> Result<
+        std::sync::Arc<
+            impl crate::adapters::http::access::TenantAccess
+            + crate::adapters::http::api_access::ApiTenantAccess
+            + 'static,
+        >,
+        forge::ComposeError,
+    > {
+        let mut policy = forge::security::RbacPolicy::new();
+        let owner = forge::security::Role::new("owner").map_err(forge::ComposeError::other)?;
+        for permission in permissions {
+            let permission = forge::security::Permission::new(*permission)
+                .map_err(forge::ComposeError::other)?;
+            policy.allow(owner.clone(), permission);
+        }
+        let pool = composition.postgres()?.pool().clone();
+        // Sessions end after FORGE_AUTH_SESSION_IDLE_TIMEOUT without a request.
+        let sessions = crate::infrastructure::auth::PostgresSessionStore::new(pool.clone())
+            .with_idle_timeout(
+                forge::auth::SessionIdleTimeout::new(
+                    composition.config().auth.session_idle_timeout,
+                )
+                .map_err(forge::ComposeError::other)?,
+            );
+        Ok(std::sync::Arc::new(
+            crate::adapters::http::access::SessionTenantAccess::new(
+                std::sync::Arc::new(sessions),
+                std::sync::Arc::new(crate::infrastructure::tenancy::PgMembershipStore::new(pool)),
+                policy,
+            ),
+        ))
+    }
+}
 
   Every route asks the access policy for `posts:read` or `posts:write`
   first; src/adapters/http/access.rs explains the deny-by-default choice for the
@@ -134,6 +372,387 @@ Forge did not edit any existing file. Wire the resource by hand:
   the index page subscribes; a stream is served only to callers the same policy
   grants `posts:read` (src/adapters/http/streams.rs).
 
-  Then apply the migration (`cargo run -- migrate` with FORGE_MIGRATION_DATABASE_URL)
-  and run `cargo test` (repository tests on a database server need
-  `cargo test -- --include-ignored` and FORGE_TEST_* URLs, see docs/database.md).
+  Then: forge migrate, and forge dev (or forge test).
+
+declare src/domain/entities/mod.rs (pub mod post;)
+//! Entities: domain objects with identity and invariants.
+
+pub mod event;
+pub mod post;
+
+declare src/application/ports/mod.rs (pub mod post_repository;)
+//! Ports: traits implemented by adapters and infrastructure.
+
+pub mod event_repository;
+pub mod post_repository;
+
+declare src/application/use_cases/mod.rs (pub mod posts;)
+//! Use cases: orchestration and transaction boundaries.
+
+pub mod events;
+pub mod posts;
+
+declare src/infrastructure/database/mod.rs (pub mod posts;)
+//! PostgreSQL infrastructure: least-privilege tenant transaction setup.
+
+pub mod events;
+pub mod posts;
+
+use forge::tenancy::TenantContext;
+use sqlx::{PgPool, Postgres, Transaction};
+
+/// Starts a PostgreSQL transaction and installs tenant/principal settings only
+/// for that transaction.
+///
+/// RLS policies should read these values with current_setting(..., true). The
+/// third set_config argument is true, so pooled connections do not retain tenant
+/// identity after commit/rollback.
+pub async fn begin_tenant_transaction<'a>(
+    pool: &'a PgPool,
+    context: &TenantContext,
+) -> Result<Transaction<'a, Postgres>, sqlx::Error> {
+    let mut transaction = pool.begin().await?;
+
+    sqlx::query(
+        "SELECT set_config('forge.tenant_id', $1, true), \
+         set_config('forge.principal_id', $2, true)",
+    )
+    .bind(context.tenant_id().to_string())
+    .bind(context.principal_id().to_string())
+    .execute(&mut *transaction)
+    .await?;
+
+    Ok(transaction)
+}
+
+declare src/adapters/http/mod.rs (pub mod posts; pub mod posts_api;)
+//! HTTP adapter. Handlers stay thin: decode the request, call a use case and
+//! map the result to a response, usually an HTML page rendered from a view
+//! model in `views` (or a `303` redirect after a form submission).
+
+pub mod access;
+pub mod api_access;
+pub mod authentication;
+pub mod events;
+pub mod events_api;
+pub mod posts;
+pub mod posts_api;
+pub mod status;
+pub mod streams;
+pub mod views;
+
+use std::sync::Arc;
+
+use forge::ComposeError;
+use forge::http::{Method, Request, Response, Router};
+use forge::i18n::Translator;
+
+use self::views::{Site, welcome::WelcomeIndex};
+
+/// Whether the welcome page links to the sign-in pages.
+const SIGN_IN: bool = true;
+
+/// Loads the site and registers the digested assets and the request layers
+/// every HTML page relies on (the request's locale, Content-Security-Policy,
+/// CSRF protection with the `_method` override, flash messages). Every page
+/// renders its layout from the returned site; `translator` is
+/// `views::locales::translator(config)`.
+pub fn site(router: &mut Router, translator: Translator) -> Result<Arc<Site>, ComposeError> {
+    let site = Arc::new(Site::load(translator)?);
+    site.register(router).map_err(ComposeError::other)?;
+    Ok(site)
+}
+
+/// Registers the application's routes. Forge adds `/health`, `/health/live`
+/// and `/health/ready` itself.
+pub fn routes(router: &mut Router, site: &Arc<Site>) -> Result<(), ComposeError> {
+    let index_site = Arc::clone(site);
+    router.route(Method::GET, "/", move |request: Request| {
+        let site = Arc::clone(&index_site);
+        async move { index(&site, &request) }
+    })?;
+    status::routes(router)?;
+    Ok(())
+}
+
+fn index(site: &Site, request: &Request) -> Response {
+    forge::web::html(&WelcomeIndex {
+        layout: site.layout(request),
+        logo: site.logo(),
+        application: env!("CARGO_PKG_NAME"),
+        sign_in: SIGN_IN,
+    })
+}
+
+declare src/adapters/http/views/mod.rs (pub mod posts;)
+//! Server-rendered views (ADR 0022). A view model is a plain struct checked
+//! against its template in `templates/` at compile time by Askama; every
+//! `{{ value }}` is HTML-escaped unless the template opts out with `|safe`.
+//!
+//! [`Site`] configures the asset pipeline (the counterpart of Rails'
+//! `config/importmap.rb` and stylesheet tags) and the request's locale, and
+//! [`Layout`] is what every page hands to `templates/layouts/application.html`.
+//! Templates translate with `layout.i18n.t(KEY)` (see `locales`).
+
+pub mod authentication;
+pub mod events;
+pub mod locales;
+pub mod posts;
+pub mod welcome;
+
+use std::error::Error;
+use std::sync::Arc;
+
+use forge::http::{Request, Router};
+use forge::i18n::Translator;
+use forge::views::{
+    AssetError, AssetSet, ContentSecurityPolicy, CsrfProtection, Flash, FlashLayer, I18n,
+    ImportMap, LocaleNegotiation, csrf_meta, csrf_token, flash, vendor,
+};
+
+// `FORGE_ASSETS`: every file under assets/, digested and embedded by build.rs.
+include!(concat!(env!("OUT_DIR"), "/forge_assets.rs"));
+
+/// Digested assets, the import map, the Content-Security-Policy and the
+/// translations shared by every page, built once at startup.
+#[derive(Debug)]
+pub struct Site {
+    translator: Arc<Translator>,
+    assets: AssetSet,
+    import_map: ImportMap,
+    policy: ContentSecurityPolicy,
+    stylesheet: String,
+    javascript: String,
+    logo: String,
+}
+
+impl Site {
+    /// Validates the embedded assets (the application's and the vendored
+    /// Turbo and Stimulus modules) and pins the JavaScript modules; pages
+    /// are translated with `translator` (`locales::translator`).
+    pub fn load(translator: Translator) -> Result<Self, Box<dyn Error + Send + Sync>> {
+        let assets = AssetSet::from_tables(&[FORGE_ASSETS, vendor::HOTWIRE_ASSETS])?;
+        // Bare specifiers that `import` statements in assets/*.js may use.
+        let import_map = ImportMap::builder()
+            .pin("@hotwired/turbo", vendor::TURBO_ASSET)
+            .pin("@hotwired/stimulus", vendor::STIMULUS_ASSET)
+            .build(&assets)?;
+        // Same-origin resources only; the import map is the one inline
+        // script, allowed by its hash.
+        let policy = ContentSecurityPolicy::strict().with_import_map(&import_map);
+        let stylesheet = asset_path(&assets, "application.css")?;
+        let javascript = asset_path(&assets, "application.js")?;
+        let logo = asset_path(&assets, "forge-rust-logo.png")?;
+        Ok(Self {
+            translator: Arc::new(translator),
+            assets,
+            import_map,
+            policy,
+            stylesheet,
+            javascript,
+            logo,
+        })
+    }
+
+    /// Digested URL of `assets/forge-rust-logo.png`, shown by the welcome page.
+    pub fn logo(&self) -> &str {
+        &self.logo
+    }
+
+    /// Registers one route per digested asset and the request layers, from
+    /// the outermost: the request's locale (the `locale` cookie, then
+    /// `Accept-Language`, then the default; translated responses get
+    /// `Content-Language`), the Content-Security-Policy on every response,
+    /// CSRF protection for every unsafe request (it also applies the
+    /// `_method` override of HTML forms before routing) and flash messages.
+    pub fn register(&self, router: &mut Router) -> Result<(), AssetError> {
+        self.assets.register(router)?;
+        router
+            .layer(LocaleNegotiation::new(Arc::clone(&self.translator)))
+            .layer(self.policy.clone())
+            .layer(CsrfProtection::new())
+            .layer(FlashLayer::new());
+        Ok(())
+    }
+
+    /// The request's locale and the translator (`i18n.t(KEY).text()` in
+    /// handlers). Without the locale layer, the default locale.
+    pub fn i18n(&self, request: &Request) -> I18n {
+        I18n::from_request(request).unwrap_or_else(|| self.default_i18n())
+    }
+
+    /// The default locale, for what is rendered without a request: live
+    /// updates reach every subscriber in it (as Rails' broadcasts do).
+    pub fn default_i18n(&self) -> I18n {
+        I18n::new(
+            Arc::clone(&self.translator),
+            self.translator.default_locale(),
+        )
+    }
+
+    /// The layout data of a page rendered for `request`. Reading it consumes
+    /// the flash and issues the CSRF token the page's forms carry.
+    pub fn layout(&self, request: &Request) -> Layout<'_> {
+        Layout {
+            i18n: self.i18n(request),
+            csrf_meta: csrf_token(request).map(|token| csrf_meta(&token)),
+            flash: flash(request),
+            import_map: self.import_map.script_tag(),
+            stylesheet: &self.stylesheet,
+            javascript: &self.javascript,
+        }
+    }
+}
+
+fn asset_path(assets: &AssetSet, logical: &str) -> Result<String, Box<dyn Error + Send + Sync>> {
+    match assets.path(logical) {
+        Some(path) => Ok(path.to_owned()),
+        None => Err(format!("assets/{logical} is missing").into()),
+    }
+}
+
+/// What `templates/layouts/application.html` renders around every page;
+/// each page sets the document title in its `title` block.
+pub struct Layout<'a> {
+    /// The request's locale: `t`, `l`, `number` and `locale` in templates.
+    pub i18n: I18n,
+    /// `<meta name="csrf-token">` for Turbo and `fetch`. `None` only when
+    /// CSRF protection is not installed, and then every form is refused.
+    pub csrf_meta: Option<String>,
+    /// The one-shot notice/alert set by the previous response.
+    pub flash: Flash,
+    /// The `<script type="importmap">` element (allowed by hash in the CSP).
+    pub import_map: &'a str,
+    /// Digested URL of `assets/application.css`.
+    pub stylesheet: &'a str,
+    /// Digested URL of `assets/application.js`.
+    pub javascript: &'a str,
+}
+
+wire src/bootstrap/routes_gen.rs (scaffold posts)
+// forge:checksum 9088a3b7657ec3ccad881889fb10c669c49fc297dd583f002625e99610747ecd
+//! Routes the generators mount. `forge generate scaffold`, `forge generate
+//! resource` and `forge generate controller` write this file, and `forge
+//! destroy` takes their blocks back out; each block starts with a `forge:`
+//! comment. Do not edit it: the generators refuse to change it once its
+//! checksum no longer matches. Mount your own routes in `compose`
+//! (src/bootstrap/mod.rs), which calls this function once.
+
+// A guard the application declares itself (a `fn protect` in
+// src/bootstrap/mod.rs) replaces the generated one below, which the
+// generators then leave out. Declaring one while the generated one is still
+// here makes the name ambiguous, a compile error rather than a guard silently
+// ignored: run the generator again.
+#[allow(unused_imports)]
+use super::*;
+use guards::*;
+
+/// Mounts the routes of the generated resources and controllers.
+pub(super) fn generated_routes(
+    composition: &mut forge::Composition<'_>,
+    site: &std::sync::Arc<crate::adapters::http::views::Site>,
+) -> Result<(), forge::ComposeError> {
+    // forge:streams streams
+    // Live updates (--broadcast), once for every broadcasting resource. On
+    // PostgreSQL every replica hears every change (LISTEN/NOTIFY); production
+    // needs FORGE_STREAMS_KEY (`openssl rand -base64 32`, the same everywhere).
+    let streams =
+        crate::adapters::http::streams::Streams::register(composition, forge::Fanout::Postgres)?;
+    // forge:scaffold events
+    {
+        // events: tenant-scoped, at /events of the tenant the session signed in to,
+        // for roles granted these permissions (the guard grants the owner role).
+        let access = protect(
+            composition,
+            &[
+                crate::application::use_cases::events::READ_PERMISSION,
+                crate::application::use_cases::events::WRITE_PERMISSION,
+            ],
+        )?;
+        let events = crate::application::use_cases::events::EventService::new(std::sync::Arc::new(
+            crate::infrastructure::database::events::PgEventRepository::new(
+                composition.postgres()?.clone(),
+            ),
+        ));
+        crate::adapters::http::events::routes(
+            composition.router(),
+            site,
+            events.clone(),
+            access.clone(),
+            &streams,
+        )?;
+        // events JSON API (/v1/events): the same session cookie and policy as the
+        // pages; changes send the session's CSRF token in X-CSRF-Token.
+        crate::adapters::http::events_api::routes(composition.router(), events, access)?;
+    }
+    // forge:scaffold posts
+    {
+        // posts: global. DenyAll refuses every request until you decide who may
+        // use them: implement GlobalAccess (src/adapters/http/access.rs).
+        let posts = crate::application::use_cases::posts::PostService::new(std::sync::Arc::new(
+            crate::infrastructure::database::posts::PgPostRepository::new(
+                composition.postgres()?.clone(),
+            ),
+        ));
+        crate::adapters::http::posts::routes(
+            composition.router(),
+            site,
+            posts.clone(),
+            std::sync::Arc::new(crate::adapters::http::access::DenyAll),
+            &streams,
+        )?;
+        // posts JSON API (/v1/posts): global. DenyAll refuses every request until
+        // you decide who may use it: implement ApiGlobalAccess
+        // (src/adapters/http/api_access.rs).
+        crate::adapters::http::posts_api::routes(
+            composition.router(),
+            posts,
+            std::sync::Arc::new(crate::adapters::http::api_access::DenyAll),
+        )?;
+    }
+    Ok(())
+}
+
+/// The guards of the generated routes.
+mod guards {
+    // forge:guard protect
+    /// The guard of tenant-scoped routes: sign-in, the CSRF token on changes, a
+    /// membership in the session's tenant, and the `owner` role (`forge setup`)
+    /// granted `permissions`. Declare `fn protect` with this signature in
+    /// src/bootstrap/mod.rs to grant other roles; the generators then use yours.
+    pub(super) fn protect(
+        composition: &mut forge::Composition<'_>,
+        permissions: &[&str],
+    ) -> Result<
+        std::sync::Arc<
+            impl crate::adapters::http::access::TenantAccess
+            + crate::adapters::http::api_access::ApiTenantAccess
+            + 'static,
+        >,
+        forge::ComposeError,
+    > {
+        let mut policy = forge::security::RbacPolicy::new();
+        let owner = forge::security::Role::new("owner").map_err(forge::ComposeError::other)?;
+        for permission in permissions {
+            let permission = forge::security::Permission::new(*permission)
+                .map_err(forge::ComposeError::other)?;
+            policy.allow(owner.clone(), permission);
+        }
+        let pool = composition.postgres()?.pool().clone();
+        // Sessions end after FORGE_AUTH_SESSION_IDLE_TIMEOUT without a request.
+        let sessions = crate::infrastructure::auth::PostgresSessionStore::new(pool.clone())
+            .with_idle_timeout(
+                forge::auth::SessionIdleTimeout::new(
+                    composition.config().auth.session_idle_timeout,
+                )
+                .map_err(forge::ComposeError::other)?,
+            );
+        Ok(std::sync::Arc::new(
+            crate::adapters::http::access::SessionTenantAccess::new(
+                std::sync::Arc::new(sessions),
+                std::sync::Arc::new(crate::infrastructure::tenancy::PgMembershipStore::new(pool)),
+                policy,
+            ),
+        ))
+    }
+}

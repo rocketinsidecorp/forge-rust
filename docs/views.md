@@ -221,11 +221,14 @@ impl GlobalAccess for Operators {
 }
 ```
 
-A `--tenant-scoped` resource lives under `/tenants/{tenant_id}/posts` and, on
-PostgreSQL, is wired with `SessionTenantAccess` (session, session CSRF token,
-membership, RBAC); the printed `RbacPolicy` grants `posts:read` and
-`posts:write` to the `owner` role that `setup` gives the first member, and
-nothing to other roles until you grant them. Its rows are isolated by a
+A `--tenant-scoped` resource lives at `/posts`, for the tenant the session
+signed in to (the `__Host-forge_tenant` cookie the sign-in pages set), and, on
+PostgreSQL, is wired in `src/bootstrap/routes_gen.rs` with the `protect` guard:
+`SessionTenantAccess` (session, session CSRF token, membership, RBAC) whose
+`RbacPolicy` grants `posts:read` and `posts:write` to the `owner` role that
+`forge setup` gives the first member, and nothing to other roles until you
+declare your own `fn protect` in `src/bootstrap/mod.rs`
+([generators](generators.md#the-routes-seam)). Its rows are isolated by a
 `tenant_id` predicate in every statement and, on PostgreSQL, by forced
 row-level security. A signed-out browser is sent to the sign-in page (next
 section) and back.
@@ -548,10 +551,11 @@ token format and limits as Forge-Go). The fastest way is the scaffold:
 forge generate scaffold event name:string starts_at:timestamp --tenant-scoped --broadcast
 forge generate scaffold note body:text --global --broadcast
 export FORGE_STREAMS_KEY=$(openssl rand -base64 32)   # required in production, same on every replica
-cargo run                                             # open /tenants/<tenant id>/events in two browsers
+forge dev                                             # open /events in two browsers
 ```
 
-Add the printed wiring (it includes `Streams::register` once). Creating,
+The scaffolds mount themselves in `src/bootstrap/routes_gen.rs`, with
+`Streams::register` once for both. Creating,
 editing or deleting an event in one browser appends, replaces or removes its
 row in the other, without a reload.
 

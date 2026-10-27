@@ -67,7 +67,8 @@ pub(crate) struct Signals {
 }
 
 impl Signals {
-    /// Installs the handlers for SIGINT and SIGTERM (Ctrl-C elsewhere) and
+    /// Installs the handlers for SIGINT, SIGTERM, SIGHUP and SIGQUIT (Ctrl-C
+    /// elsewhere) and
     /// returns once they are registered.
     pub(crate) fn install() -> Result<Self, CliError> {
         Self::install_for(Shutdown::new())
@@ -135,7 +136,7 @@ impl Drop for Signals {
 /// What the signal thread does with Ctrl-C.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Mode {
-    /// SIGINT and SIGTERM ask to stop.
+    /// SIGINT, SIGTERM, SIGHUP and SIGQUIT ask to stop.
     Stop,
     /// SIGTERM, SIGHUP and SIGQUIT ask to stop; SIGINT is swallowed.
     Client,
@@ -176,16 +177,14 @@ fn listen(
             let registered = (|| {
                 let terminate = signal(SignalKind::terminate())?;
                 let interrupt = signal(SignalKind::interrupt())?;
-                // Hang-up and quit keep their default meaning (they end the
-                // CLI) unless a client runs and must be told.
-                let (hangup, quit) = if mode == Mode::Client {
-                    (
-                        Some(signal(SignalKind::hangup())?),
-                        Some(signal(SignalKind::quit())?),
-                    )
-                } else {
-                    (None, None)
-                };
+                // Hang-up (a closed terminal) and quit stop the CLI too,
+                // through its shutdown: their default action would end it at
+                // once and leave a child it runs in a process group of its own
+                // (`forge dev`'s application) serving as an orphan.
+                let (hangup, quit) = (
+                    Some(signal(SignalKind::hangup())?),
+                    Some(signal(SignalKind::quit())?),
+                );
                 Ok::<_, io::Error>((terminate, interrupt, hangup, quit))
             })();
             let (mut terminate, mut interrupt, mut hangup, mut quit) = match registered {

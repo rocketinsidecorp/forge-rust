@@ -5,13 +5,13 @@
 //!
 //! | Method | Path | Action | Permission |
 //! | --- | --- | --- | --- |
-//! | `GET` | `/tenants/{tenant_id}/events` | index | `events:read` |
-//! | `GET` | `/tenants/{tenant_id}/events/new` | new | `events:write` |
-//! | `POST` | `/tenants/{tenant_id}/events` | create | `events:write` |
-//! | `GET` | `/tenants/{tenant_id}/events/{id}` | show | `events:read` |
-//! | `GET` | `/tenants/{tenant_id}/events/{id}/edit` | edit | `events:write` |
-//! | `PATCH`, `PUT` | `/tenants/{tenant_id}/events/{id}` | update | `events:write` |
-//! | `DELETE` | `/tenants/{tenant_id}/events/{id}` | delete | `events:write` |
+//! | `GET` | `/events` | index | `events:read` |
+//! | `GET` | `/events/new` | new | `events:write` |
+//! | `POST` | `/events` | create | `events:write` |
+//! | `GET` | `/events/{id}` | show | `events:read` |
+//! | `GET` | `/events/{id}/edit` | edit | `events:write` |
+//! | `PATCH`, `PUT` | `/events/{id}` | update | `events:write` |
+//! | `DELETE` | `/events/{id}` | delete | `events:write` |
 //!
 //! HTML forms send `PATCH` and `DELETE` as `POST` with `_method`; the CSRF
 //! layer applies the override after checking the token. Invalid input is
@@ -65,8 +65,8 @@ pub fn routes(
         read: Permission::new(READ_PERMISSION).map_err(ComposeError::other)?,
         write: Permission::new(WRITE_PERMISSION).map_err(ComposeError::other)?,
     });
-    let collection = "/tenants/{tenant_id}/events";
-    let member = "/tenants/{tenant_id}/events/{id}";
+    let collection = "/events";
+    let member = "/events/{id}";
     route(router, &state, Method::GET, collection, index)?;
     route(
         router,
@@ -158,7 +158,7 @@ async fn index(state: Arc<EventRoutes>, request: Request) -> Response {
         Ok(context) => context,
         Err(denied) => return denied.response(),
     };
-    let collection = collection_path(&context);
+    let collection = collection_path();
     let Ok(query) = request.query::<IndexQuery>() else {
         return not_found(&state, &request, &collection);
     };
@@ -182,7 +182,7 @@ async fn show(state: Arc<EventRoutes>, request: Request) -> Response {
         Ok(context) => context,
         Err(denied) => return denied.response(),
     };
-    let collection = collection_path(&context);
+    let collection = collection_path();
     let Some(id) = path_id(&request) else {
         return not_found(&state, &request, &collection);
     };
@@ -199,11 +199,10 @@ async fn show(state: Arc<EventRoutes>, request: Request) -> Response {
 }
 
 async fn new(state: Arc<EventRoutes>, request: Request) -> Response {
-    let context = match state.access.authorize(&request, &state.write).await {
-        Ok(context) => context,
-        Err(denied) => return denied.response(),
-    };
-    let collection = collection_path(&context);
+    if let Err(denied) = state.access.authorize(&request, &state.write).await {
+        return denied.response();
+    }
+    let collection = collection_path();
     render_new(
         &state,
         &request,
@@ -219,7 +218,7 @@ async fn create(state: Arc<EventRoutes>, request: Request) -> Response {
         Ok(context) => context,
         Err(denied) => return denied.response(),
     };
-    let collection = collection_path(&context);
+    let collection = collection_path();
     let form: EventForm = match request.form() {
         Ok(form) => form,
         Err(error) => {
@@ -269,7 +268,7 @@ async fn edit(state: Arc<EventRoutes>, request: Request) -> Response {
         Ok(context) => context,
         Err(denied) => return denied.response(),
     };
-    let collection = collection_path(&context);
+    let collection = collection_path();
     let Some(id) = path_id(&request) else {
         return not_found(&state, &request, &collection);
     };
@@ -292,7 +291,7 @@ async fn update(state: Arc<EventRoutes>, request: Request) -> Response {
         Ok(context) => context,
         Err(denied) => return denied.response(),
     };
-    let collection = collection_path(&context);
+    let collection = collection_path();
     let Some(id) = path_id(&request) else {
         return not_found(&state, &request, &collection);
     };
@@ -380,7 +379,7 @@ async fn destroy(state: Arc<EventRoutes>, request: Request) -> Response {
         Ok(context) => context,
         Err(denied) => return denied.response(),
     };
-    let collection = collection_path(&context);
+    let collection = collection_path();
     let Some(id) = path_id(&request) else {
         return not_found(&state, &request, &collection);
     };
@@ -677,10 +676,8 @@ fn path_id(request: &Request) -> Option<EventId> {
     request.path_param_as("id").ok()
 }
 
-/// `/tenants/<tenant id>/events` of the authorized tenant (never the
-/// raw path, which only selected the membership to check).
-fn collection_path(context: &TenantContext) -> String {
-    format!("/tenants/{}/events", context.tenant_id())
+fn collection_path() -> String {
+    "/events".to_owned()
 }
 
 fn yes_no(value: bool) -> String {

@@ -31,15 +31,18 @@ pub(crate) enum FieldType {
 }
 
 impl FieldType {
-    pub(crate) const NAMES: &'static str = "string, text, integer, boolean, timestamp, uuid";
+    pub(crate) const NAMES: &'static str = "string, text, integer, boolean, timestamp, uuid \
+        (also int, bool, time and datetime)";
 
+    /// The canonical names (D22), plus Forge-Go's `int`, `bool` and `time`
+    /// and Rails' `datetime`.
     fn parse(name: &str) -> Option<Self> {
         Some(match name {
             "string" => Self::String,
             "text" => Self::Text,
-            "integer" => Self::Integer,
-            "boolean" => Self::Boolean,
-            "timestamp" => Self::Timestamp,
+            "integer" | "int" => Self::Integer,
+            "boolean" | "bool" => Self::Boolean,
+            "timestamp" | "time" | "datetime" => Self::Timestamp,
             "uuid" => Self::Uuid,
             _ => return None,
         })
@@ -133,22 +136,6 @@ const RUST_KEYWORDS: &[&str] = &[
     "priv", "try", "typeof", "unsized", "virtual", "yield", "union",
 ];
 
-/// SQL keywords reserved by the SQL standard and by PostgreSQL, MySQL or
-/// SQLite in common use. Generated SQL quotes every identifier anyway; the
-/// list keeps schemas readable and portable.
-const SQL_KEYWORDS: &str = "\
-    add all alter analyze and any array asc asymmetric authorization \
-    between binary both by case cast check collate column constraint create \
-    cross current_date current_role current_time current_timestamp \
-    current_user database default deferrable delete desc distinct drop \
-    except exists explain fetch foreign from full grant group having ilike \
-    index inner insert intersect interval into is join key leading left \
-    like limit localtime localtimestamp natural not null offset on only or \
-    order outer overlaps primary range rank references rename replace \
-    returning revoke right row rows schema select session_user set similar \
-    some symmetric table then to trailing trigger unique update user using \
-    values variadic verbose view when window with";
-
 /// PascalCase names that generated modules import or that the prelude
 /// defines; an entity with one of these names would not compile.
 const RESERVED_TYPES: &[&str] = &[
@@ -230,6 +217,11 @@ const RESERVED_LOCALS: &[&str] = &[
     "version",
 ];
 
+/// Crates generated code names by path (`forge::...`, `std::...`); `crate`,
+/// `self` and `super` are Rust keywords, refused already. A module of one of
+/// these names would shadow the crate in the code around it.
+pub(crate) const CRATE_NAMES: &[&str] = &["alloc", "core", "forge", "std"];
+
 /// Plural names that would collide with framework routes or generated
 /// modules (`/health`, `/assets`, `/streams`, `/tenants/{tenant_id}/...`,
 /// `adapters::http::views`, `adapters::http::access` and
@@ -264,6 +256,20 @@ pub(crate) fn parse(
         }
     };
     for name in [&singular, &plural] {
+        if CRATE_NAMES.contains(&name.as_str()) {
+            return invalid(format!(
+                "`{name}` is the name of a crate the generated code uses by path ({}); choose \
+                 another resource name or --plural",
+                CRATE_NAMES.join(", ")
+            ));
+        }
+        if crate::wiring::SEAM_NAMES.contains(&name.as_str()) {
+            return invalid(format!(
+                "`{name}` names a guard, shared block or part of the generated routes seam \
+                 (src/bootstrap/routes_gen.rs: {}); choose another resource name or --plural",
+                crate::wiring::SEAM_NAMES.join(", ")
+            ));
+        }
         if RESERVED_LOCALS.contains(&name.as_str()) {
             return invalid(format!(
                 "`{name}` names a variable of the generated code; choose another resource name \
@@ -318,6 +324,35 @@ pub(crate) fn parse(
     Ok(resource)
 }
 
+/// Parses the `field:type[?]` arguments of `forge generate migration`, for
+/// the columns of `table`.
+pub(crate) fn parse_columns(table: &str, fields: &[String]) -> Result<Vec<Field>, InvalidScaffold> {
+    check_name("table name", table)?;
+    if table.starts_with("forge_") || table.starts_with("sqlite_") || table.starts_with("_sqlx") {
+        return invalid(format!(
+            "table `{table}` uses a prefix reserved for Forge, SQLx and SQLite internals"
+        ));
+    }
+    if fields.len() > MAX_FIELDS {
+        return invalid(format!("at most {MAX_FIELDS} fields are supported"));
+    }
+    let mut parsed: Vec<Field> = Vec::with_capacity(fields.len());
+    for declaration in fields {
+        let field = parse_field(declaration)?;
+        if parsed.iter().any(|existing| existing.name == field.name) {
+            return invalid(format!("field `{}` is declared more than once", field.name));
+        }
+        parsed.push(field);
+    }
+    check_identifier_lengths(&Resource {
+        singular: table.to_owned(),
+        plural: table.to_owned(),
+        fields: parsed.clone(),
+        scope: Scope::Global,
+    })?;
+    Ok(parsed)
+}
+
 /// Accepts `snake_case` or `PascalCase` and returns `snake_case`.
 fn resource_name(name: &str) -> Result<String, InvalidScaffold> {
     let snake = if name.starts_with(|c: char| c.is_ascii_uppercase()) {
@@ -367,12 +402,8 @@ fn check_name(what: &str, name: &str) -> Result<(), InvalidScaffold> {
     if RUST_KEYWORDS.contains(&name) {
         return invalid(format!("{what} `{name}` is a Rust keyword"));
     }
-    if SQL_KEYWORDS
-        .split_whitespace()
-        .any(|keyword| keyword == name)
-    {
-        return invalid(format!("{what} `{name}` is an SQL keyword"));
-    }
+    // SQL keywords (`order`, `group`) are fine: generated SQL quotes every
+    // identifier, as Forge-Go's does.
     Ok(())
 }
 
@@ -584,7 +615,6 @@ mod tests {
             "post_",
             "café",
             "type",
-            "select",
             "tenant",
             "site",
             "Request",
@@ -606,6 +636,88 @@ mod tests {
         }
     }
 
+    /// The seam's own names (its guards, shared blocks, function, module and
+    /// parameters) are never a resource or plural: `--plural protect` would
+    /// shadow the guard of the routes (Forge-Go's review found such a
+    /// collision turning a guard off).
+    #[test]
+    fn rejects_the_names_of_the_routes_seam() {
+        for name in crate::wiring::SEAM_NAMES {
+            let as_name = parse(name, &["a:string".to_owned()], Scope::Global, None)
+                .err()
+                .map(|error| error.to_string())
+                .unwrap_or_default();
+            assert!(!as_name.is_empty(), "{name} is refused as a resource name");
+            let as_plural = parse("thing", &["a:string".to_owned()], Scope::Global, Some(name))
+                .err()
+                .map(|error| error.to_string())
+                .unwrap_or_default();
+            assert!(as_plural.contains("routes seam"), "{name}: {as_plural}");
+        }
+    }
+
+    /// Names of crates the generated code uses by path are refused as a
+    /// resource or a plural, as are `crate`, `self` and `super` (keywords).
+    #[test]
+    fn rejects_the_names_of_crates_used_by_path() {
+        for name in ["alloc", "core", "forge", "std"] {
+            let as_plural = parse("thing", &["a:string".to_owned()], Scope::Global, Some(name))
+                .err()
+                .map(|error| error.to_string())
+                .unwrap_or_default();
+            assert!(
+                as_plural.contains("crate the generated code uses"),
+                "{name}: {as_plural}"
+            );
+            let as_name = parse(name, &["a:string".to_owned()], Scope::Global, None)
+                .err()
+                .map(|error| error.to_string())
+                .unwrap_or_default();
+            assert!(
+                as_name.contains("crate the generated code uses"),
+                "{name}: {as_name}"
+            );
+        }
+        for keyword in ["crate", "self", "super"] {
+            assert!(
+                parse(keyword, &["a:string".to_owned()], Scope::Global, None).is_err(),
+                "{keyword}"
+            );
+        }
+    }
+
+    /// Generated SQL quotes every identifier, so SQL keywords are names like
+    /// any other, as in Forge-Go (`forge generate resource order` makes the
+    /// table `orders`); field types take Forge-Go's and Rails' spellings.
+    #[test]
+    fn accepts_sql_keywords_and_type_aliases() {
+        let order = parse(
+            "order",
+            &[
+                "select:string".to_owned(),
+                "group:int".to_owned(),
+                "public:bool?".to_owned(),
+                "at:time".to_owned(),
+                "on:datetime?".to_owned(),
+            ],
+            Scope::Global,
+            None,
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(order.plural, "orders");
+        let kinds: Vec<FieldType> = order.fields.iter().map(|field| field.kind).collect();
+        assert_eq!(
+            kinds,
+            [
+                FieldType::String,
+                FieldType::Integer,
+                FieldType::Boolean,
+                FieldType::Timestamp,
+                FieldType::Timestamp
+            ]
+        );
+    }
+
     #[test]
     fn rejects_invalid_fields() {
         for declarations in [
@@ -618,7 +730,6 @@ mod tests {
             &["version:integer"][..],
             &["created_at:timestamp"][..],
             &["csrf_token:string"][..],
-            &["order:integer"][..],
             &["match:string"][..],
             &["Title:string"][..],
             &["title:string", "title:text"][..],
