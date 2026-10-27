@@ -104,26 +104,10 @@ app="$work/benchapp"
 cp "$root/Cargo.lock" "$app/Cargo.lock"
 (cd "$app" && "$forge" generate scaffold post title:string body:text --tenant-scoped >"$work/scaffold.out")
 
-# The generators never edit your code; apply what the scaffold prints, once,
-# as the tests of forge-cli do. 1. The module declarations: `FILE pub mod x;`.
-awk '/^  1\. Declare/ { on = 1; next } /^  2\. In src\/bootstrap/ { on = 0 } on && / pub mod / { print $1, $4 }' "$work/scaffold.out" >"$work/declarations.txt"
-[ -s "$work/declarations.txt" ] || { echo "bench.sh: the scaffold printed no module declarations" >&2; exit 1; }
-while read -r file module; do
-	# the sorted mod block is cosmetic: a declaration at the end of the file compiles the same
-	printf 'pub mod %s\n' "$module" >>"$app/$file"
-done <"$work/declarations.txt"
-# 2. The statements for the end of `fn compose` (the lines indented four
-# spaces after the instruction, up to the first line that is not).
-awk '/^  2\. In src\/bootstrap\/mod\.rs/ { on = 1; next } on && /^    / { print; started = 1; next } on && started { exit }' "$work/scaffold.out" >"$work/wiring.rs.txt"
-[ -s "$work/wiring.rs.txt" ] || { echo "bench.sh: the scaffold printed no wiring" >&2; exit 1; }
-bootstrap="$app/src/bootstrap/mod.rs"
-# The function the scaffold names (`fn compose`), and its closing `Ok(())`.
-function="$(sed -n 's/^  2\. In src\/bootstrap\/mod\.rs, at the end of `fn \([a-z_]*\)`.*$/\1/p' "$work/scaffold.out" | head -n 1)"
-[ -n "$function" ] || { echo "bench.sh: the scaffold does not name the function to wire" >&2; exit 1; }
-end="$(awk -v name="$function" '$0 ~ "^(pub )?fn " name "\\(" { on = 1 } on && /^    Ok\(\(\)\)$/ { print NR; exit }' "$bootstrap")"
-[ -n "$end" ] || { echo "bench.sh: bootstrap/mod.rs changed: no 'Ok(())' closes fn ${function}" >&2; exit 1; }
-{ head -n $((end - 1)) "$bootstrap"; cat "$work/wiring.rs.txt"; tail -n +"$end" "$bootstrap"; } >"$bootstrap.new"
-mv "$bootstrap.new" "$bootstrap"
+# The scaffold wires itself (module declarations and the routes seam,
+# src/bootstrap/routes_gen.rs); check that it did.
+grep -q '^pub mod posts;' "$app/src/application/use_cases/mod.rs" || { echo "bench.sh: the scaffold did not declare its modules" >&2; exit 1; }
+grep -q '// forge:scaffold posts' "$app/src/bootstrap/routes_gen.rs" || { echo "bench.sh: the scaffold did not wire its routes" >&2; exit 1; }
 # The scaffold's index shows PAGE_SIZE rows (25) and takes no limit: make the
 # page the BENCH_ROWS rows the report claims.
 sed -i -E "s/^pub const PAGE_SIZE: u16 = [0-9]+;/pub const PAGE_SIZE: u16 = ${rows};/" "$app/src/application/use_cases/posts.rs"
