@@ -465,8 +465,6 @@ fn declared_module(line: &str) -> Option<&str> {
     None
 }
 
-/// `source` with `pub mod name;` added in sorted order, `None` when it is
-/// already there, or the line that declares `name` another way.
 /// Whether `line` is an outer attribute or doc comment, which belongs to
 /// the item below it (`#[cfg(test)]`, `#[path = "..."]`, `/// docs`).
 fn attaches(line: &str) -> bool {
@@ -498,6 +496,8 @@ fn foreign_declaration(lines: &[&str], index: usize, canonical: &str) -> Option<
     })
 }
 
+/// `source` with `pub mod name;` added in sorted order, `None` when it is
+/// already there, or the line that declares `name` another way.
 fn declare(source: &str, name: &str) -> Result<Option<String>, String> {
     let canonical = format!("pub mod {name};");
     let lines: Vec<&str> = source.lines().collect();
