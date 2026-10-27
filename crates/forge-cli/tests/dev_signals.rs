@@ -107,6 +107,7 @@ fn dev(root: &Path) -> (Child, i32) {
         }
     }
     let _ = child.kill();
+    let _ = child.wait();
     panic!("the application did not start:\n{log}");
 }
 
