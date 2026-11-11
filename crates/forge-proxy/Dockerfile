@@ -27,7 +27,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
 RUN mkdir -p /out/var/lib/forge-proxy/acme /out/run/forge-proxy \
     && chmod 0700 /out/var/lib/forge-proxy /out/var/lib/forge-proxy/acme /out/run/forge-proxy
 
-FROM gcr.io/distroless/cc-debian13:nonroot@sha256:b7e81cb1af38d9345680e68bcf564d388f96304e25222030fc8c051faf8565b3 AS runtime
+FROM gcr.io/distroless/cc-debian13:nonroot@sha256:83b9b50586253821cf63ffcec87d3d94265a093ad30da232039af962dd8f4edf AS runtime
 COPY --from=build /out/forge-proxy /usr/local/bin/forge-proxy
 COPY --from=build --chown=65532:65532 /out/var/lib/forge-proxy /var/lib/forge-proxy
 COPY --from=build --chown=65532:65532 /out/run/forge-proxy /run/forge-proxy
